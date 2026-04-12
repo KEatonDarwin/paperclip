@@ -603,6 +603,7 @@ export function shouldResetTaskSessionForWake(
 
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (wakeReason === "issue_assigned") return true;
+  if (wakeReason === "direct_chat") return true;
   return false;
 }
 
@@ -620,6 +621,7 @@ function describeSessionResetReason(
 
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (wakeReason === "issue_assigned") return "wake reason is issue_assigned";
+  if (wakeReason === "direct_chat") return "wake reason is direct_chat (fresh session per chat)";
   return null;
 }
 

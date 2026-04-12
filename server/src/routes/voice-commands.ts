@@ -244,7 +244,72 @@ export function voiceCommandRoutes(db: Db) {
     assertCompanyAccess(req, existing.companyId);
 
     await svc.remove(id, existing.companyId);
+
+    // If we just deleted a processing command, promote the next queued one
+    if (existing.status === "processing" && existing.routerAgentId) {
+      const next = await svc.promoteNextQueued(existing.companyId);
+      if (next?.routerAgentId) {
+        const agent = await agents.getById(next.routerAgentId);
+        if (agent) {
+          await wakeRouter({
+            svc,
+            chats,
+            heartbeat,
+            companyId: existing.companyId,
+            routerAgentId: next.routerAgentId,
+            userId: next.initiatedByUserId,
+            cmdId: next.id,
+            rawText: next.rawText,
+          });
+        }
+      }
+    }
+
     res.status(204).end();
+  });
+
+  // Force-push a queued command to processing immediately
+  router.post("/voice-commands/:id/push", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+
+    const existing = await svc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Voice command not found" });
+      return;
+    }
+    assertCompanyAccess(req, existing.companyId);
+
+    if (existing.status !== "queued") {
+      res.status(409).json({ error: "Only queued commands can be pushed" });
+      return;
+    }
+
+    if (!existing.routerAgentId) {
+      res.status(409).json({ error: "Voice command has no router agent" });
+      return;
+    }
+
+    const agent = await agents.getById(existing.routerAgentId);
+    if (!agent) {
+      res.status(409).json({ error: "Router agent not found" });
+      return;
+    }
+
+    const userId = (req.actor as { userId: string }).userId;
+    const { chatId } = await wakeRouter({
+      svc,
+      chats,
+      heartbeat,
+      companyId: existing.companyId,
+      routerAgentId: existing.routerAgentId,
+      userId,
+      cmdId: existing.id,
+      rawText: existing.rawText,
+    });
+
+    const updated = await svc.getById(id);
+    res.json({ ...updated, chatId });
   });
 
   // Submit a correction for a voice command

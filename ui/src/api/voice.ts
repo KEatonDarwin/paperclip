@@ -72,4 +72,6 @@ export const voiceApi = {
   }) => api.post<VoiceCommand>(`/voice-commands/${id}/correct`, data),
 
   delete: (id: string) => api.delete<void>(`/voice-commands/${id}`),
+
+  push: (id: string) => api.post<VoiceCommand>(`/voice-commands/${id}/push`, {}),
 };

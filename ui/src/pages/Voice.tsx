@@ -9,7 +9,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "../lib/utils";
-import { Mic, MicOff, Send, ExternalLink, CornerDownLeft, Loader2, CheckCircle2, XCircle, Clock, AlertCircle, Trash2 } from "lucide-react";
+import { Mic, MicOff, Send, ExternalLink, CornerDownLeft, Loader2, CheckCircle2, XCircle, Clock, AlertCircle, Trash2, PlayCircle } from "lucide-react";
 
 // ─── Speech recognition types ───
 interface SpeechRecognitionEvent extends Event {
@@ -66,11 +66,13 @@ function VoiceCommandRow({
   companyPrefix,
   onCorrect,
   onDelete,
+  onPush,
 }: {
   cmd: VoiceCommand;
   companyPrefix: string;
   onCorrect: (cmd: VoiceCommand) => void;
   onDelete: (id: string) => void;
+  onPush: (id: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const isActive = cmd.status === "processing" || cmd.status === "queued";
@@ -151,6 +153,20 @@ function VoiceCommandRow({
               <CornerDownLeft className="h-3 w-3 mr-1" />
               Correct
             </Button>
+            {cmd.status === "queued" && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="text-blue-600 hover:text-blue-700 hover:bg-blue-50 border-blue-200"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onPush(cmd.id);
+                }}
+              >
+                <PlayCircle className="h-3 w-3 mr-1" />
+                Push Now
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="sm"
@@ -216,6 +232,14 @@ export function Voice() {
   // Delete mutation
   const deleteMutation = useMutation({
     mutationFn: (id: string) => voiceApi.delete(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.voice.list(selectedCompanyId!) });
+    },
+  });
+
+  // Push mutation (force queued → processing)
+  const pushMutation = useMutation({
+    mutationFn: (id: string) => voiceApi.push(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.voice.list(selectedCompanyId!) });
     },
@@ -448,6 +472,7 @@ export function Voice() {
                   setCorrectionText("");
                 }}
                 onDelete={(id) => deleteMutation.mutate(id)}
+                onPush={(id) => pushMutation.mutate(id)}
               />
             ))
           )}

@@ -14,6 +14,7 @@ import {
   CheckCircle2,
   XCircle,
 } from "lucide-react";
+import { MarkdownBody } from "../components/MarkdownBody";
 
 function formatDuration(sec: number | null): string {
   if (!sec) return "";
@@ -175,10 +176,8 @@ function ExtractionRow({
               </div>
             )}
             {extraction.status === "completed" && extraction.report && (
-              <div className="rounded-lg bg-gray-50 dark:bg-gray-800/50 p-4 text-sm">
-                <pre className="whitespace-pre-wrap font-sans text-gray-800 dark:text-gray-200 leading-relaxed">
-                  {extraction.report}
-                </pre>
+              <div className="rounded-lg bg-gray-50 dark:bg-gray-800/50 p-4">
+                <MarkdownBody>{extraction.report}</MarkdownBody>
               </div>
             )}
           </td>

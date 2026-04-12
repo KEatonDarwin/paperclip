@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, readdir, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readdir, readFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { promisify } from "node:util";
 import type { Db } from "@paperclipai/db";
 import { youtubeExtractionService } from "./youtube-extractions.js";
@@ -132,6 +132,71 @@ async function analyzeWithClaude(meta: YtDlpMeta, transcript: string): Promise<s
   }
 }
 
+const VAULT_EXTRACTIONS_DIR = join(
+  homedir(),
+  ".paperclip/instances/default/paperclip-wiki/outputs/youtube-extractions",
+);
+
+function detectVerdict(report: string): string {
+  if (report.includes("HIGHLY RECOMMENDED")) return "HIGHLY RECOMMENDED";
+  if (report.includes("WORTH EXPLORING")) return "WORTH EXPLORING";
+  if (report.includes("NOT RELEVANT")) return "NOT RELEVANT";
+  return "UNKNOWN";
+}
+
+function formatDurationStr(sec: number | undefined): string {
+  if (!sec) return "unknown";
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return `${m}m ${s}s`;
+}
+
+async function writeVaultNote(
+  meta: YtDlpMeta,
+  url: string,
+  report: string,
+): Promise<void> {
+  try {
+    await mkdir(VAULT_EXTRACTIONS_DIR, { recursive: true });
+
+    const date = new Date().toISOString().slice(0, 10);
+    const safeId = (meta.id ?? "unknown").replace(/[^a-zA-Z0-9_-]/g, "");
+    const filename = `${date}-${safeId}.md`;
+    const filePath = join(VAULT_EXTRACTIONS_DIR, filename);
+
+    const verdict = detectVerdict(report);
+    const channel = meta.channel ?? meta.uploader ?? "unknown";
+    const duration = formatDurationStr(meta.duration);
+    const views = meta.view_count?.toLocaleString() ?? "unknown";
+
+    const content = [
+      "---",
+      `title: "${meta.title.replace(/"/g, '\\"')}"`,
+      `channel: "${channel}"`,
+      `url: "${url}"`,
+      `video_id: "${meta.id ?? ""}"`,
+      `analyzed: ${date}`,
+      `verdict: ${verdict}`,
+      `tags: [youtube-extraction]`,
+      "---",
+      "",
+      `# ${meta.title}`,
+      "",
+      `**Channel:** ${channel} · **Duration:** ${duration} · **Views:** ${views}`,
+      `**URL:** ${url}`,
+      `**Analyzed:** ${date}`,
+      "",
+      "---",
+      "",
+      report,
+    ].join("\n");
+
+    await writeFile(filePath, content, "utf8");
+  } catch {
+    // vault write is best-effort — never fail the extraction over it
+  }
+}
+
 export async function processYoutubeExtraction(db: Db, extractionId: string, url: string): Promise<void> {
   const svc = youtubeExtractionService(db);
   const outDir = await mkdtemp(join(tmpdir(), "yt-extract-"));
@@ -167,6 +232,7 @@ export async function processYoutubeExtraction(db: Db, extractionId: string, url
     const report = await analyzeWithClaude(meta, transcript);
 
     await svc.update(extractionId, { report, status: "completed" });
+    await writeVaultNote(meta, url, report);
   } catch (err) {
     await svc.update(extractionId, {
       status: "failed",

@@ -3,12 +3,11 @@ import { NavLink, useLocation } from "@/lib/router";
 import {
   House,
   CircleDot,
-  SquarePen,
+  Mic,
   Users,
   Inbox,
 } from "lucide-react";
 import { useCompany } from "../context/CompanyContext";
-import { useDialog } from "../context/DialogContext";
 import { cn } from "../lib/utils";
 import { useInboxBadge } from "../hooks/useInboxBadge";
 
@@ -27,7 +26,7 @@ interface MobileNavLinkItem {
 interface MobileNavActionItem {
   type: "action";
   label: string;
-  icon: typeof SquarePen;
+  icon: typeof House;
   onClick: () => void;
 }
 
@@ -36,14 +35,13 @@ type MobileNavItem = MobileNavLinkItem | MobileNavActionItem;
 export function MobileBottomNav({ visible }: MobileBottomNavProps) {
   const location = useLocation();
   const { selectedCompanyId } = useCompany();
-  const { openNewIssue } = useDialog();
   const inboxBadge = useInboxBadge(selectedCompanyId);
 
   const items = useMemo<MobileNavItem[]>(
     () => [
       { type: "link", to: "/dashboard", label: "Home", icon: House },
       { type: "link", to: "/issues", label: "Issues", icon: CircleDot },
-      { type: "action", label: "Create", icon: SquarePen, onClick: () => openNewIssue() },
+      { type: "link", to: "/voice", label: "Voice", icon: Mic },
       { type: "link", to: "/agents/all", label: "Agents", icon: Users },
       {
         type: "link",
@@ -53,7 +51,7 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
         badge: inboxBadge.inbox,
       },
     ],
-    [openNewIssue, inboxBadge.inbox],
+    [inboxBadge.inbox],
   );
 
   return (

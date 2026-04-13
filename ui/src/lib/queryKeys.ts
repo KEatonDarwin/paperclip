@@ -135,8 +135,21 @@ export const queryKeys = {
     detail: (agentId: string, chatId: string) => ["chats", agentId, chatId] as const,
     messages: (agentId: string, chatId: string) => ["chats", agentId, chatId, "messages"] as const,
   },
+  voice: {
+    list: (companyId: string) => ["voice", companyId] as const,
+    stats: (companyId: string) => ["voice", "stats", companyId] as const,
+    detail: (id: string) => ["voice", "detail", id] as const,
+  },
+  youtube: {
+    list: (companyId: string) => ["youtube", companyId] as const,
+    detail: (id: string) => ["youtube", "detail", id] as const,
+  },
   skills: {
     available: ["skills", "available"] as const,
+  },
+  calendar: {
+    events: (companyId: string, start: string, end: string) =>
+      ["calendar", companyId, start, end] as const,
   },
   plugins: {
     all: ["plugins"] as const,

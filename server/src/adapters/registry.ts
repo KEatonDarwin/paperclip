@@ -72,12 +72,28 @@ import {
   sessionCodec as hermesSessionCodec,
   listSkills as hermesListSkills,
   syncSkills as hermesSyncSkills,
-  detectModel as detectModelFromHermes,
 } from "hermes-paperclip-adapter/server";
 import {
   agentConfigurationDoc as hermesAgentConfigurationDoc,
   models as hermesModels,
 } from "hermes-paperclip-adapter";
+import {
+  execute as auggieExecute,
+  testEnvironment as auggieTestEnvironment,
+  sessionCodec as auggieSessionCodec,
+  listAuggieModels,
+} from "@paperclipai/adapter-auggie-local/server";
+import {
+  agentConfigurationDoc as auggieAgentConfigurationDoc,
+} from "@paperclipai/adapter-auggie-local";
+import {
+  execute as ollamaExecute,
+  testEnvironment as ollamaTestEnvironment,
+} from "@paperclipai/adapter-ollama-local/server";
+import {
+  agentConfigurationDoc as ollamaAgentConfigurationDoc,
+  models as ollamaModels,
+} from "@paperclipai/adapter-ollama-local";
 import { processAdapter } from "./process/index.js";
 import { httpAdapter } from "./http/index.js";
 
@@ -184,7 +200,27 @@ const hermesLocalAdapter: ServerAdapterModule = {
   models: hermesModels,
   supportsLocalAgentJwt: true,
   agentConfigurationDoc: hermesAgentConfigurationDoc,
-  detectModel: () => detectModelFromHermes(),
+};
+
+const auggieLocalAdapter: ServerAdapterModule = {
+  type: "auggie_local",
+  execute: auggieExecute,
+  testEnvironment: auggieTestEnvironment,
+  sessionCodec: auggieSessionCodec,
+  sessionManagement: getAdapterSessionManagement("auggie_local") ?? undefined,
+  models: [],
+  listModels: listAuggieModels,
+  supportsLocalAgentJwt: true,
+  agentConfigurationDoc: auggieAgentConfigurationDoc,
+};
+
+const ollamaLocalAdapter: ServerAdapterModule = {
+  type: "ollama_local",
+  execute: ollamaExecute,
+  testEnvironment: ollamaTestEnvironment,
+  models: ollamaModels,
+  supportsLocalAgentJwt: true,
+  agentConfigurationDoc: ollamaAgentConfigurationDoc,
 };
 
 const adaptersByType = new Map<string, ServerAdapterModule>(
@@ -197,6 +233,8 @@ const adaptersByType = new Map<string, ServerAdapterModule>(
     geminiLocalAdapter,
     openclawGatewayAdapter,
     hermesLocalAdapter,
+    auggieLocalAdapter,
+    ollamaLocalAdapter,
     processAdapter,
     httpAdapter,
   ].map((a) => [a.type, a]),

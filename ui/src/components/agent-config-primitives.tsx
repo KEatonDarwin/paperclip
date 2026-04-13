@@ -65,6 +65,8 @@ export const adapterLabels: Record<string, string> = {
   openclaw_gateway: "OpenClaw Gateway",
   cursor: "Cursor (local)",
   hermes_local: "Hermes Agent",
+  ollama_local: "Ollama (local)",
+  auggie_local: "Augment Code (local)",
   process: "Process",
   http: "HTTP",
 };

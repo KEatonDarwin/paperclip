@@ -105,6 +105,19 @@ importers:
         specifier: ^5.7.3
         version: 5.9.3
 
+  packages/adapters/auggie-local:
+    dependencies:
+      '@paperclipai/adapter-utils':
+        specifier: workspace:*
+        version: link:../../adapter-utils
+    devDependencies:
+      '@types/node':
+        specifier: ^24.6.0
+        version: 24.12.0
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.3
+
   packages/adapters/claude-local:
     dependencies:
       '@paperclipai/adapter-utils':
@@ -161,6 +174,19 @@ importers:
       picocolors:
         specifier: ^1.1.1
         version: 1.1.1
+    devDependencies:
+      '@types/node':
+        specifier: ^24.6.0
+        version: 24.12.0
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.3
+
+  packages/adapters/ollama-local:
+    dependencies:
+      '@paperclipai/adapter-utils':
+        specifier: workspace:*
+        version: link:../../adapter-utils
     devDependencies:
       '@types/node':
         specifier: ^24.6.0
@@ -505,6 +531,9 @@ importers:
       '@aws-sdk/client-s3':
         specifier: ^3.888.0
         version: 3.994.0
+      '@paperclipai/adapter-auggie-local':
+        specifier: workspace:*
+        version: link:../packages/adapters/auggie-local
       '@paperclipai/adapter-claude-local':
         specifier: workspace:*
         version: link:../packages/adapters/claude-local
@@ -517,6 +546,9 @@ importers:
       '@paperclipai/adapter-gemini-local':
         specifier: workspace:*
         version: link:../packages/adapters/gemini-local
+      '@paperclipai/adapter-ollama-local':
+        specifier: workspace:*
+        version: link:../packages/adapters/ollama-local
       '@paperclipai/adapter-openclaw-gateway':
         specifier: workspace:*
         version: link:../packages/adapters/openclaw-gateway
@@ -9514,14 +9546,6 @@ snapshots:
       chai: 5.3.3
       tinyrainbow: 2.0.0
 
-  '@vitest/mocker@3.2.4(vite@7.3.1(@types/node@24.12.0)(jiti@2.6.1)(lightningcss@1.30.2)(tsx@4.21.0))':
-    dependencies:
-      '@vitest/spy': 3.2.4
-      estree-walker: 3.0.3
-      magic-string: 0.30.21
-    optionalDependencies:
-      vite: 7.3.1(@types/node@24.12.0)(jiti@2.6.1)(lightningcss@1.30.2)(tsx@4.21.0)
-
   '@vitest/mocker@3.2.4(vite@7.3.1(@types/node@25.2.3)(jiti@2.6.1)(lightningcss@1.30.2)(tsx@4.21.0))':
     dependencies:
       '@vitest/spy': 3.2.4
@@ -12383,7 +12407,7 @@ snapshots:
     dependencies:
       '@types/chai': 5.2.3
       '@vitest/expect': 3.2.4
-      '@vitest/mocker': 3.2.4(vite@7.3.1(@types/node@24.12.0)(jiti@2.6.1)(lightningcss@1.30.2)(tsx@4.21.0))
+      '@vitest/mocker': 3.2.4(vite@7.3.1(@types/node@25.2.3)(jiti@2.6.1)(lightningcss@1.30.2)(tsx@4.21.0))
       '@vitest/pretty-format': 3.2.4
       '@vitest/runner': 3.2.4
       '@vitest/snapshot': 3.2.4

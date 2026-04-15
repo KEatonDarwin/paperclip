@@ -53,12 +53,11 @@ export function quickNoteRoutes(db: Db) {
     });
   }
 
-  // List notes for current user
+  // List notes for current user (or all company notes for agents)
   router.get("/companies/:companyId/quick-notes", async (req, res) => {
     const companyId = req.params.companyId as string;
-    assertBoard(req);
     assertCompanyAccess(req, companyId);
-    const userId = (req.actor as { userId: string }).userId;
+    const userId = req.actor.type === "board" ? (req.actor as { userId: string }).userId : null;
     const includeDismissed = req.query.includeDismissed === "true";
     const notes = await svc.list(companyId, userId, { includeDismissed });
     res.json(notes);
@@ -82,7 +81,6 @@ export function quickNoteRoutes(db: Db) {
 
   // Get single note
   router.get("/quick-notes/:noteId", async (req, res) => {
-    assertBoard(req);
     const note = await svc.getById(req.params.noteId as string);
     if (!note) return res.status(404).json({ error: "Not found" });
     assertCompanyAccess(req, note.companyId);
@@ -91,7 +89,6 @@ export function quickNoteRoutes(db: Db) {
 
   // Update note
   router.patch("/quick-notes/:noteId", validate(updateSchema), async (req, res) => {
-    assertBoard(req);
     const existing = await svc.getById(req.params.noteId as string);
     if (!existing) return res.status(404).json({ error: "Not found" });
     assertCompanyAccess(req, existing.companyId);
@@ -99,7 +96,7 @@ export function quickNoteRoutes(db: Db) {
     res.json(note);
   });
 
-  // Delete note
+  // Delete note (board only)
   router.delete("/quick-notes/:noteId", async (req, res) => {
     assertBoard(req);
     const existing = await svc.getById(req.params.noteId as string);
@@ -111,25 +108,31 @@ export function quickNoteRoutes(db: Db) {
 
   // List thread entries for a note
   router.get("/quick-notes/:noteId/threads", async (req, res) => {
-    assertBoard(req);
+    const note = await svc.getById(req.params.noteId as string);
+    if (!note) return res.status(404).json({ error: "Not found" });
+    assertCompanyAccess(req, note.companyId);
     const entries = await svc.listThreads(req.params.noteId as string);
     res.json(entries);
   });
 
-  // Add thread entry (user reply)
+  // Add thread entry (user or agent)
   router.post("/quick-notes/:noteId/threads", validate(threadSchema), async (req, res) => {
-    assertBoard(req);
-    const userId = (req.actor as { userId: string }).userId;
     const noteId = req.params.noteId as string;
+    const note = await svc.getById(noteId);
+    if (!note) return res.status(404).json({ error: "Not found" });
+    assertCompanyAccess(req, note.companyId);
+    const authorType = req.actor.type === "agent" ? "agent" : "user";
+    const authorId = req.actor.type === "agent"
+      ? (req.actor as { agentId: string }).agentId
+      : (req.actor as { userId: string }).userId;
     const entry = await svc.addThread({
       noteId,
-      authorType: "user",
-      authorId: userId,
+      authorType,
+      authorId,
       body: req.body.body,
     });
     res.status(201).json(entry);
-    const note = await svc.getById(noteId);
-    if (note) {
+    if (authorType === "user") {
       void wakeJarvisIfActive(note.companyId, noteId).catch(() => {});
     }
   });

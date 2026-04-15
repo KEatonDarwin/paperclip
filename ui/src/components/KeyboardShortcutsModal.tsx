@@ -44,15 +44,21 @@ export function KeyboardShortcutsModal() {
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
+      // Close on Escape regardless of focus
+      if (e.key === "Escape" && open) {
+        setOpen(false);
+        return;
+      }
+
       const target = e.target as HTMLElement;
       if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) return;
 
-      if (e.key === "?" && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // Support both "?" (Shift+/) and "/" with shiftKey for cross-browser/layout compat
+      const isQuestionMark =
+        (e.key === "?" || (e.key === "/" && e.shiftKey)) && !e.ctrlKey && !e.metaKey && !e.altKey;
+      if (isQuestionMark) {
         e.preventDefault();
         setOpen((prev) => !prev);
-      }
-      if (e.key === "Escape" && open) {
-        setOpen(false);
       }
     }
     document.addEventListener("keydown", handleKeyDown);

@@ -8,7 +8,7 @@ const manifest: PaperclipPluginManifestV1 = {
   description:
     "Connects to Kevin's personal ADHD-optimized productivity app. Manages tasks, projects, Fridge items (ideas), and focus sessions for the Darwin workday.",
   author: "Darwin",
-  categories: ["connector", "productivity"],
+  categories: ["connector", "automation"],
   capabilities: [
     "plugin.state.read",
     "plugin.state.write",

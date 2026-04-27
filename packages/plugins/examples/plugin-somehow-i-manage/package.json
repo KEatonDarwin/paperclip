@@ -1,0 +1,39 @@
+{
+  "name": "@paperclipai/plugin-somehow-i-manage",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "A Paperclip plugin that connects to the 'Somehow I Manage' (SHIM) personal productivity app",
+  "scripts": {
+    "build": "node ./esbuild.config.mjs",
+    "dev": "node ./esbuild.config.mjs --watch",
+    "dev:ui": "paperclip-plugin-dev-server --root . --ui-dir dist/ui --port 4179",
+    "typecheck": "tsc --noEmit"
+  },
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js",
+    "ui": "./dist/ui/"
+  },
+  "keywords": [
+    "paperclip",
+    "plugin",
+    "shim",
+    "productivity",
+    "tasks",
+    "pomodoro"
+  ],
+  "author": "Darwin",
+  "license": "MIT",
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "workspace:*",
+    "@types/node": "^24.6.0",
+    "@types/react": "^19.0.8",
+    "esbuild": "^0.27.3",
+    "tslib": "^2.8.1",
+    "typescript": "^5.7.3"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  }
+}

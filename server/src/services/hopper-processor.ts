@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { hopperService } from "./hopper.js";
+import { slackDm } from "./slack-dm.js";
 
 const softwareClassifySchema = z.object({
   kind: z.enum(["bug", "feature"]).nullable(),
@@ -202,11 +203,27 @@ export function hopperProcessor(db: Db) {
     }
 
     if (!parsed.has_info) {
-      await svc.update(itemId, {
+      const updatePatch: Parameters<typeof svc.update>[1] = {
         status: "needs_info",
         kind: parsed.kind ?? null,
         question: parsed.question ?? null,
-      });
+      };
+
+      // Send Slack DM if configured and item doesn't already have a thread
+      const slackToken = process.env.SLACK_BOT_TOKEN;
+      const slackUserId = process.env.SLACK_HOPPER_USER_ID;
+      if (slackToken && slackUserId && parsed.question && !item?.slackThreadTs) {
+        try {
+          const slack = slackDm(slackToken, slackUserId);
+          const channelId = await slack.openChannel();
+          const threadTs = await slack.postMessage(channelId, parsed.question);
+          updatePatch.slackThreadTs = threadTs;
+        } catch {
+          // Slack DM failed — fall through to in-app question only
+        }
+      }
+
+      await svc.update(itemId, updatePatch);
       if (parsed.question) {
         await svc.addThread({
           itemId,

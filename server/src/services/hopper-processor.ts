@@ -114,7 +114,7 @@ export function hopperProcessor(db: Db) {
           description: parsed.description,
           assigneeAgentId: ctoAgentId,
           status: "todo",
-          priority: "medium",
+          priority: parsed.kind === "bug" ? "high" : "medium",
         }),
       });
 

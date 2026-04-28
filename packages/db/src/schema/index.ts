@@ -64,3 +64,4 @@ export { voiceCommands } from "./voice_commands.js";
 export { youtubeExtractions } from "./youtube_extractions.js";
 export { quickNotes, quickNoteThreads } from "./quick_notes.js";
 export { hopperItems, hopperItemThreads } from "./hopper_items.js";
+export { hopperPreferences } from "./hopper_preferences.js";

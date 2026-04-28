@@ -22,6 +22,17 @@ vi.mock("../services/hopper.js", () => ({
   hopperService: () => mockHopperSvc,
 }));
 
+const mockPrefsSvc = {
+  get: vi.fn().mockResolvedValue(null),
+  set: vi.fn(),
+  list: vi.fn(),
+};
+
+vi.mock("../services/hopper-preferences.js", () => ({
+  hopperPreferencesService: () => mockPrefsSvc,
+  prefKeyForKind: (kind: string) => `preferred_time_for_kind:${kind}`,
+}));
+
 import { hopperCalendarPlacer } from "../services/hopper-calendar-placer.js";
 
 const NOW = new Date("2026-04-29T09:00:00Z");
@@ -32,6 +43,7 @@ describe("hopperCalendarPlacer", () => {
     process.env.GOOGLE_CALENDAR_CLIENT_ID = "client-id";
     process.env.GOOGLE_CALENDAR_CLIENT_SECRET = "client-secret";
     process.env.GOOGLE_CALENDAR_REFRESH_TOKEN = "refresh-token";
+    mockPrefsSvc.get.mockResolvedValue(null); // No learned preferences by default
   });
 
   it("does nothing when env vars are not set", async () => {
@@ -118,6 +130,28 @@ describe("hopperCalendarPlacer", () => {
     // Only second item should have been placed
     expect(mockHopperSvc.update).toHaveBeenCalledTimes(1);
     expect(mockHopperSvc.update).toHaveBeenCalledWith("item-ok", { calendarEventId: "gcal-event-789" });
+  });
+
+  it("applies learned time preference when finding slot", async () => {
+    // Item is scheduled for 9am, but user prefers "evening" for task_work
+    const scheduledAt = new Date("2030-04-29T09:00:00Z"); // far future so "is future" check passes
+    const item = { id: "item-pref", companyId: "co-1", scheduledAt, durationMinutes: 60, kind: "task_work" };
+    mockHopperSvc.listItemsForCalendarPlacement.mockResolvedValue([item]);
+    mockHopperSvc.getById.mockResolvedValue({ id: "item-pref", prompt: "Write report", taskMode: "personal", companyId: "co-1", userId: "user-1" });
+    mockHopperSvc.listThreads.mockResolvedValue([]);
+    mockPrefsSvc.get.mockResolvedValue("evening"); // learned pref: evening = 18:00
+
+    mockFindFreeSlot.mockImplementation(async (start: Date) => start);
+    mockCreateEvent.mockResolvedValue({ eventId: "gcal-evt", htmlLink: "https://cal.google.com/x" });
+    mockHopperSvc.update.mockResolvedValue({});
+    mockHopperSvc.addThread.mockResolvedValue({});
+
+    const placer = hopperCalendarPlacer({} as any);
+    await placer.tick();
+
+    // findFreeSlot should be called with adjusted hour (18:00), not 9:00
+    const calledWith = mockFindFreeSlot.mock.calls[0][0] as Date;
+    expect(calledWith.getHours()).toBe(18);
   });
 
   it("extracts title from processor confirmation thread message", async () => {

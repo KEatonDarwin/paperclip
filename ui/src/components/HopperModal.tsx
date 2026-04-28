@@ -1,21 +1,23 @@
 import { useState, useEffect, useRef } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { hopperApi } from "../api/hopper";
+import { hopperApi, type HopperTaskMode } from "../api/hopper";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/utils";
-import { Bug, Zap, X } from "lucide-react";
+import { Bug, Zap, X, CalendarDays, Code2 } from "lucide-react";
 
 export function HopperModal() {
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
+  const [mode, setMode] = useState<HopperTaskMode>("software");
   const [submitted, setSubmitted] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const { selectedCompanyId } = useCompany();
   const queryClient = useQueryClient();
 
   const create = useMutation({
-    mutationFn: (prompt: string) => hopperApi.create(selectedCompanyId!, prompt),
+    mutationFn: ({ prompt, taskMode }: { prompt: string; taskMode: HopperTaskMode }) =>
+      hopperApi.create(selectedCompanyId!, prompt, taskMode),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.hopper.list(selectedCompanyId!) });
       setSubmitted(true);
@@ -57,7 +59,7 @@ export function HopperModal() {
   function handleSubmit() {
     const prompt = text.trim();
     if (!prompt || !selectedCompanyId || create.isPending) return;
-    create.mutate(prompt);
+    create.mutate({ prompt, taskMode: mode });
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -68,6 +70,8 @@ export function HopperModal() {
   }
 
   if (!open) return null;
+
+  const isSoftware = mode === "software";
 
   return (
     <div
@@ -87,11 +91,47 @@ export function HopperModal() {
       <div className="relative z-10 w-full max-w-lg mx-4 rounded-lg border border-border bg-background shadow-2xl">
         {/* Header */}
         <div className="flex items-center gap-2 px-4 pt-4 pb-2">
-          <div className="flex items-center gap-1.5 text-muted-foreground">
-            <Bug className="h-4 w-4" />
-            <Zap className="h-3.5 w-3.5" />
+          {/* Mode toggle */}
+          <div className="flex items-center rounded-md border border-border bg-muted p-0.5 text-xs">
+            <button
+              type="button"
+              onClick={() => setMode("software")}
+              className={cn(
+                "flex items-center gap-1 rounded px-2 py-1 transition-colors",
+                isSoftware
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <Code2 className="h-3 w-3" />
+              Software
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode("personal")}
+              className={cn(
+                "flex items-center gap-1 rounded px-2 py-1 transition-colors",
+                !isSoftware
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <CalendarDays className="h-3 w-3" />
+              Personal task
+            </button>
           </div>
-          <span className="text-sm font-medium text-foreground">Report a bug or request a feature</span>
+
+          <div className="flex items-center gap-1.5 text-muted-foreground ml-1">
+            {isSoftware ? (
+              <>
+                <Bug className="h-4 w-4" />
+                <Zap className="h-3.5 w-3.5" />
+              </>
+            ) : (
+              <CalendarDays className="h-4 w-4" />
+            )}
+          </div>
+
           <button
             type="button"
             onClick={() => { setOpen(false); setText(""); setSubmitted(false); }}
@@ -108,7 +148,11 @@ export function HopperModal() {
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Describe what's broken or what you'd like added... (Enter to submit)"
+            placeholder={
+              isSoftware
+                ? "Describe what's broken or what you'd like added... (Enter to submit)"
+                : "What do you need to do? (e.g. take out the trash, write unit tests, call dentist...)"
+            }
             maxLength={4000}
             rows={3}
             className={cn(

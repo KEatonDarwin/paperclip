@@ -379,6 +379,13 @@
       "when": 1745836800000,
       "tag": "0053_hopper",
       "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "7",
+      "when": 1745837000000,
+      "tag": "0054_task_scheduler",
+      "breakpoints": true
     }
   ]
 }

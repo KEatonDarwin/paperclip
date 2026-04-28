@@ -33,6 +33,12 @@ Follow these steps every time you wake up:
 - Your entire response text will be captured as the agent chat message. Write it as prose addressed to the user. Do not narrate what you are doing step-by-step — just do the work and deliver the answer.
 - Do **not** do any inbox check, checkout, or status updates for this wakeup. Just respond to the message and exit.
 
+**Step 0b — Comment-wake short-circuit.** If `PAPERCLIP_WAKE_REASON` equals `issue_commented` AND `PAPERCLIP_TASK_ID` is set, **skip the inbox scan entirely.** You were woken because someone commented on a specific task. Go directly to Step 5 (Checkout) using `PAPERCLIP_TASK_ID`, including `in_review` in `expectedStatuses`. Then proceed from Step 6.
+
+- Do **not** call `GET /api/agents/me/inbox-lite` — go straight to the task.
+- Include `"in_review"` in the checkout `expectedStatuses` array, since the task may be awaiting review.
+- After checkout, fetch `PAPERCLIP_WAKE_COMMENT_ID` comment first to read the new context.
+
 **Step 1 — Identity.** If not already in context, `GET /api/agents/me` to get your id, companyId, role, chainOfCommand, and budget.
 
 **Step 2 — Approval follow-up (when triggered).** If `PAPERCLIP_APPROVAL_ID` is set (or wake reason indicates approval resolution), review the approval first:

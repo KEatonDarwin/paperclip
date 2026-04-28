@@ -33,6 +33,7 @@ import { youtubeExtractionRoutes } from "./routes/youtube-extractions.js";
 import { calendarRoutes } from "./routes/calendar.js";
 import { digestRoutes } from "./routes/digests.js";
 import { quickNoteRoutes } from "./routes/quick-notes.js";
+import { hopperRoutes } from "./routes/hopper.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -165,6 +166,7 @@ export async function createApp(
   api.use(calendarRoutes(db));
   api.use(digestRoutes(db));
   api.use(quickNoteRoutes(db));
+  api.use(hopperRoutes(db));
   const hostServicesDisposers = new Map<string, () => void>();
   const workerManager = createPluginWorkerManager();
   const pluginRegistry = pluginRegistryService(db);

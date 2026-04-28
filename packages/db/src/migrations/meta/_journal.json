@@ -372,6 +372,13 @@
       "when": 1776974840797,
       "tag": "0052_dry_dust",
       "breakpoints": true
+    },
+    {
+      "idx": 53,
+      "version": "7",
+      "when": 1745836800000,
+      "tag": "0053_hopper",
+      "breakpoints": true
     }
   ]
 }

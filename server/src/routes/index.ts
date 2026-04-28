@@ -19,3 +19,4 @@ export { voiceCommandRoutes } from "./voice-commands.js";
 export { calendarRoutes } from "./calendar.js";
 export { digestRoutes } from "./digests.js";
 export { quickNoteRoutes } from "./quick-notes.js";
+export { hopperRoutes } from "./hopper.js";

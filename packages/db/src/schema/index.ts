@@ -63,3 +63,4 @@ export { agentChatMessages } from "./agent_chat_messages.js";
 export { voiceCommands } from "./voice_commands.js";
 export { youtubeExtractions } from "./youtube_extractions.js";
 export { quickNotes, quickNoteThreads } from "./quick_notes.js";
+export { hopperItems, hopperItemThreads } from "./hopper_items.js";

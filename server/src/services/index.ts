@@ -34,3 +34,5 @@ export { createStorageServiceFromConfig, getStorageService } from "../storage/in
 export { splitTestingService } from "./split-testing.js";
 export { chatService } from "./chats.js";
 export { calendarService } from "./calendar.js";
+export { hopperService } from "./hopper.js";
+export { hopperProcessor } from "./hopper-processor.js";

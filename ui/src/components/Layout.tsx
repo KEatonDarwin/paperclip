@@ -16,6 +16,8 @@ import { ToastViewport } from "./ToastViewport";
 import { GlobalChatBubble } from "./GlobalChatBubble";
 import { CommandModal } from "./CommandModal";
 import { QuickNotesModal } from "./QuickNotesModal";
+import { HopperModal } from "./HopperModal";
+import { HopperWidget } from "./HopperWidget";
 import { KeyboardShortcutsModal } from "./KeyboardShortcutsModal";
 import { MobileBottomNav } from "./MobileBottomNav";
 import { WorktreeBanner } from "./WorktreeBanner";
@@ -443,6 +445,8 @@ export function Layout() {
       <GlobalChatBubble />
       <CommandModal />
       <QuickNotesModal />
+      <HopperModal />
+      <HopperWidget />
       <KeyboardShortcutsModal />
     </div>
   );

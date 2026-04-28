@@ -156,6 +156,10 @@ export const queryKeys = {
     detail: (noteId: string) => ["quickNotes", "detail", noteId] as const,
     threads: (noteId: string) => ["quickNotes", noteId, "threads"] as const,
   },
+  hopper: {
+    list: (companyId: string) => ["hopper", companyId] as const,
+    threads: (itemId: string) => ["hopper", itemId, "threads"] as const,
+  },
   skills: {
     available: ["skills", "available"] as const,
   },

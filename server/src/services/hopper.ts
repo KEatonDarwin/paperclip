@@ -1,6 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import { hopperItems, hopperItemThreads } from "@paperclipai/db";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNotNull } from "drizzle-orm";
 
 export function hopperService(db: Db) {
   async function list(companyId: string, userId: string, opts?: { includeDismissed?: boolean }) {
@@ -92,5 +92,26 @@ export function hopperService(db: Db) {
       .orderBy(hopperItemThreads.createdAt);
   }
 
-  return { list, create, getById, update, remove, addThread, listThreads };
+  async function listPendingSlackItems(): Promise<
+    Array<{ id: string; companyId: string; slackThreadTs: string }>
+  > {
+    const rows = await db
+      .select({
+        id: hopperItems.id,
+        companyId: hopperItems.companyId,
+        slackThreadTs: hopperItems.slackThreadTs,
+      })
+      .from(hopperItems)
+      .where(
+        and(
+          eq(hopperItems.status, "needs_info"),
+          isNotNull(hopperItems.slackThreadTs),
+        ),
+      );
+    return rows.filter(
+      (r): r is typeof r & { slackThreadTs: string } => r.slackThreadTs !== null,
+    );
+  }
+
+  return { list, create, getById, update, remove, addThread, listThreads, listPendingSlackItems };
 }

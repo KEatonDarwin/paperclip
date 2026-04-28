@@ -19,3 +19,4 @@ export { companySkillsApi } from "./companySkills";
 export { splitTestingApi } from "./splitTesting";
 
 export { hopperApi } from "./hopper";
+export { scheduledTasksApi } from "./scheduled-tasks";

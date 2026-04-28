@@ -160,6 +160,11 @@ export const queryKeys = {
     list: (companyId: string) => ["hopper", companyId] as const,
     threads: (itemId: string) => ["hopper", itemId, "threads"] as const,
   },
+  scheduledTasks: {
+    list: (companyId: string) => ["scheduledTasks", companyId] as const,
+    detail: (taskId: string) => ["scheduledTasks", "detail", taskId] as const,
+    threads: (taskId: string) => ["scheduledTasks", taskId, "threads"] as const,
+  },
   skills: {
     available: ["skills", "available"] as const,
   },

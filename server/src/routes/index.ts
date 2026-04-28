@@ -20,3 +20,4 @@ export { calendarRoutes } from "./calendar.js";
 export { digestRoutes } from "./digests.js";
 export { quickNoteRoutes } from "./quick-notes.js";
 export { hopperRoutes } from "./hopper.js";
+export { scheduledTaskRoutes } from "./scheduled-tasks.js";

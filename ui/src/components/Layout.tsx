@@ -18,6 +18,7 @@ import { CommandModal } from "./CommandModal";
 import { QuickNotesModal } from "./QuickNotesModal";
 import { HopperModal } from "./HopperModal";
 import { HopperWidget } from "./HopperWidget";
+import { ScheduledTasksWidget } from "./ScheduledTasksWidget";
 import { KeyboardShortcutsModal } from "./KeyboardShortcutsModal";
 import { MobileBottomNav } from "./MobileBottomNav";
 import { WorktreeBanner } from "./WorktreeBanner";
@@ -447,6 +448,7 @@ export function Layout() {
       <QuickNotesModal />
       <HopperModal />
       <HopperWidget />
+      <ScheduledTasksWidget />
       <KeyboardShortcutsModal />
     </div>
   );

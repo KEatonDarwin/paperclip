@@ -1,7 +1,6 @@
 import { api } from "./client";
 
-export type HopperTaskMode = "software" | "personal";
-export type HopperKind = "bug" | "feature" | "task_personal" | "task_work" | "task_home" | "event" | "reminder" | null;
+export type HopperKind = "bug" | "feature" | null;
 
 export interface HopperItem {
   id: string;
@@ -9,15 +8,10 @@ export interface HopperItem {
   userId: string;
   prompt: string;
   status: "processing" | "needs_info" | "created" | "done" | "cancelled";
-  taskMode: HopperTaskMode;
   kind: HopperKind;
   question: string | null;
   linkedIssueId: string | null;
   linkedIssueIdentifier: string | null;
-  scheduledAt: string | null;
-  durationMinutes: number | null;
-  calendarEventId: string | null;
-  slackThreadTs: string | null;
   dismissed: boolean;
   createdAt: string;
   updatedAt: string;
@@ -36,8 +30,8 @@ export const hopperApi = {
   list: (companyId: string) =>
     api.get<HopperItem[]>(`/companies/${companyId}/hopper`),
 
-  create: (companyId: string, prompt: string, mode: HopperTaskMode = "software") =>
-    api.post<HopperItem>(`/companies/${companyId}/hopper`, { prompt, mode }),
+  create: (companyId: string, prompt: string) =>
+    api.post<HopperItem>(`/companies/${companyId}/hopper`, { prompt }),
 
   update: (itemId: string, data: { dismissed?: boolean; status?: string }) =>
     api.patch<HopperItem>(`/hopper/${itemId}`, data),

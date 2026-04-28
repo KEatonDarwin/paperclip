@@ -393,6 +393,13 @@
       "when": 1745838000000,
       "tag": "0055_hopper_preferences",
       "breakpoints": true
+    },
+    {
+      "idx": 56,
+      "version": "7",
+      "when": 1745839000000,
+      "tag": "0056_scheduled_tasks",
+      "breakpoints": true
     }
   ]
 }

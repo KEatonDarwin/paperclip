@@ -22,6 +22,7 @@ export function hopperService(db: Db) {
     companyId: string;
     userId: string;
     prompt: string;
+    taskMode?: string;
   }) {
     const [item] = await db
       .insert(hopperItems)
@@ -29,6 +30,7 @@ export function hopperService(db: Db) {
         companyId: input.companyId,
         userId: input.userId,
         prompt: input.prompt,
+        taskMode: input.taskMode ?? "software",
         status: "processing",
       })
       .returning();
@@ -51,6 +53,10 @@ export function hopperService(db: Db) {
       question?: string | null;
       linkedIssueId?: string | null;
       linkedIssueIdentifier?: string | null;
+      scheduledAt?: Date | null;
+      durationMinutes?: number | null;
+      calendarEventId?: string | null;
+      slackThreadTs?: string | null;
       dismissed?: boolean;
     },
   ) {

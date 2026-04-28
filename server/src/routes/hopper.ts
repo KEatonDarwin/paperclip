@@ -8,6 +8,7 @@ import { assertBoard, assertCompanyAccess } from "./authz.js";
 
 const createSchema = z.object({
   prompt: z.string().min(1).max(4000),
+  mode: z.enum(["software", "personal"]).optional().default("software"),
 });
 
 const updateSchema = z.object({
@@ -44,6 +45,7 @@ export function hopperRoutes(db: Db) {
       companyId,
       userId,
       prompt: req.body.prompt,
+      taskMode: req.body.mode,
     });
     res.status(201).json(item);
     void processor.process(item.id).catch(() => {});

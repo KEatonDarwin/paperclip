@@ -1,9 +1,17 @@
 import type { Db } from "@paperclipai/db";
 import { hopperService } from "./hopper.js";
+import { hopperPreferencesService, prefKeyForKind } from "./hopper-preferences.js";
 import { googleCalendarService } from "./hopper-google-calendar.js";
 
 const DEFAULT_DURATION_MINUTES = 30;
 const AGENT_ID = "d33e935d-533f-45a1-bb7a-ee4a2c86b2d8";
+
+const PREFERRED_TIME_HOURS: Record<string, number> = {
+  early_morning: 5,
+  morning: 9,
+  afternoon: 13,
+  evening: 18,
+};
 
 export function hopperCalendarPlacer(db: Db) {
   async function tick(): Promise<void> {
@@ -13,6 +21,7 @@ export function hopperCalendarPlacer(db: Db) {
     if (!clientId || !clientSecret || !refreshToken) return;
 
     const svc = hopperService(db);
+    const prefsSvc = hopperPreferencesService(db);
     const calendar = googleCalendarService(clientId, clientSecret, refreshToken);
 
     let items: Awaited<ReturnType<typeof svc.listItemsForCalendarPlacement>>;
@@ -25,14 +34,26 @@ export function hopperCalendarPlacer(db: Db) {
     for (const item of items) {
       try {
         const durationMinutes = item.durationMinutes ?? DEFAULT_DURATION_MINUTES;
-        const preferredStart = item.scheduledAt;
+
+        // Apply learned preferences: adjust preferred hour based on task kind
+        const full = await svc.getById(item.id);
+        if (!full) continue;
+
+        let preferredStart = item.scheduledAt;
+        if (item.kind) {
+          const learnedPref = await prefsSvc.get(full.companyId, full.userId, prefKeyForKind(item.kind)).catch(() => null);
+          if (learnedPref && PREFERRED_TIME_HOURS[learnedPref] !== undefined) {
+            const adjusted = new Date(item.scheduledAt);
+            adjusted.setHours(PREFERRED_TIME_HOURS[learnedPref], 0, 0, 0);
+            // Only use the learned preference if it's in the future
+            if (adjusted.getTime() > Date.now()) {
+              preferredStart = adjusted;
+            }
+          }
+        }
 
         // Find the first free slot at or after the proposed time
         const start = await calendar.findFreeSlot(preferredStart, durationMinutes);
-
-        // Get full item for title/description
-        const full = await svc.getById(item.id);
-        if (!full) continue;
 
         const threads = await svc.listThreads(item.id);
         const title = extractTitle(full.prompt, threads);

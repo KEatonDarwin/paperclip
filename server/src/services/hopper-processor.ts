@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { hopperService } from "./hopper.js";
+import { hopperPreferencesService, prefKeyForKind } from "./hopper-preferences.js";
 import { slackDm } from "./slack-dm.js";
 
 const softwareClassifySchema = z.object({
@@ -59,6 +60,7 @@ Respond ONLY with valid JSON. No explanation, no markdown fences.`;
 
 export function hopperProcessor(db: Db) {
   const svc = hopperService(db);
+  const prefsSvc = hopperPreferencesService(db);
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const ctoAgentId = "d33e935d-533f-45a1-bb7a-ee4a2c86b2d8";
 
@@ -258,6 +260,21 @@ export function hopperProcessor(db: Db) {
       scheduledAt,
       durationMinutes: parsed.duration_minutes ?? null,
     });
+
+    // Save time-of-day preference for this task kind when explicitly stated
+    if (parsed.kind && parsed.preferred_time_of_day && parsed.preferred_time_of_day !== "anytime") {
+      try {
+        await prefsSvc.set(
+          item!.companyId,
+          item!.userId,
+          prefKeyForKind(parsed.kind),
+          parsed.preferred_time_of_day,
+          "explicit",
+        );
+      } catch {
+        // Preference save failure is non-fatal
+      }
+    }
 
     // Add a confirmation thread message
     const timeStr = scheduledAt

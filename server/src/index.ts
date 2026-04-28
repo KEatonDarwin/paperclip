@@ -31,6 +31,7 @@ import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import { heartbeatService, reconcilePersistedRuntimeServicesOnStartup, routineService } from "./services/index.js";
 import { hopperSlackPoller } from "./services/hopper-slack-poller.js";
 import { hopperCalendarPlacer } from "./services/hopper-calendar-placer.js";
+import { hopperDailyBriefing } from "./services/hopper-daily-briefing.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -628,6 +629,16 @@ export async function startServer(): Promise<StartedServer> {
         });
       }, 60_000);
       logger.info("hopper Google Calendar placer registered (60s interval)");
+    }
+
+    if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_HOPPER_USER_ID) {
+      const dailyBriefing = hopperDailyBriefing(db as any);
+      setInterval(() => {
+        void dailyBriefing.tick().catch((err) => {
+          logger.error({ err }, "hopper daily briefing tick failed");
+        });
+      }, 60_000);
+      logger.info("hopper daily briefing registered (fires at configured time, default 05:30)");
     }
   }
 

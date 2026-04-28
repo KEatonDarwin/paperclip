@@ -4,12 +4,16 @@ interface TokenResponse {
   token_type: string;
 }
 
-interface CalendarEvent {
+export interface CalendarEvent {
   id: string;
   summary: string;
-  start: { dateTime: string };
-  end: { dateTime: string };
+  start: { dateTime?: string; date?: string };
+  end: { dateTime?: string; date?: string };
   htmlLink: string;
+}
+
+interface EventListResponse {
+  items?: CalendarEvent[];
 }
 
 interface FreeBusyResponse {
@@ -26,6 +30,7 @@ interface GoogleCalendarService {
     start: Date,
     durationMinutes: number,
   ): Promise<{ eventId: string; htmlLink: string }>;
+  listEvents(timeMin: Date, timeMax: Date): Promise<CalendarEvent[]>;
 }
 
 export function googleCalendarService(
@@ -153,5 +158,22 @@ export function googleCalendarService(
     return { eventId: event.id, htmlLink: event.htmlLink };
   }
 
-  return { findFreeSlot, createEvent };
+  async function listEvents(timeMin: Date, timeMax: Date): Promise<CalendarEvent[]> {
+    const headers = await authHeaders();
+    const params = new URLSearchParams({
+      timeMin: timeMin.toISOString(),
+      timeMax: timeMax.toISOString(),
+      singleEvents: "true",
+      orderBy: "startTime",
+    });
+    const res = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
+      { headers },
+    );
+    if (!res.ok) return [];
+    const data = (await res.json()) as EventListResponse;
+    return data.items ?? [];
+  }
+
+  return { findFreeSlot, createEvent, listEvents };
 }

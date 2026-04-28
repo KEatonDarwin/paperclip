@@ -8,7 +8,6 @@ import { assertBoard, assertCompanyAccess } from "./authz.js";
 
 const createSchema = z.object({
   prompt: z.string().min(1).max(4000),
-  mode: z.enum(["software", "personal"]).optional().default("software"),
 });
 
 const updateSchema = z.object({
@@ -25,7 +24,7 @@ export function hopperRoutes(db: Db) {
   const svc = hopperService(db);
   const processor = hopperProcessor(db);
 
-  // List hopper items for current user
+  // List hopper items (software only) for current user
   router.get("/companies/:companyId/hopper", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertBoard(req);
@@ -35,7 +34,7 @@ export function hopperRoutes(db: Db) {
     res.json(items);
   });
 
-  // Create hopper item + trigger processor async
+  // Create hopper item (software mode) + trigger processor async
   router.post("/companies/:companyId/hopper", validate(createSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertBoard(req);
@@ -45,7 +44,6 @@ export function hopperRoutes(db: Db) {
       companyId,
       userId,
       prompt: req.body.prompt,
-      taskMode: req.body.mode,
     });
     res.status(201).json(item);
     void processor.process(item.id).catch(() => {});
@@ -89,12 +87,7 @@ export function hopperRoutes(db: Db) {
     const authorId = req.actor.type === "agent"
       ? (req.actor as { agentId: string }).agentId
       : (req.actor as { userId: string }).userId;
-    const entry = await svc.addThread({
-      itemId,
-      authorType,
-      authorId,
-      body: req.body.body,
-    });
+    const entry = await svc.addThread({ itemId, authorType, authorId, body: req.body.body });
     res.status(201).json(entry);
     if (authorType === "user") {
       void processor.process(itemId).catch(() => {});

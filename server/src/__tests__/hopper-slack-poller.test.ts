@@ -12,15 +12,16 @@ vi.mock("../services/slack-dm.js", () => ({
   }),
 }));
 
-const mockHopperSvc = {
-  listPendingSlackItems: vi.fn(),
+const mockStSvc = {
+  listPendingSlackTasks: vi.fn(),
   addThread: vi.fn(),
   update: vi.fn(),
 };
-const mockProcessor = { process: vi.fn() };
+const mockProcessor = { processScheduledTask: vi.fn() };
 
-vi.mock("../services/hopper.js", () => ({
-  hopperService: () => mockHopperSvc,
+vi.mock("../services/scheduled-tasks.js", () => ({
+  scheduledTasksService: () => mockStSvc,
+  scheduledTaskIdentifier: (n: number) => `SCH-${n}`,
 }));
 
 vi.mock("../services/hopper-processor.js", () => ({
@@ -29,7 +30,7 @@ vi.mock("../services/hopper-processor.js", () => ({
 
 import { hopperSlackPoller } from "../services/hopper-slack-poller.js";
 
-describe("hopperSlackPoller", () => {
+describe("hopperSlackPoller (v2 — scheduled_tasks)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.SLACK_BOT_TOKEN = "xoxb-test";
@@ -40,59 +41,57 @@ describe("hopperSlackPoller", () => {
     delete process.env.SLACK_BOT_TOKEN;
     const poller = hopperSlackPoller({} as any);
     await poller.tick();
-    expect(mockHopperSvc.listPendingSlackItems).not.toHaveBeenCalled();
+    expect(mockStSvc.listPendingSlackTasks).not.toHaveBeenCalled();
   });
 
-  it("does nothing when no pending items", async () => {
-    mockHopperSvc.listPendingSlackItems.mockResolvedValue([]);
+  it("does nothing when no pending tasks", async () => {
+    mockStSvc.listPendingSlackTasks.mockResolvedValue([]);
     const poller = hopperSlackPoller({} as any);
     await poller.tick();
     expect(mockFetchReplies).not.toHaveBeenCalled();
   });
 
   it("fetches replies and re-runs processor on new user message", async () => {
-    mockHopperSvc.listPendingSlackItems.mockResolvedValue([
-      { id: "item-1", companyId: "co-1", slackThreadTs: "1000.000" },
+    mockStSvc.listPendingSlackTasks.mockResolvedValue([
+      { id: "task-1", companyId: "co-1", slackThreadTs: "1000.000" },
     ]);
     mockOpenChannel.mockResolvedValue("D-channel-1");
     mockFetchReplies.mockResolvedValue([
       { type: "message", ts: "1001.000", text: "tomorrow morning", user: "U1" },
     ]);
-    mockHopperSvc.addThread.mockResolvedValue({});
-    mockProcessor.process.mockResolvedValue(undefined);
+    mockStSvc.addThread.mockResolvedValue({});
+    mockProcessor.processScheduledTask.mockResolvedValue(undefined);
 
     const poller = hopperSlackPoller({} as any);
     await poller.tick();
 
-    expect(mockHopperSvc.addThread).toHaveBeenCalledWith({
-      itemId: "item-1",
+    expect(mockStSvc.addThread).toHaveBeenCalledWith({
+      taskId: "task-1",
       authorType: "user",
       authorId: "U123",
       body: "tomorrow morning",
     });
-    expect(mockProcessor.process).toHaveBeenCalledWith("item-1");
+    expect(mockProcessor.processScheduledTask).toHaveBeenCalledWith("task-1");
   });
 
   it("skips already-seen replies on second tick", async () => {
-    mockHopperSvc.listPendingSlackItems.mockResolvedValue([
-      { id: "item-1", companyId: "co-1", slackThreadTs: "1000.000" },
+    mockStSvc.listPendingSlackTasks.mockResolvedValue([
+      { id: "task-1", companyId: "co-1", slackThreadTs: "1000.000" },
     ]);
     mockOpenChannel.mockResolvedValue("D-channel-1");
-    // First tick: one new reply
     mockFetchReplies.mockResolvedValueOnce([
       { type: "message", ts: "1001.000", text: "tomorrow morning", user: "U1" },
     ]);
-    // Second tick: no new messages (cursor updated to "1001.000")
     mockFetchReplies.mockResolvedValueOnce([]);
 
-    mockHopperSvc.addThread.mockResolvedValue({});
-    mockProcessor.process.mockResolvedValue(undefined);
+    mockStSvc.addThread.mockResolvedValue({});
+    mockProcessor.processScheduledTask.mockResolvedValue(undefined);
 
     const poller = hopperSlackPoller({} as any);
-    await poller.tick(); // processes reply
-    await poller.tick(); // cursor advanced, no new messages
+    await poller.tick();
+    await poller.tick();
 
-    expect(mockHopperSvc.addThread).toHaveBeenCalledTimes(1);
-    expect(mockProcessor.process).toHaveBeenCalledTimes(1);
+    expect(mockStSvc.addThread).toHaveBeenCalledTimes(1);
+    expect(mockProcessor.processScheduledTask).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,27 +1,14 @@
 import { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { hopperApi, type HopperItem, type HopperThread, type HopperKind } from "../api/hopper";
+import { hopperApi, type HopperItem, type HopperThread } from "../api/hopper";
 import { issuesApi } from "../api/issues";
 import { useCompany } from "../context/CompanyContext";
 import { useToast } from "../context/ToastContext";
 import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/utils";
-import { Loader2, CheckCircle2, AlertTriangle, X, Send, ChevronDown, CalendarDays, Clock } from "lucide-react";
+import { Loader2, CheckCircle2, AlertTriangle, X, Send, ChevronDown } from "lucide-react";
 
-function kindLabel(kind: HopperKind): string {
-  switch (kind) {
-    case "task_personal": return "Personal";
-    case "task_work": return "Work";
-    case "task_home": return "Home";
-    case "event": return "Event";
-    case "reminder": return "Reminder";
-    case "bug": return "Bug";
-    case "feature": return "Feature";
-    default: return "";
-  }
-}
-
-// Compact status card for a single hopper item
+// Compact status card for a single hopper item (software only)
 function HopperItemCard({
   item,
   onExpand,
@@ -64,50 +51,6 @@ function HopperItemCard({
     );
   }
 
-  if (item.status === "created" && item.taskMode === "personal") {
-    const scheduledStr = item.scheduledAt
-      ? new Date(item.scheduledAt).toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
-      : null;
-    const kindStr = kindLabel(item.kind);
-    return (
-      <div className="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 shadow-md text-sm text-emerald-900 dark:border-emerald-500/25 dark:bg-emerald-950/60 dark:text-emerald-100">
-        <div className="flex items-center gap-2">
-          <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" />
-          <span className="flex-1 font-medium truncate">Task queued</span>
-          {kindStr && (
-            <span className="shrink-0 rounded-full bg-emerald-200/60 px-1.5 py-0.5 text-[10px] font-medium dark:bg-emerald-800/60">
-              {kindStr}
-            </span>
-          )}
-          <button
-            type="button"
-            onClick={onDismiss}
-            className="shrink-0 rounded p-0.5 hover:bg-emerald-200/50 dark:hover:bg-emerald-800/50"
-            title="Dismiss"
-          >
-            <X className="h-3.5 w-3.5" />
-          </button>
-        </div>
-        {(scheduledStr || item.durationMinutes) && (
-          <div className="mt-1 flex items-center gap-3 text-xs text-emerald-700 dark:text-emerald-300">
-            {scheduledStr && (
-              <span className="flex items-center gap-1">
-                <CalendarDays className="h-3 w-3" />
-                {scheduledStr}
-              </span>
-            )}
-            {item.durationMinutes && (
-              <span className="flex items-center gap-1">
-                <Clock className="h-3 w-3" />
-                {item.durationMinutes} min
-              </span>
-            )}
-          </div>
-        )}
-      </div>
-    );
-  }
-
   if (item.status === "created" && item.linkedIssueIdentifier) {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 shadow-md text-sm text-emerald-900 dark:border-emerald-500/25 dark:bg-emerald-950/60 dark:text-emerald-100">
@@ -134,7 +77,6 @@ function HopperItemCard({
     );
   }
 
-  // created but no identifier yet
   if (item.status === "created") {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 shadow-md text-sm text-emerald-900 dark:border-emerald-500/25 dark:bg-emerald-950/60 dark:text-emerald-100">
@@ -205,7 +147,6 @@ function HopperConversation({
 
       {/* Thread */}
       <div className="max-h-48 overflow-y-auto px-3 py-2 space-y-2">
-        {/* Original prompt */}
         <div className="rounded-md bg-muted px-2.5 py-1.5 text-xs text-muted-foreground">
           <span className="font-medium">You: </span>{item.prompt}
         </div>
@@ -317,7 +258,6 @@ export function HopperWidget() {
     <div className="fixed bottom-4 right-4 z-[130] flex flex-col gap-2 items-end" aria-live="polite">
       {activeItems.map((item) => (
         <div key={item.id}>
-          {/* Completion watcher for created items with a linked issue */}
           {item.status === "created" && item.linkedIssueId && (
             <IssueCompletionWatcher
               item={item}
@@ -337,7 +277,6 @@ export function HopperWidget() {
             />
           )}
 
-          {/* Conversation panel (expanded when needs_info) */}
           {expandedId === item.id && item.status === "needs_info" ? (
             <HopperConversation
               item={item}

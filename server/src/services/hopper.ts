@@ -1,6 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import { hopperItems, hopperItemThreads } from "@paperclipai/db";
-import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 
 export function hopperService(db: Db) {
   async function list(companyId: string, userId: string, opts?: { includeDismissed?: boolean }) {
@@ -22,7 +22,6 @@ export function hopperService(db: Db) {
     companyId: string;
     userId: string;
     prompt: string;
-    taskMode?: string;
   }) {
     const [item] = await db
       .insert(hopperItems)
@@ -30,7 +29,6 @@ export function hopperService(db: Db) {
         companyId: input.companyId,
         userId: input.userId,
         prompt: input.prompt,
-        taskMode: input.taskMode ?? "software",
         status: "processing",
       })
       .returning();
@@ -53,10 +51,6 @@ export function hopperService(db: Db) {
       question?: string | null;
       linkedIssueId?: string | null;
       linkedIssueIdentifier?: string | null;
-      scheduledAt?: Date | null;
-      durationMinutes?: number | null;
-      calendarEventId?: string | null;
-      slackThreadTs?: string | null;
       dismissed?: boolean;
     },
   ) {
@@ -92,51 +86,5 @@ export function hopperService(db: Db) {
       .orderBy(hopperItemThreads.createdAt);
   }
 
-  async function listPendingSlackItems(): Promise<
-    Array<{ id: string; companyId: string; slackThreadTs: string }>
-  > {
-    const rows = await db
-      .select({
-        id: hopperItems.id,
-        companyId: hopperItems.companyId,
-        slackThreadTs: hopperItems.slackThreadTs,
-      })
-      .from(hopperItems)
-      .where(
-        and(
-          eq(hopperItems.status, "needs_info"),
-          isNotNull(hopperItems.slackThreadTs),
-        ),
-      );
-    return rows.filter(
-      (r): r is typeof r & { slackThreadTs: string } => r.slackThreadTs !== null,
-    );
-  }
-
-  async function listItemsForCalendarPlacement(): Promise<
-    Array<{ id: string; companyId: string; scheduledAt: Date; durationMinutes: number | null; kind: string | null }>
-  > {
-    const rows = await db
-      .select({
-        id: hopperItems.id,
-        companyId: hopperItems.companyId,
-        scheduledAt: hopperItems.scheduledAt,
-        durationMinutes: hopperItems.durationMinutes,
-        kind: hopperItems.kind,
-      })
-      .from(hopperItems)
-      .where(
-        and(
-          eq(hopperItems.status, "created"),
-          eq(hopperItems.taskMode, "personal"),
-          isNull(hopperItems.calendarEventId),
-          isNotNull(hopperItems.scheduledAt),
-        ),
-      );
-    return rows.filter(
-      (r): r is typeof r & { scheduledAt: Date } => r.scheduledAt !== null,
-    );
-  }
-
-  return { list, create, getById, update, remove, addThread, listThreads, listPendingSlackItems, listItemsForCalendarPlacement };
+  return { list, create, getById, update, remove, addThread, listThreads };
 }

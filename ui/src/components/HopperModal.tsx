@@ -1,33 +1,47 @@
 import { useState, useEffect, useRef } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { hopperApi, type HopperTaskMode } from "../api/hopper";
+import { hopperApi } from "../api/hopper";
+import { scheduledTasksApi } from "../api/scheduled-tasks";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/utils";
 import { Bug, Zap, X, CalendarDays, Code2 } from "lucide-react";
 
+type InputMode = "software" | "personal";
+
 export function HopperModal() {
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
-  const [mode, setMode] = useState<HopperTaskMode>("software");
+  const [mode, setMode] = useState<InputMode>("software");
   const [submitted, setSubmitted] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const { selectedCompanyId } = useCompany();
   const queryClient = useQueryClient();
 
-  const create = useMutation({
-    mutationFn: ({ prompt, taskMode }: { prompt: string; taskMode: HopperTaskMode }) =>
-      hopperApi.create(selectedCompanyId!, prompt, taskMode),
+  const createSoftware = useMutation({
+    mutationFn: (prompt: string) => hopperApi.create(selectedCompanyId!, prompt),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.hopper.list(selectedCompanyId!) });
-      setSubmitted(true);
-      setTimeout(() => {
-        setOpen(false);
-        setText("");
-        setSubmitted(false);
-      }, 800);
+      onSubmitSuccess();
     },
   });
+
+  const createScheduled = useMutation({
+    mutationFn: (requestText: string) => scheduledTasksApi.create(selectedCompanyId!, requestText),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.scheduledTasks.list(selectedCompanyId!) });
+      onSubmitSuccess();
+    },
+  });
+
+  function onSubmitSuccess() {
+    setSubmitted(true);
+    setTimeout(() => {
+      setOpen(false);
+      setText("");
+      setSubmitted(false);
+    }, 800);
+  }
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
@@ -58,8 +72,14 @@ export function HopperModal() {
 
   function handleSubmit() {
     const prompt = text.trim();
-    if (!prompt || !selectedCompanyId || create.isPending) return;
-    create.mutate({ prompt, taskMode: mode });
+    if (!prompt || !selectedCompanyId) return;
+    if (mode === "software") {
+      if (createSoftware.isPending) return;
+      createSoftware.mutate(prompt);
+    } else {
+      if (createScheduled.isPending) return;
+      createScheduled.mutate(prompt);
+    }
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -72,6 +92,7 @@ export function HopperModal() {
   if (!open) return null;
 
   const isSoftware = mode === "software";
+  const isPending = createSoftware.isPending || createScheduled.isPending;
 
   return (
     <div
@@ -117,7 +138,7 @@ export function HopperModal() {
               )}
             >
               <CalendarDays className="h-3 w-3" />
-              Personal task
+              Schedule task
             </button>
           </div>
 
@@ -151,7 +172,7 @@ export function HopperModal() {
             placeholder={
               isSoftware
                 ? "Describe what's broken or what you'd like added... (Enter to submit)"
-                : "What do you need to do? (e.g. take out the trash, write unit tests, call dentist...)"
+                : "What do you need to schedule? (e.g. take out the trash Wed, write unit tests before Thursday, call dentist...)"
             }
             maxLength={4000}
             rows={3}
@@ -159,18 +180,18 @@ export function HopperModal() {
               "w-full resize-none rounded-md border border-input bg-transparent px-3 py-2 text-sm outline-none placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring",
               submitted && "opacity-50",
             )}
-            disabled={create.isPending || submitted}
+            disabled={isPending || submitted}
           />
           <div className="mt-2 flex items-center justify-between">
             <span className="text-xs text-muted-foreground">
               {submitted
-                ? "Submitted! Processing..."
+                ? isSoftware ? "Submitted! Processing..." : "Received! Scheduling..."
                 : "Enter to submit · Shift+Enter for new line · Esc to close"}
             </span>
             <button
               type="button"
               onClick={handleSubmit}
-              disabled={!text.trim() || create.isPending || submitted}
+              disabled={!text.trim() || isPending || submitted}
               className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-40 hover:bg-primary/90"
             >
               Submit

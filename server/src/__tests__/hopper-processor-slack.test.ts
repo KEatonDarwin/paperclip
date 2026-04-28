@@ -12,15 +12,25 @@ vi.mock("../services/slack-dm.js", () => ({
   }),
 }));
 
-const mockHopperSvc = {
+const mockStSvc = {
   getById: vi.fn(),
   listThreads: vi.fn(),
   update: vi.fn(),
   addThread: vi.fn(),
 };
 
+vi.mock("../services/scheduled-tasks.js", () => ({
+  scheduledTasksService: () => mockStSvc,
+  scheduledTaskIdentifier: (n: number) => `SCH-${n}`,
+}));
+
 vi.mock("../services/hopper.js", () => ({
-  hopperService: () => mockHopperSvc,
+  hopperService: () => ({
+    getById: vi.fn(),
+    listThreads: vi.fn(),
+    update: vi.fn(),
+    addThread: vi.fn(),
+  }),
 }));
 
 vi.mock("@anthropic-ai/sdk", () => ({
@@ -47,39 +57,43 @@ vi.mock("@anthropic-ai/sdk", () => ({
   })),
 }));
 
+vi.mock("../services/hopper-preferences.js", () => ({
+  hopperPreferencesService: () => ({ get: vi.fn(), set: vi.fn(), list: vi.fn() }),
+  prefKeyForKind: (kind: string) => `preferred_time_for_kind:${kind}`,
+}));
+
 import { hopperProcessor } from "../services/hopper-processor.js";
 
-describe("hopperProcessor Slack integration", () => {
+describe("hopperProcessor Slack integration (scheduled tasks)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.SLACK_BOT_TOKEN = "xoxb-test";
     process.env.SLACK_HOPPER_USER_ID = "U123";
-    mockHopperSvc.getById.mockResolvedValue({
-      id: "item-1",
+    mockStSvc.getById.mockResolvedValue({
+      id: "task-1",
       companyId: "co-1",
-      prompt: "take out the trash",
-      taskMode: "personal",
-      status: "processing",
+      requestText: "take out the trash",
+      status: "pending",
       slackThreadTs: null,
     });
-    mockHopperSvc.listThreads.mockResolvedValue([]);
-    mockHopperSvc.update.mockResolvedValue({});
-    mockHopperSvc.addThread.mockResolvedValue({});
+    mockStSvc.listThreads.mockResolvedValue([]);
+    mockStSvc.update.mockResolvedValue({});
+    mockStSvc.addThread.mockResolvedValue({});
     mockOpenChannel.mockResolvedValue("D-channel-1");
     mockPostMessage.mockResolvedValue("1234567890.000001");
   });
 
-  it("sends Slack DM when personal task hits needs_info", async () => {
+  it("sends Slack DM when scheduled task hits needs-info path", async () => {
     const processor = hopperProcessor({} as any);
-    await processor.process("item-1");
+    await processor.processScheduledTask("task-1");
 
     expect(mockOpenChannel).toHaveBeenCalledOnce();
     expect(mockPostMessage).toHaveBeenCalledWith(
       "D-channel-1",
       "When do you need this done by?",
     );
-    expect(mockHopperSvc.update).toHaveBeenCalledWith(
-      "item-1",
+    expect(mockStSvc.update).toHaveBeenCalledWith(
+      "task-1",
       expect.objectContaining({ slackThreadTs: "1234567890.000001" }),
     );
   });
@@ -87,27 +101,26 @@ describe("hopperProcessor Slack integration", () => {
   it("skips Slack when SLACK_BOT_TOKEN is not set", async () => {
     delete process.env.SLACK_BOT_TOKEN;
     const processor = hopperProcessor({} as any);
-    await processor.process("item-1");
+    await processor.processScheduledTask("task-1");
 
     expect(mockOpenChannel).not.toHaveBeenCalled();
     expect(mockPostMessage).not.toHaveBeenCalled();
   });
 
-  it("skips Slack when item already has a slackThreadTs (follow-up question)", async () => {
-    mockHopperSvc.getById.mockResolvedValue({
-      id: "item-1",
+  it("skips Slack when task already has a slackThreadTs (follow-up)", async () => {
+    mockStSvc.getById.mockResolvedValue({
+      id: "task-1",
       companyId: "co-1",
-      prompt: "take out the trash",
-      taskMode: "personal",
-      status: "needs_info",
+      requestText: "take out the trash",
+      status: "pending",
       slackThreadTs: "existing-thread-ts",
     });
-    mockHopperSvc.listThreads.mockResolvedValue([
+    mockStSvc.listThreads.mockResolvedValue([
       { authorType: "user", body: "tomorrow morning" },
     ]);
 
     const processor = hopperProcessor({} as any);
-    await processor.process("item-1");
+    await processor.processScheduledTask("task-1");
 
     expect(mockOpenChannel).not.toHaveBeenCalled();
     expect(mockPostMessage).not.toHaveBeenCalled();

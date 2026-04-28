@@ -20,11 +20,12 @@ vi.mock("../services/hopper-google-calendar.js", () => ({
   }),
 }));
 
-const mockHopperSvc = {
-  listItemsForCalendarPlacement: vi.fn(),
+const mockStSvc = {
+  listTasksForCalendarPlacement: vi.fn(),
 };
-vi.mock("../services/hopper.js", () => ({
-  hopperService: () => mockHopperSvc,
+vi.mock("../services/scheduled-tasks.js", () => ({
+  scheduledTasksService: () => mockStSvc,
+  scheduledTaskIdentifier: (n: number) => `SCH-${n}`,
 }));
 
 import { hopperDailyBriefing } from "../services/hopper-daily-briefing.js";
@@ -47,7 +48,6 @@ describe("hopperDailyBriefing", () => {
   });
 
   it("does nothing when current time does not match briefing time", async () => {
-    // Use a briefing time that is definitely not now
     const svc = hopperDailyBriefing({} as any, { briefingHour: 3, briefingMinute: 17 });
     await svc.tick();
     expect(mockOpenChannel).not.toHaveBeenCalled();
@@ -61,7 +61,7 @@ describe("hopperDailyBriefing", () => {
     });
 
     mockListEvents.mockResolvedValue([]);
-    mockHopperSvc.listItemsForCalendarPlacement.mockResolvedValue([]);
+    mockStSvc.listTasksForCalendarPlacement.mockResolvedValue([]);
     mockOpenChannel.mockResolvedValue("D-channel");
     mockPostMessage.mockResolvedValue("ts-abc");
 
@@ -79,7 +79,7 @@ describe("hopperDailyBriefing", () => {
     });
 
     mockListEvents.mockResolvedValue([]);
-    mockHopperSvc.listItemsForCalendarPlacement.mockResolvedValue([]);
+    mockStSvc.listTasksForCalendarPlacement.mockResolvedValue([]);
     mockOpenChannel.mockResolvedValue("D-channel");
     mockPostMessage.mockResolvedValue("ts-abc");
 
@@ -105,7 +105,7 @@ describe("hopperDailyBriefing", () => {
         htmlLink: "https://cal.google.com/1",
       },
     ]);
-    mockHopperSvc.listItemsForCalendarPlacement.mockResolvedValue([]);
+    mockStSvc.listTasksForCalendarPlacement.mockResolvedValue([]);
     mockOpenChannel.mockResolvedValue("D-channel");
     mockPostMessage.mockResolvedValue("ts-abc");
 
@@ -116,7 +116,7 @@ describe("hopperDailyBriefing", () => {
     expect(message).toContain("Scheduled today");
   });
 
-  it("mentions pending items count in briefing", async () => {
+  it("mentions pending tasks count in briefing", async () => {
     const now = new Date();
     const svc = hopperDailyBriefing({} as any, {
       briefingHour: now.getHours(),
@@ -124,9 +124,9 @@ describe("hopperDailyBriefing", () => {
     });
 
     mockListEvents.mockResolvedValue([]);
-    mockHopperSvc.listItemsForCalendarPlacement.mockResolvedValue([
-      { id: "item-1", kind: "task_personal", scheduledAt: now, durationMinutes: 30 },
-      { id: "item-2", kind: "task_work", scheduledAt: now, durationMinutes: 60 },
+    mockStSvc.listTasksForCalendarPlacement.mockResolvedValue([
+      { id: "task-1", kind: "task_personal", scheduledAt: now, durationMinutes: 30 },
+      { id: "task-2", kind: "task_work", scheduledAt: now, durationMinutes: 60 },
     ]);
     mockOpenChannel.mockResolvedValue("D-channel");
     mockPostMessage.mockResolvedValue("ts-abc");
@@ -146,7 +146,7 @@ describe("hopperDailyBriefing", () => {
       briefingMinute: now.getMinutes(),
     });
 
-    mockHopperSvc.listItemsForCalendarPlacement.mockResolvedValue([]);
+    mockStSvc.listTasksForCalendarPlacement.mockResolvedValue([]);
     mockOpenChannel.mockResolvedValue("D-channel");
     mockPostMessage.mockResolvedValue("ts-abc");
 

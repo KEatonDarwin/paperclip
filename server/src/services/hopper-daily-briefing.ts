@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import { hopperService } from "./hopper.js";
+import { scheduledTasksService } from "./scheduled-tasks.js";
 import { googleCalendarService, type CalendarEvent } from "./hopper-google-calendar.js";
 import { slackDm } from "./slack-dm.js";
 
@@ -14,13 +14,8 @@ export function hopperDailyBriefing(db: Db, config?: Partial<BriefingConfig>) {
   const briefingHour = config?.briefingHour ?? parseInt(process.env.HOPPER_BRIEFING_HOUR ?? "5", 10);
   const briefingMinute = config?.briefingMinute ?? parseInt(process.env.HOPPER_BRIEFING_MINUTE ?? "30", 10);
 
-  // Track last sent date as YYYY-MM-DD string so we only fire once per day
   let lastSentDate = "";
 
-  /**
-   * Call this on a regular interval (e.g., every 60 seconds).
-   * Fires the briefing once per day when the current time matches the configured hour/minute.
-   */
   async function tick(): Promise<void> {
     const slackToken = process.env.SLACK_BOT_TOKEN;
     const slackUserId = process.env.SLACK_HOPPER_USER_ID;
@@ -33,7 +28,6 @@ export function hopperDailyBriefing(db: Db, config?: Partial<BriefingConfig>) {
     const now = new Date();
     const todayKey = now.toISOString().slice(0, 10);
 
-    // Only fire once per day at the right time
     if (lastSentDate === todayKey) return;
     if (now.getHours() !== briefingHour || now.getMinutes() !== briefingMinute) return;
 
@@ -42,7 +36,6 @@ export function hopperDailyBriefing(db: Db, config?: Partial<BriefingConfig>) {
     try {
       await sendBriefing({ db, slackToken, slackUserId, gcalClientId, gcalClientSecret, gcalRefreshToken, now });
     } catch {
-      // Reset so we retry on the next tick if it failed
       lastSentDate = "";
     }
   }
@@ -61,7 +54,6 @@ async function sendBriefing(opts: {
 }): Promise<void> {
   const { db, slackToken, slackUserId, gcalClientId, gcalClientSecret, gcalRefreshToken, now } = opts;
 
-  const svc = hopperService(db);
   const slack = slackDm(slackToken, slackUserId);
 
   // Fetch today's calendar events if Google Calendar is configured
@@ -79,10 +71,18 @@ async function sendBriefing(opts: {
     }
   }
 
-  // Fetch pending hopper items (created personal tasks without a calendar event)
-  const pendingItems = await svc.listItemsForCalendarPlacement();
+  // Fetch pending scheduled tasks (status=scheduled but no calendar event yet)
+  const stSvc = scheduledTasksService(db);
+  const startOfDay = new Date(now);
+  startOfDay.setHours(0, 0, 0, 0);
+  const endOfDay = new Date(now);
+  endOfDay.setHours(23, 59, 59, 999);
 
-  const message = formatBriefingMessage(now, calendarEvents, pendingItems);
+  // All companies — briefing is a global daily summary
+  // In practice this is single-tenant, but we query without company filter for simplicity
+  const pendingTasks = await stSvc.listTasksForCalendarPlacement().catch(() => []);
+
+  const message = formatBriefingMessage(now, calendarEvents, pendingTasks);
 
   const channelId = await slack.openChannel();
   await slack.postMessage(channelId, message);
@@ -91,7 +91,7 @@ async function sendBriefing(opts: {
 function formatBriefingMessage(
   date: Date,
   events: CalendarEvent[],
-  pendingItems: Array<{ id: string; kind: string | null }>,
+  pendingTasks: Array<{ id: string; kind: string | null }>,
 ): string {
   const dateStr = date.toLocaleDateString("en-US", {
     weekday: "long",
@@ -116,10 +116,10 @@ function formatBriefingMessage(
     lines.push("_No calendar events today._");
   }
 
-  if (pendingItems.length > 0) {
+  if (pendingTasks.length > 0) {
     lines.push("");
-    lines.push(`*${pendingItems.length} task${pendingItems.length === 1 ? "" : "s"} pending calendar placement:*`);
-    lines.push("_These are in your Hopper queue but not yet on your calendar._");
+    lines.push(`*${pendingTasks.length} task${pendingTasks.length === 1 ? "" : "s"} pending calendar placement:*`);
+    lines.push("_These are classified and ready but not yet on your calendar._");
   }
 
   lines.push("");

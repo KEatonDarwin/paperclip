@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { hopperService } from "./hopper.js";
+import { scheduledTasksService } from "./scheduled-tasks.js";
 import { hopperPreferencesService, prefKeyForKind } from "./hopper-preferences.js";
 import { slackDm } from "./slack-dm.js";
 
@@ -70,7 +71,6 @@ export function hopperProcessor(db: Db) {
 
     const threads = await svc.listThreads(itemId);
 
-    // Build conversation context
     const messages: { role: "user" | "assistant"; content: string }[] = [];
     messages.push({ role: "user", content: item.prompt });
     for (const t of threads) {
@@ -78,15 +78,12 @@ export function hopperProcessor(db: Db) {
       messages.push({ role, content: t.body });
     }
 
-    const isPersonalMode = item.taskMode === "personal";
-    const systemPrompt = isPersonalMode ? PERSONAL_TASK_SYSTEM_PROMPT : SOFTWARE_SYSTEM_PROMPT;
-
     let raw: string;
     try {
       const response = await client.messages.create({
         model: "claude-haiku-4-5-20251001",
         max_tokens: 1024,
-        system: systemPrompt,
+        system: SOFTWARE_SYSTEM_PROMPT,
         messages,
       });
       raw = response.content[0].type === "text" ? response.content[0].text : "";
@@ -101,11 +98,136 @@ export function hopperProcessor(db: Db) {
       return;
     }
 
-    if (isPersonalMode) {
-      await processPersonalTask(itemId, item, raw, ctoAgentId);
-    } else {
-      await processSoftwareItem(itemId, item, raw, ctoAgentId);
+    await processSoftwareItem(itemId, item, raw, ctoAgentId);
+  }
+
+  /** Process a personal task that lives in scheduled_tasks (not hopper_items) */
+  async function processScheduledTask(taskId: string): Promise<void> {
+    const stSvc = scheduledTasksService(db);
+    const task = await stSvc.getById(taskId);
+    if (!task) return;
+
+    const threads = await stSvc.listThreads(taskId);
+
+    const messages: { role: "user" | "assistant"; content: string }[] = [];
+    messages.push({ role: "user", content: task.requestText });
+    for (const t of threads) {
+      const role = t.authorType === "agent" ? "assistant" : "user";
+      messages.push({ role, content: t.body });
     }
+
+    let raw: string;
+    try {
+      const response = await client.messages.create({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 1024,
+        system: PERSONAL_TASK_SYSTEM_PROMPT,
+        messages,
+      });
+      raw = response.content[0].type === "text" ? response.content[0].text : "";
+    } catch {
+      await stSvc.addThread({
+        taskId,
+        authorType: "agent",
+        authorId: ctoAgentId,
+        body: "Could you tell me more about what you need to do and roughly when?",
+      });
+      return;
+    }
+
+    let parsed: z.infer<typeof personalTaskSchema>;
+    try {
+      parsed = personalTaskSchema.parse(JSON.parse(raw));
+    } catch {
+      await stSvc.addThread({
+        taskId,
+        authorType: "agent",
+        authorId: ctoAgentId,
+        body: "Could you tell me more about what you need to do and roughly when?",
+      });
+      return;
+    }
+
+    if (!parsed.has_info) {
+      const updatePatch: Parameters<typeof stSvc.update>[1] = {
+        kind: parsed.kind ?? null,
+      };
+
+      // Send Slack DM for clarification if configured and no thread yet
+      const slackToken = process.env.SLACK_BOT_TOKEN;
+      const slackUserId = process.env.SLACK_HOPPER_USER_ID;
+      if (slackToken && slackUserId && parsed.question && !task.slackThreadTs) {
+        try {
+          const slack = slackDm(slackToken, slackUserId);
+          const channelId = await slack.openChannel();
+          const threadTs = await slack.postMessage(channelId, parsed.question);
+          updatePatch.slackThreadTs = threadTs;
+        } catch {
+          // Slack DM failed — fall through
+        }
+      }
+
+      await stSvc.update(taskId, updatePatch);
+      if (parsed.question) {
+        await stSvc.addThread({
+          taskId,
+          authorType: "agent",
+          authorId: ctoAgentId,
+          body: parsed.question,
+        });
+      }
+      return;
+    }
+
+    // Compute scheduledAt from deadline or default to tomorrow
+    let scheduledAt: Date | null = null;
+    if (parsed.deadline) {
+      const deadlineDate = new Date(parsed.deadline);
+      if (!isNaN(deadlineDate.getTime())) {
+        deadlineDate.setHours(preferredTimeToHour(parsed.preferred_time_of_day), 0, 0, 0);
+        scheduledAt = deadlineDate;
+      }
+    } else {
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours(preferredTimeToHour(parsed.preferred_time_of_day), 0, 0, 0);
+      scheduledAt = tomorrow;
+    }
+
+    await stSvc.update(taskId, {
+      title: parsed.title ?? null,
+      kind: parsed.kind ?? null,
+      status: "scheduled",
+      scheduledAt,
+      durationMinutes: parsed.duration_minutes ?? null,
+      notes: parsed.description ?? null,
+    });
+
+    // Save time-of-day preference for this kind
+    if (parsed.kind && parsed.preferred_time_of_day && parsed.preferred_time_of_day !== "anytime") {
+      try {
+        await prefsSvc.set(
+          task.companyId,
+          task.userId,
+          prefKeyForKind(parsed.kind),
+          parsed.preferred_time_of_day,
+          "explicit",
+        );
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    const timeStr = scheduledAt
+      ? scheduledAt.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+      : "TBD";
+    const durationStr = parsed.duration_minutes ? ` (~${parsed.duration_minutes} min)` : "";
+    await stSvc.addThread({
+      taskId,
+      authorType: "agent",
+      authorId: ctoAgentId,
+      body: `Got it! **${parsed.title ?? task.requestText}**${durationStr} is queued for **${timeStr}**. I'll place it on Google Calendar shortly.`,
+    });
   }
 
   async function processSoftwareItem(
@@ -184,111 +306,6 @@ export function hopperProcessor(db: Db) {
     });
   }
 
-  async function processPersonalTask(
-    itemId: string,
-    item: Awaited<ReturnType<ReturnType<typeof hopperService>["getById"]>>,
-    raw: string,
-    ctoAgentId: string,
-  ): Promise<void> {
-    let parsed: z.infer<typeof personalTaskSchema>;
-    try {
-      parsed = personalTaskSchema.parse(JSON.parse(raw));
-    } catch {
-      await svc.update(itemId, { status: "needs_info" });
-      await svc.addThread({
-        itemId,
-        authorType: "agent",
-        authorId: ctoAgentId,
-        body: "Could you tell me more about what you need to do and roughly when?",
-      });
-      return;
-    }
-
-    if (!parsed.has_info) {
-      const updatePatch: Parameters<typeof svc.update>[1] = {
-        status: "needs_info",
-        kind: parsed.kind ?? null,
-        question: parsed.question ?? null,
-      };
-
-      // Send Slack DM if configured and item doesn't already have a thread
-      const slackToken = process.env.SLACK_BOT_TOKEN;
-      const slackUserId = process.env.SLACK_HOPPER_USER_ID;
-      if (slackToken && slackUserId && parsed.question && !item?.slackThreadTs) {
-        try {
-          const slack = slackDm(slackToken, slackUserId);
-          const channelId = await slack.openChannel();
-          const threadTs = await slack.postMessage(channelId, parsed.question);
-          updatePatch.slackThreadTs = threadTs;
-        } catch {
-          // Slack DM failed — fall through to in-app question only
-        }
-      }
-
-      await svc.update(itemId, updatePatch);
-      if (parsed.question) {
-        await svc.addThread({
-          itemId,
-          authorType: "agent",
-          authorId: ctoAgentId,
-          body: parsed.question,
-        });
-      }
-      return;
-    }
-
-    // Compute a suggested scheduledAt based on preferred_time_of_day and deadline
-    let scheduledAt: Date | null = null;
-    if (parsed.deadline) {
-      const deadlineDate = new Date(parsed.deadline);
-      if (!isNaN(deadlineDate.getTime())) {
-        const timeOfDayHour = preferredTimeToHour(parsed.preferred_time_of_day);
-        deadlineDate.setHours(timeOfDayHour, 0, 0, 0);
-        scheduledAt = deadlineDate;
-      }
-    } else {
-      // Default: next available slot based on preferred time of day (use tomorrow)
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      tomorrow.setHours(preferredTimeToHour(parsed.preferred_time_of_day), 0, 0, 0);
-      scheduledAt = tomorrow;
-    }
-
-    await svc.update(itemId, {
-      status: "created",
-      kind: parsed.kind ?? null,
-      scheduledAt,
-      durationMinutes: parsed.duration_minutes ?? null,
-    });
-
-    // Save time-of-day preference for this task kind when explicitly stated
-    if (parsed.kind && parsed.preferred_time_of_day && parsed.preferred_time_of_day !== "anytime") {
-      try {
-        await prefsSvc.set(
-          item!.companyId,
-          item!.userId,
-          prefKeyForKind(parsed.kind),
-          parsed.preferred_time_of_day,
-          "explicit",
-        );
-      } catch {
-        // Preference save failure is non-fatal
-      }
-    }
-
-    // Add a confirmation thread message
-    const timeStr = scheduledAt
-      ? scheduledAt.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
-      : "TBD";
-    const durationStr = parsed.duration_minutes ? ` (~${parsed.duration_minutes} min)` : "";
-    await svc.addThread({
-      itemId,
-      authorType: "agent",
-      authorId: ctoAgentId,
-      body: `Got it! I've captured **${parsed.title}**${durationStr} and queued it for **${timeStr}**. I'll place it on Google Calendar shortly.`,
-    });
-  }
-
   function preferredTimeToHour(pref: string | null): number {
     switch (pref) {
       case "early_morning": return 5;
@@ -299,5 +316,5 @@ export function hopperProcessor(db: Db) {
     }
   }
 
-  return { process: processItem };
+  return { process: processItem, processScheduledTask };
 }

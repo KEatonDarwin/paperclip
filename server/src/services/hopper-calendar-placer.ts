@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import { hopperService } from "./hopper.js";
+import { scheduledTasksService } from "./scheduled-tasks.js";
 import { hopperPreferencesService, prefKeyForKind } from "./hopper-preferences.js";
 import { googleCalendarService } from "./hopper-google-calendar.js";
 
@@ -20,52 +20,49 @@ export function hopperCalendarPlacer(db: Db) {
     const refreshToken = process.env.GOOGLE_CALENDAR_REFRESH_TOKEN;
     if (!clientId || !clientSecret || !refreshToken) return;
 
-    const svc = hopperService(db);
+    const stSvc = scheduledTasksService(db);
     const prefsSvc = hopperPreferencesService(db);
     const calendar = googleCalendarService(clientId, clientSecret, refreshToken);
 
-    let items: Awaited<ReturnType<typeof svc.listItemsForCalendarPlacement>>;
+    let tasks: Awaited<ReturnType<typeof stSvc.listTasksForCalendarPlacement>>;
     try {
-      items = await svc.listItemsForCalendarPlacement();
+      tasks = await stSvc.listTasksForCalendarPlacement();
     } catch {
       return;
     }
 
-    for (const item of items) {
+    for (const task of tasks) {
       try {
-        const durationMinutes = item.durationMinutes ?? DEFAULT_DURATION_MINUTES;
+        const durationMinutes = task.durationMinutes ?? DEFAULT_DURATION_MINUTES;
 
-        // Apply learned preferences: adjust preferred hour based on task kind
-        const full = await svc.getById(item.id);
+        const full = await stSvc.getById(task.id);
         if (!full) continue;
 
-        let preferredStart = item.scheduledAt;
-        if (item.kind) {
-          const learnedPref = await prefsSvc.get(full.companyId, full.userId, prefKeyForKind(item.kind)).catch(() => null);
+        let preferredStart = task.scheduledAt;
+        if (task.kind) {
+          const learnedPref = await prefsSvc.get(full.companyId, full.userId, prefKeyForKind(task.kind)).catch(() => null);
           if (learnedPref && PREFERRED_TIME_HOURS[learnedPref] !== undefined) {
-            const adjusted = new Date(item.scheduledAt);
+            const adjusted = new Date(task.scheduledAt);
             adjusted.setHours(PREFERRED_TIME_HOURS[learnedPref], 0, 0, 0);
-            // Only use the learned preference if it's in the future
             if (adjusted.getTime() > Date.now()) {
               preferredStart = adjusted;
             }
           }
         }
 
-        // Find the first free slot at or after the proposed time
         const start = await calendar.findFreeSlot(preferredStart, durationMinutes);
 
-        const threads = await svc.listThreads(item.id);
-        const title = extractTitle(full.prompt, threads);
+        const threads = await stSvc.listThreads(task.id);
+        const title = extractTitle(full.title ?? full.requestText, threads);
 
         const { eventId, htmlLink } = await calendar.createEvent(
           title,
-          full.prompt !== title ? full.prompt : null,
+          full.requestText !== title ? full.requestText : null,
           start,
           durationMinutes,
         );
 
-        await svc.update(item.id, { calendarEventId: eventId });
+        await stSvc.update(task.id, { calendarEventId: eventId });
 
         const timeStr = start.toLocaleDateString("en-US", {
           weekday: "short",
@@ -74,14 +71,14 @@ export function hopperCalendarPlacer(db: Db) {
           hour: "numeric",
           minute: "2-digit",
         });
-        await svc.addThread({
-          itemId: item.id,
+        await stSvc.addThread({
+          taskId: task.id,
           authorType: "agent",
           authorId: AGENT_ID,
           body: `Scheduled on Google Calendar: **${timeStr}** (~${durationMinutes} min). [View event](${htmlLink})`,
         });
       } catch {
-        // Skip this item; will retry on next tick
+        // Skip this task; will retry on next tick
       }
     }
   }
@@ -89,12 +86,7 @@ export function hopperCalendarPlacer(db: Db) {
   return { tick };
 }
 
-/**
- * Derive a short event title from the item prompt and thread context.
- * Uses the last agent thread entry if it contains a bolded title (from processor confirmation),
- * otherwise falls back to the first 80 chars of the prompt.
- */
-function extractTitle(prompt: string, threads: Array<{ authorType: string; body: string }>): string {
+function extractTitle(titleOrPrompt: string, threads: Array<{ authorType: string; body: string }>): string {
   for (let i = threads.length - 1; i >= 0; i--) {
     const t = threads[i];
     if (t.authorType === "agent") {
@@ -102,5 +94,5 @@ function extractTitle(prompt: string, threads: Array<{ authorType: string; body:
       if (match?.[1]) return match[1].slice(0, 80);
     }
   }
-  return prompt.slice(0, 80);
+  return titleOrPrompt.slice(0, 80);
 }

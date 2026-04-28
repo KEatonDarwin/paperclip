@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, index, boolean, integer } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, index, boolean } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
 
@@ -10,15 +10,10 @@ export const hopperItems = pgTable(
     userId: text("user_id").notNull(),
     prompt: text("prompt").notNull(),
     status: text("status").notNull().default("processing"), // 'processing' | 'needs_info' | 'created' | 'done' | 'cancelled'
-    taskMode: text("task_mode").notNull().default("software"), // 'software' | 'personal'
-    kind: text("kind"), // 'bug' | 'feature' | 'task_personal' | 'task_work' | 'task_home' | 'event' | 'reminder' | null
+    kind: text("kind"), // 'bug' | 'feature' | null
     question: text("question"),
     linkedIssueId: uuid("linked_issue_id").references(() => issues.id, { onDelete: "set null" }),
     linkedIssueIdentifier: text("linked_issue_identifier"),
-    scheduledAt: timestamp("scheduled_at", { withTimezone: true }),
-    durationMinutes: integer("duration_minutes"),
-    calendarEventId: text("calendar_event_id"),
-    slackThreadTs: text("slack_thread_ts"),
     dismissed: boolean("dismissed").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

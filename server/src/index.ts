@@ -29,6 +29,7 @@ import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import { heartbeatService, reconcilePersistedRuntimeServicesOnStartup, routineService } from "./services/index.js";
+import { hopperSlackPoller } from "./services/hopper-slack-poller.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -606,8 +607,19 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "periodic heartbeat recovery failed");
         });
     }, config.heartbeatSchedulerIntervalMs);
+
+    // Slack DM poller — checks open Hopper threads for user replies every 60s
+    if (process.env.SLACK_BOT_TOKEN) {
+      const slackPoller = hopperSlackPoller(db as any);
+      setInterval(() => {
+        void slackPoller.tick().catch((err) => {
+          logger.error({ err }, "hopper slack poller tick failed");
+        });
+      }, 60_000);
+      logger.info("hopper Slack DM poller registered (60s interval)");
+    }
   }
-  
+
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
     let backupInFlight = false;

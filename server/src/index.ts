@@ -30,6 +30,7 @@ import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import { heartbeatService, reconcilePersistedRuntimeServicesOnStartup, routineService } from "./services/index.js";
 import { hopperSlackPoller } from "./services/hopper-slack-poller.js";
+import { hopperCalendarPlacer } from "./services/hopper-calendar-placer.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -617,6 +618,16 @@ export async function startServer(): Promise<StartedServer> {
         });
       }, 60_000);
       logger.info("hopper Slack DM poller registered (60s interval)");
+    }
+
+    if (process.env.GOOGLE_CALENDAR_REFRESH_TOKEN) {
+      const calendarPlacer = hopperCalendarPlacer(db as any);
+      setInterval(() => {
+        void calendarPlacer.tick().catch((err) => {
+          logger.error({ err }, "hopper calendar placer tick failed");
+        });
+      }, 60_000);
+      logger.info("hopper Google Calendar placer registered (60s interval)");
     }
   }
 

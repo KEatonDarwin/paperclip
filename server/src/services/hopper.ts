@@ -1,6 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import { hopperItems, hopperItemThreads } from "@paperclipai/db";
-import { and, desc, eq, isNotNull } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
 
 export function hopperService(db: Db) {
   async function list(companyId: string, userId: string, opts?: { includeDismissed?: boolean }) {
@@ -113,5 +113,30 @@ export function hopperService(db: Db) {
     );
   }
 
-  return { list, create, getById, update, remove, addThread, listThreads, listPendingSlackItems };
+  async function listItemsForCalendarPlacement(): Promise<
+    Array<{ id: string; companyId: string; scheduledAt: Date; durationMinutes: number | null; kind: string | null }>
+  > {
+    const rows = await db
+      .select({
+        id: hopperItems.id,
+        companyId: hopperItems.companyId,
+        scheduledAt: hopperItems.scheduledAt,
+        durationMinutes: hopperItems.durationMinutes,
+        kind: hopperItems.kind,
+      })
+      .from(hopperItems)
+      .where(
+        and(
+          eq(hopperItems.status, "created"),
+          eq(hopperItems.taskMode, "personal"),
+          isNull(hopperItems.calendarEventId),
+          isNotNull(hopperItems.scheduledAt),
+        ),
+      );
+    return rows.filter(
+      (r): r is typeof r & { scheduledAt: Date } => r.scheduledAt !== null,
+    );
+  }
+
+  return { list, create, getById, update, remove, addThread, listThreads, listPendingSlackItems, listItemsForCalendarPlacement };
 }

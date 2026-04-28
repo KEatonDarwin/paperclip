@@ -268,7 +268,7 @@ export function hopperProcessor(db: Db) {
       itemId,
       authorType: "agent",
       authorId: ctoAgentId,
-      body: `Got it! I've captured **${parsed.title}**${durationStr} and proposed scheduling it for **${timeStr}**. Google Calendar placement coming in the next phase — for now it's queued in Hopper.`,
+      body: `Got it! I've captured **${parsed.title}**${durationStr} and queued it for **${timeStr}**. I'll place it on Google Calendar shortly.`,
     });
   }
 

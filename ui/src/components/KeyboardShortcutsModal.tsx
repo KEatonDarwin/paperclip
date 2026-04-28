@@ -26,6 +26,7 @@ const SHORTCUTS: Shortcut[] = [
   // Modals
   { keys: ["Ctrl", "Shift", "K"], description: "Open command modal", category: "Modals" },
   { keys: ["Ctrl", "Shift", "P"], description: "Open quick notes", category: "Modals" },
+  { keys: ["Ctrl", "Shift", "B"], description: "Report bug or feature (Hopper)", category: "Modals" },
   { keys: ["Shift", "?"], description: "Show keyboard shortcuts", category: "Modals" },
 ];
 

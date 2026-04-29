@@ -621,7 +621,7 @@ export async function startServer(): Promise<StartedServer> {
       logger.info("hopper Slack DM poller registered (60s interval)");
     }
 
-    if (process.env.GOOGLE_CALENDAR_REFRESH_TOKEN) {
+    {
       const calendarPlacer = hopperCalendarPlacer(db as any);
       setInterval(() => {
         void calendarPlacer.tick().catch((err) => {

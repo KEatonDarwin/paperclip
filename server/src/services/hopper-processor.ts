@@ -5,6 +5,7 @@ import { hopperService } from "./hopper.js";
 import { scheduledTasksService } from "./scheduled-tasks.js";
 import { hopperPreferencesService, prefKeyForKind } from "./hopper-preferences.js";
 import { slackDm } from "./slack-dm.js";
+import { syncPreferencesToObsidian } from "./hopper-obsidian-memory.js";
 
 const softwareClassifySchema = z.object({
   kind: z.enum(["bug", "feature"]).nullable(),
@@ -203,7 +204,7 @@ export function hopperProcessor(db: Db) {
       notes: parsed.description ?? null,
     });
 
-    // Save time-of-day preference for this kind
+    // Save time-of-day preference for this kind and sync to Obsidian
     if (parsed.kind && parsed.preferred_time_of_day && parsed.preferred_time_of_day !== "anytime") {
       try {
         await prefsSvc.set(
@@ -213,6 +214,7 @@ export function hopperProcessor(db: Db) {
           parsed.preferred_time_of_day,
           "explicit",
         );
+        void syncPreferencesToObsidian(db, task.companyId, task.userId).catch(() => {});
       } catch {
         // Non-fatal
       }

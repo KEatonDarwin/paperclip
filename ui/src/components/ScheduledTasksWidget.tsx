@@ -26,6 +26,22 @@ function ScheduledTaskCard({
   onExpand: () => void;
   onCancel: () => void;
 }) {
+  // pending with clarification needed (has threads but no scheduledAt yet)
+  if (task.status === "pending" && task.slackThreadTs) {
+    return (
+      <button
+        type="button"
+        onClick={onExpand}
+        className="flex w-full items-center gap-2 rounded-lg border border-amber-400 bg-amber-50 px-3 py-2 shadow-md text-sm text-amber-900 dark:border-amber-500/50 dark:bg-amber-950/60 dark:text-amber-100 animate-pulse hover:animate-none hover:bg-amber-100 dark:hover:bg-amber-900/40 transition-colors"
+      >
+        <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" />
+        <span className="flex-1 text-left truncate">Need more info — click here</span>
+        <span className="text-[10px] font-mono text-amber-700/60 dark:text-amber-300/60 shrink-0">{task.identifier}</span>
+        <ChevronDown className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+      </button>
+    );
+  }
+
   if (task.status === "pending") {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 shadow-md text-sm text-muted-foreground">
@@ -41,22 +57,6 @@ function ScheduledTaskCard({
           <X className="h-3.5 w-3.5" />
         </button>
       </div>
-    );
-  }
-
-  // pending with clarification needed (has threads but no scheduledAt yet)
-  if (task.status === "pending" && task.slackThreadTs) {
-    return (
-      <button
-        type="button"
-        onClick={onExpand}
-        className="flex w-full items-center gap-2 rounded-lg border border-amber-400 bg-amber-50 px-3 py-2 shadow-md text-sm text-amber-900 dark:border-amber-500/50 dark:bg-amber-950/60 dark:text-amber-100 animate-pulse hover:animate-none hover:bg-amber-100 dark:hover:bg-amber-900/40 transition-colors"
-      >
-        <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" />
-        <span className="flex-1 text-left truncate">Need more info — click here</span>
-        <span className="text-[10px] font-mono text-amber-700/60 dark:text-amber-300/60 shrink-0">{task.identifier}</span>
-        <ChevronDown className="h-3.5 w-3.5 shrink-0 text-amber-500" />
-      </button>
     );
   }
 

@@ -3,8 +3,7 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
 import { scheduledTasksService, scheduledTaskIdentifier } from "../services/scheduled-tasks.js";
-import { issueService, heartbeatService } from "../services/index.js";
-import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { heartbeatService } from "../services/index.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 
 const JARVIS_AGENT_ID = "ee9f5ec7-3eba-49ca-8f11-4ce67367a1ec";
@@ -32,37 +31,9 @@ function withIdentifier<T extends { seqNum: number }>(task: T) {
   return { ...task, identifier: scheduledTaskIdentifier(task.seqNum) };
 }
 
-function buildJarvisIssueDescription(task: {
-  id: string;
-  seqNum: number;
-  requestText: string;
-  deadlineAt?: Date | null;
-}): string {
-  const identifier = scheduledTaskIdentifier(task.seqNum);
-  const deadlineStr = task.deadlineAt
-    ? new Date(task.deadlineAt).toISOString().split("T")[0]
-    : "None";
-  return [
-    `## Scheduled Task — ${identifier}`,
-    "",
-    `**Request:** ${task.requestText}`,
-    "",
-    `**Task ID:** \`${task.id}\``,
-    `**Deadline:** ${deadlineStr}`,
-    "",
-    "Process this task:",
-    "1. Check the calendar for available slots",
-    "2. Classify the task kind and estimate duration",
-    "3. Pick the best time given schedule and learned preferences",
-    `4. Call \`PATCH /api/scheduled-tasks/${task.id}\` with \`status: \"scheduled\"\`, \`scheduledAt\`, \`kind\`, \`durationMinutes\``,
-    "5. If you need more info, send a Slack DM first and update the task when Kevin replies",
-    "6. Mark this issue done when the task is scheduled",
-  ].join("\n");
-}
 
 export function scheduledTaskRoutes(db: Db) {
   const router = Router();
-  const issueSvc = issueService(db);
   const heartbeat = heartbeatService(db);
 
   // List scheduled tasks for current user
@@ -91,31 +62,16 @@ export function scheduledTaskRoutes(db: Db) {
     });
     res.status(201).json(withIdentifier(task));
 
-    // Create a Paperclip issue for Jarvis to process this task
-    void (async () => {
-      try {
-        const issue = await issueSvc.create(companyId, {
-          title: `Schedule: ${task.requestText.slice(0, 100)}`,
-          description: buildJarvisIssueDescription(task),
-          status: "todo",
-          priority: "high",
-          assigneeAgentId: JARVIS_AGENT_ID,
-          createdByAgentId: null,
-          createdByUserId: userId,
-        });
-        void queueIssueAssignmentWakeup({
-          heartbeat,
-          issue,
-          reason: "issue_assigned",
-          mutation: "create",
-          contextSource: "scheduled_task.create",
-          requestedByActorType: "user",
-          requestedByActorId: userId,
-        });
-      } catch {
-        // Non-fatal: task is created, Jarvis will catch it on next heartbeat
-      }
-    })();
+    // Wake Jarvis directly with the task context — no issue created
+    void heartbeat.wakeup(JARVIS_AGENT_ID, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "scheduled_task_new",
+      payload: { scheduledTaskId: task.id },
+      requestedByActorType: "user",
+      requestedByActorId: userId,
+      contextSnapshot: { scheduledTaskId: task.id, scheduledTaskText: task.requestText.slice(0, 200) },
+    }).catch(() => {});
   });
 
   // Get a single scheduled task

@@ -64,7 +64,7 @@ const s = {
 // ─── Today Widget ─────────────────────────────────────────────────────────────
 
 export function ShimTodayWidget() {
-  const snapshot = usePluginData<TodaySnapshot>("today-snapshot");
+  const { data: snapshot } = usePluginData<TodaySnapshot>("today-snapshot");
 
   if (!snapshot || !snapshot.date) {
     return (
@@ -107,8 +107,8 @@ export function ShimTodayWidget() {
 // ─── Full Page ────────────────────────────────────────────────────────────────
 
 export function ShimPage() {
-  const snapshot = usePluginData<TodaySnapshot>("today-snapshot");
-  const config = usePluginData<ConfigStatus>("config-status");
+  const { data: snapshot } = usePluginData<TodaySnapshot>("today-snapshot");
+  const { data: config } = usePluginData<ConfigStatus>("config-status");
 
   return (
     <div style={s.page}>

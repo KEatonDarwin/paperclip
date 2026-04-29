@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
   definePlugin,
   runWorker,
@@ -9,130 +11,66 @@ import {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const JARVIS_AGENT_ID = "ee9f5ec7-3eba-49ca-8f11-4ce67367a1ec";
-const GCAL_TOKEN_URL = "https://oauth2.googleapis.com/token";
-const GCAL_API_BASE = "https://www.googleapis.com/calendar/v3";
+const GOG_BIN = "/usr/local/bin/gog";
+const execFileAsync = promisify(execFile);
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type GCalConfig = {
-  clientId?: string;
-  clientSecret?: string;
-  refreshToken?: string;
+type GogConfig = {
+  gogAccount?: string;
   calendarId?: string;
   timezone?: string;
 };
 
-type TokenCache = {
-  accessToken: string;
-  expiresAt: number; // ms epoch
-};
-
-type GCalEvent = {
+type GogEvent = {
   id: string;
   summary?: string;
   description?: string;
   location?: string;
   start?: { dateTime?: string; date?: string; timeZone?: string };
   end?: { dateTime?: string; date?: string; timeZone?: string };
-  hangoutLink?: string;
-  conferenceData?: { entryPoints?: Array<{ uri: string; entryPointType: string }> };
+  conferenceData?: {
+    entryPoints?: Array<{ uri: string; entryPointType: string }>;
+  };
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-async function getConfig(ctx: PluginContext): Promise<GCalConfig> {
+async function getConfig(ctx: PluginContext): Promise<GogConfig> {
   const raw = await ctx.config.get();
-  return (raw ?? {}) as GCalConfig;
+  return (raw ?? {}) as GogConfig;
 }
 
-function requireCredentials(cfg: GCalConfig): {
-  clientId: string;
-  clientSecret: string;
-  refreshToken: string;
-  calendarId: string;
-  timezone: string;
-} {
-  if (!cfg.clientId?.trim() || !cfg.clientSecret?.trim() || !cfg.refreshToken?.trim()) {
-    throw new Error(
-      "Google Calendar credentials not configured. Set clientId, clientSecret, and refreshToken in plugin settings."
-    );
-  }
-  return {
-    clientId: cfg.clientId.trim(),
-    clientSecret: cfg.clientSecret.trim(),
-    refreshToken: cfg.refreshToken.trim(),
-    calendarId: cfg.calendarId?.trim() || "primary",
-    timezone: cfg.timezone?.trim() || "America/Chicago",
-  };
+function account(cfg: GogConfig): string {
+  return cfg.gogAccount?.trim() || "kevineatonfx@gmail.com";
 }
 
-async function getAccessToken(ctx: PluginContext, cfg: GCalConfig): Promise<string> {
-  // Try cached token first
-  const cached = (await ctx.state.get({
-    scopeKind: "instance",
-    stateKey: "token-cache",
-  })) as TokenCache | null;
-
-  if (cached && cached.expiresAt > Date.now() + 60_000) {
-    return cached.accessToken;
-  }
-
-  // Refresh the token
-  const { clientId, clientSecret, refreshToken } = requireCredentials(cfg);
-  const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    client_id: clientId,
-    client_secret: clientSecret,
-    refresh_token: refreshToken,
-  });
-
-  const resp = await fetch(GCAL_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
-
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "unknown error");
-    throw new Error(`Failed to refresh Google OAuth token: ${resp.status} ${text}`);
-  }
-
-  const data = (await resp.json()) as { access_token: string; expires_in: number };
-  const accessToken = data.access_token;
-  const expiresAt = Date.now() + data.expires_in * 1000;
-
-  await ctx.state.set({ scopeKind: "instance", stateKey: "token-cache" }, {
-    accessToken,
-    expiresAt,
-  } satisfies TokenCache);
-
-  return accessToken;
+function calId(cfg: GogConfig): string {
+  return cfg.calendarId?.trim() || "primary";
 }
 
-async function gcalFetch(
-  ctx: PluginContext,
-  cfg: GCalConfig,
-  path: string,
-  init: RequestInit = {}
+function tz(cfg: GogConfig): string {
+  return cfg.timezone?.trim() || "America/Chicago";
+}
+
+async function runGog(
+  subcommand: string,
+  args: string[],
+  acct: string,
+  opts: { json?: boolean; force?: boolean } = {}
 ): Promise<unknown> {
-  const accessToken = await getAccessToken(ctx, cfg);
-  const url = path.startsWith("http") ? path : `${GCAL_API_BASE}${path}`;
-  const resp = await fetch(url, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      ...(init.headers ?? {}),
-    },
-  });
+  const env: Record<string, string> = {
+    ...process.env as Record<string, string>,
+    GOG_KEYRING_BACKEND: "file",
+    GOG_KEYRING_PASSWORD: "",
+  };
+  const allArgs = ["calendar", subcommand, ...args, "--no-input", "-a", acct];
+  if (opts.json !== false) allArgs.push("--json", "--results-only");
+  if (opts.force) allArgs.push("--force");
 
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "unknown error");
-    throw new Error(`Google Calendar API error ${resp.status}: ${text}`);
-  }
-
-  if (resp.status === 204) return null;
-  return resp.json();
+  const { stdout } = await execFileAsync(GOG_BIN, allArgs, { env });
+  if (!stdout.trim()) return null;
+  return JSON.parse(stdout);
 }
 
 function summarizeError(err: unknown): string {
@@ -140,7 +78,6 @@ function summarizeError(err: unknown): string {
   return String(err);
 }
 
-/** Format an ISO datetime string for display using the configured timezone. */
 function formatTime(isoStr: string | undefined, timezone: string): string {
   if (!isoStr) return "?";
   try {
@@ -155,7 +92,6 @@ function formatTime(isoStr: string | undefined, timezone: string): string {
   }
 }
 
-/** Format a date header line like "☀️ Monday, April 28" */
 function formatDateHeader(dateStr: string, timezone: string): string {
   try {
     const d = new Date(`${dateStr}T00:00:00`);
@@ -173,35 +109,31 @@ function formatDateHeader(dateStr: string, timezone: string): string {
   }
 }
 
-/** Build a human-readable day summary string. */
-function buildDaySummary(events: GCalEvent[], dateStr: string, timezone: string): string {
+function buildDaySummary(events: GogEvent[], dateStr: string, timezone: string): string {
   const header = formatDateHeader(dateStr, timezone);
-
-  if (events.length === 0) {
-    return `${header}\n\nNo events today.`;
-  }
+  if (events.length === 0) return `${header}\n\nNo events today.`;
 
   const lines = events.map((ev) => {
-    const start = formatTime(ev.start?.dateTime, timezone);
-    const end = formatTime(ev.end?.dateTime, timezone);
+    const startStr = ev.start?.dateTime
+      ? formatTime(ev.start.dateTime, timezone)
+      : ev.start?.date
+      ? "all day"
+      : "?";
+    const endStr = ev.end?.dateTime ? ` – ${formatTime(ev.end.dateTime, timezone)}` : "";
     const title = ev.summary ?? "(no title)";
-    // Detect video call link
-    const hangout = ev.hangoutLink;
-    const conferenceUri = ev.conferenceData?.entryPoints?.find(
+    const videoUri = ev.conferenceData?.entryPoints?.find(
       (e) => e.entryPointType === "video"
     )?.uri;
-    const meetPart =
-      hangout || conferenceUri
-        ? ` (${hangout ? "Google Meet" : new URL(conferenceUri!).hostname})`
-        : "";
-    return `${start} – ${end}  ${title}${meetPart}`;
+    const meetPart = videoUri
+      ? ` (${new URL(videoUri).hostname})`
+      : "";
+    return `${startStr}${endStr}  ${title}${meetPart}`;
   });
 
   const count = events.length;
   return `${header}\n\n${lines.join("\n")}\n\n${count} event${count === 1 ? "" : "s"} today.`;
 }
 
-/** ISO date string for today or a given date, local to timezone. */
 function todayInTz(timezone: string, date?: string): string {
   if (date) return date;
   return new Intl.DateTimeFormat("en-CA", { timeZone: timezone }).format(new Date());
@@ -211,7 +143,7 @@ function todayInTz(timezone: string, date?: string): string {
 
 const plugin = definePlugin({
   async setup(ctx) {
-    ctx.logger.info("Google Calendar plugin starting up");
+    ctx.logger.info("Google Calendar (gog) plugin starting up");
 
     // ── Job: morning-briefing ─────────────────────────────────────────────────
     ctx.jobs.register("morning-briefing", async (_jobCtx) => {
@@ -219,7 +151,10 @@ const plugin = definePlugin({
       try {
         const companyId =
           process.env["PAPERCLIP_COMPANY_ID"] ??
-          ((await ctx.state.get({ scopeKind: "instance", stateKey: "company-id" })) as string | null) ??
+          ((await ctx.state.get({
+            scopeKind: "instance",
+            stateKey: "company-id",
+          })) as string | null) ??
           "";
 
         if (!companyId) {
@@ -259,17 +194,16 @@ const plugin = definePlugin({
         const { date } = (params ?? {}) as { date?: string };
         try {
           const cfg = await getConfig(ctx);
-          const { calendarId, timezone } = requireCredentials(cfg);
-          const dateStr = todayInTz(timezone, date);
+          const dateStr = todayInTz(tz(cfg), date);
           const timeMin = `${dateStr}T00:00:00Z`;
           const timeMax = `${dateStr}T23:59:59Z`;
-          const data = (await gcalFetch(
-            ctx,
-            cfg,
-            `/calendars/${encodeURIComponent(calendarId)}/events?timeMin=${encodeURIComponent(timeMin)}&timeMax=${encodeURIComponent(timeMax)}&singleEvents=true&orderBy=startTime`
-          )) as { items?: GCalEvent[] };
-          const events = data.items ?? [];
-          return { content: buildDaySummary(events, dateStr, timezone) };
+          const events = (await runGog(
+            "events",
+            [calId(cfg), "--from", timeMin, "--to", timeMax],
+            account(cfg),
+            { json: true }
+          )) as GogEvent[] | null;
+          return { content: buildDaySummary(events ?? [], dateStr, tz(cfg)) };
         } catch (err) {
           return { error: `Error fetching day summary: ${summarizeError(err)}` };
         }
@@ -295,16 +229,13 @@ const plugin = definePlugin({
         const { dateStart, dateEnd } = params as { dateStart: string; dateEnd: string };
         try {
           const cfg = await getConfig(ctx);
-          const { calendarId } = requireCredentials(cfg);
-          const timeMin = `${dateStart}T00:00:00Z`;
-          const timeMax = `${dateEnd}T23:59:59Z`;
-          const data = (await gcalFetch(
-            ctx,
-            cfg,
-            `/calendars/${encodeURIComponent(calendarId)}/events?timeMin=${encodeURIComponent(timeMin)}&timeMax=${encodeURIComponent(timeMax)}&singleEvents=true&orderBy=startTime`
-          )) as { items?: GCalEvent[] };
-          const events = data.items ?? [];
-          if (events.length === 0) {
+          const events = (await runGog(
+            "events",
+            [calId(cfg), "--from", `${dateStart}T00:00:00Z`, "--to", `${dateEnd}T23:59:59Z`],
+            account(cfg),
+            { json: true }
+          )) as GogEvent[] | null;
+          if (!events || events.length === 0) {
             return { content: `No events found between ${dateStart} and ${dateEnd}.` };
           }
           return { content: JSON.stringify(events, null, 2) };
@@ -332,11 +263,11 @@ const plugin = definePlugin({
         const { eventId } = params as { eventId: string };
         try {
           const cfg = await getConfig(ctx);
-          const { calendarId } = requireCredentials(cfg);
-          const event = await gcalFetch(
-            ctx,
-            cfg,
-            `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`
+          const event = await runGog(
+            "event",
+            [calId(cfg), eventId],
+            account(cfg),
+            { json: true }
           );
           return { content: JSON.stringify(event, null, 2) };
         } catch (err) {
@@ -373,24 +304,18 @@ const plugin = definePlugin({
         };
         try {
           const cfg = await getConfig(ctx);
-          const { calendarId, timezone } = requireCredentials(cfg);
-          const body: Record<string, unknown> = {
-            summary: title,
-            start: { dateTime: startTime, timeZone: timezone },
-            end: { dateTime: endTime, timeZone: timezone },
-          };
-          if (description) body["description"] = description;
-          if (location) body["location"] = location;
+          const args = [
+            calId(cfg),
+            "--summary", title,
+            "--from", startTime,
+            "--to", endTime,
+          ];
+          if (description) args.push("--description", description);
+          if (location) args.push("--location", location);
 
-          const created = await gcalFetch(
-            ctx,
-            cfg,
-            `/calendars/${encodeURIComponent(calendarId)}/events`,
-            { method: "POST", body: JSON.stringify(body) }
-          );
-          const ev = created as GCalEvent;
+          const created = (await runGog("create", args, account(cfg), { json: true })) as GogEvent;
           return {
-            content: `Event created: **${ev.summary ?? title}** (ID: \`${ev.id}\`)\n\`\`\`json\n${JSON.stringify(created, null, 2)}\n\`\`\``,
+            content: `Event created: **${created?.summary ?? title}** (ID: \`${created?.id}\`)\n\`\`\`json\n${JSON.stringify(created, null, 2)}\n\`\`\``,
           };
         } catch (err) {
           return { error: `Error creating event: ${summarizeError(err)}` };
@@ -403,7 +328,7 @@ const plugin = definePlugin({
       "gcal_update_event",
       {
         displayName: "Google Calendar: Update Event",
-        description: "Updates fields on an existing calendar event (PATCH).",
+        description: "Updates fields on an existing calendar event.",
         parametersSchema: {
           type: "object",
           properties: {
@@ -426,19 +351,13 @@ const plugin = definePlugin({
         };
         try {
           const cfg = await getConfig(ctx);
-          const { calendarId, timezone } = requireCredentials(cfg);
-          const patch: Record<string, unknown> = {};
-          if (title) patch["summary"] = title;
-          if (startTime) patch["start"] = { dateTime: startTime, timeZone: timezone };
-          if (endTime) patch["end"] = { dateTime: endTime, timeZone: timezone };
-          if (description !== undefined) patch["description"] = description;
+          const args = [calId(cfg), eventId];
+          if (title) args.push("--summary", title);
+          if (startTime) args.push("--from", startTime);
+          if (endTime) args.push("--to", endTime);
+          if (description !== undefined) args.push("--description", description);
 
-          const updated = await gcalFetch(
-            ctx,
-            cfg,
-            `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
-            { method: "PATCH", body: JSON.stringify(patch) }
-          );
+          const updated = await runGog("update", args, account(cfg), { json: true, force: true });
           return {
             content: `Event updated.\n\`\`\`json\n${JSON.stringify(updated, null, 2)}\n\`\`\``,
           };
@@ -466,13 +385,10 @@ const plugin = definePlugin({
         const { eventId } = params as { eventId: string };
         try {
           const cfg = await getConfig(ctx);
-          const { calendarId } = requireCredentials(cfg);
-          await gcalFetch(
-            ctx,
-            cfg,
-            `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
-            { method: "DELETE" }
-          );
+          await runGog("delete", [calId(cfg), eventId], account(cfg), {
+            json: false,
+            force: true,
+          });
           return { content: `Event \`${eventId}\` deleted successfully.` };
         } catch (err) {
           return { error: `Error deleting event: ${summarizeError(err)}` };
@@ -480,46 +396,51 @@ const plugin = definePlugin({
       }
     );
 
-    // ── Data endpoint: today's summary (for UI) ───────────────────────────────
+    // ── Data: today-summary (for UI) ──────────────────────────────────────────
     ctx.data.register("today-summary", async () => {
       try {
         const cfg = await getConfig(ctx);
-        const { calendarId, timezone } = requireCredentials(cfg);
-        const dateStr = todayInTz(timezone);
-        const timeMin = `${dateStr}T00:00:00Z`;
-        const timeMax = `${dateStr}T23:59:59Z`;
-        const data = (await gcalFetch(
-          ctx,
-          cfg,
-          `/calendars/${encodeURIComponent(calendarId)}/events?timeMin=${encodeURIComponent(timeMin)}&timeMax=${encodeURIComponent(timeMax)}&singleEvents=true&orderBy=startTime`
-        )) as { items?: GCalEvent[] };
-        const events = data.items ?? [];
+        const dateStr = todayInTz(tz(cfg));
+        const events = (await runGog(
+          "events",
+          [calId(cfg), "--from", `${dateStr}T00:00:00Z`, "--to", `${dateStr}T23:59:59Z`],
+          account(cfg),
+          { json: true }
+        )) as GogEvent[] | null;
+        const evList = events ?? [];
         return {
           date: dateStr,
-          summary: buildDaySummary(events, dateStr, timezone),
-          eventCount: events.length,
+          summary: buildDaySummary(evList, dateStr, tz(cfg)),
+          eventCount: evList.length,
         };
       } catch {
         return { date: null, summary: null, eventCount: 0 };
       }
     });
 
+    // ── Data: config-status (for UI) ──────────────────────────────────────────
     ctx.data.register("config-status", async () => {
       const cfg = await getConfig(ctx);
+      let gogWorking = false;
+      try {
+        await runGog("calendars", [], account(cfg), { json: true });
+        gogWorking = true;
+      } catch {
+        gogWorking = false;
+      }
       return {
-        hasClientId: Boolean(cfg.clientId?.trim()),
-        hasClientSecret: Boolean(cfg.clientSecret?.trim()),
-        hasRefreshToken: Boolean(cfg.refreshToken?.trim()),
-        calendarId: cfg.calendarId ?? "primary",
-        timezone: cfg.timezone ?? "America/Chicago",
+        gogAccount: account(cfg),
+        gogWorking,
+        calendarId: calId(cfg),
+        timezone: tz(cfg),
       };
     });
 
-    ctx.logger.info("Google Calendar plugin ready");
+    ctx.logger.info("Google Calendar (gog) plugin ready");
   },
 
   async onHealth() {
-    return { status: "ok", message: "Google Calendar plugin worker is running" };
+    return { status: "ok", message: "Google Calendar (gog) plugin worker is running" };
   },
 });
 

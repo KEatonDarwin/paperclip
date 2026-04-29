@@ -3,18 +3,16 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclipai.plugin-google-calendar",
   apiVersion: 1,
-  version: "0.1.0",
+  version: "0.2.0",
   displayName: "Google Calendar",
   description:
-    "Connects to Google Calendar API v3 to read, create, update, and delete calendar events.",
+    "Google Calendar integration via the gog CLI. Reads, creates, updates, and deletes events using the locally-installed gog command-line tool — no OAuth credentials needed in plugin settings.",
   author: "Paperclip",
   categories: ["connector", "automation"],
   capabilities: [
     "plugin.state.read",
     "plugin.state.write",
-    "secrets.read-ref",
     "jobs.schedule",
-    "http.outbound",
     "agent.tools.register",
     "instance.settings.register",
     "agents.read",
@@ -29,25 +27,12 @@ const manifest: PaperclipPluginManifestV1 = {
   instanceConfigSchema: {
     type: "object",
     properties: {
-      clientId: {
+      gogAccount: {
         type: "string",
-        title: "Google OAuth2 Client ID",
+        title: "Google Account Email",
         description:
-          "OAuth2 client ID from the Google Cloud Console (Credentials → OAuth 2.0 Client IDs).",
-        default: "",
-      },
-      clientSecret: {
-        type: "string",
-        title: "Google OAuth2 Client Secret",
-        description: "OAuth2 client secret paired with the Client ID above.",
-        default: "",
-      },
-      refreshToken: {
-        type: "string",
-        title: "OAuth2 Refresh Token",
-        description:
-          "Long-lived refresh token obtained from the OAuth2 consent flow. Used to mint new access tokens automatically.",
-        default: "",
+          "Email address of the Google account authorized in gog (e.g. you@gmail.com). Must match the account set up via `gog auth add`.",
+        default: "kevineatonfx@gmail.com",
       },
       calendarId: {
         type: "string",
@@ -125,11 +110,11 @@ const manifest: PaperclipPluginManifestV1 = {
           title: { type: "string", description: "Event title / summary" },
           startTime: {
             type: "string",
-            description: "ISO 8601 datetime (e.g. '2026-04-28T09:00:00')",
+            description: "ISO 8601 datetime (e.g. '2026-04-29T09:00:00')",
           },
           endTime: {
             type: "string",
-            description: "ISO 8601 datetime (e.g. '2026-04-28T10:00:00')",
+            description: "ISO 8601 datetime (e.g. '2026-04-29T10:00:00')",
           },
           description: { type: "string", description: "Optional event description / notes" },
           location: { type: "string", description: "Optional location string" },

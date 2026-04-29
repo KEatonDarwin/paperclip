@@ -43,9 +43,8 @@ type TodaySummary = {
 };
 
 type ConfigStatus = {
-  hasClientId: boolean;
-  hasClientSecret: boolean;
-  hasRefreshToken: boolean;
+  gogAccount: string;
+  gogWorking: boolean;
   calendarId: string;
   timezone: string;
 };
@@ -70,7 +69,7 @@ export function TodayWidget() {
         </>
       ) : (
         <div style={{ color: "#6b7280", fontSize: 14 }}>
-          Configure credentials in plugin settings to see today's events.
+          No events found or gog is not configured.
         </div>
       )}
     </div>
@@ -83,15 +82,13 @@ export function CalendarPage() {
   const { data: status } = usePluginData<ConfigStatus>("config-status");
   const { data: today, loading: todayLoading } = usePluginData<TodaySummary>("today-summary");
 
-  const allConfigured =
-    status?.hasClientId && status?.hasClientSecret && status?.hasRefreshToken;
-
   return (
     <div style={{ maxWidth: 720, margin: "0 auto", padding: 24 }}>
       <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 4 }}>📅 Google Calendar</h1>
       <p style={{ color: "#6b7280", marginBottom: 24, fontSize: 14 }}>
-        Google Calendar API v3 connector. Configure OAuth2 credentials in plugin settings, then
-        use agent tools to view, create, update, and delete events.
+        Google Calendar connector powered by the{" "}
+        <code>gog</code> CLI. No OAuth credentials needed here — auth is managed via{" "}
+        <code>gog auth add</code> on the server.
       </p>
 
       {/* Connection Status */}
@@ -99,21 +96,15 @@ export function CalendarPage() {
         <div style={{ fontWeight: 600, marginBottom: 12 }}>Connection Status</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 8, fontSize: 14 }}>
           <div>
-            Client ID
-            <span style={styles.badge(Boolean(status?.hasClientId))}>
-              {status?.hasClientId ? "configured" : "not set"}
+            gog CLI
+            <span style={styles.badge(Boolean(status?.gogWorking))}>
+              {status?.gogWorking ? "connected" : "not reachable"}
             </span>
           </div>
           <div>
-            Client Secret
-            <span style={styles.badge(Boolean(status?.hasClientSecret))}>
-              {status?.hasClientSecret ? "configured" : "not set"}
-            </span>
-          </div>
-          <div>
-            Refresh Token
-            <span style={styles.badge(Boolean(status?.hasRefreshToken))}>
-              {status?.hasRefreshToken ? "configured" : "not set"}
+            Account
+            <span style={{ marginLeft: 8, fontWeight: 600 }}>
+              {status?.gogAccount ?? "—"}
             </span>
           </div>
           <div>
@@ -159,9 +150,10 @@ export function CalendarPage() {
       {/* Today's Events */}
       <div style={styles.card}>
         <div style={{ fontWeight: 600, marginBottom: 8 }}>Today's Events</div>
-        {!allConfigured ? (
+        {!status?.gogWorking ? (
           <div style={{ color: "#6b7280", fontSize: 14 }}>
-            Configure all three OAuth2 credentials above to enable live event data.
+            gog is not reachable. Check that <code>/usr/local/bin/gog</code> is installed and{" "}
+            <code>gog auth list</code> works on the server.
           </div>
         ) : todayLoading ? (
           <div style={{ color: "#6b7280", fontSize: 14 }}>Loading…</div>
@@ -177,33 +169,20 @@ export function CalendarPage() {
         )}
       </div>
 
-      {/* Setup Instructions */}
+      {/* Setup Notes */}
       <div style={styles.card}>
-        <div style={{ fontWeight: 600, marginBottom: 8 }}>Setup Guide</div>
-        <ol style={{ margin: 0, paddingLeft: 20, fontSize: 13, lineHeight: 2, color: "#374151" }}>
-          <li>
-            Go to{" "}
-            <strong>Google Cloud Console → APIs &amp; Services → Credentials</strong>
-          </li>
-          <li>
-            Create an <strong>OAuth 2.0 Client ID</strong> (Desktop app type)
-          </li>
-          <li>
-            Enable the <strong>Google Calendar API</strong> for your project
-          </li>
-          <li>
-            Run the OAuth consent flow to obtain a <strong>refresh token</strong> (scopes:{" "}
-            <code>https://www.googleapis.com/auth/calendar</code>)
-          </li>
-          <li>
-            Paste <strong>Client ID</strong>, <strong>Client Secret</strong>, and{" "}
-            <strong>Refresh Token</strong> into Plugin Settings
-          </li>
-          <li>
-            Set your <strong>Calendar ID</strong> (use <code>primary</code> for default) and
-            your <strong>Timezone</strong>
-          </li>
-        </ol>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>How Authentication Works</div>
+        <p style={{ margin: "0 0 8px", fontSize: 13, color: "#374151", lineHeight: 1.6 }}>
+          This plugin delegates all Google API calls to the{" "}
+          <code>gog</code> CLI tool installed at{" "}
+          <code>/usr/local/bin/gog</code>. Auth tokens are stored in{" "}
+          <code>~/.config/gogcli/keyring/</code> and managed by{" "}
+          <code>gog auth</code> — no credentials are needed in plugin settings.
+        </p>
+        <p style={{ margin: 0, fontSize: 13, color: "#374151", lineHeight: 1.6 }}>
+          To re-authorize, run <code>gog auth add &lt;email&gt; --services calendar --remote</code>{" "}
+          on the server.
+        </p>
       </div>
     </div>
   );

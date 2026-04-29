@@ -22,7 +22,7 @@ import {
   Loader2,
   CheckCircle2,
   Clock,
-  RefreshCw,
+  Bot,
 } from "lucide-react";
 import { calendarApi, type CalendarEvent } from "../api/calendar";
 import { scheduledTasksApi, type ScheduledTask, type ScheduledTaskKind } from "../api/scheduled-tasks";
@@ -437,14 +437,18 @@ function AskJarvisBar({ companyId }: { companyId: string }) {
   }
 
   return (
-    <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
-      <RefreshCw className="h-4 w-4 text-muted-foreground shrink-0" />
+    <div className="flex items-center gap-3 rounded-lg border border-primary/30 bg-primary/5 px-4 py-2.5">
+      <div className="flex items-center gap-1.5 shrink-0">
+        <Bot className="h-4 w-4 text-primary" />
+        <span className="text-sm font-semibold text-primary">Ask Jarvis</span>
+      </div>
+      <div className="h-4 w-px bg-border shrink-0" />
       <input
         type="text"
         value={text}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => { if (e.key === "Enter") handleSubmit(); }}
-        placeholder='Ask Jarvis to schedule something… e.g. "take out the trash Wednesday"'
+        placeholder='Schedule something… e.g. "take out the trash Wednesday at 9am"'
         className="flex-1 min-w-0 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
         disabled={submit.isPending}
       />
@@ -455,7 +459,7 @@ function AskJarvisBar({ companyId }: { companyId: string }) {
           type="button"
           onClick={handleSubmit}
           disabled={!text.trim()}
-          className="shrink-0 rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 transition-colors"
+          className="shrink-0 rounded p-1 text-primary hover:text-primary/80 disabled:opacity-30 transition-colors"
           aria-label="Send to Jarvis"
         >
           <Send className="h-4 w-4" />

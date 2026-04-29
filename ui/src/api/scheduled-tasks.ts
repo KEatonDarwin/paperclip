@@ -45,8 +45,18 @@ export const scheduledTasksApi = {
   get: (taskId: string) =>
     api.get<ScheduledTask>(`/scheduled-tasks/${taskId}`),
 
-  update: (taskId: string, data: { status?: ScheduledTaskStatus; notes?: string }) =>
-    api.patch<ScheduledTask>(`/scheduled-tasks/${taskId}`, data),
+  update: (
+    taskId: string,
+    data: {
+      status?: ScheduledTaskStatus;
+      notes?: string;
+      title?: string | null;
+      kind?: ScheduledTaskKind;
+      scheduledAt?: string | null;
+      durationMinutes?: number | null;
+      deadlineAt?: string | null;
+    },
+  ) => api.patch<ScheduledTask>(`/scheduled-tasks/${taskId}`, data),
 
   remove: (taskId: string) =>
     api.delete<void>(`/scheduled-tasks/${taskId}`),

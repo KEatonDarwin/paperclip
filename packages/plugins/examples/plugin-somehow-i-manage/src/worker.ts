@@ -52,8 +52,9 @@ type ShimFocusSession = {
   status: string;
   planned_duration?: number;
   started_at?: string;
-  stopped_at?: string;
-  break_time_seconds?: number;
+  ended_at?: string;
+  work_duration?: number;
+  break_duration?: number;
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -557,8 +558,15 @@ const plugin = definePlugin({
           shimFetch(ctx, cfg, `/focus-sessions?date=${today}`).catch(() => []),
           shimFetch(ctx, cfg, "/tasks?status=open,in_progress").catch(() => []),
         ]);
-        const sessions = Array.isArray(sessionsRaw) ? (sessionsRaw as ShimFocusSession[]) : [];
-        const tasks = Array.isArray(tasksRaw) ? (tasksRaw as ShimTask[]) : [];
+        const unpack = <T,>(raw: unknown): T[] => {
+          if (Array.isArray(raw)) return raw as T[];
+          const d = (raw as { data?: T[] }).data;
+          return Array.isArray(d) ? d : [];
+        };
+        const sessions = unpack<ShimFocusSession>(sessionsRaw);
+        const tasks = unpack<ShimTask>(tasksRaw).filter(
+          (t) => t.status === "open" || t.status === "in_progress",
+        );
         const completedSessions = sessions.filter((s) => s.status === "completed");
         return {
           date: today,

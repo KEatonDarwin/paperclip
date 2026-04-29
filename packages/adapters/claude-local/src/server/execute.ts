@@ -201,6 +201,15 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   if (chatMessage) {
     env.PAPERCLIP_CHAT_MESSAGE = chatMessage;
   }
+  // Expose the full contextSnapshot as PAPERCLIP_WAKE_CONTEXT so agents can
+  // access payload fields (e.g. scheduledTaskId) that don't have dedicated env vars.
+  const wakeContextPayload: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(context)) {
+    if (v !== undefined && v !== null && v !== "") wakeContextPayload[k] = v;
+  }
+  if (Object.keys(wakeContextPayload).length > 0) {
+    env.PAPERCLIP_WAKE_CONTEXT = JSON.stringify(wakeContextPayload);
+  }
   if (effectiveWorkspaceCwd) {
     env.PAPERCLIP_WORKSPACE_CWD = effectiveWorkspaceCwd;
   }
@@ -425,11 +434,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ctxWakeReason === "direct_chat" && ctxChatMessage.length > 0
       ? `---\nDirect chat message (wake_reason=direct_chat):\n\n${ctxChatMessage}`
       : "";
+  // Embed scheduled-task context directly in the prompt so the agent can act
+  // immediately without reading env vars (which are invisible in resumed sessions).
+  const ctxScheduledTaskId = asString(context.scheduledTaskId, "");
+  const ctxScheduledTaskText = asString(context.scheduledTaskText, "");
+  const scheduledTaskInline =
+    (ctxWakeReason === "scheduled_task_new" || ctxWakeReason === "scheduled_task_reply") &&
+    ctxScheduledTaskId.length > 0
+      ? `---\nScheduled task wake (wake_reason=${ctxWakeReason}):\n\nscheduledTaskId: ${ctxScheduledTaskId}${ctxScheduledTaskText.length > 0 ? `\ntaskText: ${ctxScheduledTaskText}` : ""}`
+      : "";
   const prompt = joinPromptSections([
     renderedBootstrapPrompt,
     sessionHandoffNote,
     renderedPrompt,
     directChatInline,
+    scheduledTaskInline,
   ]);
   const promptMetrics = {
     promptChars: prompt.length,

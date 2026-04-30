@@ -21,10 +21,12 @@ function ScheduledTaskCard({
   task,
   onExpand,
   onCancel,
+  onDismiss,
 }: {
   task: ScheduledTask;
   onExpand: () => void;
   onCancel: () => void;
+  onDismiss: () => void;
 }) {
   // pending with clarification needed (has threads but no scheduledAt yet)
   if (task.status === "pending" && task.slackThreadTs) {
@@ -78,7 +80,7 @@ function ScheduledTaskCard({
           <span className="text-[10px] font-mono text-emerald-600/60 dark:text-emerald-400/60 shrink-0">{task.identifier}</span>
           <button
             type="button"
-            onClick={onCancel}
+            onClick={onDismiss}
             className="shrink-0 rounded p-0.5 hover:bg-emerald-200/50 dark:hover:bg-emerald-800/50"
             title="Dismiss"
           >
@@ -216,6 +218,7 @@ function ScheduledTaskConversation({
 
 export function ScheduledTasksWidget() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
   const { selectedCompanyId } = useCompany();
   const queryClient = useQueryClient();
 
@@ -235,10 +238,12 @@ export function ScheduledTasksWidget() {
   });
 
   // Show tasks that are active: pending or just-scheduled (not completed/cancelled)
-  // Hide "scheduled" tasks once they have a calendar event (the job is done, no need to stay visible)
+  // Hide "scheduled" tasks once they have a calendar event or have been locally dismissed
   const visibleTasks = tasks.filter((t) =>
-    t.status === "pending" ||
-    (t.status === "scheduled" && !t.calendarEventId),
+    !dismissedIds.has(t.id) && (
+      t.status === "pending" ||
+      (t.status === "scheduled" && !t.calendarEventId)
+    ),
   );
 
   if (visibleTasks.length === 0) return null;
@@ -259,6 +264,7 @@ export function ScheduledTasksWidget() {
               task={task}
               onExpand={() => setExpandedId(task.id)}
               onCancel={() => cancel.mutate(task.id)}
+              onDismiss={() => setDismissedIds((prev) => new Set(prev).add(task.id))}
             />
           )}
         </div>

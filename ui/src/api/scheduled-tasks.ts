@@ -3,6 +3,8 @@ import { api } from "./client";
 export type ScheduledTaskKind = "task_personal" | "task_work" | "task_home" | "event" | "reminder" | null;
 export type ScheduledTaskStatus = "pending" | "scheduled" | "completed" | "cancelled";
 
+export type ScheduledTaskOrigin = "jarvis_bar" | "keyboard_shortcut" | "apple_watch" | "api" | "slack" | null;
+
 export interface ScheduledTask {
   id: string;
   companyId: string;
@@ -18,6 +20,7 @@ export interface ScheduledTask {
   deadlineAt: string | null;
   calendarEventId: string | null;
   slackThreadTs: string | null;
+  origin: ScheduledTaskOrigin;
   notes: string | null;
   createdAt: string;
   updatedAt: string;
@@ -36,10 +39,11 @@ export const scheduledTasksApi = {
   list: (companyId: string) =>
     api.get<ScheduledTask[]>(`/companies/${companyId}/scheduled-tasks`),
 
-  create: (companyId: string, requestText: string, deadlineAt?: string) =>
+  create: (companyId: string, requestText: string, deadlineAt?: string, origin?: ScheduledTaskOrigin) =>
     api.post<ScheduledTask>(`/companies/${companyId}/scheduled-tasks`, {
       requestText,
       ...(deadlineAt ? { deadlineAt } : {}),
+      ...(origin ? { origin } : {}),
     }),
 
   get: (taskId: string) =>

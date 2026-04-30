@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Calendar, dateFnsLocalizer, type View } from "react-big-calendar";
 import "react-big-calendar/lib/css/react-big-calendar.css";
@@ -23,9 +23,10 @@ import {
   CheckCircle2,
   Clock,
   Bot,
+  MessageSquare,
 } from "lucide-react";
 import { calendarApi, type CalendarEvent } from "../api/calendar";
-import { scheduledTasksApi, type ScheduledTask, type ScheduledTaskKind } from "../api/scheduled-tasks";
+import { scheduledTasksApi, type ScheduledTask, type ScheduledTaskKind, type ScheduledTaskThread, type ScheduledTaskOrigin } from "../api/scheduled-tasks";
 import { agentsApi } from "../api/agents";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
@@ -253,49 +254,55 @@ function SystemEventDetail({
   );
 }
 
-// ─── Scheduled task edit modal ─────────────────────────────────────────────────
+// ─── Scheduled task chat modal ───────────────────────────────────────────────
 
-const KIND_OPTIONS: { value: ScheduledTaskKind; label: string }[] = [
-  { value: "task_personal", label: "Personal" },
-  { value: "task_work", label: "Work" },
-  { value: "task_home", label: "Home" },
-  { value: "event", label: "Event" },
-  { value: "reminder", label: "Reminder" },
-];
-
-function toLocalDatetimeValue(iso: string | null): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+function originLabel(origin: ScheduledTaskOrigin): string {
+  switch (origin) {
+    case "jarvis_bar": return "Jarvis Bar";
+    case "keyboard_shortcut": return "Keyboard Shortcut";
+    case "apple_watch": return "Apple Watch";
+    case "api": return "API";
+    case "slack": return "Slack";
+    default: return "";
+  }
 }
 
-function ScheduledTaskEditModal({
+function kindLabel(kind: ScheduledTaskKind): string {
+  switch (kind) {
+    case "task_personal": return "Personal";
+    case "task_work": return "Work";
+    case "task_home": return "Home";
+    case "event": return "Event";
+    case "reminder": return "Reminder";
+    default: return "";
+  }
+}
+
+function ScheduledTaskChatModal({
   task,
   onClose,
 }: {
   task: ScheduledTask;
   onClose: () => void;
 }) {
+  const [reply, setReply] = useState("");
   const queryClient = useQueryClient();
   const { selectedCompanyId } = useCompany();
-  const [title, setTitle] = useState(task.title ?? "");
-  const [kind, setKind] = useState<ScheduledTaskKind>(task.kind);
-  const [scheduledAt, setScheduledAt] = useState(toLocalDatetimeValue(task.scheduledAt));
-  const [durationMinutes, setDurationMinutes] = useState(String(task.durationMinutes ?? ""));
+  const bottomRef = useRef<HTMLDivElement>(null);
   const synced = Boolean(task.calendarEventId);
 
-  const update = useMutation({
-    mutationFn: () =>
-      scheduledTasksApi.update(task.id, {
-        title: title.trim() || null,
-        kind,
-        scheduledAt: scheduledAt ? new Date(scheduledAt).toISOString() : null,
-        durationMinutes: durationMinutes ? Number(durationMinutes) : null,
-      }),
+  const { data: threads = [] } = useQuery({
+    queryKey: queryKeys.scheduledTasks.threads(task.id),
+    queryFn: () => scheduledTasksApi.listThreads(task.id),
+    refetchInterval: 3000,
+  });
+
+  const addThread = useMutation({
+    mutationFn: (body: string) => scheduledTasksApi.addThread(task.id, body),
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.scheduledTasks.threads(task.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.scheduledTasks.list(selectedCompanyId!) });
-      onClose();
+      setReply("");
     },
   });
 
@@ -307,109 +314,134 @@ function ScheduledTaskEditModal({
     },
   });
 
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [threads]);
+
+  function handleSubmit() {
+    const body = reply.trim();
+    if (!body || addThread.isPending) return;
+    addThread.mutate(body);
+  }
+
+  const scheduledStr = task.scheduledAt
+    ? new Date(task.scheduledAt).toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+    : null;
+  const kindStr = kindLabel(task.kind);
+  const originStr = originLabel(task.origin);
+
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center p-4 sm:items-center" onClick={onClose}>
       <div
-        className="relative w-full max-w-md rounded-xl border border-border bg-card p-5 shadow-lg"
+        className="relative flex w-full max-w-md flex-col rounded-xl border border-border bg-card shadow-lg overflow-hidden"
+        style={{ maxHeight: "min(600px, 85vh)" }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="mb-4 flex items-start justify-between gap-3">
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="h-2.5 w-2.5 rounded-full shrink-0" style={{ backgroundColor: synced ? "#22c55e" : "#f59e0b" }} />
-              <p className="text-sm font-semibold text-foreground">{task.identifier}</p>
-              {synced ? (
-                <span className="flex items-center gap-1 rounded-full bg-green-100 px-1.5 py-0.5 text-[10px] font-medium text-green-700 dark:bg-green-900/40 dark:text-green-300">
-                  <CheckCircle2 className="h-2.5 w-2.5" /> Synced
-                </span>
-              ) : (
-                <span className="flex items-center gap-1 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">
-                  <Clock className="h-2.5 w-2.5" /> Pending sync
-                </span>
+        <div className="shrink-0 border-b border-border px-5 py-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <MessageSquare className="h-4 w-4 shrink-0 text-primary" />
+                <p className="text-sm font-semibold text-foreground truncate">{task.title ?? task.requestText.slice(0, 50)}</p>
+              </div>
+              <div className="mt-1 flex items-center gap-2 flex-wrap">
+                <span className="text-[10px] font-mono text-muted-foreground">{task.identifier}</span>
+                {synced ? (
+                  <span className="flex items-center gap-0.5 rounded-full bg-green-100 px-1.5 py-0.5 text-[10px] font-medium text-green-700 dark:bg-green-900/40 dark:text-green-300">
+                    <CheckCircle2 className="h-2.5 w-2.5" /> Synced
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-0.5 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">
+                    <Clock className="h-2.5 w-2.5" /> Pending
+                  </span>
+                )}
+                {kindStr && (
+                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{kindStr}</span>
+                )}
+                {originStr && (
+                  <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">via {originStr}</span>
+                )}
+              </div>
+              {scheduledStr && (
+                <div className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
+                  <CalendarIcon className="h-3 w-3" />
+                  {scheduledStr}
+                  {task.durationMinutes && <span className="ml-1">({task.durationMinutes} min)</span>}
+                </div>
               )}
             </div>
-            <p className="mt-0.5 text-xs text-muted-foreground line-clamp-2">{task.requestText}</p>
+            <button onClick={onClose} className="shrink-0 text-muted-foreground hover:text-foreground transition-colors" aria-label="Close">
+              ✕
+            </button>
           </div>
-          <button onClick={onClose} className="text-muted-foreground hover:text-foreground transition-colors" aria-label="Close">
-            ✕
-          </button>
         </div>
 
-        {/* Fields */}
-        <div className="space-y-3">
-          <div>
-            <label className="block text-xs font-medium text-muted-foreground mb-1">Title</label>
+        {/* Thread */}
+        <div className="flex-1 overflow-y-auto px-5 py-3 space-y-2 min-h-0">
+          {/* Original request */}
+          <div className="rounded-lg bg-muted/60 px-3 py-2 text-xs">
+            <span className="font-medium text-muted-foreground">Original request:</span>
+            <p className="mt-0.5 text-foreground">{task.requestText}</p>
+          </div>
+
+          {threads.map((t: ScheduledTaskThread) => (
+            <div
+              key={t.id}
+              className={
+                t.authorType === "agent"
+                  ? "rounded-lg bg-primary/5 border border-primary/10 px-3 py-2 text-xs"
+                  : "rounded-lg bg-muted px-3 py-2 text-xs"
+              }
+            >
+              <span className="font-medium text-muted-foreground">
+                {t.authorType === "agent" ? "Jarvis: " : "You: "}
+              </span>
+              <span className="text-foreground whitespace-pre-wrap">{t.body}</span>
+              <div className="mt-1 text-[10px] text-muted-foreground/60">
+                {new Date(t.createdAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
+              </div>
+            </div>
+          ))}
+
+          {threads.length === 0 && (
+            <div className="py-4 text-center text-xs text-muted-foreground">
+              No messages yet. Send a message to discuss this task with Jarvis.
+            </div>
+          )}
+
+          <div ref={bottomRef} />
+        </div>
+
+        {/* Input */}
+        <div className="shrink-0 border-t border-border px-5 py-3">
+          <div className="flex gap-2">
             <input
               type="text"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder={task.requestText.slice(0, 60)}
-              className="w-full rounded-md border border-input bg-transparent px-3 py-1.5 text-sm outline-none placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring"
+              value={reply}
+              onChange={(e) => setReply(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") handleSubmit(); }}
+              placeholder="Tell Jarvis about this task..."
+              className="flex-1 min-w-0 rounded-md border border-input bg-transparent px-3 py-1.5 text-sm outline-none placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring"
+              autoFocus
             />
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={!reply.trim() || addThread.isPending}
+              className="shrink-0 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-40 hover:bg-primary/90 transition-colors"
+            >
+              {addThread.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+            </button>
           </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-medium text-muted-foreground mb-1">Kind</label>
-              <select
-                value={kind ?? ""}
-                onChange={(e) => setKind((e.target.value as ScheduledTaskKind) || null)}
-                className="w-full rounded-md border border-input bg-transparent px-3 py-1.5 text-sm outline-none focus:border-ring focus:ring-1 focus:ring-ring"
-              >
-                <option value="">Unclassified</option>
-                {KIND_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value ?? ""}>{o.label}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-muted-foreground mb-1">Duration (min)</label>
-              <input
-                type="number"
-                min={1}
-                max={480}
-                value={durationMinutes}
-                onChange={(e) => setDurationMinutes(e.target.value)}
-                placeholder="30"
-                className="w-full rounded-md border border-input bg-transparent px-3 py-1.5 text-sm outline-none focus:border-ring focus:ring-1 focus:ring-ring"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-xs font-medium text-muted-foreground mb-1">Scheduled time</label>
-            <input
-              type="datetime-local"
-              value={scheduledAt}
-              onChange={(e) => setScheduledAt(e.target.value)}
-              className="w-full rounded-md border border-input bg-transparent px-3 py-1.5 text-sm outline-none focus:border-ring focus:ring-1 focus:ring-ring"
-            />
-          </div>
-        </div>
-
-        {/* Actions */}
-        <div className="mt-5 flex items-center justify-between gap-2">
           <button
             type="button"
             onClick={() => cancel.mutate()}
             disabled={cancel.isPending}
-            className="text-xs text-muted-foreground hover:text-destructive transition-colors disabled:opacity-40"
+            className="mt-2 w-full text-center text-xs text-muted-foreground hover:text-destructive transition-colors disabled:opacity-40"
           >
-            Cancel task
+            Cancel this task
           </button>
-          <div className="flex gap-2">
-            <Button variant="outline" size="sm" onClick={onClose}>
-              Discard
-            </Button>
-            <Button
-              size="sm"
-              onClick={() => update.mutate()}
-              disabled={update.isPending}
-            >
-              {update.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Save"}
-            </Button>
-          </div>
         </div>
       </div>
     </div>
@@ -423,7 +455,7 @@ function AskJarvisBar({ companyId }: { companyId: string }) {
   const [text, setText] = useState("");
 
   const submit = useMutation({
-    mutationFn: (requestText: string) => scheduledTasksApi.create(companyId, requestText),
+    mutationFn: (requestText: string) => scheduledTasksApi.create(companyId, requestText, undefined, "jarvis_bar"),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.scheduledTasks.list(companyId) });
       setText("");
@@ -687,7 +719,7 @@ export function CalendarPage() {
       )}
 
       {selectedScheduledTask && (
-        <ScheduledTaskEditModal
+        <ScheduledTaskChatModal
           task={selectedScheduledTask}
           onClose={() => setSelectedScheduledTask(null)}
         />

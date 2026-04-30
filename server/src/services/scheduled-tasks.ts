@@ -26,6 +26,7 @@ export function scheduledTasksService(db: Db) {
     userId: string;
     requestText: string;
     deadlineAt?: Date | null;
+    origin?: string | null;
   }) {
     const [task] = await db
       .insert(scheduledTasks)
@@ -34,6 +35,7 @@ export function scheduledTasksService(db: Db) {
         userId: input.userId,
         requestText: input.requestText,
         deadlineAt: input.deadlineAt ?? null,
+        origin: input.origin ?? null,
         status: "pending",
       })
       .returning();

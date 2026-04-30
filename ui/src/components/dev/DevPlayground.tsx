@@ -84,6 +84,11 @@ export function DevPlayground({
   const [catalogOpen, setCatalogOpen] = useState(true);
   const [collapsedCats, setCollapsedCats] = useState<Set<string>>(new Set());
 
+  // Editable request line
+  const [method, setMethod] = useState<HttpMethod>(tools[0]?.method ?? "GET");
+  const [liveUrl, setLiveUrl] = useState<string>("");
+  const [userEditedUrl, setUserEditedUrl] = useState(false);
+
   // Inputs
   const [pathVars, setPathVars] = useState<Record<string, string>>({});
   const [queryValues, setQueryValues] = useState<Record<string, string>>({});
@@ -108,6 +113,7 @@ export function DevPlayground({
 
   useEffect(() => {
     if (!selectedTool) return;
+    setMethod(selectedTool.method);
     setBody(selectedTool.bodyTemplate);
     const pv: Record<string, string> = {};
     selectedTool.pathParams.forEach((p) => (pv[p] = ""));
@@ -115,20 +121,23 @@ export function DevPlayground({
     const qv: Record<string, string> = {};
     selectedTool.queryParams.forEach((p) => (qv[p.name] = ""));
     setQueryValues(qv);
+    setUserEditedUrl(false);
     setResponse(null);
   }, [selectedTool]);
 
-  function resolveUrl(tool: PlaygroundTool): string {
-    let url = baseUrl.replace(/\/$/, "") + tool.urlTemplate;
-    tool.pathParams.forEach((p) => {
+  // Sync liveUrl from structured params unless user has manually typed in the URL bar
+  useEffect(() => {
+    if (!selectedTool || userEditedUrl) return;
+    let url = baseUrl.replace(/\/$/, "") + selectedTool.urlTemplate;
+    selectedTool.pathParams.forEach((p) => {
       url = url.replace(`{${p}}`, encodeURIComponent(pathVars[p] ?? ""));
     });
-    const qps = tool.queryParams
+    const qps = selectedTool.queryParams
       .filter((p) => queryValues[p.name]?.trim())
       .map((p) => `${encodeURIComponent(p.name)}=${encodeURIComponent(queryValues[p.name]!.trim())}`);
     if (qps.length > 0) url += "?" + qps.join("&");
-    return url;
-  }
+    setLiveUrl(url);
+  }, [pathVars, queryValues, selectedTool, baseUrl, userEditedUrl]);
 
   async function testConnection() {
     if (!testConnectionPath) return;
@@ -150,24 +159,24 @@ export function DevPlayground({
   }
 
   const run = useCallback(async () => {
-    if (!selectedTool) return;
+    if (!liveUrl.trim()) return;
     abortRef.current?.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     setLoading(true);
     setResponse(null);
 
-    const url = resolveUrl(selectedTool);
+    const url = liveUrl.trim();
     const headers: Record<string, string> = { Accept: "application/json" };
     if (apiToken.trim()) headers["Authorization"] = `Bearer ${apiToken.trim()}`;
-    const hasBody = selectedTool.method !== "GET" && selectedTool.method !== "DELETE" && body.trim();
+    const hasBody = method !== "GET" && method !== "DELETE" && body.trim();
     if (hasBody) headers["Content-Type"] = "application/json";
 
     const t0 = Date.now();
     let entry: HistoryEntry;
     try {
       const res = await fetch(url, {
-        method: selectedTool.method,
+        method,
         headers,
         body: hasBody ? body : undefined,
         signal: ctrl.signal,
@@ -183,8 +192,8 @@ export function DevPlayground({
       entry = {
         id: Math.random().toString(36).slice(2),
         timestamp: Date.now(),
-        toolName: selectedTool.name,
-        method: selectedTool.method,
+        toolName: selectedTool?.name ?? "custom",
+        method,
         url,
         status: res.status,
         durationMs,
@@ -199,8 +208,8 @@ export function DevPlayground({
       entry = {
         id: Math.random().toString(36).slice(2),
         timestamp: Date.now(),
-        toolName: selectedTool.name,
-        method: selectedTool.method,
+        toolName: selectedTool?.name ?? "custom",
+        method,
         url,
         status: null,
         durationMs: Date.now() - t0,
@@ -215,7 +224,7 @@ export function DevPlayground({
     setHistory(updated);
     saveHistory(historyKey, updated);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTool, baseUrl, apiToken, body, pathVars, queryValues, history, historyKey]);
+  }, [liveUrl, method, apiToken, body, selectedTool, history, historyKey]);
 
   const filteredTools = search.trim()
     ? tools.filter(
@@ -386,7 +395,7 @@ export function DevPlayground({
                       </button>
                     )}
                     <span className="text-sm font-semibold">{selectedTool.displayName}</span>
-                    <MethodBadge method={selectedTool.method} />
+                    <MethodBadge method={method} />
                     <code className="text-[11px] text-muted-foreground font-mono bg-muted px-1.5 py-0.5 rounded">
                       {selectedTool.name}
                     </code>
@@ -396,10 +405,26 @@ export function DevPlayground({
 
                 {/* URL bar + Run button */}
                 <div className="flex items-center gap-2 px-4 py-2 border-b border-border bg-muted/20 shrink-0">
-                  <MethodBadge method={selectedTool.method} />
-                  <code className="text-xs font-mono text-muted-foreground flex-1 truncate">
-                    {resolveUrl(selectedTool)}
-                  </code>
+                  <select
+                    value={method}
+                    onChange={(e) => setMethod(e.target.value as HttpMethod)}
+                    className="text-xs font-mono font-bold border border-border rounded px-1.5 py-1 bg-background shrink-0"
+                  >
+                    {(["GET", "POST", "PUT", "PATCH", "DELETE"] as HttpMethod[]).map((m) => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                  </select>
+                  <input
+                    type="text"
+                    value={liveUrl}
+                    onChange={(e) => {
+                      setLiveUrl(e.target.value);
+                      setUserEditedUrl(true);
+                    }}
+                    placeholder={`${defaultBaseUrl}/api/v1/...`}
+                    className="flex-1 text-xs font-mono border border-border rounded px-2 py-1 bg-background min-w-0"
+                    onKeyDown={(e) => { if (e.key === "Enter") void run(); }}
+                  />
                   <button
                     onClick={run}
                     disabled={loading}
@@ -499,7 +524,7 @@ export function DevPlayground({
                     </section>
                   )}
 
-                  {selectedTool.method !== "GET" && selectedTool.method !== "DELETE" && (
+                  {method !== "GET" && method !== "DELETE" && (
                     <section className="flex-1 flex flex-col min-h-0">
                       <div className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide mb-2">
                         Request Body (JSON)

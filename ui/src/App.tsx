@@ -40,6 +40,7 @@ import { OrgChart } from "./pages/OrgChart";
 import { Voice } from "./pages/Voice";
 import { YouTube } from "./pages/YouTube";
 import { ApiRunner } from "./pages/ApiRunner";
+import { ShimRunner } from "./pages/ShimRunner";
 import { CalendarPage } from "./pages/CalendarPage";
 import { DigestPlayerPage } from "./pages/DigestPlayerPage";
 import { NewAgent } from "./pages/NewAgent";
@@ -139,6 +140,7 @@ function boardRoutes() {
       <Route path="voice" element={<Voice />} />
       <Route path="youtube" element={<YouTube />} />
       <Route path="api-runner" element={<ApiRunner />} />
+      <Route path="shim-runner" element={<ShimRunner />} />
       <Route path="calendar" element={<CalendarPage />} />
       <Route path="digest-player" element={<DigestPlayerPage />} />
       <Route path="agents" element={<Navigate to="/agents/all" replace />} />

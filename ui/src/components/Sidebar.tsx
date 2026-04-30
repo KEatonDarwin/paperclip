@@ -15,6 +15,7 @@ import {
   Terminal,
   Headphones,
   Youtube,
+  Wrench,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { SidebarSection } from "./SidebarSection";
@@ -118,9 +119,13 @@ export function Sidebar() {
           <SidebarNavItem to="/costs" label="Costs" icon={DollarSign} />
           <SidebarNavItem to="/activity" label="Activity" icon={History} />
           <SidebarNavItem to="/youtube" label="YouTube" icon={Youtube} />
-          <SidebarNavItem to="/api-runner" label="API Runner" icon={Terminal} />
           <SidebarNavItem to="/digest-player" label="Digest Player" icon={Headphones} />
           <SidebarNavItem to="/company/settings" label="Settings" icon={Settings} />
+        </SidebarSection>
+
+        <SidebarSection label="Developers">
+          <SidebarNavItem to="/api-runner" label="API Runner" icon={Terminal} />
+          <SidebarNavItem to="/shim-runner" label="SHIM Runner" icon={Wrench} />
         </SidebarSection>
 
         <PluginSlotOutlet

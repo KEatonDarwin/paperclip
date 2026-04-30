@@ -107,5 +107,6 @@ export function hopperCalendarPlacer(db: Db) {
 }
 
 function extractTitle(titleOrPrompt: string): string {
-  return titleOrPrompt.slice(0, 80);
+  // Titles set by Jarvis are already clean; requestText fallback gets truncated
+  return titleOrPrompt.slice(0, 100).trim();
 }

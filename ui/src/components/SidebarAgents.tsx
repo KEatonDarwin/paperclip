@@ -1,7 +1,7 @@
 import { useMemo, useState, useRef } from "react";
 import { NavLink, useLocation } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { ChevronRight, Plus, FolderPlus, X, Pencil, Check } from "lucide-react";
+import { ChevronRight, Plus, FolderPlus, X, Pencil, Check, MoreHorizontal, EyeOff, Eye } from "lucide-react";
 import { useCompany } from "../context/CompanyContext";
 import { useDialog } from "../context/DialogContext";
 import { useSidebar } from "../context/SidebarContext";
@@ -18,6 +18,12 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import type { Agent, AgentGroup } from "@paperclipai/shared";
 function AgentRow({
   agent,
@@ -86,6 +92,7 @@ function GroupSection({
   onDrop,
   onRename,
   onDelete,
+  onToggleDefaultCollapsed,
 }: {
   group: AgentGroup;
   agents: Agent[];
@@ -99,8 +106,9 @@ function GroupSection({
   onDrop: (groupId: string | null) => void;
   onRename: (groupId: string, name: string) => void;
   onDelete: (groupId: string) => void;
+  onToggleDefaultCollapsed: (groupId: string, collapsed: boolean) => void;
 }) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(!group.defaultCollapsed);
   const [dragOver, setDragOver] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState(group.name);
@@ -145,13 +153,28 @@ function GroupSection({
                 <Check className="h-2.5 w-2.5" />
               </button>
             ) : (
-              <button onClick={() => { setEditing(true); setEditName(group.name); }} className="flex items-center justify-center h-4 w-4 rounded text-muted-foreground/60 hover:text-foreground hover:bg-accent/50 transition-colors" aria-label="Rename group">
-                <Pencil className="h-2.5 w-2.5" />
-              </button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button className="flex items-center justify-center h-4 w-4 rounded text-muted-foreground/60 hover:text-foreground hover:bg-accent/50 transition-colors" aria-label="Group options">
+                    <MoreHorizontal className="h-2.5 w-2.5" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="min-w-[140px]">
+                  <DropdownMenuItem onClick={() => { setEditing(true); setEditName(group.name); }}>
+                    <Pencil className="h-3 w-3 mr-2" />
+                    Rename
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onToggleDefaultCollapsed(group.id, !group.defaultCollapsed)}>
+                    {group.defaultCollapsed ? <Eye className="h-3 w-3 mr-2" /> : <EyeOff className="h-3 w-3 mr-2" />}
+                    {group.defaultCollapsed ? "Start expanded" : "Start collapsed"}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onDelete(group.id)} className="text-destructive focus:text-destructive">
+                    <X className="h-3 w-3 mr-2" />
+                    Delete
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             )}
-            <button onClick={() => onDelete(group.id)} className="flex items-center justify-center h-4 w-4 rounded text-muted-foreground/60 hover:text-destructive hover:bg-accent/50 transition-colors" aria-label="Delete group">
-              <X className="h-2.5 w-2.5" />
-            </button>
           </div>
         </div>
         <CollapsibleContent>
@@ -227,6 +250,11 @@ export function SidebarAgents() {
       queryClient.invalidateQueries({ queryKey: queryKeys.agentGroups.list(selectedCompanyId!) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(selectedCompanyId!) });
     },
+  });
+  const toggleDefaultCollapsedMutation = useMutation({
+    mutationFn: ({ groupId, defaultCollapsed }: { groupId: string; defaultCollapsed: boolean }) =>
+      agentGroupsApi.update(selectedCompanyId!, groupId, { defaultCollapsed }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.agentGroups.list(selectedCompanyId!) }),
   });
   const assignGroupMutation = useMutation({
     mutationFn: ({ agentId, groupId }: { agentId: string; groupId: string | null }) =>
@@ -342,6 +370,7 @@ export function SidebarAgents() {
               onDrop={handleDrop}
               onRename={(groupId, name) => renameGroupMutation.mutate({ groupId, name })}
               onDelete={(groupId) => deleteGroupMutation.mutate(groupId)}
+              onToggleDefaultCollapsed={(groupId, collapsed) => toggleDefaultCollapsedMutation.mutate({ groupId, defaultCollapsed: collapsed })}
             />
           ))}
 

@@ -22,20 +22,21 @@ export function agentGroupService(db: Db) {
       return row;
     },
 
-    create: async (companyId: string, data: { name: string; sortOrder?: number }) => {
+    create: async (companyId: string, data: { name: string; sortOrder?: number; defaultCollapsed?: boolean }) => {
       const created = await db
         .insert(agentGroups)
         .values({
           companyId,
           name: data.name,
           sortOrder: data.sortOrder ?? 0,
+          defaultCollapsed: data.defaultCollapsed ?? false,
         })
         .returning()
         .then((rows) => rows[0]);
       return created;
     },
 
-    update: async (companyId: string, groupId: string, data: { name?: string; sortOrder?: number }) => {
+    update: async (companyId: string, groupId: string, data: { name?: string; sortOrder?: number; defaultCollapsed?: boolean }) => {
       const existing = await db
         .select()
         .from(agentGroups)
@@ -48,6 +49,7 @@ export function agentGroupService(db: Db) {
         .set({
           ...(data.name !== undefined ? { name: data.name } : {}),
           ...(data.sortOrder !== undefined ? { sortOrder: data.sortOrder } : {}),
+          ...(data.defaultCollapsed !== undefined ? { defaultCollapsed: data.defaultCollapsed } : {}),
           updatedAt: new Date(),
         })
         .where(eq(agentGroups.id, groupId))

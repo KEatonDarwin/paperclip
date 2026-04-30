@@ -138,6 +138,7 @@ export type UpdateAgentPermissions = z.infer<typeof updateAgentPermissionsSchema
 export const createAgentGroupSchema = z.object({
   name: z.string().min(1).max(100),
   sortOrder: z.number().int().nonnegative().optional().default(0),
+  defaultCollapsed: z.boolean().optional().default(false),
 });
 
 export type CreateAgentGroup = z.infer<typeof createAgentGroupSchema>;
@@ -145,6 +146,7 @@ export type CreateAgentGroup = z.infer<typeof createAgentGroupSchema>;
 export const updateAgentGroupSchema = z.object({
   name: z.string().min(1).max(100).optional(),
   sortOrder: z.number().int().nonnegative().optional(),
+  defaultCollapsed: z.boolean().optional(),
 });
 
 export type UpdateAgentGroup = z.infer<typeof updateAgentGroupSchema>;

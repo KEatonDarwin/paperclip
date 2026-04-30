@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, integer, timestamp, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, integer, boolean, timestamp, index } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 
 export const agentGroups = pgTable(
@@ -8,6 +8,7 @@ export const agentGroups = pgTable(
     companyId: uuid("company_id").notNull().references(() => companies.id),
     name: text("name").notNull(),
     sortOrder: integer("sort_order").notNull().default(0),
+    defaultCollapsed: boolean("default_collapsed").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

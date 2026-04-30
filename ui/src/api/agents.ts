@@ -206,9 +206,9 @@ export interface AvailableSkill {
 export const agentGroupsApi = {
   list: (companyId: string) =>
     api.get<AgentGroup[]>(`/companies/${companyId}/agent-groups`),
-  create: (companyId: string, data: { name: string; sortOrder?: number }) =>
+  create: (companyId: string, data: { name: string; sortOrder?: number; defaultCollapsed?: boolean }) =>
     api.post<AgentGroup>(`/companies/${companyId}/agent-groups`, data),
-  update: (companyId: string, groupId: string, data: { name?: string; sortOrder?: number }) =>
+  update: (companyId: string, groupId: string, data: { name?: string; sortOrder?: number; defaultCollapsed?: boolean }) =>
     api.patch<AgentGroup>(`/companies/${companyId}/agent-groups/${groupId}`, data),
   delete: (companyId: string, groupId: string) =>
     api.delete<{ ok: boolean }>(`/companies/${companyId}/agent-groups/${groupId}`),

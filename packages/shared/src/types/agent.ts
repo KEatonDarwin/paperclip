@@ -57,6 +57,7 @@ export interface AgentGroup {
   companyId: string;
   name: string;
   sortOrder: number;
+  defaultCollapsed: boolean;
   createdAt: Date;
   updatedAt: Date;
 }

@@ -407,6 +407,13 @@
       "when": 1745840000000,
       "tag": "0057_scheduled_tasks_origin",
       "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "7",
+      "when": 1745841000000,
+      "tag": "0058_agent_group_default_collapsed",
+      "breakpoints": true
     }
   ]
 }

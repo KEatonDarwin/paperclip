@@ -12,10 +12,8 @@ import {
   Repeat,
   Settings,
   CalendarDays,
-  Terminal,
   Headphones,
   Youtube,
-  Wrench,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { SidebarSection } from "./SidebarSection";
@@ -29,6 +27,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { useInboxBadge } from "../hooks/useInboxBadge";
 import { Button } from "@/components/ui/button";
 import { PluginSlotOutlet } from "@/plugins/slots";
+import { DEV_PAGES } from "../lib/dev-pages";
 
 export function Sidebar() {
   const { openNewIssue } = useDialog();
@@ -124,8 +123,9 @@ export function Sidebar() {
         </SidebarSection>
 
         <SidebarSection label="Developers">
-          <SidebarNavItem to="/api-runner" label="API Runner" icon={Terminal} />
-          <SidebarNavItem to="/shim-runner" label="SHIM Runner" icon={Wrench} />
+          {DEV_PAGES.map((page) => (
+            <SidebarNavItem key={page.slug} to={`/${page.slug}`} label={page.label} icon={page.icon} />
+          ))}
         </SidebarSection>
 
         <PluginSlotOutlet

@@ -7,9 +7,6 @@ import {
   ChevronDown,
   ChevronRight,
   Clock,
-  CheckCircle2,
-  XCircle,
-  AlertCircle,
   Terminal,
   Copy,
   RotateCcw,
@@ -17,10 +14,10 @@ import {
   Search,
   X,
 } from "lucide-react";
+import { JsonNode } from "../components/dev/JsonNode";
+import { HttpStatusBadge, METHOD_COLORS, type HttpMethod } from "../components/dev/HttpBadges";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
-
-type HttpMethod = "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
 
 interface KVPair {
   id: string;
@@ -156,86 +153,6 @@ const API_CATALOG: CatalogCategory[] = [
     ],
   },
 ];
-
-// ─── JSON Tree Viewer ─────────────────────────────────────────────────────────
-
-function JsonNode({ value, depth = 0 }: { value: unknown; depth?: number }) {
-  const [collapsed, setCollapsed] = useState(depth > 2);
-
-  if (value === null) return <span className="text-muted-foreground">null</span>;
-  if (typeof value === "boolean")
-    return <span className={value ? "text-green-500" : "text-red-500"}>{String(value)}</span>;
-  if (typeof value === "number")
-    return <span className="text-blue-500 dark:text-blue-400">{String(value)}</span>;
-  if (typeof value === "string")
-    return <span className="text-amber-600 dark:text-amber-400">"{value}"</span>;
-
-  if (Array.isArray(value)) {
-    if (value.length === 0) return <span className="text-muted-foreground">[]</span>;
-    return (
-      <span>
-        <button
-          onClick={() => setCollapsed(!collapsed)}
-          className="inline-flex items-center gap-0.5 hover:text-foreground text-muted-foreground"
-        >
-          {collapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-        </button>
-        {collapsed ? (
-          <span className="text-muted-foreground">[{value.length} items]</span>
-        ) : (
-          <span>
-            {"["}
-            <div style={{ paddingLeft: `${(depth + 1) * 16}px` }}>
-              {value.map((item, i) => (
-                <div key={i} className="leading-relaxed">
-                  <JsonNode value={item} depth={depth + 1} />
-                  {i < value.length - 1 && <span className="text-muted-foreground">,</span>}
-                </div>
-              ))}
-            </div>
-            {"]"}
-          </span>
-        )}
-      </span>
-    );
-  }
-
-  if (typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>);
-    if (entries.length === 0) return <span className="text-muted-foreground">{"{}"}</span>;
-    return (
-      <span>
-        <button
-          onClick={() => setCollapsed(!collapsed)}
-          className="inline-flex items-center gap-0.5 hover:text-foreground text-muted-foreground"
-        >
-          {collapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-        </button>
-        {collapsed ? (
-          <span className="text-muted-foreground">{"{"}…{"}"} {entries.length} keys</span>
-        ) : (
-          <span>
-            {"{"}
-            <div style={{ paddingLeft: `${(depth + 1) * 16}px` }}>
-              {entries.map(([k, v], i) => (
-                <div key={k} className="leading-relaxed">
-                  <span className="text-foreground font-medium">"{k}"</span>
-                  <span className="text-muted-foreground">: </span>
-                  <JsonNode value={v} depth={depth + 1} />
-                  {i < entries.length - 1 && <span className="text-muted-foreground">,</span>}
-                </div>
-              ))}
-            </div>
-            {"}"}
-          </span>
-        )}
-      </span>
-    );
-  }
-
-  return <span>{String(value)}</span>;
-}
-
 
 // ─── Key-Value Editor ─────────────────────────────────────────────────────────
 
@@ -412,29 +329,6 @@ function CatalogPanel({
   );
 }
 
-// ─── Status Badge ─────────────────────────────────────────────────────────────
-
-function StatusBadge({ status }: { status: number | null; error?: string | null }) {
-  if (status === null)
-    return <span className="text-xs text-muted-foreground flex items-center gap-1"><AlertCircle className="h-3.5 w-3.5" /> Error</span>;
-  const ok = status >= 200 && status < 300;
-  const warn = status >= 300 && status < 500;
-  return (
-    <span
-      className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${
-        ok
-          ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
-          : warn
-          ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
-          : "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400"
-      }`}
-    >
-      {ok ? <CheckCircle2 className="h-3 w-3" /> : <XCircle className="h-3 w-3" />}
-      {status}
-    </span>
-  );
-}
-
 // ─── History Persistence ──────────────────────────────────────────────────────
 
 const HISTORY_KEY = "paperclip_api_runner_history";
@@ -462,21 +356,13 @@ function saveHistory(entries: HistoryEntry[]) {
 
 const METHODS: HttpMethod[] = ["GET", "POST", "PATCH", "PUT", "DELETE"];
 
-const METHOD_COLORS: Record<HttpMethod, string> = {
-  GET: "text-green-600 dark:text-green-400",
-  POST: "text-blue-600 dark:text-blue-400",
-  PATCH: "text-amber-600 dark:text-amber-400",
-  PUT: "text-purple-600 dark:text-purple-400",
-  DELETE: "text-red-600 dark:text-red-400",
-};
-
 type RequestTab = "params" | "headers" | "body";
 
 export function ApiRunner() {
   const { setBreadcrumbs } = useBreadcrumbs();
 
   useEffect(() => {
-    setBreadcrumbs([{ label: "API Runner" }]);
+    setBreadcrumbs([{ label: "Developers" }, { label: "API Runner" }]);
   }, [setBreadcrumbs]);
 
   // ── Request state
@@ -722,7 +608,7 @@ export function ApiRunner() {
             <span className="text-xs font-medium text-muted-foreground">Response</span>
             {response && (
               <>
-                <StatusBadge status={response.status} error={response.error} />
+                <HttpStatusBadge status={response.status} />
                 {response.durationMs !== null && (
                   <span className="text-xs text-muted-foreground flex items-center gap-1 ml-auto">
                     <Clock className="h-3 w-3" /> {response.durationMs}ms
@@ -797,11 +683,7 @@ export function ApiRunner() {
                   {entry.method}
                 </span>
                 <span className="text-xs font-mono text-muted-foreground truncate flex-1">{entry.url}</span>
-                {entry.status !== null ? (
-                  <StatusBadge status={entry.status} />
-                ) : (
-                  <AlertCircle className="h-3.5 w-3.5 text-destructive" />
-                )}
+                <HttpStatusBadge status={entry.status} />
                 {entry.durationMs !== null && (
                   <span className="text-xs text-muted-foreground shrink-0">{entry.durationMs}ms</span>
                 )}

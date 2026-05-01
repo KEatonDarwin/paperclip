@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useRef, useState, type ReactNode } from "react";
 
 interface NewIssueDefaults {
   status?: string;
@@ -24,6 +24,8 @@ interface DialogContextValue {
   newIssueDefaults: NewIssueDefaults;
   openNewIssue: (defaults?: NewIssueDefaults) => void;
   closeNewIssue: () => void;
+  registerNewIssueDefaultsProvider: (provider: () => NewIssueDefaults) => void;
+  clearNewIssueDefaultsProvider: () => void;
   newProjectOpen: boolean;
   openNewProject: () => void;
   closeNewProject: () => void;
@@ -51,9 +53,22 @@ export function DialogProvider({ children }: { children: ReactNode }) {
   const [newAgentOpen, setNewAgentOpen] = useState(false);
   const [onboardingOpen, setOnboardingOpen] = useState(false);
   const [onboardingOptions, setOnboardingOptions] = useState<OnboardingOptions>({});
+  const newIssueDefaultsProviderRef = useRef<(() => NewIssueDefaults) | null>(null);
+
+  const registerNewIssueDefaultsProvider = useCallback((provider: () => NewIssueDefaults) => {
+    newIssueDefaultsProviderRef.current = provider;
+  }, []);
+
+  const clearNewIssueDefaultsProvider = useCallback(() => {
+    newIssueDefaultsProviderRef.current = null;
+  }, []);
 
   const openNewIssue = useCallback((defaults: NewIssueDefaults = {}) => {
-    setNewIssueDefaults(defaults);
+    const hasExplicitDefaults = Object.keys(defaults).length > 0;
+    const effectiveDefaults = hasExplicitDefaults
+      ? defaults
+      : (newIssueDefaultsProviderRef.current?.() ?? {});
+    setNewIssueDefaults(effectiveDefaults);
     setNewIssueOpen(true);
   }, []);
 
@@ -105,6 +120,8 @@ export function DialogProvider({ children }: { children: ReactNode }) {
         newIssueDefaults,
         openNewIssue,
         closeNewIssue,
+        registerNewIssueDefaultsProvider,
+        clearNewIssueDefaultsProvider,
         newProjectOpen,
         openNewProject,
         closeNewProject,

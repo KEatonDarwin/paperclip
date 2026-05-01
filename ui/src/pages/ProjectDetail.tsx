@@ -11,6 +11,7 @@ import { agentsApi } from "../api/agents";
 import { heartbeatsApi } from "../api/heartbeats";
 import { assetsApi } from "../api/assets";
 import { usePanel } from "../context/PanelContext";
+import { useDialog } from "../context/DialogContext";
 import { useCompany } from "../context/CompanyContext";
 import { useToast } from "../context/ToastContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
@@ -454,6 +455,7 @@ export function ProjectDetail() {
   }>();
   const { companies, selectedCompanyId, setSelectedCompanyId } = useCompany();
   const { closePanel } = usePanel();
+  const { registerNewIssueDefaultsProvider, clearNewIssueDefaultsProvider } = useDialog();
   const { setBreadcrumbs } = useBreadcrumbs();
   const { pushToast } = useToast();
   const queryClient = useQueryClient();
@@ -545,6 +547,15 @@ export function ProjectDetail() {
     if (!project?.companyId || project.companyId === selectedCompanyId) return;
     setSelectedCompanyId(project.companyId, { source: "route_sync" });
   }, [project?.companyId, selectedCompanyId, setSelectedCompanyId]);
+
+  useEffect(() => {
+    if (!project) return;
+    registerNewIssueDefaultsProvider(() => ({
+      projectId: project.id,
+      ...(project.defaultAssigneeAgentId ? { assigneeAgentId: project.defaultAssigneeAgentId } : {}),
+    }));
+    return () => clearNewIssueDefaultsProvider();
+  }, [project, registerNewIssueDefaultsProvider, clearNewIssueDefaultsProvider]);
 
   const invalidateProject = () => {
     queryClient.invalidateQueries({ queryKey: queryKeys.projects.detail(routeProjectRef) });

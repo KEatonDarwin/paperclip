@@ -414,6 +414,13 @@
       "when": 1745841000000,
       "tag": "0058_agent_group_default_collapsed",
       "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1745842000000,
+      "tag": "0059_project_default_assignee",
+      "breakpoints": true
     }
   ]
 }

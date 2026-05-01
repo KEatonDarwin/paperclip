@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Project } from "@paperclipai/shared";
 import { StatusBadge } from "./StatusBadge";
 import { cn, formatDate } from "../lib/utils";
+import { agentsApi } from "../api/agents";
 import { goalsApi } from "../api/goals";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { projectsApi } from "../api/projects";
@@ -42,6 +43,7 @@ export type ProjectConfigFieldKey =
   | "description"
   | "status"
   | "goals"
+  | "default_assignee"
   | "execution_workspace_enabled"
   | "execution_workspace_default_mode"
   | "execution_workspace_base_ref"
@@ -239,6 +241,14 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
     queryFn: () => goalsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+  const { data: agents } = useQuery({
+    queryKey: queryKeys.agents.list(selectedCompanyId!),
+    queryFn: () => agentsApi.list(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+  });
+  const activeAgents = (agents ?? []).filter((a) => a.status !== "terminated");
+  const [defaultAssigneeOpen, setDefaultAssigneeOpen] = useState(false);
+  const defaultAssigneeAgent = activeAgents.find((a) => a.id === project.defaultAssigneeAgentId);
   const { data: experimentalSettings } = useQuery({
     queryKey: queryKeys.instance.experimentalSettings,
     queryFn: () => instanceSettingsApi.getExperimental(),
@@ -519,6 +529,64 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
             <span className="text-sm font-mono">{project.leadAgentId.slice(0, 8)}</span>
           </PropertyRow>
         )}
+        <PropertyRow label={<FieldLabel label="Default For" state={fieldState("default_assignee")} />}>
+          {onUpdate || onFieldUpdate ? (
+            <div className="flex items-center gap-1.5">
+              <Popover open={defaultAssigneeOpen} onOpenChange={setDefaultAssigneeOpen}>
+                <PopoverTrigger asChild>
+                  <button className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent/50 transition-colors">
+                    {defaultAssigneeAgent ? (
+                      <span className="truncate">{defaultAssigneeAgent.name}</span>
+                    ) : (
+                      <span className="text-muted-foreground">No default agent</span>
+                    )}
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent className="w-56 p-1" align="start">
+                  <button
+                    className={cn(
+                      "flex items-center w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-muted-foreground",
+                      !project.defaultAssigneeAgentId && "bg-accent",
+                    )}
+                    onClick={() => {
+                      commitField("default_assignee", { defaultAssigneeAgentId: null });
+                      setDefaultAssigneeOpen(false);
+                    }}
+                  >
+                    No default agent
+                  </button>
+                  {activeAgents.map((agent) => (
+                    <button
+                      key={agent.id}
+                      className={cn(
+                        "flex items-center w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50",
+                        agent.id === project.defaultAssigneeAgentId && "bg-accent",
+                      )}
+                      onClick={() => {
+                        commitField("default_assignee", { defaultAssigneeAgentId: agent.id });
+                        setDefaultAssigneeOpen(false);
+                      }}
+                    >
+                      {agent.name}
+                    </button>
+                  ))}
+                </PopoverContent>
+              </Popover>
+              {project.defaultAssigneeAgentId && (
+                <button
+                  className="text-muted-foreground hover:text-foreground"
+                  type="button"
+                  onClick={() => commitField("default_assignee", { defaultAssigneeAgentId: null })}
+                  aria-label="Clear default agent"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              )}
+            </div>
+          ) : (
+            <span className="text-sm">{defaultAssigneeAgent?.name ?? "None"}</span>
+          )}
+        </PropertyRow>
         <PropertyRow
           label={<FieldLabel label="Goals" state={fieldState("goals")} />}
           alignStart

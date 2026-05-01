@@ -823,7 +823,10 @@ export function NewIssueDialog() {
     setProjectWorkspaceId(defaultProjectWorkspaceIdForProject(nextProject));
     setExecutionWorkspaceMode(defaultExecutionWorkspaceModeForProject(nextProject));
     setSelectedExecutionWorkspaceId("");
-  }, [orderedProjects]);
+    if (nextProject?.defaultAssigneeAgentId && !assigneeValue) {
+      setAssigneeValue(assigneeValueFromSelection({ assigneeAgentId: nextProject.defaultAssigneeAgentId }));
+    }
+  }, [orderedProjects, assigneeValue]);
 
   useEffect(() => {
     if (!newIssueOpen || !projectId || executionWorkspaceDefaultProjectId.current === projectId) {

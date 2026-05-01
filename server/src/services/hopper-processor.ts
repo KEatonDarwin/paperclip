@@ -1,4 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { hopperService } from "./hopper.js";
@@ -7,6 +9,8 @@ import { hopperPreferencesService, prefKeyForKind } from "./hopper-preferences.j
 import { slackDm } from "./slack-dm.js";
 import { syncPreferencesToObsidian } from "./hopper-obsidian-memory.js";
 import { secretService } from "./secrets.js";
+
+const execFileAsync = promisify(execFile);
 
 const softwareClassifySchema = z.object({
   kind: z.enum(["bug", "feature"]).nullable(),
@@ -74,16 +78,46 @@ export function hopperProcessor(db: Db) {
   const secretsSvc = secretService(db);
   const ctoAgentId = "d33e935d-533f-45a1-bb7a-ee4a2c86b2d8";
 
-  async function getAnthropicClient(companyId: string): Promise<Anthropic> {
-    const secret = await secretsSvc.getByName(companyId, "ANTHROPIC_API_KEY");
-    if (secret) {
-      const apiKey = await secretsSvc.resolveSecretValue(companyId, secret.id, "latest");
-      return new Anthropic({ apiKey });
+  async function classify(
+    companyId: string,
+    systemPrompt: string,
+    messages: { role: "user" | "assistant"; content: string }[],
+  ): Promise<string> {
+    // Try Anthropic SDK (company secrets → env var)
+    try {
+      const secret = await secretsSvc.getByName(companyId, "ANTHROPIC_API_KEY");
+      const apiKey = secret
+        ? await secretsSvc.resolveSecretValue(companyId, secret.id, "latest")
+        : process.env.ANTHROPIC_API_KEY;
+
+      if (apiKey) {
+        const client = new Anthropic({ apiKey });
+        const response = await client.messages.create({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 1024,
+          system: systemPrompt,
+          messages,
+        });
+        return response.content[0].type === "text" ? response.content[0].text : "";
+      }
+    } catch (sdkErr) {
+      console.error("[hopper] SDK classification failed, trying CLI fallback:", sdkErr);
     }
-    if (process.env.ANTHROPIC_API_KEY) {
-      return new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    }
-    throw new Error("ANTHROPIC_API_KEY not found in company secrets or environment");
+
+    // Fallback: use Claude CLI with subscription auth
+    const prompt = messages.length === 1
+      ? messages[0].content
+      : messages.map(m => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`).join("\n\n");
+
+    const result = await execFileAsync("claude", [
+      "--print",
+      "--model", "haiku",
+      "--system-prompt", systemPrompt,
+      "--no-session-persistence",
+      prompt,
+    ], { timeout: 60_000 });
+
+    return result.stdout;
   }
 
   async function processItem(itemId: string): Promise<void> {
@@ -101,14 +135,7 @@ export function hopperProcessor(db: Db) {
 
     let raw: string;
     try {
-      const client = await getAnthropicClient(item.companyId);
-      const response = await client.messages.create({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 1024,
-        system: SOFTWARE_SYSTEM_PROMPT,
-        messages,
-      });
-      raw = response.content[0].type === "text" ? response.content[0].text : "";
+      raw = await classify(item.companyId, SOFTWARE_SYSTEM_PROMPT, messages);
     } catch (err) {
       console.error("[hopper] Failed to classify software item:", err);
       await svc.update(itemId, { status: "needs_info" });
@@ -141,14 +168,7 @@ export function hopperProcessor(db: Db) {
 
     let raw: string;
     try {
-      const client = await getAnthropicClient(task.companyId);
-      const response = await client.messages.create({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 1024,
-        system: PERSONAL_TASK_SYSTEM_PROMPT,
-        messages,
-      });
-      raw = response.content[0].type === "text" ? response.content[0].text : "";
+      raw = await classify(task.companyId, PERSONAL_TASK_SYSTEM_PROMPT, messages);
     } catch (err) {
       console.error("[hopper] Failed to classify scheduled task:", err);
       await stSvc.addThread({

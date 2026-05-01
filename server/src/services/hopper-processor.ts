@@ -61,6 +61,13 @@ You must respond with a JSON object that has exactly these fields:
 
 Respond ONLY with valid JSON. No explanation, no markdown fences.`;
 
+function extractJson(raw: string): string {
+  let text = raw.trim();
+  const fenceMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+  if (fenceMatch) text = fenceMatch[1].trim();
+  return text;
+}
+
 export function hopperProcessor(db: Db) {
   const svc = hopperService(db);
   const prefsSvc = hopperPreferencesService(db);
@@ -155,7 +162,7 @@ export function hopperProcessor(db: Db) {
 
     let parsed: z.infer<typeof personalTaskSchema>;
     try {
-      parsed = personalTaskSchema.parse(JSON.parse(raw));
+      parsed = personalTaskSchema.parse(JSON.parse(extractJson(raw)));
     } catch (err) {
       console.error("[hopper] Failed to parse scheduled task response:", err, "raw:", raw);
       await stSvc.addThread({
@@ -258,7 +265,7 @@ export function hopperProcessor(db: Db) {
   ): Promise<void> {
     let parsed: z.infer<typeof softwareClassifySchema>;
     try {
-      parsed = softwareClassifySchema.parse(JSON.parse(raw));
+      parsed = softwareClassifySchema.parse(JSON.parse(extractJson(raw)));
     } catch (err) {
       console.error("[hopper] Failed to parse software item response:", err, "raw:", raw);
       await svc.update(itemId, { status: "needs_info" });
@@ -266,7 +273,7 @@ export function hopperProcessor(db: Db) {
         itemId,
         authorType: "agent",
         authorId: ctoAgentId,
-        body: "Could you provide more details about what you'd like to achieve and any relevant context?",
+        body: "Sorry, I had trouble understanding your request. Could you try rephrasing it?",
       });
       return;
     }

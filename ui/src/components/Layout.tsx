@@ -18,8 +18,10 @@ import { CommandModal } from "./CommandModal";
 import { QuickNotesModal } from "./QuickNotesModal";
 import { HopperModal } from "./HopperModal";
 import { HopperWidget } from "./HopperWidget";
+import { ScheduledTaskModal } from "./ScheduledTaskModal";
 import { ScheduledTasksWidget } from "./ScheduledTasksWidget";
 import { KeyboardShortcutsModal } from "./KeyboardShortcutsModal";
+import { VersionInfoModal } from "./VersionInfoModal";
 import { MobileScheduleBubble } from "./MobileScheduleBubble";
 import { MobileBottomNav } from "./MobileBottomNav";
 import { WorktreeBanner } from "./WorktreeBanner";
@@ -316,9 +318,18 @@ export function Layout() {
                 {health?.version && (
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <span className="px-2 text-xs text-muted-foreground shrink-0 cursor-default">v</span>
+                      <button
+                        type="button"
+                        className="px-2 text-xs text-muted-foreground shrink-0 cursor-pointer hover:text-foreground transition-colors"
+                        onClick={() => {
+                          document.dispatchEvent(new CustomEvent("open-version-info"));
+                          if (isMobile) setSidebarOpen(false);
+                        }}
+                      >
+                        v{health.version}
+                      </button>
                     </TooltipTrigger>
-                    <TooltipContent>v{health.version}</TooltipContent>
+                    <TooltipContent>Click for build details</TooltipContent>
                   </Tooltip>
                 )}
                 <Button variant="ghost" size="icon-sm" className="text-muted-foreground shrink-0" asChild>
@@ -374,9 +385,15 @@ export function Layout() {
                 {health?.version && (
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <span className="px-2 text-xs text-muted-foreground shrink-0 cursor-default">v</span>
+                      <button
+                        type="button"
+                        className="px-2 text-xs text-muted-foreground shrink-0 cursor-pointer hover:text-foreground transition-colors"
+                        onClick={() => document.dispatchEvent(new CustomEvent("open-version-info"))}
+                      >
+                        v{health.version}
+                      </button>
                     </TooltipTrigger>
-                    <TooltipContent>v{health.version}</TooltipContent>
+                    <TooltipContent>Click for build details</TooltipContent>
                   </Tooltip>
                 )}
                 <Button variant="ghost" size="icon-sm" className="text-muted-foreground shrink-0" asChild>
@@ -450,8 +467,10 @@ export function Layout() {
       <QuickNotesModal />
       <HopperModal />
       <HopperWidget />
+      <ScheduledTaskModal />
       <ScheduledTasksWidget />
       <KeyboardShortcutsModal />
+      <VersionInfoModal />
     </div>
   );
 }

@@ -1,12 +1,12 @@
 import { useState, useEffect, useRef } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { hopperApi } from "../api/hopper";
+import { scheduledTasksApi } from "../api/scheduled-tasks";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/utils";
-import { Bug, Zap, X } from "lucide-react";
+import { CalendarDays, X } from "lucide-react";
 
-export function HopperModal() {
+export function ScheduledTaskModal() {
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [submitted, setSubmitted] = useState(false);
@@ -14,10 +14,11 @@ export function HopperModal() {
   const { selectedCompanyId } = useCompany();
   const queryClient = useQueryClient();
 
-  const createSoftware = useMutation({
-    mutationFn: (prompt: string) => hopperApi.create(selectedCompanyId!, prompt),
+  const createScheduled = useMutation({
+    mutationFn: (requestText: string) =>
+      scheduledTasksApi.create(selectedCompanyId!, requestText, undefined, "keyboard_shortcut"),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.hopper.list(selectedCompanyId!) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.scheduledTasks.list(selectedCompanyId!) });
       setSubmitted(true);
       setTimeout(() => {
         setOpen(false);
@@ -29,7 +30,7 @@ export function HopperModal() {
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key.toLowerCase() === "b" && e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
+      if (e.key.toLowerCase() === "t" && e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
         e.preventDefault();
         setOpen((prev) => !prev);
       }
@@ -43,10 +44,10 @@ export function HopperModal() {
       setOpen(true);
     }
     document.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("paperclip:open-hopper", handleOpenEvent);
+    window.addEventListener("paperclip:open-scheduled-task", handleOpenEvent);
     return () => {
       document.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("paperclip:open-hopper", handleOpenEvent);
+      window.removeEventListener("paperclip:open-scheduled-task", handleOpenEvent);
     };
   }, [open]);
 
@@ -56,8 +57,8 @@ export function HopperModal() {
 
   function handleSubmit() {
     const prompt = text.trim();
-    if (!prompt || !selectedCompanyId || createSoftware.isPending) return;
-    createSoftware.mutate(prompt);
+    if (!prompt || !selectedCompanyId || createScheduled.isPending) return;
+    createScheduled.mutate(prompt);
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -85,10 +86,9 @@ export function HopperModal() {
       <div className="relative z-10 w-full max-w-lg mx-4 rounded-lg border border-border bg-background shadow-2xl">
         <div className="flex items-center gap-2 px-4 pt-4 pb-2">
           <div className="flex items-center gap-1.5 text-muted-foreground">
-            <Bug className="h-4 w-4" />
-            <Zap className="h-3.5 w-3.5" />
+            <CalendarDays className="h-4 w-4" />
           </div>
-          <span className="text-sm font-medium text-foreground">Report bug or feature</span>
+          <span className="text-sm font-medium text-foreground">Schedule task</span>
           <button
             type="button"
             onClick={() => { setOpen(false); setText(""); setSubmitted(false); }}
@@ -104,25 +104,25 @@ export function HopperModal() {
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Describe what's broken or what you'd like added... (Enter to submit)"
+            placeholder="What do you need to schedule? (e.g. take out the trash Wed, write unit tests before Thursday, call dentist...)"
             maxLength={4000}
             rows={3}
             className={cn(
               "w-full resize-none rounded-md border border-input bg-transparent px-3 py-2 text-sm outline-none placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring",
               submitted && "opacity-50",
             )}
-            disabled={createSoftware.isPending || submitted}
+            disabled={createScheduled.isPending || submitted}
           />
           <div className="mt-2 flex items-center justify-between">
             <span className="text-xs text-muted-foreground">
               {submitted
-                ? "Submitted! Processing..."
+                ? "Received! Scheduling..."
                 : "Enter to submit · Shift+Enter for new line · Esc to close"}
             </span>
             <button
               type="button"
               onClick={handleSubmit}
-              disabled={!text.trim() || createSoftware.isPending || submitted}
+              disabled={!text.trim() || createScheduled.isPending || submitted}
               className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-40 hover:bg-primary/90"
             >
               Submit

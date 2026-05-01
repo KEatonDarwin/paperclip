@@ -20,6 +20,7 @@ import { HopperModal } from "./HopperModal";
 import { HopperWidget } from "./HopperWidget";
 import { ScheduledTasksWidget } from "./ScheduledTasksWidget";
 import { KeyboardShortcutsModal } from "./KeyboardShortcutsModal";
+import { MobileScheduleBubble } from "./MobileScheduleBubble";
 import { MobileBottomNav } from "./MobileBottomNav";
 import { WorktreeBanner } from "./WorktreeBanner";
 import { DevRestartBanner } from "./DevRestartBanner";
@@ -444,6 +445,7 @@ export function Layout() {
       <NewAgentDialog />
       <ToastViewport />
       <GlobalChatBubble />
+      <MobileScheduleBubble />
       <CommandModal />
       <QuickNotesModal />
       <HopperModal />

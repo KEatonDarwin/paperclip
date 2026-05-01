@@ -3,7 +3,7 @@ import { api } from "./client";
 export type ScheduledTaskKind = "task_personal" | "task_work" | "task_home" | "event" | "reminder" | null;
 export type ScheduledTaskStatus = "pending" | "scheduled" | "completed" | "cancelled";
 
-export type ScheduledTaskOrigin = "jarvis_bar" | "keyboard_shortcut" | "apple_watch" | "api" | "slack" | null;
+export type ScheduledTaskOrigin = "jarvis_bar" | "keyboard_shortcut" | "apple_watch" | "api" | "slack" | "mobile_shortcut" | null;
 
 export interface ScheduledTask {
   id: string;

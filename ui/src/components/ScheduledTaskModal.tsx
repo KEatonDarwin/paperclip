@@ -30,7 +30,7 @@ export function ScheduledTaskModal() {
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key.toLowerCase() === "t" && e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
+      if (e.key.toLowerCase() === "f" && e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
         e.preventDefault();
         setOpen((prev) => !prev);
       }

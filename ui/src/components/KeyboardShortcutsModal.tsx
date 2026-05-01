@@ -27,7 +27,7 @@ const SHORTCUTS: Shortcut[] = [
   { keys: ["Ctrl", "Shift", "K"], description: "Open command modal", category: "Modals" },
   { keys: ["Ctrl", "Shift", "P"], description: "Open quick notes", category: "Modals" },
   { keys: ["Ctrl", "Shift", "B"], description: "Report bug or feature (Hopper)", category: "Modals" },
-  { keys: ["Ctrl", "Shift", "T"], description: "Schedule a task", category: "Modals" },
+  { keys: ["Ctrl", "Shift", "F"], description: "Schedule a task", category: "Modals" },
   { keys: ["Ctrl", "Shift", "I"], description: "Show build / version info", category: "Modals" },
   { keys: ["Shift", "?"], description: "Show keyboard shortcuts", category: "Modals" },
 ];

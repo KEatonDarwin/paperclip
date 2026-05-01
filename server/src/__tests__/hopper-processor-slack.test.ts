@@ -33,28 +33,19 @@ vi.mock("../services/hopper.js", () => ({
   }),
 }));
 
-vi.mock("@anthropic-ai/sdk", () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: {
-      create: vi.fn().mockResolvedValue({
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              kind: "task_personal",
-              has_info: false,
-              question: "When do you need this done by?",
-              title: null,
-              description: null,
-              duration_minutes: null,
-              preferred_time_of_day: null,
-              deadline: null,
-            }),
-          },
-        ],
-      }),
-    },
-  })),
+vi.mock("node:child_process", () => ({
+  execFile: vi.fn((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+    cb(null, { stdout: JSON.stringify({
+      kind: "task_personal",
+      has_info: false,
+      question: "When do you need this done by?",
+      title: null,
+      description: null,
+      duration_minutes: null,
+      preferred_time_of_day: null,
+      deadline: null,
+    }) });
+  }),
 }));
 
 vi.mock("../services/hopper-preferences.js", () => ({

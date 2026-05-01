@@ -1,11 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// Mock Anthropic
-const mockCreate = vi.fn();
-vi.mock("@anthropic-ai/sdk", () => ({
-  default: class {
-    messages = { create: mockCreate };
-  },
+// Mock Claude CLI via child_process
+const { mockExecFile } = vi.hoisted(() => ({ mockExecFile: vi.fn() }));
+vi.mock("node:child_process", () => ({
+  execFile: mockExecFile,
 }));
 
 const mockStSvc = {
@@ -62,20 +60,17 @@ describe("hopperProcessor learning integration (scheduled tasks)", () => {
     });
     mockStSvc.listThreads.mockResolvedValue([]);
 
-    mockCreate.mockResolvedValue({
-      content: [{
-        type: "text",
-        text: JSON.stringify({
-          kind: "task_personal",
-          has_info: true,
-          question: null,
-          title: "Gym session",
-          description: null,
-          duration_minutes: 60,
-          preferred_time_of_day: "early_morning",
-          deadline: null,
-        }),
-      }],
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+      cb(null, { stdout: JSON.stringify({
+        kind: "task_personal",
+        has_info: true,
+        question: null,
+        title: "Gym session",
+        description: null,
+        duration_minutes: 60,
+        preferred_time_of_day: "early_morning",
+        deadline: null,
+      }) });
     });
 
     mockStSvc.update.mockResolvedValue({});
@@ -104,20 +99,17 @@ describe("hopperProcessor learning integration (scheduled tasks)", () => {
     });
     mockStSvc.listThreads.mockResolvedValue([]);
 
-    mockCreate.mockResolvedValue({
-      content: [{
-        type: "text",
-        text: JSON.stringify({
-          kind: "reminder",
-          has_info: true,
-          question: null,
-          title: "Call dentist",
-          description: null,
-          duration_minutes: null,
-          preferred_time_of_day: "anytime",
-          deadline: null,
-        }),
-      }],
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+      cb(null, { stdout: JSON.stringify({
+        kind: "reminder",
+        has_info: true,
+        question: null,
+        title: "Call dentist",
+        description: null,
+        duration_minutes: null,
+        preferred_time_of_day: "anytime",
+        deadline: null,
+      }) });
     });
 
     mockStSvc.update.mockResolvedValue({});
@@ -140,20 +132,17 @@ describe("hopperProcessor learning integration (scheduled tasks)", () => {
     });
     mockStSvc.listThreads.mockResolvedValue([]);
 
-    mockCreate.mockResolvedValue({
-      content: [{
-        type: "text",
-        text: JSON.stringify({
-          kind: null,
-          has_info: true,
-          question: null,
-          title: "Something",
-          description: null,
-          duration_minutes: 30,
-          preferred_time_of_day: "morning",
-          deadline: null,
-        }),
-      }],
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+      cb(null, { stdout: JSON.stringify({
+        kind: null,
+        has_info: true,
+        question: null,
+        title: "Something",
+        description: null,
+        duration_minutes: 30,
+        preferred_time_of_day: "morning",
+        deadline: null,
+      }) });
     });
 
     mockStSvc.update.mockResolvedValue({});
@@ -176,20 +165,17 @@ describe("hopperProcessor learning integration (scheduled tasks)", () => {
     });
     mockStSvc.listThreads.mockResolvedValue([]);
 
-    mockCreate.mockResolvedValue({
-      content: [{
-        type: "text",
-        text: JSON.stringify({
-          kind: "task_work",
-          has_info: true,
-          question: null,
-          title: "Write Q2 report",
-          description: "Quarterly report due Friday",
-          duration_minutes: 120,
-          preferred_time_of_day: "morning",
-          deadline: "2026-05-02",
-        }),
-      }],
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+      cb(null, { stdout: JSON.stringify({
+        kind: "task_work",
+        has_info: true,
+        question: null,
+        title: "Write Q2 report",
+        description: "Quarterly report due Friday",
+        duration_minutes: 120,
+        preferred_time_of_day: "morning",
+        deadline: "2026-05-02",
+      }) });
     });
 
     mockStSvc.update.mockResolvedValue({});

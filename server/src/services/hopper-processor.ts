@@ -6,6 +6,7 @@ import { scheduledTasksService } from "./scheduled-tasks.js";
 import { hopperPreferencesService, prefKeyForKind } from "./hopper-preferences.js";
 import { slackDm } from "./slack-dm.js";
 import { syncPreferencesToObsidian } from "./hopper-obsidian-memory.js";
+import { secretService } from "./secrets.js";
 
 const softwareClassifySchema = z.object({
   kind: z.enum(["bug", "feature"]).nullable(),
@@ -63,8 +64,20 @@ Respond ONLY with valid JSON. No explanation, no markdown fences.`;
 export function hopperProcessor(db: Db) {
   const svc = hopperService(db);
   const prefsSvc = hopperPreferencesService(db);
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const secretsSvc = secretService(db);
   const ctoAgentId = "d33e935d-533f-45a1-bb7a-ee4a2c86b2d8";
+
+  async function getAnthropicClient(companyId: string): Promise<Anthropic> {
+    const secret = await secretsSvc.getByName(companyId, "ANTHROPIC_API_KEY");
+    if (secret) {
+      const apiKey = await secretsSvc.resolveSecretValue(companyId, secret.id, "latest");
+      return new Anthropic({ apiKey });
+    }
+    if (process.env.ANTHROPIC_API_KEY) {
+      return new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    }
+    throw new Error("ANTHROPIC_API_KEY not found in company secrets or environment");
+  }
 
   async function processItem(itemId: string): Promise<void> {
     const item = await svc.getById(itemId);
@@ -81,6 +94,7 @@ export function hopperProcessor(db: Db) {
 
     let raw: string;
     try {
+      const client = await getAnthropicClient(item.companyId);
       const response = await client.messages.create({
         model: "claude-haiku-4-5-20251001",
         max_tokens: 1024,
@@ -88,13 +102,14 @@ export function hopperProcessor(db: Db) {
         messages,
       });
       raw = response.content[0].type === "text" ? response.content[0].text : "";
-    } catch {
+    } catch (err) {
+      console.error("[hopper] Failed to classify software item:", err);
       await svc.update(itemId, { status: "needs_info" });
       await svc.addThread({
         itemId,
         authorType: "agent",
         authorId: ctoAgentId,
-        body: "Could you provide more details about what you'd like to achieve and any relevant context?",
+        body: "Sorry, I had trouble processing your request. Please try again in a moment.",
       });
       return;
     }
@@ -119,6 +134,7 @@ export function hopperProcessor(db: Db) {
 
     let raw: string;
     try {
+      const client = await getAnthropicClient(task.companyId);
       const response = await client.messages.create({
         model: "claude-haiku-4-5-20251001",
         max_tokens: 1024,
@@ -126,12 +142,13 @@ export function hopperProcessor(db: Db) {
         messages,
       });
       raw = response.content[0].type === "text" ? response.content[0].text : "";
-    } catch {
+    } catch (err) {
+      console.error("[hopper] Failed to classify scheduled task:", err);
       await stSvc.addThread({
         taskId,
         authorType: "agent",
         authorId: ctoAgentId,
-        body: "Could you tell me more about what you need to do and roughly when?",
+        body: "Sorry, I had trouble processing your request. Please try again in a moment.",
       });
       return;
     }
@@ -139,7 +156,8 @@ export function hopperProcessor(db: Db) {
     let parsed: z.infer<typeof personalTaskSchema>;
     try {
       parsed = personalTaskSchema.parse(JSON.parse(raw));
-    } catch {
+    } catch (err) {
+      console.error("[hopper] Failed to parse scheduled task response:", err, "raw:", raw);
       await stSvc.addThread({
         taskId,
         authorType: "agent",
@@ -241,7 +259,8 @@ export function hopperProcessor(db: Db) {
     let parsed: z.infer<typeof softwareClassifySchema>;
     try {
       parsed = softwareClassifySchema.parse(JSON.parse(raw));
-    } catch {
+    } catch (err) {
+      console.error("[hopper] Failed to parse software item response:", err, "raw:", raw);
       await svc.update(itemId, { status: "needs_info" });
       await svc.addThread({
         itemId,

@@ -11,7 +11,7 @@ const JARVIS_AGENT_ID = "ee9f5ec7-3eba-49ca-8f11-4ce67367a1ec";
 const createSchema = z.object({
   requestText: z.string().min(1).max(4000),
   deadlineAt: z.string().datetime().optional(),
-  origin: z.enum(["jarvis_bar", "keyboard_shortcut", "apple_watch", "api", "slack"]).optional(),
+  origin: z.enum(["jarvis_bar", "keyboard_shortcut", "apple_watch", "api", "slack", "mobile_shortcut"]).optional(),
 });
 
 const updateSchema = z.object({

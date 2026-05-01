@@ -18,7 +18,7 @@ export const scheduledTasks = pgTable(
     deadlineAt: timestamp("deadline_at", { withTimezone: true }),
     calendarEventId: text("calendar_event_id"),
     slackThreadTs: text("slack_thread_ts"),
-    origin: text("origin"), // 'jarvis_bar' | 'keyboard_shortcut' | 'apple_watch' | 'api' | 'slack'
+    origin: text("origin"), // 'jarvis_bar' | 'keyboard_shortcut' | 'apple_watch' | 'api' | 'slack' | 'mobile_shortcut'
     notes: text("notes"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

@@ -11,12 +11,14 @@ import {
   persistedQuery,
   addToCart,
   getShoppingLists,
+  getShoppingList,
   formatWeeklyAd,
   formatOrderHistory,
   formatCart,
   formatAccountDetails,
   formatProductDetails,
   formatShoppingLists,
+  formatShoppingList,
   setStore,
   type HEBSession,
   type RawHistoryOrder,
@@ -798,6 +800,34 @@ const plugin = definePlugin({
           return { content: formatShoppingLists(result.lists) };
         } catch (err) {
           return { error: `Error fetching shopping lists: ${summarizeError(err)}` };
+        }
+      }
+    );
+
+    // ── Tool: get shopping list items ──────────────────────────────────────────
+    ctx.tools.register(
+      "heb_get_shopping_list_items",
+      {
+        displayName: "HEB: Get Shopping List Items",
+        description: "Returns all items in a specific HEB shopping list. Use this to see what products are in a list, including product IDs, names, brands, prices, and quantities.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            listId: { type: "string", description: "Shopping list ID (get from heb_get_shopping_lists)" },
+          },
+          required: ["listId"],
+        },
+      },
+      async (params, _runCtx: ToolRunContext): Promise<ToolResult> => {
+        const { listId } = params as { listId: string };
+        try {
+          const cfg = await getConfig(ctx);
+          const session = buildCookieSession(cfg);
+          const list = await getShoppingList(session, listId);
+          if (list.items.length === 0) return { content: `Shopping list "${list.name}" is empty.` };
+          return { content: formatShoppingList(list) };
+        } catch (err) {
+          return { error: `Error fetching shopping list items: ${summarizeError(err)}` };
         }
       }
     );

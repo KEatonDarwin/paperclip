@@ -62,14 +62,16 @@ describe("hopperProcessor learning integration (scheduled tasks)", () => {
 
     mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
       cb(null, { stdout: JSON.stringify({
-        kind: "task_personal",
         has_info: true,
         question: null,
-        title: "Gym session",
-        description: null,
-        duration_minutes: 60,
-        preferred_time_of_day: "early_morning",
-        deadline: null,
+        tasks: [{
+          kind: "task_personal",
+          title: "Gym session",
+          description: null,
+          duration_minutes: 60,
+          preferred_time_of_day: "early_morning",
+          deadline: null,
+        }],
       }) });
     });
 
@@ -101,14 +103,16 @@ describe("hopperProcessor learning integration (scheduled tasks)", () => {
 
     mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
       cb(null, { stdout: JSON.stringify({
-        kind: "reminder",
         has_info: true,
         question: null,
-        title: "Call dentist",
-        description: null,
-        duration_minutes: null,
-        preferred_time_of_day: "anytime",
-        deadline: null,
+        tasks: [{
+          kind: "reminder",
+          title: "Call dentist",
+          description: null,
+          duration_minutes: null,
+          preferred_time_of_day: "anytime",
+          deadline: null,
+        }],
       }) });
     });
 
@@ -134,14 +138,16 @@ describe("hopperProcessor learning integration (scheduled tasks)", () => {
 
     mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
       cb(null, { stdout: JSON.stringify({
-        kind: null,
         has_info: true,
         question: null,
-        title: "Something",
-        description: null,
-        duration_minutes: 30,
-        preferred_time_of_day: "morning",
-        deadline: null,
+        tasks: [{
+          kind: null,
+          title: "Something",
+          description: null,
+          duration_minutes: 30,
+          preferred_time_of_day: "morning",
+          deadline: null,
+        }],
       }) });
     });
 
@@ -167,14 +173,16 @@ describe("hopperProcessor learning integration (scheduled tasks)", () => {
 
     mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
       cb(null, { stdout: JSON.stringify({
-        kind: "task_work",
         has_info: true,
         question: null,
-        title: "Write Q2 report",
-        description: "Quarterly report due Friday",
-        duration_minutes: 120,
-        preferred_time_of_day: "morning",
-        deadline: "2026-05-02",
+        tasks: [{
+          kind: "task_work",
+          title: "Write Q2 report",
+          description: "Quarterly report due Friday",
+          duration_minutes: 120,
+          preferred_time_of_day: "morning",
+          deadline: "2026-05-02",
+        }],
       }) });
     });
 

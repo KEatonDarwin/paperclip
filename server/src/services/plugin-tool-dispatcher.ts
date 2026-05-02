@@ -62,6 +62,8 @@ export interface AgentToolDescriptor {
   parametersSchema: Record<string, unknown>;
   /** The plugin that provides this tool. */
   pluginId: string;
+  /** Whether the plugin worker process is currently running. */
+  workerRunning: boolean;
 }
 
 /**
@@ -279,6 +281,7 @@ export function createPluginToolDispatcher(
       description: tool.description,
       parametersSchema: tool.parametersSchema,
       pluginId: tool.pluginDbId,
+      workerRunning: workerManager?.isRunning(tool.pluginDbId) ?? false,
     };
   }
 
@@ -406,6 +409,18 @@ export function createPluginToolDispatcher(
         },
         "dispatching tool execution",
       );
+
+      // Lazy-start: if the tool's plugin worker isn't running, start it
+      if (lifecycleManager && workerManager) {
+        const tool = registry.getTool(namespacedName);
+        if (tool && !workerManager.isRunning(tool.pluginDbId)) {
+          log.info(
+            { tool: namespacedName, pluginDbId: tool.pluginDbId },
+            "worker not running — attempting lazy start before execution",
+          );
+          await lifecycleManager.ensureWorkerRunning(tool.pluginDbId);
+        }
+      }
 
       const result = await registry.executeTool(
         namespacedName,

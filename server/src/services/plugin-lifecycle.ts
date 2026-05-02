@@ -223,6 +223,19 @@ export interface PluginLifecycleManager {
   restartWorker(pluginId: string): Promise<void>;
 
   /**
+   * Ensure the worker process is running for a plugin in `ready` state.
+   *
+   * If the worker is already running, this is a no-op. If not, the plugin
+   * is re-activated (worker spawned, tools re-registered, etc.). This
+   * enables lazy worker startup — e.g. when a board user tries to execute
+   * a plugin tool from the Plugin Runner page.
+   *
+   * @param pluginId - The UUID of the plugin
+   * @throws if the plugin is not found or not in `ready` state
+   */
+  ensureWorkerRunning(pluginId: string): Promise<void>;
+
+  /**
    * Get the current lifecycle state for a plugin.
    */
   getStatus(pluginId: string): Promise<PluginStatus | null>;
@@ -789,6 +802,32 @@ export function pluginLifecycleManager(
       log.info(
         { pluginId, pluginKey: plugin.pluginKey },
         "plugin lifecycle: worker restarted",
+      );
+    },
+
+    // -- ensureWorkerRunning ------------------------------------------------
+    async ensureWorkerRunning(pluginId: string): Promise<void> {
+      if (!workerManager) return;
+      if (workerManager.isRunning(pluginId)) return;
+
+      const plugin = await requirePlugin(pluginId);
+      if (plugin.status !== "ready") {
+        throw badRequest(
+          `Cannot start worker for plugin in status '${plugin.status}'. ` +
+            `Plugin must be in 'ready' status.`,
+        );
+      }
+
+      log.info(
+        { pluginId, pluginKey: plugin.pluginKey },
+        "plugin lifecycle: lazy-starting worker for ready plugin",
+      );
+
+      await activateReadyPlugin(pluginId);
+
+      log.info(
+        { pluginId, pluginKey: plugin.pluginKey },
+        "plugin lifecycle: worker lazy-started",
       );
     },
 

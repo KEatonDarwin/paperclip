@@ -25,7 +25,6 @@ import { VersionInfoModal } from "./VersionInfoModal";
 import { MobileScheduleBubble } from "./MobileScheduleBubble";
 import { MobileBottomNav } from "./MobileBottomNav";
 import { MobileQuickActions, type QuickActionPattern } from "./MobileQuickActions";
-import { MobileQuickActionsPatternSwitcher } from "./MobileQuickActionsPatternSwitcher";
 import { WorktreeBanner } from "./WorktreeBanner";
 import { DevRestartBanner } from "./DevRestartBanner";
 import { useDialog } from "../context/DialogContext";
@@ -85,6 +84,17 @@ export function Layout() {
       return "side-drawer";
     } catch { return "side-drawer"; }
   });
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<QuickActionPattern>).detail;
+      if (detail === "side-drawer" || detail === "bottom-sheet") {
+        setQuickActionPattern(detail);
+      }
+    };
+    window.addEventListener("paperclip:quick-action-pattern-changed", handler);
+    return () => window.removeEventListener("paperclip:quick-action-pattern-changed", handler);
+  }, []);
   const [instanceSettingsTarget, setInstanceSettingsTarget] = useState<string>(() => readRememberedInstanceSettingsPath());
   const nextTheme = theme === "dark" ? "light" : "dark";
   const matchedCompany = useMemo(() => {
@@ -473,16 +483,10 @@ export function Layout() {
       <GlobalChatBubble />
       {!isMobile && <MobileScheduleBubble />}
       {isMobile && (
-        <>
-          <MobileQuickActionsPatternSwitcher
-            current={quickActionPattern}
-            onChange={setQuickActionPattern}
-          />
-          <MobileQuickActions
-            pattern={quickActionPattern}
-            onOpenChat={() => window.dispatchEvent(new CustomEvent("paperclip:open-chat-bubble"))}
-          />
-        </>
+        <MobileQuickActions
+          pattern={quickActionPattern}
+          onOpenChat={() => window.dispatchEvent(new CustomEvent("paperclip:open-chat-bubble"))}
+        />
       )}
       <CommandModal />
       <QuickNotesModal />

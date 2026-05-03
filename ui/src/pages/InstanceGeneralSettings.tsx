@@ -1,10 +1,24 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { SlidersHorizontal } from "lucide-react";
+import { PanelRight, SlidersHorizontal, Rows3 } from "lucide-react";
 import { instanceSettingsApi } from "@/api/instanceSettings";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/utils";
+import type { QuickActionPattern } from "../components/MobileQuickActions";
+
+function readQuickActionPattern(): QuickActionPattern {
+  try {
+    const stored = localStorage.getItem("paperclip.mobileQuickActionPattern");
+    if (stored === "side-drawer" || stored === "bottom-sheet") return stored;
+  } catch {}
+  return "side-drawer";
+}
+
+function setQuickActionPattern(pattern: QuickActionPattern) {
+  try { localStorage.setItem("paperclip.mobileQuickActionPattern", pattern); } catch {}
+  window.dispatchEvent(new CustomEvent("paperclip:quick-action-pattern-changed", { detail: pattern }));
+}
 
 export function InstanceGeneralSettings() {
   const { setBreadcrumbs } = useBreadcrumbs();
@@ -50,6 +64,7 @@ export function InstanceGeneralSettings() {
   }
 
   const censorUsernameInLogs = generalQuery.data?.censorUsernameInLogs === true;
+  const [qaPattern, setQaPattern] = useState<QuickActionPattern>(readQuickActionPattern);
 
   return (
     <div className="max-w-4xl space-y-6">
@@ -97,6 +112,40 @@ export function InstanceGeneralSettings() {
               )}
             />
           </button>
+        </div>
+      </section>
+
+      <section className="rounded-xl border border-border bg-card p-5 space-y-3">
+        <div className="space-y-1.5">
+          <h2 className="text-sm font-semibold">Mobile quick actions style</h2>
+          <p className="max-w-2xl text-sm text-muted-foreground">
+            Choose how the quick-action menu appears on mobile devices.
+          </p>
+        </div>
+        <div className="flex gap-3">
+          {([
+            { value: "side-drawer" as const, label: "Drawer", icon: PanelRight, desc: "Slides from right edge" },
+            { value: "bottom-sheet" as const, label: "Sheet", icon: Rows3, desc: "Rises from bottom" },
+          ]).map((opt) => (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => {
+                setQaPattern(opt.value);
+                setQuickActionPattern(opt.value);
+              }}
+              className={cn(
+                "flex flex-1 flex-col items-center gap-2 rounded-lg border p-4 transition-colors",
+                qaPattern === opt.value
+                  ? "border-primary bg-primary/5"
+                  : "border-border hover:border-muted-foreground/30",
+              )}
+            >
+              <opt.icon className={cn("h-6 w-6", qaPattern === opt.value ? "text-primary" : "text-muted-foreground")} />
+              <span className={cn("text-sm font-medium", qaPattern === opt.value ? "text-primary" : "text-foreground")}>{opt.label}</span>
+              <span className="text-xs text-muted-foreground">{opt.desc}</span>
+            </button>
+          ))}
         </div>
       </section>
     </div>

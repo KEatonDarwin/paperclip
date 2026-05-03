@@ -15,7 +15,7 @@ import { scheduledTasksApi } from "../api/scheduled-tasks";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
 
-export type QuickActionPattern = "fab-radial" | "side-drawer" | "bottom-sheet";
+export type QuickActionPattern = "side-drawer" | "bottom-sheet";
 
 interface MobileQuickActionsProps {
   pattern: QuickActionPattern;
@@ -117,8 +117,6 @@ export function MobileQuickActions({ pattern, onOpenChat }: MobileQuickActionsPr
   }
 
   switch (pattern) {
-    case "fab-radial":
-      return <FabRadial isOpen={isOpen} setIsOpen={setIsOpen} actions={actions} />;
     case "side-drawer":
       return <SideDrawer isOpen={isOpen} setIsOpen={setIsOpen} actions={actions} />;
     case "bottom-sheet":
@@ -126,88 +124,7 @@ export function MobileQuickActions({ pattern, onOpenChat }: MobileQuickActionsPr
   }
 }
 
-// --- Pattern 1: FAB with radial/arc expansion (Waze-style) ---
-
-function FabRadial({
-  isOpen,
-  setIsOpen,
-  actions,
-}: {
-  isOpen: boolean;
-  setIsOpen: (v: boolean) => void;
-  actions: ActionItem[];
-}) {
-  const angles = [-150, -120, -90, -60];
-
-  return (
-    <div className="fixed bottom-24 right-4 z-40 md:hidden">
-      {/* Action items in arc */}
-      {actions.map((item, i) => {
-        const angle = angles[i]! * (Math.PI / 180);
-        const radius = 80;
-        const x = isOpen ? Math.cos(angle) * radius : 0;
-        const y = isOpen ? Math.sin(angle) * radius : 0;
-        const Icon = item.icon;
-
-        return (
-          <div
-            key={item.id}
-            className={cn(
-              "absolute bottom-0 right-0 transition-all duration-300 ease-out",
-              isOpen ? "opacity-100 scale-100" : "opacity-0 scale-0 pointer-events-none",
-            )}
-            style={{
-              transform: `translate(${x}px, ${y}px)`,
-              transitionDelay: isOpen ? `${i * 50}ms` : "0ms",
-            }}
-          >
-            <button
-              onClick={item.action}
-              className={cn(
-                "h-11 w-11 rounded-full shadow-lg flex items-center justify-center text-white",
-                item.color,
-              )}
-              title={item.label}
-            >
-              <Icon className="h-5 w-5" />
-            </button>
-            <span
-              className={cn(
-                "absolute -top-6 left-1/2 -translate-x-1/2 text-[10px] font-medium text-foreground whitespace-nowrap bg-background/90 px-1.5 py-0.5 rounded shadow-sm transition-opacity",
-                isOpen ? "opacity-100 delay-200" : "opacity-0",
-              )}
-            >
-              {item.label}
-            </span>
-          </div>
-        );
-      })}
-
-      {/* Backdrop */}
-      {isOpen && (
-        <div
-          className="fixed inset-0 -z-10"
-          onClick={() => setIsOpen(false)}
-        />
-      )}
-
-      {/* Main FAB */}
-      <button
-        onClick={() => setIsOpen(!isOpen)}
-        className={cn(
-          "relative h-14 w-14 rounded-full shadow-xl flex items-center justify-center transition-all duration-200",
-          isOpen
-            ? "bg-muted-foreground text-background rotate-45"
-            : "bg-primary text-primary-foreground",
-        )}
-      >
-        <Plus className="h-6 w-6 transition-transform duration-200" />
-      </button>
-    </div>
-  );
-}
-
-// --- Pattern 2: Side drawer (slides from right edge) ---
+// --- Pattern 1: Side drawer (slides from right edge) ---
 
 function SideDrawer({
   isOpen,
@@ -281,7 +198,7 @@ function SideDrawer({
   );
 }
 
-// --- Pattern 3: Bottom sheet speed dial ---
+// --- Pattern 2: Bottom sheet speed dial ---
 
 function BottomSheet({
   isOpen,

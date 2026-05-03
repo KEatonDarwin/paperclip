@@ -2,7 +2,6 @@ import { cn } from "../lib/utils";
 import type { QuickActionPattern } from "./MobileQuickActions";
 
 const patterns: { value: QuickActionPattern; label: string }[] = [
-  { value: "fab-radial", label: "Radial" },
   { value: "side-drawer", label: "Drawer" },
   { value: "bottom-sheet", label: "Sheet" },
 ];

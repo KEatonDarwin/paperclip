@@ -80,8 +80,10 @@ export function Layout() {
   const [mobileNavVisible, setMobileNavVisible] = useState(true);
   const [quickActionPattern, setQuickActionPattern] = useState<QuickActionPattern>(() => {
     try {
-      return (localStorage.getItem("paperclip.mobileQuickActionPattern") as QuickActionPattern) || "fab-radial";
-    } catch { return "fab-radial"; }
+      const stored = localStorage.getItem("paperclip.mobileQuickActionPattern");
+      if (stored === "side-drawer" || stored === "bottom-sheet") return stored;
+      return "side-drawer";
+    } catch { return "side-drawer"; }
   });
   const [instanceSettingsTarget, setInstanceSettingsTarget] = useState<string>(() => readRememberedInstanceSettingsPath());
   const nextTheme = theme === "dark" ? "light" : "dark";

@@ -77,6 +77,15 @@ export function GlobalChatBubble() {
     }
   };
 
+  // Listen for external open requests (from MobileQuickActions)
+  useEffect(() => {
+    function handleOpenRequest() {
+      handleOpen();
+    }
+    window.addEventListener("paperclip:open-chat-bubble", handleOpenRequest);
+    return () => window.removeEventListener("paperclip:open-chat-bubble", handleOpenRequest);
+  }, [agents, selectedAgentId]);
+
   // Ctrl+. → open / cycle agent; Esc → close
   // (Ctrl+Shift+C conflicts with browser DevTools inspector)
   useEffect(() => {
@@ -121,7 +130,7 @@ export function GlobalChatBubble() {
       <button
         title="Open chat"
         onClick={handleOpen}
-        className="fixed bottom-6 right-6 z-50 h-12 w-12 rounded-full bg-primary text-primary-foreground shadow-lg hover:scale-105 transition-transform flex items-center justify-center"
+        className="fixed bottom-6 right-6 z-50 h-12 w-12 rounded-full bg-primary text-primary-foreground shadow-lg hover:scale-105 transition-transform flex items-center justify-center md:flex hidden"
       >
         <MessageCircle className="h-5 w-5" />
       </button>

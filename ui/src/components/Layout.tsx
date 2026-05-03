@@ -24,6 +24,8 @@ import { KeyboardShortcutsModal } from "./KeyboardShortcutsModal";
 import { VersionInfoModal } from "./VersionInfoModal";
 import { MobileScheduleBubble } from "./MobileScheduleBubble";
 import { MobileBottomNav } from "./MobileBottomNav";
+import { MobileQuickActions, type QuickActionPattern } from "./MobileQuickActions";
+import { MobileQuickActionsPatternSwitcher } from "./MobileQuickActionsPatternSwitcher";
 import { WorktreeBanner } from "./WorktreeBanner";
 import { DevRestartBanner } from "./DevRestartBanner";
 import { useDialog } from "../context/DialogContext";
@@ -76,6 +78,11 @@ export function Layout() {
   const onboardingTriggered = useRef(false);
   const lastMainScrollTop = useRef(0);
   const [mobileNavVisible, setMobileNavVisible] = useState(true);
+  const [quickActionPattern, setQuickActionPattern] = useState<QuickActionPattern>(() => {
+    try {
+      return (localStorage.getItem("paperclip.mobileQuickActionPattern") as QuickActionPattern) || "fab-radial";
+    } catch { return "fab-radial"; }
+  });
   const [instanceSettingsTarget, setInstanceSettingsTarget] = useState<string>(() => readRememberedInstanceSettingsPath());
   const nextTheme = theme === "dark" ? "light" : "dark";
   const matchedCompany = useMemo(() => {
@@ -462,7 +469,19 @@ export function Layout() {
       <NewAgentDialog />
       <ToastViewport />
       <GlobalChatBubble />
-      <MobileScheduleBubble />
+      {!isMobile && <MobileScheduleBubble />}
+      {isMobile && (
+        <>
+          <MobileQuickActionsPatternSwitcher
+            current={quickActionPattern}
+            onChange={setQuickActionPattern}
+          />
+          <MobileQuickActions
+            pattern={quickActionPattern}
+            onOpenChat={() => window.dispatchEvent(new CustomEvent("paperclip:open-chat-bubble"))}
+          />
+        </>
+      )}
       <CommandModal />
       <QuickNotesModal />
       <HopperModal />

@@ -5,7 +5,7 @@ import {
   X,
   MessageCircle,
   CalendarPlus,
-  StickyNote,
+  FilePlus,
   Bug,
   Send,
   ChevronRight,
@@ -13,6 +13,7 @@ import {
 import { cn } from "../lib/utils";
 import { scheduledTasksApi } from "../api/scheduled-tasks";
 import { useCompany } from "../context/CompanyContext";
+import { useDialog } from "../context/DialogContext";
 import { queryKeys } from "../lib/queryKeys";
 
 export type QuickActionPattern = "side-drawer" | "bottom-sheet";
@@ -37,6 +38,7 @@ export function MobileQuickActions({ pattern, onOpenChat }: MobileQuickActionsPr
   const [submitted, setSubmitted] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const { selectedCompanyId } = useCompany();
+  const { openNewIssue } = useDialog();
   const queryClient = useQueryClient();
 
   const createTask = useMutation({
@@ -83,13 +85,13 @@ export function MobileQuickActions({ pattern, onOpenChat }: MobileQuickActionsPr
       action: () => setScheduleMode(true),
     },
     {
-      id: "notes",
-      label: "Notes",
-      icon: StickyNote,
+      id: "create",
+      label: "Create",
+      icon: FilePlus,
       color: "bg-amber-500",
       action: () => {
         setIsOpen(false);
-        window.dispatchEvent(new CustomEvent("paperclip:open-quick-notes"));
+        openNewIssue();
       },
     },
     {

@@ -2059,6 +2059,101 @@ export function agentRoutes(db: Db) {
     res.status(202).json(run);
   });
 
+  router.post("/agents/:id/heartbeat", async (req, res) => {
+    const id = req.params.id as string;
+    const agent = await svc.getById(id);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    assertCompanyAccess(req, agent.companyId);
+
+    const reason = typeof req.body?.reason === "string" ? req.body.reason : null;
+    const run = await heartbeat.wakeup(id, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason,
+      requestedByActorType: req.actor.type === "agent" ? "agent" : "user",
+      requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,
+      contextSnapshot: {
+        triggeredBy: req.actor.type,
+        actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,
+      },
+    });
+
+    if (!run) {
+      res.status(202).json({ status: "skipped", agentId: id });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "heartbeat.invoked",
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      details: { agentId: id },
+    });
+
+    res.status(202).json({ status: "triggered", agentId: id, run });
+  });
+
+  router.post("/companies/:companyId/agents/heartbeat", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+
+    const allAgents = await svc.list(companyId);
+    const eligible = allAgents.filter(
+      (a) => a.status !== "paused" && a.status !== "terminated" && a.status !== "pending_approval",
+    );
+
+    const results: Array<{ agentId: string; agentName: string; status: string; runId?: string }> = [];
+    for (const agent of eligible) {
+      const run = await heartbeat.wakeup(agent.id, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "bulk_heartbeat",
+        requestedByActorType: "user",
+        requestedByActorId: req.actor.userId ?? null,
+        contextSnapshot: {
+          triggeredBy: "user",
+          actorId: req.actor.userId,
+          bulk: true,
+        },
+      });
+      results.push({
+        agentId: agent.id,
+        agentName: agent.name,
+        status: run ? "triggered" : "skipped",
+        runId: run?.id,
+      });
+    }
+
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "heartbeat.bulk_invoked",
+      entityType: "company",
+      entityId: companyId,
+      details: { triggered: results.filter((r) => r.status === "triggered").length, skipped: results.filter((r) => r.status === "skipped").length },
+    });
+
+    res.status(202).json({
+      triggered: results.filter((r) => r.status === "triggered").length,
+      skipped: results.filter((r) => r.status === "skipped").length,
+      agents: results,
+    });
+  });
+
   router.post("/agents/:id/claude-login", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;

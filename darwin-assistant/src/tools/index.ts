@@ -1,0 +1,102 @@
+export interface ToolDef {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  execute: (args: Record<string, unknown>) => Promise<unknown>;
+}
+
+export {
+  createIssue,
+  searchIssues,
+  getIssue,
+  updateIssueStatus,
+  addComment,
+  listAgents,
+  listProjects,
+  getSystemHealth,
+} from './paperclip.js';
+
+export { createCalendarEvent } from './calendar.js';
+
+export {
+  readWikiPage,
+  writeWikiPage,
+  listWikiPages,
+  searchWiki,
+  readMemory,
+  writeMemory,
+} from './wiki.js';
+
+export {
+  listShimTasks,
+  createShimTask,
+  updateShimTask,
+  listShimProjects,
+  listShimFridge,
+  createShimFridgeItem,
+  listFocusSessions,
+  startFocusSession,
+  stopFocusSession,
+} from './shim.js';
+
+import {
+  createIssue,
+  searchIssues,
+  getIssue,
+  updateIssueStatus,
+  addComment,
+  listAgents,
+  listProjects,
+  getSystemHealth,
+} from './paperclip.js';
+import { createCalendarEvent } from './calendar.js';
+import {
+  readWikiPage,
+  writeWikiPage,
+  listWikiPages,
+  searchWiki,
+  readMemory,
+  writeMemory,
+} from './wiki.js';
+import {
+  listShimTasks,
+  createShimTask,
+  updateShimTask,
+  listShimProjects,
+  listShimFridge,
+  createShimFridgeItem,
+  listFocusSessions,
+  startFocusSession,
+  stopFocusSession,
+} from './shim.js';
+
+export const ALL_TOOLS: ToolDef[] = [
+  createIssue,
+  searchIssues,
+  getIssue,
+  updateIssueStatus,
+  addComment,
+  listAgents,
+  listProjects,
+  getSystemHealth,
+  createCalendarEvent,
+  readWikiPage,
+  writeWikiPage,
+  listWikiPages,
+  searchWiki,
+  readMemory,
+  writeMemory,
+  listShimTasks,
+  createShimTask,
+  updateShimTask,
+  listShimProjects,
+  listShimFridge,
+  createShimFridgeItem,
+  listFocusSessions,
+  startFocusSession,
+  stopFocusSession,
+];
+
+export const TOOL_MAP: Map<string, ToolDef> = new Map(
+  ALL_TOOLS.map((t) => [t.name, t]),
+);

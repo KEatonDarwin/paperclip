@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
 import { scheduledTasksService, scheduledTaskIdentifier } from "../services/scheduled-tasks.js";
+import { gogUpdateEvent, gogDeleteEvent } from "../services/hopper-calendar-placer.js";
 import { heartbeatService } from "../services/index.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 
@@ -22,6 +23,17 @@ const updateSchema = z.object({
   durationMinutes: z.number().int().positive().nullable().optional(),
   deadlineAt: z.string().datetime().nullable().optional(),
   notes: z.string().max(8000).optional(),
+});
+
+const preplacedSchema = z.object({
+  original_prompt: z.string().min(1).max(4000),
+  title: z.string().min(1).max(200),
+  summary: z.string().max(4000).optional(),
+  scheduled_for: z.string().datetime({ offset: true }),
+  duration_minutes: z.number().int().positive(),
+  kind: z.enum(["task_personal", "task_work", "task_home", "event", "reminder"]).optional(),
+  origin: z.string().max(50).optional(),
+  userId: z.string().optional(),
 });
 
 const threadSchema = z.object({
@@ -76,6 +88,36 @@ export function scheduledTaskRoutes(db: Db) {
     }).catch(() => {});
   });
 
+  // Create a pre-placed scheduled task — bypass AI placer, go straight to calendar sync
+  router.post("/companies/:companyId/scheduled-tasks/preplaced", validate(preplacedSchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    let userId: string;
+    if (req.actor.type === "agent") {
+      if (!req.body.userId) {
+        return res.status(400).json({ error: "userId is required for agent callers" });
+      }
+      userId = req.body.userId;
+    } else {
+      userId = req.body.userId || (req.actor as { userId: string }).userId;
+    }
+
+    const svc = scheduledTasksService(db);
+    const task = await svc.createPreplaced({
+      companyId,
+      userId,
+      requestText: req.body.original_prompt,
+      title: req.body.title,
+      scheduledAt: new Date(req.body.scheduled_for),
+      durationMinutes: req.body.duration_minutes,
+      kind: req.body.kind ?? null,
+      notes: req.body.summary ?? null,
+      origin: req.body.origin ?? "preplaced",
+    });
+    res.status(201).json(withIdentifier(task));
+  });
+
   // Get a single scheduled task
   router.get("/scheduled-tasks/:taskId", async (req, res) => {
     const svc = scheduledTasksService(db);
@@ -105,6 +147,45 @@ export function scheduledTaskRoutes(db: Db) {
     if (req.body.notes !== undefined) patch.notes = req.body.notes;
     const task = await svc.update(req.params.taskId as string, patch);
     res.json(task ? withIdentifier(task) : null);
+
+    // Sync time/duration/title changes to Google Calendar if event exists
+    if (task && existing.calendarEventId) {
+      const timeChanged = patch.scheduledAt !== undefined &&
+        patch.scheduledAt?.getTime() !== existing.scheduledAt?.getTime();
+      const durationChanged = patch.durationMinutes !== undefined &&
+        patch.durationMinutes !== existing.durationMinutes;
+      const titleChanged = patch.title !== undefined && patch.title !== existing.title;
+
+      if (timeChanged || durationChanged || titleChanged) {
+        const scheduledAt = task.scheduledAt;
+        if (scheduledAt) {
+          const duration = task.durationMinutes ?? 30;
+          const endTime = new Date(scheduledAt.getTime() + duration * 60_000);
+          void gogUpdateEvent({
+            eventId: existing.calendarEventId,
+            startTime: scheduledAt,
+            endTime,
+            title: titleChanged ? (task.title ?? undefined) : undefined,
+          }).then(() =>
+            svc.addThread({
+              taskId: task.id,
+              authorType: "agent",
+              authorId: JARVIS_AGENT_ID,
+              body: `Google Calendar event updated to **${scheduledAt.toLocaleDateString("en-US", {
+                weekday: "short", month: "short", day: "numeric",
+                hour: "numeric", minute: "2-digit",
+                timeZone: process.env.GOG_TIMEZONE || "America/Chicago",
+              })}** (~${duration} min).`,
+            }),
+          ).catch(() => {});
+        } else {
+          // scheduledAt cleared — delete the calendar event
+          void gogDeleteEvent(existing.calendarEventId)
+            .then(() => svc.update(task.id, { calendarEventId: null }))
+            .catch(() => {});
+        }
+      }
+    }
   });
 
   // Cancel / delete a scheduled task
@@ -116,6 +197,9 @@ export function scheduledTaskRoutes(db: Db) {
     assertCompanyAccess(req, existing.companyId);
     await svc.remove(req.params.taskId as string);
     res.status(204).end();
+    if (existing.calendarEventId) {
+      void gogDeleteEvent(existing.calendarEventId).catch(() => {});
+    }
   });
 
   // List thread entries for a task

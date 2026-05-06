@@ -160,9 +160,39 @@ export function scheduledTasksService(db: Db) {
     });
   }
 
+  async function createPreplaced(input: {
+    companyId: string;
+    userId: string;
+    requestText: string;
+    title: string;
+    scheduledAt: Date;
+    durationMinutes: number;
+    kind?: string | null;
+    notes?: string | null;
+    origin?: string | null;
+  }) {
+    const [task] = await db
+      .insert(scheduledTasks)
+      .values({
+        companyId: input.companyId,
+        userId: input.userId,
+        requestText: input.requestText,
+        title: input.title,
+        scheduledAt: input.scheduledAt,
+        durationMinutes: input.durationMinutes,
+        kind: input.kind ?? null,
+        notes: input.notes ?? null,
+        origin: input.origin ?? "preplaced",
+        status: "scheduled",
+      })
+      .returning();
+    return task;
+  }
+
   return {
     list,
     create,
+    createPreplaced,
     getById,
     update,
     remove,

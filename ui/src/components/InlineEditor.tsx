@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { cn } from "../lib/utils";
+import { MarkdownBody } from "./MarkdownBody";
 import { MarkdownEditor, type MarkdownEditorRef, type MentionOption } from "./MarkdownEditor";
 import { useAutosaveIndicator } from "../hooks/useAutosaveIndicator";
 
@@ -72,12 +73,12 @@ export function InlineEditor({
   }, [editing, autoSize]);
 
   useEffect(() => {
-    if (!editing || !multiline) return;
+    if (!multilineFocused || !multiline) return;
     const frame = requestAnimationFrame(() => {
       markdownRef.current?.focus();
     });
     return () => cancelAnimationFrame(frame);
-  }, [editing, multiline]);
+  }, [multilineFocused, multiline]);
 
   const commit = useCallback(async (nextValue = draft) => {
     const trimmed = nextValue.trim();
@@ -139,14 +140,32 @@ export function InlineEditor({
   }, [autosaveState, commit, draft, markDirty, multiline, multilineFocused, reset, runSave, value]);
 
   if (multiline) {
+    if (!multilineFocused) {
+      return (
+        <div
+          className={cn(
+            markdownPad,
+            "rounded transition-colors cursor-text hover:bg-accent/20",
+          )}
+          onClick={() => setMultilineFocused(true)}
+        >
+          {draft ? (
+            <MarkdownBody className={className}>{draft}</MarkdownBody>
+          ) : (
+            <div className={cn("text-muted-foreground italic", className)}>
+              {placeholder}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     return (
       <div
         className={cn(
           markdownPad,
-          "rounded transition-colors",
-          multilineFocused ? "bg-transparent" : "hover:bg-accent/20",
+          "rounded transition-colors bg-transparent",
         )}
-        onFocusCapture={() => setMultilineFocused(true)}
         onBlurCapture={(event) => {
           if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
           if (autosaveDebounceRef.current) {

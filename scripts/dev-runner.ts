@@ -83,6 +83,16 @@ const env: NodeJS.ProcessEnv = {
   PAPERCLIP_UI_DEV_MIDDLEWARE: "true",
 };
 
+// Ensure the server child has adequate heap space.
+// Default V8 limits on ARM64 can be as low as ~2.2 GB, which is insufficient
+// when the process hosts Vite dev middleware, the API server, and heartbeat orchestrator.
+const heapSizeMb = Number(process.env.PAPERCLIP_MAX_HEAP_MB) || 4096;
+const heapFlag = `--max-old-space-size=${heapSizeMb}`;
+const existingNodeOpts = env.NODE_OPTIONS ?? "";
+if (!existingNodeOpts.includes("--max-old-space-size")) {
+  env.NODE_OPTIONS = existingNodeOpts ? `${existingNodeOpts} ${heapFlag}` : heapFlag;
+}
+
 if (mode === "dev") {
   env.PAPERCLIP_DEV_SERVER_STATUS_FILE = devServerStatusFilePath;
   env.PAPERCLIP_MIGRATION_AUTO_APPLY ??= "true";

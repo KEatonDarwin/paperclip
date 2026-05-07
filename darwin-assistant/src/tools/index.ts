@@ -40,6 +40,12 @@ export {
   stopFocusSession,
 } from './shim.js';
 
+export {
+  enqueueCheckin,
+  listCheckins,
+  cancelCheckin,
+} from './checkin.js';
+
 import {
   createIssue,
   searchIssues,
@@ -71,6 +77,11 @@ import {
   startFocusSession,
   stopFocusSession,
 } from './shim.js';
+import {
+  enqueueCheckin,
+  listCheckins,
+  cancelCheckin,
+} from './checkin.js';
 
 export const ALL_TOOLS: ToolDef[] = [
   createIssue,
@@ -98,6 +109,9 @@ export const ALL_TOOLS: ToolDef[] = [
   listFocusSessions,
   startFocusSession,
   stopFocusSession,
+  enqueueCheckin,
+  listCheckins,
+  cancelCheckin,
 ];
 
 export const TOOL_MAP: Map<string, ToolDef> = new Map(

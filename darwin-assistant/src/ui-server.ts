@@ -83,6 +83,145 @@ function highlightJson(raw: string): string {
   }
 }
 
+// -- API request/response rendering --
+
+interface ParsedClaudeEvent {
+  type: string;
+  subtype?: string;
+  raw: Record<string, unknown>;
+}
+
+function parseStreamJsonEvents(rawOutput: string): ParsedClaudeEvent[] {
+  const events: ParsedClaudeEvent[] = [];
+  for (const line of rawOutput.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed) as Record<string, unknown>;
+      events.push({
+        type: (typeof obj.type === 'string' ? obj.type : 'unknown'),
+        subtype: typeof obj.subtype === 'string' ? obj.subtype : undefined,
+        raw: obj,
+      });
+    } catch { /* skip non-JSON lines */ }
+  }
+  return events;
+}
+
+interface ApiTurnSummary {
+  model: string | null;
+  stopReason: string | null;
+  requestId: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
+
+function extractApiSummary(events: ParsedClaudeEvent[]): ApiTurnSummary {
+  let model: string | null = null;
+  let stopReason: string | null = null;
+  let requestId: string | null = null;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheWriteTokens = 0;
+
+  for (const ev of events) {
+    const r = ev.raw;
+    if (typeof r.model === 'string') model = r.model;
+    if (typeof r.stop_reason === 'string') stopReason = r.stop_reason;
+    if (typeof r.request_id === 'string') requestId = r.request_id;
+    if (ev.type === 'result') {
+      if (typeof r.stop_reason === 'string') stopReason = r.stop_reason;
+      const u = r.usage as Record<string, unknown> | undefined;
+      if (u) {
+        if (typeof u.input_tokens === 'number') inputTokens = u.input_tokens;
+        if (typeof u.output_tokens === 'number') outputTokens = u.output_tokens;
+        if (typeof u.cache_read_input_tokens === 'number') cacheReadTokens = u.cache_read_input_tokens;
+        if (typeof u.cache_creation_input_tokens === 'number') cacheWriteTokens = u.cache_creation_input_tokens;
+      }
+    }
+  }
+
+  return { model, stopReason, requestId, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
+}
+
+function estimateCost(summary: ApiTurnSummary): string | null {
+  if (!summary.model || (!summary.inputTokens && !summary.outputTokens)) return null;
+  const m = summary.model.toLowerCase();
+  let inRate = 0, outRate = 0;
+  if (m.includes('opus')) { inRate = 15; outRate = 75; }
+  else if (m.includes('sonnet')) { inRate = 3; outRate = 15; }
+  else if (m.includes('haiku')) { inRate = 0.25; outRate = 1.25; }
+  else return null;
+
+  const cacheReadRate = inRate * 0.1;
+  const nonCachedInput = Math.max(0, summary.inputTokens - summary.cacheReadTokens);
+  const cost =
+    (nonCachedInput / 1_000_000) * inRate +
+    (summary.cacheReadTokens / 1_000_000) * cacheReadRate +
+    (summary.outputTokens / 1_000_000) * outRate;
+  return `~$${cost.toFixed(4)}`;
+}
+
+interface ApiTurnData {
+  label: string;
+  claudeInput: string | null;
+  claudeOutput: string | null;
+  timingMs: number | null;
+}
+
+function renderApiTurn(turn: ApiTurnData, index: number): string {
+  const events = turn.claudeOutput ? parseStreamJsonEvents(turn.claudeOutput) : [];
+  const summary = extractApiSummary(events);
+  const cost = estimateCost(summary);
+
+  const metaParts: string[] = [];
+  if (summary.model) metaParts.push(escapeHtml(summary.model));
+  if (turn.timingMs) metaParts.push(formatMs(turn.timingMs));
+  if (summary.stopReason) metaParts.push(`stop: ${escapeHtml(summary.stopReason)}`);
+  if (summary.inputTokens || summary.outputTokens) {
+    metaParts.push(`${summary.inputTokens.toLocaleString()} in / ${summary.outputTokens.toLocaleString()} out`);
+  }
+  if (cost) metaParts.push(cost);
+
+  let reqIdHtml = '';
+  if (summary.requestId) {
+    reqIdHtml = `<span class="req-id" title="Anthropic Request ID">${escapeHtml(summary.requestId)}</span>`;
+  }
+
+  let requestBlock = '';
+  if (turn.claudeInput) {
+    requestBlock = `<details class="api-detail">
+      <summary>Request (stdin)</summary>
+      <div class="copy-wrap"><button class="copy-btn" onclick="copyJson(this)">Copy</button><pre class="text-block">${escapeHtml(turn.claudeInput)}</pre></div>
+    </details>`;
+  }
+
+  let responseBlock = '';
+  if (events.length) {
+    const eventsJson = JSON.stringify(events.map(e => e.raw), null, 2);
+    responseBlock = `<details class="api-detail">
+      <summary>Response (${events.length} event${events.length !== 1 ? 's' : ''})</summary>
+      <div class="copy-wrap"><button class="copy-btn" onclick="copyJson(this)">Copy</button><pre class="json-block">${highlightJson(eventsJson)}</pre></div>
+    </details>`;
+  } else if (turn.claudeOutput) {
+    responseBlock = `<details class="api-detail">
+      <summary>Response (raw)</summary>
+      <div class="copy-wrap"><button class="copy-btn" onclick="copyJson(this)">Copy</button><pre class="text-block">${escapeHtml(turn.claudeOutput)}</pre></div>
+    </details>`;
+  }
+
+  return `<div class="api-turn">
+    <div class="api-turn-header">
+      <span class="api-turn-label">${escapeHtml(turn.label)}</span>
+      <div class="api-turn-meta">${metaParts.join(' · ')}${reqIdHtml ? ' · ' + reqIdHtml : ''}</div>
+    </div>
+    ${requestBlock}${responseBlock}
+  </div>`;
+}
+
 // -- Exchange grouping --
 
 interface ToolCallPair { call: TurnRow; result: TurnRow | null }
@@ -180,6 +319,25 @@ function renderLayout(title: string, body: string, nav?: string): string {
     .copy-btn:hover { color: #f0f6fc; background: #30363d; }
     .token-bar { display: flex; gap: 16px; padding: 6px 10px; font-size: 11px; color: #6e7681; background: #161b22; border-top: 1px solid #21262d; flex-wrap: wrap; }
     .token-bar .tk-label { color: #484f58; }
+    .api-panel { border-top: 1px solid #21262d; }
+    .api-panel[open] { background: #0d1117; }
+    .api-summary { padding: 8px 12px; font-size: 12px; color: #8b949e; cursor: pointer; display: flex; gap: 12px; align-items: center; list-style: none; user-select: none; }
+    .api-summary::-webkit-details-marker { display: none; }
+    .api-summary:hover { background: #161b22; color: #c9d1d9; }
+    .api-badge { background: #2d1b3d; color: #d2a8ff; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 500; }
+    .api-turn { border: 1px solid #21262d; border-radius: 4px; margin-bottom: 6px; overflow: hidden; }
+    .api-turn-header { padding: 6px 10px; background: #161b22; font-size: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .api-turn-label { color: #d2a8ff; font-weight: 500; }
+    .api-turn-meta { display: flex; gap: 12px; font-size: 11px; color: #6e7681; flex-wrap: wrap; }
+    .api-turn-meta .req-id { color: #d29922; font-family: 'SF Mono', 'Fira Code', monospace; }
+    .api-detail { border-top: 1px solid #21262d; }
+    .api-detail summary { padding: 4px 10px; font-size: 12px; color: #8b949e; cursor: pointer; }
+    .api-detail summary:hover { color: #c9d1d9; }
+    .api-events { padding: 0; }
+    .api-event { border-top: 1px solid #21262d; }
+    .api-event-header { padding: 4px 10px; font-size: 11px; color: #6e7681; display: flex; gap: 8px; align-items: center; }
+    .api-event-type { color: #d2a8ff; font-weight: 500; font-family: 'SF Mono', 'Fira Code', monospace; }
+    .text-block { padding: 8px 10px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; line-height: 1.4; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; margin: 0; background: #0d1117; color: #c9d1d9; }
     .section { margin-bottom: 24px; }
     .section h2 { font-size: 16px; color: #f0f6fc; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #21262d; }
     .checkin-item { padding: 8px 12px; border: 1px solid #30363d; border-radius: 6px; margin-bottom: 6px; font-size: 13px; }
@@ -375,10 +533,42 @@ function renderExchange(ex: Exchange): string {
       </details>`;
     }
 
+    // API Request/Response panel — collect all Claude invocations in this exchange
+    const apiTurns: ApiTurnData[] = [];
+    for (let i = 0; i < ex.toolCalls.length; i++) {
+      const tc = ex.toolCalls[i];
+      if (tc.call.claude_input || tc.call.claude_output) {
+        apiTurns.push({
+          label: `Claude → ${escapeHtml(tc.call.tool_name ?? 'tool_use')}`,
+          claudeInput: tc.call.claude_input,
+          claudeOutput: tc.call.claude_output,
+          timingMs: tc.call.timing_ms,
+        });
+      }
+    }
+    if (ex.assistant && (ex.assistant.claude_input || ex.assistant.claude_output)) {
+      apiTurns.push({
+        label: 'Claude → response',
+        claudeInput: ex.assistant.claude_input,
+        claudeOutput: ex.assistant.claude_output,
+        timingMs: ex.assistant.timing_ms,
+      });
+    }
+
+    let apiHtml = '';
+    if (apiTurns.length > 0) {
+      const apiTurnsHtml = apiTurns.map((t, i) => renderApiTurn(t, i)).join('');
+      apiHtml = `<details class="api-panel">
+        <summary class="api-summary"><span class="api-badge">${apiTurns.length} API turn${apiTurns.length !== 1 ? 's' : ''}</span><span class="debug-stat">Raw Claude request/response</span></summary>
+        <div class="debug-content">${apiTurnsHtml}</div>
+      </details>`;
+    }
+
     html += `<div class="msg msg-assistant">
       <div class="msg-header"><span>Assistant</span><span>${ts ? formatTimestamp(ts) : ''}</span></div>
       ${content ? `<div class="msg-body">${escapeHtml(content)}</div>` : ''}
       ${debugHtml}
+      ${apiHtml}
     </div>`;
   }
 

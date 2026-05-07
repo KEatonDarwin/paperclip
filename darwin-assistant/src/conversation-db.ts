@@ -45,6 +45,8 @@ for (const col of [
   'cache_read_tokens INTEGER',
   'cache_write_tokens INTEGER',
   'model TEXT',
+  'claude_input TEXT',
+  'claude_output TEXT',
 ]) {
   try { db.exec(`ALTER TABLE turns ADD COLUMN ${col}`); } catch {}
 }
@@ -75,6 +77,8 @@ export interface TurnRow {
   cache_read_tokens: number | null;
   cache_write_tokens: number | null;
   model: string | null;
+  claude_input: string | null;
+  claude_output: string | null;
 }
 
 export interface TurnMetadata {
@@ -84,6 +88,8 @@ export interface TurnMetadata {
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
   model?: string;
+  claudeInput?: string;
+  claudeOutput?: string;
 }
 
 const stmts = {
@@ -108,8 +114,8 @@ const stmts = {
   getMaxTurnIndex: db.prepare<[number], { max_idx: number | null }>(
     `SELECT MAX(turn_index) as max_idx FROM turns WHERE conversation_id = ?`,
   ),
-  insertTurn: db.prepare<[number, number, string, string | null, string | null, string | null, string | null, number | null, number | null, number | null, number | null, number | null, string | null]>(
-    `INSERT INTO turns (conversation_id, turn_index, role, content, tool_name, tool_args, tool_result, timing_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  insertTurn: db.prepare<[number, number, string, string | null, string | null, string | null, string | null, number | null, number | null, number | null, number | null, number | null, string | null, string | null, string | null]>(
+    `INSERT INTO turns (conversation_id, turn_index, role, content, tool_name, tool_args, tool_result, timing_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, claude_input, claude_output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ),
   getTurns: db.prepare<[number], TurnRow>(
     `SELECT * FROM turns WHERE conversation_id = ? ORDER BY turn_index ASC`,
@@ -179,6 +185,7 @@ export function addTurn(
     metadata?.timingMs ?? null, metadata?.inputTokens ?? null,
     metadata?.outputTokens ?? null, metadata?.cacheReadTokens ?? null,
     metadata?.cacheWriteTokens ?? null, metadata?.model ?? null,
+    metadata?.claudeInput ?? null, metadata?.claudeOutput ?? null,
   );
   stmts.touchConversation.run(conversationId);
   return nextIndex;

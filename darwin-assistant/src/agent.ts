@@ -57,6 +57,7 @@ interface ClaudeResult {
   sessionId: string | null;
   usage?: ClaudeUsage;
   model?: string;
+  rawOutput?: string;
 }
 
 function parseClaudeOutput(stdout: string): ClaudeResult {
@@ -112,11 +113,11 @@ function parseClaudeOutput(stdout: string): ClaudeResult {
         };
       }
       const r = typeof event.result === 'string' ? event.result.trim() : '';
-      return { text: r || texts.join('').trim(), sessionId, usage, model };
+      return { text: r || texts.join('').trim(), sessionId, usage, model, rawOutput: stdout };
     }
   }
 
-  return { text: texts.join('').trim() || stdout.trim(), sessionId, usage, model };
+  return { text: texts.join('').trim() || stdout.trim(), sessionId, usage, model, rawOutput: stdout };
 }
 
 function parseToolCall(
@@ -236,6 +237,8 @@ async function runConversationTurn(conv: ConversationRow, input: string): Promis
       cacheReadTokens: result.usage?.cacheReadTokens,
       cacheWriteTokens: result.usage?.cacheWriteTokens,
       model: result.model,
+      claudeInput: stdinContent,
+      claudeOutput: result.rawOutput,
     };
 
     const toolCall = parseToolCall(result.text);

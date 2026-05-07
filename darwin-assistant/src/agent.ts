@@ -8,6 +8,7 @@ import {
   closeConversation as dbCloseConversation,
   touchConversation,
   type ConversationRow,
+  type TurnMetadata,
 } from './conversation-db.js';
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN ?? 'claude';
@@ -44,14 +45,25 @@ function buildInitialPrompt(userMessage: string): string {
   return [buildSystemPrompt(), buildToolsBlock(), '---', `Human: ${userMessage}`, 'Assistant:'].join('\n\n');
 }
 
+interface ClaudeUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
 interface ClaudeResult {
   text: string;
   sessionId: string | null;
+  usage?: ClaudeUsage;
+  model?: string;
 }
 
 function parseClaudeOutput(stdout: string): ClaudeResult {
   const texts: string[] = [];
   let sessionId: string | null = null;
+  let usage: ClaudeUsage | undefined;
+  let model: string | undefined;
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -61,6 +73,10 @@ function parseClaudeOutput(stdout: string): ClaudeResult {
 
     if (typeof event.session_id === 'string' && event.session_id) {
       sessionId = event.session_id;
+    }
+
+    if (typeof event.model === 'string' && event.model) {
+      model = event.model;
     }
 
     if (event.type === 'system' && event.subtype === 'init') {
@@ -86,12 +102,21 @@ function parseClaudeOutput(stdout: string): ClaudeResult {
       if (typeof event.session_id === 'string' && event.session_id) {
         sessionId = event.session_id;
       }
+      const u = event.usage as Record<string, unknown> | undefined;
+      if (u) {
+        usage = {
+          inputTokens: (typeof u.input_tokens === 'number' ? u.input_tokens : 0),
+          outputTokens: (typeof u.output_tokens === 'number' ? u.output_tokens : 0),
+          cacheReadTokens: typeof u.cache_read_input_tokens === 'number' ? u.cache_read_input_tokens : undefined,
+          cacheWriteTokens: typeof u.cache_creation_input_tokens === 'number' ? u.cache_creation_input_tokens : undefined,
+        };
+      }
       const r = typeof event.result === 'string' ? event.result.trim() : '';
-      return { text: r || texts.join('').trim(), sessionId };
+      return { text: r || texts.join('').trim(), sessionId, usage, model };
     }
   }
 
-  return { text: texts.join('').trim() || stdout.trim(), sessionId };
+  return { text: texts.join('').trim() || stdout.trim(), sessionId, usage, model };
 }
 
 function parseToolCall(
@@ -187,6 +212,7 @@ async function runConversationTurn(conv: ConversationRow, input: string): Promis
   }
 
   for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
+    const claudeT0 = Date.now();
     let result = await runClaude(stdinContent, sessionId);
 
     // Session expired or unknown — retry without resume
@@ -196,23 +222,34 @@ async function runConversationTurn(conv: ConversationRow, input: string): Promis
       stdinContent = buildInitialPrompt(input);
       result = await runClaude(stdinContent, null);
     }
+    const claudeMs = Date.now() - claudeT0;
 
     if (result.sessionId && result.sessionId !== sessionId) {
       sessionId = result.sessionId;
       updateSessionId(conv.id, sessionId);
     }
 
+    const claudeMeta: TurnMetadata = {
+      timingMs: claudeMs,
+      inputTokens: result.usage?.inputTokens,
+      outputTokens: result.usage?.outputTokens,
+      cacheReadTokens: result.usage?.cacheReadTokens,
+      cacheWriteTokens: result.usage?.cacheWriteTokens,
+      model: result.model,
+    };
+
     const toolCall = parseToolCall(result.text);
 
     if (!toolCall) {
-      addTurn(conv.id, 'assistant', result.text);
+      addTurn(conv.id, 'assistant', result.text, undefined, undefined, undefined, claudeMeta);
       touchConversation(conv.id);
       return result.text;
     }
 
-    addTurn(conv.id, 'tool_call', null, toolCall.name, JSON.stringify(toolCall.arguments));
+    addTurn(conv.id, 'tool_call', null, toolCall.name, JSON.stringify(toolCall.arguments), undefined, claudeMeta);
 
     const tool = TOOL_MAP.get(toolCall.name);
+    const toolT0 = Date.now();
     let toolResult: unknown;
     try {
       toolResult = tool
@@ -221,9 +258,10 @@ async function runConversationTurn(conv: ConversationRow, input: string): Promis
     } catch (err) {
       toolResult = { error: err instanceof Error ? err.message : String(err) };
     }
+    const toolMs = Date.now() - toolT0;
 
     const toolResultStr = JSON.stringify(toolResult, null, 2);
-    addTurn(conv.id, 'tool_result', null, toolCall.name, undefined, toolResultStr);
+    addTurn(conv.id, 'tool_result', null, toolCall.name, undefined, toolResultStr, { timingMs: toolMs });
 
     // Feed tool result back — always use --resume now since we have a session
     stdinContent = `<tool_result name="${toolCall.name}">\n${toolResultStr}\n</tool_result>`;

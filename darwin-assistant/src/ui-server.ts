@@ -37,6 +37,89 @@ function formatTimestamp(dateStr: string): string {
   return d.toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
+function formatMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+// -- JSON syntax highlighting --
+
+function highlightJsonValue(value: unknown, depth: number): string {
+  if (value === null) return '<span class="json-lit">null</span>';
+  if (typeof value === 'boolean') return `<span class="json-lit">${value}</span>`;
+  if (typeof value === 'number') return `<span class="json-num">${value}</span>`;
+  if (typeof value === 'string') {
+    const str = escapeHtml(JSON.stringify(value));
+    if (str.length > 500) return `<span class="json-str">${str.slice(0, 497)}…"</span>`;
+    return `<span class="json-str">${str}</span>`;
+  }
+
+  const indent = '  '.repeat(depth);
+  const inner = '  '.repeat(depth + 1);
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) return '[]';
+    const items = value.map(v => inner + highlightJsonValue(v, depth + 1));
+    return `[\n${items.join(',\n')}\n${indent}]`;
+  }
+
+  if (typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length === 0) return '{}';
+    const items = entries.map(([k, v]) =>
+      `${inner}<span class="json-key">${escapeHtml(JSON.stringify(k))}</span>: ${highlightJsonValue(v, depth + 1)}`
+    );
+    return `{\n${items.join(',\n')}\n${indent}}`;
+  }
+
+  return escapeHtml(String(value));
+}
+
+function highlightJson(raw: string): string {
+  try {
+    return highlightJsonValue(JSON.parse(raw), 0);
+  } catch {
+    return escapeHtml(raw);
+  }
+}
+
+// -- Exchange grouping --
+
+interface ToolCallPair { call: TurnRow; result: TurnRow | null }
+interface Exchange { user?: TurnRow; toolCalls: ToolCallPair[]; assistant?: TurnRow }
+
+function groupTurnsIntoExchanges(turns: TurnRow[]): Exchange[] {
+  const exchanges: Exchange[] = [];
+  let current: Exchange = { toolCalls: [] };
+
+  for (const t of turns) {
+    if (t.role === 'user') {
+      if (current.user || current.assistant || current.toolCalls.length) {
+        exchanges.push(current);
+        current = { toolCalls: [] };
+      }
+      current.user = t;
+    } else if (t.role === 'tool_call') {
+      current.toolCalls.push({ call: t, result: null });
+    } else if (t.role === 'tool_result') {
+      const last = current.toolCalls[current.toolCalls.length - 1];
+      if (last && !last.result) last.result = t;
+    } else if (t.role === 'assistant') {
+      current.assistant = t;
+      exchanges.push(current);
+      current = { toolCalls: [] };
+    }
+  }
+
+  if (current.user || current.assistant || current.toolCalls.length) {
+    exchanges.push(current);
+  }
+
+  return exchanges;
+}
+
+// -- Layout --
+
 function renderLayout(title: string, body: string, nav?: string): string {
   return `<!DOCTYPE html>
 <html>
@@ -55,7 +138,7 @@ function renderLayout(title: string, body: string, nav?: string): string {
     header h1 { font-size: 18px; color: #f0f6fc; }
     header nav a { color: #8b949e; font-size: 14px; }
     header nav a:hover, header nav a.active { color: #f0f6fc; }
-    .status-bar { display: flex; gap: 24px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; font-size: 13px; }
+    .status-bar { display: flex; gap: 24px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; font-size: 13px; flex-wrap: wrap; }
     .status-bar .label { color: #8b949e; }
     .status-bar .value { color: #f0f6fc; font-weight: 500; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 500; }
@@ -67,13 +150,36 @@ function renderLayout(title: string, body: string, nav?: string): string {
     th { text-align: left; padding: 8px 12px; border-bottom: 2px solid #30363d; color: #8b949e; font-size: 12px; text-transform: uppercase; }
     td { padding: 8px 12px; border-bottom: 1px solid #21262d; font-size: 14px; }
     tr:hover td { background: #161b22; }
-    .turn { border: 1px solid #30363d; border-radius: 6px; margin-bottom: 8px; overflow: hidden; }
-    .turn-header { padding: 8px 12px; background: #161b22; font-size: 12px; color: #8b949e; display: flex; justify-content: space-between; }
-    .turn-body { padding: 12px; font-size: 14px; white-space: pre-wrap; word-break: break-word; }
-    .turn-user .turn-header { border-left: 3px solid #58a6ff; }
-    .turn-assistant .turn-header { border-left: 3px solid #3fb950; }
-    .turn-tool_call .turn-header { border-left: 3px solid #d29922; }
-    .turn-tool_result .turn-header { border-left: 3px solid #a371f7; }
+    .msg { border: 1px solid #30363d; border-radius: 6px; margin-bottom: 8px; overflow: hidden; }
+    .msg-header { padding: 8px 12px; background: #161b22; font-size: 12px; color: #8b949e; display: flex; justify-content: space-between; align-items: center; }
+    .msg-body { padding: 12px; font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+    .msg-user .msg-header { border-left: 3px solid #58a6ff; }
+    .msg-assistant .msg-header { border-left: 3px solid #3fb950; }
+    .debug-panel { border-top: 1px solid #21262d; }
+    .debug-panel[open] { background: #0d1117; }
+    .debug-summary { padding: 8px 12px; font-size: 12px; color: #8b949e; cursor: pointer; display: flex; gap: 12px; align-items: center; list-style: none; user-select: none; }
+    .debug-summary::-webkit-details-marker { display: none; }
+    .debug-summary:hover { background: #161b22; color: #c9d1d9; }
+    .debug-badge { background: #1a3a5c; color: #58a6ff; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 500; }
+    .debug-stat { color: #6e7681; font-size: 11px; }
+    .debug-content { padding: 8px 12px; }
+    .tool-group { border: 1px solid #21262d; border-radius: 4px; margin-bottom: 6px; overflow: hidden; }
+    .tool-group-header { padding: 6px 10px; background: #161b22; font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
+    .tool-name { color: #d29922; font-weight: 500; font-family: 'SF Mono', 'Fira Code', monospace; }
+    .tool-timing { color: #6e7681; font-size: 11px; }
+    .tool-detail { border-top: 1px solid #21262d; }
+    .tool-detail summary { padding: 4px 10px; font-size: 12px; color: #8b949e; cursor: pointer; }
+    .tool-detail summary:hover { color: #c9d1d9; }
+    .json-block { padding: 8px 10px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; line-height: 1.4; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; margin: 0; background: #0d1117; color: #c9d1d9; }
+    .json-key { color: #79c0ff; }
+    .json-str { color: #a5d6ff; }
+    .json-num { color: #d2a8ff; }
+    .json-lit { color: #ff7b72; }
+    .copy-wrap { position: relative; }
+    .copy-btn { position: absolute; top: 4px; right: 4px; background: #21262d; border: 1px solid #30363d; color: #8b949e; padding: 2px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; z-index: 1; }
+    .copy-btn:hover { color: #f0f6fc; background: #30363d; }
+    .token-bar { display: flex; gap: 16px; padding: 6px 10px; font-size: 11px; color: #6e7681; background: #161b22; border-top: 1px solid #21262d; flex-wrap: wrap; }
+    .token-bar .tk-label { color: #484f58; }
     .section { margin-bottom: 24px; }
     .section h2 { font-size: 16px; color: #f0f6fc; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #21262d; }
     .checkin-item { padding: 8px 12px; border: 1px solid #30363d; border-radius: 6px; margin-bottom: 6px; font-size: 13px; }
@@ -96,9 +202,14 @@ function renderLayout(title: string, body: string, nav?: string): string {
     </div>
   </header>
   <div class="container">${body}</div>
+  <script>
+  function copyJson(btn){var p=btn.closest('.copy-wrap').querySelector('pre');navigator.clipboard.writeText(p.textContent).then(function(){btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy'},1500)})}
+  </script>
 </body>
 </html>`;
 }
+
+// -- Status / List --
 
 function renderStatusBar(): string {
   const active = getActiveConversation();
@@ -156,30 +267,122 @@ function renderConversationList(): string {
   </table>`;
 }
 
-function renderTurn(t: TurnRow): string {
-  const roleLabel: Record<string, string> = {
-    user: 'User',
-    assistant: 'Assistant',
-    tool_call: `Tool Call → ${t.tool_name ?? '?'}`,
-    tool_result: `Tool Result ← ${t.tool_name ?? '?'}`,
-  };
-  const label = roleLabel[t.role] ?? t.role;
-  let body = '';
+// -- Exchange rendering --
 
-  if (t.role === 'user' || t.role === 'assistant') {
-    body = escapeHtml(t.content ?? '');
-  } else if (t.role === 'tool_call') {
-    body = `<span class="mono">${escapeHtml(t.tool_args ?? '{}')}</span>`;
-  } else if (t.role === 'tool_result') {
-    const raw = t.tool_result ?? '';
-    const truncated = raw.length > 2000 ? raw.slice(0, 2000) + '\n… (truncated)' : raw;
-    body = `<span class="mono">${escapeHtml(truncated)}</span>`;
+function renderExchange(ex: Exchange): string {
+  let html = '';
+
+  if (ex.user) {
+    html += `<div class="msg msg-user">
+      <div class="msg-header"><span>User</span><span>${formatTimestamp(ex.user.created_at)}</span></div>
+      <div class="msg-body">${escapeHtml(ex.user.content ?? '')}</div>
+    </div>`;
   }
 
-  return `<div class="turn turn-${escapeHtml(t.role)}">
-    <div class="turn-header"><span>${escapeHtml(label)}</span><span>${formatTimestamp(t.created_at)}</span></div>
-    <div class="turn-body">${body}</div>
-  </div>`;
+  if (ex.assistant || ex.toolCalls.length) {
+    const content = ex.assistant?.content ?? '';
+    const ts = ex.assistant?.created_at ?? ex.toolCalls[0]?.call.created_at ?? '';
+
+    let totalModelMs = 0;
+    let totalToolMs = 0;
+    let totalIn = 0;
+    let totalOut = 0;
+    let totalCacheRead = 0;
+    let totalCacheWrite = 0;
+    let model: string | null = null;
+
+    for (const tc of ex.toolCalls) {
+      if (tc.call.timing_ms) totalModelMs += tc.call.timing_ms;
+      if (tc.result?.timing_ms) totalToolMs += tc.result.timing_ms;
+      if (tc.call.input_tokens) totalIn += tc.call.input_tokens;
+      if (tc.call.output_tokens) totalOut += tc.call.output_tokens;
+      if (tc.call.cache_read_tokens) totalCacheRead += tc.call.cache_read_tokens;
+      if (tc.call.cache_write_tokens) totalCacheWrite += tc.call.cache_write_tokens;
+      if (tc.call.model) model = tc.call.model;
+    }
+    if (ex.assistant) {
+      if (ex.assistant.timing_ms) totalModelMs += ex.assistant.timing_ms;
+      if (ex.assistant.input_tokens) totalIn += ex.assistant.input_tokens;
+      if (ex.assistant.output_tokens) totalOut += ex.assistant.output_tokens;
+      if (ex.assistant.cache_read_tokens) totalCacheRead += ex.assistant.cache_read_tokens;
+      if (ex.assistant.cache_write_tokens) totalCacheWrite += ex.assistant.cache_write_tokens;
+      if (ex.assistant.model) model = ex.assistant.model;
+    }
+
+    const hasDebug = ex.toolCalls.length > 0 || totalModelMs > 0 || totalIn > 0;
+    let debugHtml = '';
+
+    if (hasDebug) {
+      const stats: string[] = [];
+      if (totalModelMs) stats.push(`<span class="debug-stat">Model: ${formatMs(totalModelMs)}</span>`);
+      if (totalToolMs) stats.push(`<span class="debug-stat">Tools: ${formatMs(totalToolMs)}</span>`);
+      if (totalIn || totalOut) {
+        let tok = `${totalIn.toLocaleString()} in / ${totalOut.toLocaleString()} out`;
+        if (totalCacheRead) tok += ` (${totalCacheRead.toLocaleString()} cached)`;
+        stats.push(`<span class="debug-stat">Tokens: ${tok}</span>`);
+      }
+      if (model) stats.push(`<span class="debug-stat">${escapeHtml(model)}</span>`);
+
+      const badge = ex.toolCalls.length > 0
+        ? `<span class="debug-badge">${ex.toolCalls.length} tool call${ex.toolCalls.length !== 1 ? 's' : ''}</span>`
+        : '<span class="debug-badge">debug</span>';
+
+      let toolsHtml = '';
+      for (const tc of ex.toolCalls) {
+        const cMs = tc.call.timing_ms ? `Model: ${formatMs(tc.call.timing_ms)}` : '';
+        const rMs = tc.result?.timing_ms ? `Exec: ${formatMs(tc.result.timing_ms)}` : '';
+        const timingStr = [cMs, rMs].filter(Boolean).join(' → ');
+
+        let argsBlock = '';
+        if (tc.call.tool_args) {
+          argsBlock = `<details class="tool-detail">
+            <summary>Arguments</summary>
+            <div class="copy-wrap"><button class="copy-btn" onclick="copyJson(this)">Copy</button><pre class="json-block">${highlightJson(tc.call.tool_args)}</pre></div>
+          </details>`;
+        }
+
+        let resultBlock = '';
+        if (tc.result?.tool_result) {
+          resultBlock = `<details class="tool-detail">
+            <summary>Result</summary>
+            <div class="copy-wrap"><button class="copy-btn" onclick="copyJson(this)">Copy</button><pre class="json-block">${highlightJson(tc.result.tool_result)}</pre></div>
+          </details>`;
+        }
+
+        toolsHtml += `<div class="tool-group">
+          <div class="tool-group-header">
+            <span class="tool-name">${escapeHtml(tc.call.tool_name ?? '?')}</span>
+            ${timingStr ? `<span class="tool-timing">${timingStr}</span>` : ''}
+          </div>
+          ${argsBlock}${resultBlock}
+        </div>`;
+      }
+
+      let tokenBar = '';
+      if (totalIn || totalOut) {
+        tokenBar = `<div class="token-bar">
+          <span><span class="tk-label">In:</span> ${totalIn.toLocaleString()}</span>
+          <span><span class="tk-label">Out:</span> ${totalOut.toLocaleString()}</span>
+          ${totalCacheRead ? `<span><span class="tk-label">Cache read:</span> ${totalCacheRead.toLocaleString()}</span>` : ''}
+          ${totalCacheWrite ? `<span><span class="tk-label">Cache write:</span> ${totalCacheWrite.toLocaleString()}</span>` : ''}
+        </div>`;
+      }
+
+      debugHtml = `<details class="debug-panel">
+        <summary class="debug-summary">${badge}${stats.join('')}</summary>
+        <div class="debug-content">${toolsHtml}</div>
+        ${tokenBar}
+      </details>`;
+    }
+
+    html += `<div class="msg msg-assistant">
+      <div class="msg-header"><span>Assistant</span><span>${ts ? formatTimestamp(ts) : ''}</span></div>
+      ${content ? `<div class="msg-body">${escapeHtml(content)}</div>` : ''}
+      ${debugHtml}
+    </div>`;
+  }
+
+  return html;
 }
 
 function renderConversationDetail(conv: ConversationRow, turns: TurnRow[]): string {
@@ -191,19 +394,25 @@ function renderConversationDetail(conv: ConversationRow, turns: TurnRow[]): stri
       ? '<span class="badge badge-active">Active</span>'
       : '<span class="badge badge-closed">Closed</span>';
 
+  const exchanges = groupTurnsIntoExchanges(turns);
+  const userTurns = turns.filter(t => t.role === 'user' || t.role === 'assistant').length;
+
   const meta = `<div class="status-bar">
     <div><span class="label">ID:</span> <span class="value conv-id">${escapeHtml(conv.external_id)}</span></div>
     <div><span class="label">Status:</span> <span class="value">${statusBadge}</span></div>
     <div><span class="label">Session:</span> <span class="value mono">${conv.claude_session_id ? escapeHtml(conv.claude_session_id) : '—'}</span></div>
-    <div><span class="label">Turns:</span> <span class="value">${turns.length}</span></div>
+    <div><span class="label">Messages:</span> <span class="value">${userTurns}</span></div>
+    <div><span class="label">Tool calls:</span> <span class="value">${turns.filter(t => t.role === 'tool_call').length}</span></div>
   </div>`;
 
-  const turnsHtml = turns.length
-    ? turns.map(renderTurn).join('')
+  const exchangesHtml = exchanges.length
+    ? exchanges.map(renderExchange).join('')
     : '<div class="empty">No turns recorded yet.</div>';
 
-  return `<div class="back"><a href="/">← All Conversations</a></div>${meta}<div class="section"><h2>Turns</h2>${turnsHtml}</div>`;
+  return `<div class="back"><a href="/">← All Conversations</a></div>${meta}<div class="section"><h2>Conversation</h2>${exchangesHtml}</div>`;
 }
+
+// -- Check-ins --
 
 async function renderCheckins(): Promise<string> {
   try {
@@ -245,6 +454,8 @@ async function renderCheckins(): Promise<string> {
   }
 }
 
+// -- Server --
+
 export function startUiServer(): void {
   const app = express();
 
@@ -268,7 +479,6 @@ export function startUiServer(): void {
     res.send(renderLayout('Check-ins', body, 'checkins'));
   });
 
-  // JSON API for programmatic access
   app.get('/api/status', (_req, res) => {
     const active = getActiveConversation();
     const convs = listActiveConversations();

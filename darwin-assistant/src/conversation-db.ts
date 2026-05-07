@@ -37,6 +37,18 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
 `);
 
+// Migrate: add debug columns to turns table
+for (const col of [
+  'timing_ms INTEGER',
+  'input_tokens INTEGER',
+  'output_tokens INTEGER',
+  'cache_read_tokens INTEGER',
+  'cache_write_tokens INTEGER',
+  'model TEXT',
+]) {
+  try { db.exec(`ALTER TABLE turns ADD COLUMN ${col}`); } catch {}
+}
+
 export interface ConversationRow {
   id: number;
   external_id: string;
@@ -57,6 +69,21 @@ export interface TurnRow {
   tool_args: string | null;
   tool_result: string | null;
   created_at: string;
+  timing_ms: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_write_tokens: number | null;
+  model: string | null;
+}
+
+export interface TurnMetadata {
+  timingMs?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  model?: string;
 }
 
 const stmts = {
@@ -81,8 +108,8 @@ const stmts = {
   getMaxTurnIndex: db.prepare<[number], { max_idx: number | null }>(
     `SELECT MAX(turn_index) as max_idx FROM turns WHERE conversation_id = ?`,
   ),
-  insertTurn: db.prepare<[number, number, string, string | null, string | null, string | null, string | null]>(
-    `INSERT INTO turns (conversation_id, turn_index, role, content, tool_name, tool_args, tool_result) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  insertTurn: db.prepare<[number, number, string, string | null, string | null, string | null, string | null, number | null, number | null, number | null, number | null, number | null, string | null]>(
+    `INSERT INTO turns (conversation_id, turn_index, role, content, tool_name, tool_args, tool_result, timing_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ),
   getTurns: db.prepare<[number], TurnRow>(
     `SELECT * FROM turns WHERE conversation_id = ? ORDER BY turn_index ASC`,
@@ -142,10 +169,17 @@ export function addTurn(
   toolName?: string,
   toolArgs?: string,
   toolResult?: string,
+  metadata?: TurnMetadata,
 ): number {
   const maxRow = stmts.getMaxTurnIndex.get(conversationId);
   const nextIndex = (maxRow?.max_idx ?? -1) + 1;
-  stmts.insertTurn.run(conversationId, nextIndex, role, content, toolName ?? null, toolArgs ?? null, toolResult ?? null);
+  stmts.insertTurn.run(
+    conversationId, nextIndex, role, content,
+    toolName ?? null, toolArgs ?? null, toolResult ?? null,
+    metadata?.timingMs ?? null, metadata?.inputTokens ?? null,
+    metadata?.outputTokens ?? null, metadata?.cacheReadTokens ?? null,
+    metadata?.cacheWriteTokens ?? null, metadata?.model ?? null,
+  );
   stmts.touchConversation.run(conversationId);
   return nextIndex;
 }

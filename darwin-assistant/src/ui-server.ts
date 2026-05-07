@@ -8,7 +8,8 @@ import {
   type ConversationRow,
   type TurnRow,
 } from './conversation-db.js';
-import { getActiveConversation } from './agent.js';
+import { getActiveConversation, getAdapters, getActiveAdapterInfo } from './agent.js';
+import { getAllSettings, getSetting, setSetting } from './conversation-db.js';
 import { query } from './db.js';
 
 const UI_PORT = parseInt(process.env.JARVIS_UI_PORT ?? '3201', 10);
@@ -356,7 +357,12 @@ function renderLayout(title: string, body: string, nav?: string): string {
         <a href="/" ${nav === 'home' ? 'class="active"' : ''}>Conversations</a>
         &nbsp;·&nbsp;
         <a href="/checkins" ${nav === 'checkins' ? 'class="active"' : ''}>Check-ins</a>
+        &nbsp;·&nbsp;
+        <a href="/settings" ${nav === 'settings' ? 'class="active"' : ''}>Settings</a>
       </nav>
+      <div style="margin-left:auto; font-size:12px; color:#8b949e;">
+        ${(() => { const info = getActiveAdapterInfo(); const adapters = getAdapters(); const a = adapters[info.adapter]; return `<span style="color:#d2a8ff;">${escapeHtml(a?.name ?? info.adapter)}</span> · <span style="color:#3fb950;">${escapeHtml(info.model ?? 'default')}</span>`; })()}
+      </div>
     </div>
   </header>
   <div class="container">${body}</div>
@@ -644,10 +650,127 @@ async function renderCheckins(): Promise<string> {
   }
 }
 
+// -- Settings page --
+
+function renderSettingsPage(): string {
+  const adapters = getAdapters();
+  const info = getActiveAdapterInfo();
+  const currentAdapter = adapters[info.adapter] ?? adapters.claude;
+  const currentModel = info.model ?? '';
+
+  const adapterOptions = Object.values(adapters).map(a =>
+    `<option value="${escapeHtml(a.id)}" ${a.id === currentAdapter.id ? 'selected' : ''}>${escapeHtml(a.name)}</option>`
+  ).join('');
+
+  const adapterModelsJson = JSON.stringify(
+    Object.fromEntries(Object.values(adapters).map(a => [a.id, a.models]))
+  );
+
+  return `
+    <div class="section">
+      <h2>Settings</h2>
+      <form id="settings-form" style="max-width: 480px;">
+        <div style="margin-bottom: 16px;">
+          <label style="display:block; color:#8b949e; font-size:13px; margin-bottom:4px;">Adapter / Provider</label>
+          <select id="adapter-select" name="adapter" style="width:100%; padding:8px 12px; background:#161b22; border:1px solid #30363d; border-radius:6px; color:#f0f6fc; font-size:14px;">
+            ${adapterOptions}
+          </select>
+        </div>
+        <div style="margin-bottom: 16px;">
+          <label style="display:block; color:#8b949e; font-size:13px; margin-bottom:4px;">Model</label>
+          <select id="model-select" name="model" style="width:100%; padding:8px 12px; background:#161b22; border:1px solid #30363d; border-radius:6px; color:#f0f6fc; font-size:14px;">
+          </select>
+          <div style="color:#484f58; font-size:12px; margin-top:4px;">Leave as "Default" to use the adapter's default model.</div>
+        </div>
+        <div id="save-status" style="display:none; padding:8px 12px; border-radius:6px; margin-bottom:12px; font-size:13px;"></div>
+        <button type="submit" style="padding:8px 20px; background:#238636; border:1px solid #2ea043; border-radius:6px; color:#fff; font-size:14px; cursor:pointer; font-weight:500;">
+          Save Settings
+        </button>
+        <span id="session-warning" style="display:none; margin-left:12px; color:#d29922; font-size:12px;">
+          ⚠ Changing adapter will reset active sessions
+        </span>
+      </form>
+    </div>
+
+    <div class="section" style="margin-top: 24px;">
+      <h2>Current Configuration</h2>
+      <div class="status-bar">
+        <div><span class="label">Adapter:</span> <span class="value">${escapeHtml(currentAdapter.name)}</span></div>
+        <div><span class="label">Model:</span> <span class="value">${escapeHtml(currentModel || 'default')}</span></div>
+        <div><span class="label">Binary:</span> <span class="value mono">${escapeHtml(currentAdapter.bin)}</span></div>
+      </div>
+    </div>
+
+    <script>
+    (function() {
+      var adapterModels = ${adapterModelsJson};
+      var adapterSel = document.getElementById('adapter-select');
+      var modelSel = document.getElementById('model-select');
+      var form = document.getElementById('settings-form');
+      var status = document.getElementById('save-status');
+      var warning = document.getElementById('session-warning');
+      var origAdapter = '${escapeHtml(currentAdapter.id)}';
+      var currentModel = '${escapeHtml(currentModel)}';
+
+      function populateModels(adapterId) {
+        var models = adapterModels[adapterId] || [];
+        modelSel.innerHTML = '<option value="">Default</option>';
+        models.forEach(function(m) {
+          var opt = document.createElement('option');
+          opt.value = m.id;
+          opt.textContent = m.label + ' (' + m.id + ')';
+          if (m.id === currentModel && adapterId === origAdapter) opt.selected = true;
+          modelSel.appendChild(opt);
+        });
+      }
+
+      populateModels(adapterSel.value);
+
+      adapterSel.addEventListener('change', function() {
+        currentModel = '';
+        populateModels(this.value);
+        warning.style.display = this.value !== origAdapter ? 'inline' : 'none';
+      });
+
+      form.addEventListener('submit', function(e) {
+        e.preventDefault();
+        var body = { adapter: adapterSel.value, model: modelSel.value };
+        fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        }).then(function(r) { return r.json(); }).then(function(data) {
+          if (data.ok) {
+            status.textContent = 'Settings saved. Changes apply to new turns.';
+            status.style.background = '#1f6f2b';
+            status.style.color = '#3fb950';
+            status.style.display = 'block';
+            origAdapter = body.adapter;
+            currentModel = body.model;
+            warning.style.display = 'none';
+            setTimeout(function() { location.reload(); }, 1200);
+          } else {
+            status.textContent = 'Error: ' + (data.error || 'unknown');
+            status.style.background = '#3d1d26';
+            status.style.color = '#f85149';
+            status.style.display = 'block';
+          }
+        }).catch(function(err) {
+          status.textContent = 'Network error: ' + err.message;
+          status.style.background = '#3d1d26';
+          status.style.color = '#f85149';
+          status.style.display = 'block';
+        });
+      });
+    })();
+    </script>`;
+}
+
 // -- Server --
 
 export function startUiServer(): void {
   const app = express();
+  app.use(express.json());
 
   app.get('/', (_req, res) => {
     const body = renderStatusBar() + renderConversationList();
@@ -667,6 +790,42 @@ export function startUiServer(): void {
   app.get('/checkins', async (_req, res) => {
     const body = renderStatusBar() + await renderCheckins();
     res.send(renderLayout('Check-ins', body, 'checkins'));
+  });
+
+  app.get('/settings', (_req, res) => {
+    const body = renderSettingsPage();
+    res.send(renderLayout('Settings', body, 'settings'));
+  });
+
+  app.get('/api/settings', (_req, res) => {
+    const settings = getAllSettings();
+    const adapters = getAdapters();
+    const info = getActiveAdapterInfo();
+    res.json({ settings, activeAdapter: info.adapter, activeModel: info.model, adapters: Object.values(adapters).map(a => ({ id: a.id, name: a.name, models: a.models })) });
+  });
+
+  app.post('/api/settings', (req, res) => {
+    const { adapter, model } = req.body as { adapter?: string; model?: string };
+    const adapters = getAdapters();
+
+    if (adapter != null) {
+      if (!adapters[adapter]) {
+        res.json({ ok: false, error: `Unknown adapter: ${adapter}` });
+        return;
+      }
+      setSetting('adapter', adapter);
+    }
+
+    if (model != null) {
+      if (model === '') {
+        setSetting('model', '');
+      } else {
+        setSetting('model', model);
+      }
+    }
+
+    const info = getActiveAdapterInfo();
+    res.json({ ok: true, adapter: info.adapter, model: info.model });
   });
 
   app.get('/api/status', (_req, res) => {

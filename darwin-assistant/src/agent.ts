@@ -7,12 +7,84 @@ import {
   addTurn,
   closeConversation as dbCloseConversation,
   touchConversation,
+  getSetting,
   type ConversationRow,
   type TurnMetadata,
 } from './conversation-db.js';
 
-const CLAUDE_BIN = process.env.CLAUDE_BIN ?? 'claude';
 const MAX_TOOL_TURNS = 50;
+
+export interface AdapterConfig {
+  id: string;
+  name: string;
+  bin: string;
+  models: { id: string; label: string }[];
+  buildArgs: (opts: { sessionId?: string | null; model?: string | null }) => string[];
+  envOverrides?: (env: Record<string, string>) => void;
+}
+
+const ADAPTERS: Record<string, AdapterConfig> = {
+  claude: {
+    id: 'claude',
+    name: 'Claude (Anthropic)',
+    bin: process.env.CLAUDE_BIN ?? 'claude',
+    models: [
+      { id: 'claude-opus-4-7', label: 'Opus 4.7' },
+      { id: 'claude-opus-4-6', label: 'Opus 4.6' },
+      { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
+      { id: 'claude-sonnet-4-5-20250514', label: 'Sonnet 4.5' },
+      { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
+    ],
+    buildArgs({ sessionId, model }) {
+      const args = ['--print', '-', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
+      if (model) args.push('--model', model);
+      if (sessionId) args.push('--resume', sessionId);
+      return args;
+    },
+    envOverrides(env) { delete env['ANTHROPIC_API_KEY']; },
+  },
+  codex: {
+    id: 'codex',
+    name: 'Codex (OpenAI)',
+    bin: process.env.CODEX_BIN ?? 'codex',
+    models: [
+      { id: 'o4-mini', label: 'o4-mini' },
+      { id: 'o3', label: 'o3' },
+      { id: 'gpt-4.1', label: 'GPT-4.1' },
+    ],
+    buildArgs({ model }) {
+      const args = ['--full-auto'];
+      if (model) args.push('--model', model);
+      return args;
+    },
+  },
+  auggie: {
+    id: 'auggie',
+    name: 'Auggie (Augment)',
+    bin: process.env.AUGGIE_BIN ?? 'auggie',
+    models: [
+      { id: 'default', label: 'Default' },
+    ],
+    buildArgs() {
+      return ['--dangerously-skip-permissions'];
+    },
+  },
+};
+
+export function getAdapters(): Record<string, AdapterConfig> {
+  return ADAPTERS;
+}
+
+function getActiveAdapter(): AdapterConfig {
+  const adapterId = getSetting('adapter') ?? 'claude';
+  return ADAPTERS[adapterId] ?? ADAPTERS.claude;
+}
+
+export function getActiveAdapterInfo(): { adapter: string; model: string | null } {
+  const adapter = getActiveAdapter();
+  const model = getSetting('model');
+  return { adapter: adapter.id, model };
+}
 
 // Track which conversation is currently being processed (for observability UI)
 let activeConversationId: number | null = null;
@@ -136,22 +208,15 @@ function parseToolCall(
 const UNKNOWN_SESSION_RE = /no conversation found with session id|unknown session|session .* not found/i;
 
 async function runClaude(input: string, sessionId?: string | null): Promise<ClaudeResult> {
+  const adapter = getActiveAdapter();
+  const model = getSetting('model');
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
-  delete env['ANTHROPIC_API_KEY'];
+  adapter.envOverrides?.(env);
 
-  const args = [
-    '--print', '-',
-    '--output-format', 'stream-json',
-    '--verbose',
-    '--dangerously-skip-permissions',
-  ];
-
-  if (sessionId) {
-    args.push('--resume', sessionId);
-  }
+  const args = adapter.buildArgs({ sessionId, model });
 
   return new Promise((resolve, reject) => {
-    const child = spawn(CLAUDE_BIN, args, { env });
+    const child = spawn(adapter.bin, args, { env });
     const outChunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
 

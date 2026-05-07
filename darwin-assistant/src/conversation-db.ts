@@ -207,4 +207,49 @@ export function countTurns(conversationId: number): number {
   return stmts.countTurns.get(conversationId)?.cnt ?? 0;
 }
 
+// -- Settings table --
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
+const settingsStmts = {
+  get: db.prepare<[string], { key: string; value: string; updated_at: string }>(
+    `SELECT * FROM settings WHERE key = ?`,
+  ),
+  getAll: db.prepare<[], { key: string; value: string; updated_at: string }>(
+    `SELECT * FROM settings ORDER BY key`,
+  ),
+  upsert: db.prepare<[string, string]>(
+    `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+  ),
+  remove: db.prepare<[string]>(
+    `DELETE FROM settings WHERE key = ?`,
+  ),
+};
+
+export function getSetting(key: string): string | null {
+  return settingsStmts.get.get(key)?.value ?? null;
+}
+
+export function getAllSettings(): Record<string, string> {
+  const rows = settingsStmts.getAll.all();
+  const result: Record<string, string> = {};
+  for (const r of rows) result[r.key] = r.value;
+  return result;
+}
+
+export function setSetting(key: string, value: string): void {
+  settingsStmts.upsert.run(key, value);
+}
+
+export function deleteSetting(key: string): void {
+  settingsStmts.remove.run(key);
+}
+
 export { db as sqliteDb };

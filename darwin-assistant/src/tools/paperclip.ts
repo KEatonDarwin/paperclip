@@ -216,6 +216,59 @@ export const updateIssueStatus: ToolDef = {
   },
 };
 
+export const updateIssue: ToolDef = {
+  name: 'update_issue',
+  description:
+    'Update fields on a Paperclip issue: reassign, change priority, move to a project, or edit title/description. Use this for field changes; use update_issue_status for status-only changes.',
+  parameters: {
+    type: 'object',
+    properties: {
+      identifier: { type: 'string', description: 'Issue identifier, e.g. DAR-382' },
+      assigneeAgentId: {
+        type: 'string',
+        description: 'UUID of the agent to assign this issue to',
+      },
+      priority: {
+        type: 'string',
+        enum: ['critical', 'high', 'medium', 'low'],
+      },
+      projectId: { type: 'string', description: 'UUID of the project to move this issue to' },
+      title: { type: 'string', description: 'New title for the issue' },
+      description: { type: 'string', description: 'New description for the issue' },
+    },
+    required: ['identifier'],
+  },
+  execute: async (args) => {
+    const { identifier, assigneeAgentId, priority, projectId, title, description } = args as {
+      identifier: string;
+      assigneeAgentId?: string;
+      priority?: string;
+      projectId?: string;
+      title?: string;
+      description?: string;
+    };
+
+    const issues = await query<{ id: string }>(
+      `SELECT id FROM issues WHERE company_id = $1 AND identifier = $2`,
+      [DARWIN_COMPANY_ID, identifier],
+    );
+    if (!issues.length) return { error: `Issue ${identifier} not found` };
+    const issueId = issues[0].id;
+
+    const patch: Record<string, unknown> = {};
+    if (assigneeAgentId !== undefined) patch.assigneeAgentId = assigneeAgentId;
+    if (priority !== undefined) patch.priority = priority;
+    if (projectId !== undefined) patch.projectId = projectId;
+    if (title !== undefined) patch.title = title;
+    if (description !== undefined) patch.description = description;
+
+    if (!Object.keys(patch).length) return { error: 'No fields to update' };
+
+    await apiPatch(`/api/companies/${DARWIN_COMPANY_ID}/issues/${issueId}`, patch);
+    return { identifier, updated: true, fields: Object.keys(patch) };
+  },
+};
+
 export const addComment: ToolDef = {
   name: 'add_comment',
   description: 'Add a comment to a Paperclip issue.',

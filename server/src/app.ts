@@ -10,6 +10,7 @@ import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
 import { healthRoutes } from "./routes/health.js";
+import { buildInfoRoutes } from "./routes/build-info.js";
 import { companyRoutes } from "./routes/companies.js";
 import { companySkillRoutes } from "./routes/company-skills.js";
 import { agentRoutes } from "./routes/agents.js";
@@ -35,6 +36,7 @@ import { digestRoutes } from "./routes/digests.js";
 import { quickNoteRoutes } from "./routes/quick-notes.js";
 import { hopperRoutes } from "./routes/hopper.js";
 import { scheduledTaskRoutes } from "./routes/scheduled-tasks.js";
+import { webhookRoutes } from "./routes/webhooks.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -146,6 +148,7 @@ export async function createApp(
       companyDeletionEnabled: opts.companyDeletionEnabled,
     }),
   );
+  api.use("/build-info", buildInfoRoutes());
   api.use("/companies", companyRoutes(db, opts.storageService));
   api.use(companySkillRoutes(db));
   api.use(agentRoutes(db));
@@ -169,6 +172,7 @@ export async function createApp(
   api.use(quickNoteRoutes(db));
   api.use(hopperRoutes(db));
   api.use(scheduledTaskRoutes(db));
+  api.use(webhookRoutes(db));
   const hostServicesDisposers = new Map<string, () => void>();
   const workerManager = createPluginWorkerManager();
   const pluginRegistry = pluginRegistryService(db);

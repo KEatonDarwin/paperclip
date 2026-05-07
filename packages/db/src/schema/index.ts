@@ -66,3 +66,4 @@ export { quickNotes, quickNoteThreads } from "./quick_notes.js";
 export { hopperItems, hopperItemThreads } from "./hopper_items.js";
 export { hopperPreferences } from "./hopper_preferences.js";
 export { scheduledTasks, scheduledTaskThreads } from "./scheduled_tasks.js";
+export { webhooks, webhookDeliveries } from "./webhooks.js";

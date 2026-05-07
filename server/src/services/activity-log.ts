@@ -9,6 +9,7 @@ import { sanitizeRecord } from "../redaction.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { dispatchOutboundWebhooks } from "./webhook-dispatch.js";
 
 const PLUGIN_EVENT_SET: ReadonlySet<string> = new Set(PLUGIN_EVENT_TYPES);
 
@@ -91,4 +92,6 @@ export async function logActivity(db: Db, input: LogActivityInput) {
       }
     }).catch(() => {});
   }
+
+  void dispatchOutboundWebhooks(db, input).catch(() => {});
 }

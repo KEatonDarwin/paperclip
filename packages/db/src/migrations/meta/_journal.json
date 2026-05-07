@@ -421,6 +421,20 @@
       "when": 1745842000000,
       "tag": "0059_project_default_assignee",
       "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1746612000000,
+      "tag": "0060_jarvis_checkins",
+      "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1746640000000,
+      "tag": "0061_outbound_webhooks",
+      "breakpoints": true
     }
   ]
 }

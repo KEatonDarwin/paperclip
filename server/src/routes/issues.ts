@@ -952,8 +952,8 @@ export function issueRoutes(db: Db, storage: StorageService) {
     res.status(201).json(issue);
   });
 
-  router.patch("/issues/:id", validate(updateIssueRouteSchema), async (req, res) => {
-    const id = req.params.id as string;
+  const updateIssueHandler = async (req: Request, res: Response) => {
+    const id = (req.params.id ?? req.params.issueId) as string;
     const existing = await svc.getById(id);
     if (!existing) {
       res.status(404).json({ error: "Issue not found" });
@@ -1217,7 +1217,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
     })();
 
     res.json({ ...issue, comment });
-  });
+  };
+  router.patch("/issues/:id", validate(updateIssueRouteSchema), updateIssueHandler);
+  router.patch("/companies/:companyId/issues/:issueId", validate(updateIssueRouteSchema), updateIssueHandler);
 
   router.delete("/issues/:id", async (req, res) => {
     const id = req.params.id as string;
@@ -1414,8 +1416,8 @@ export function issueRoutes(db: Db, storage: StorageService) {
     res.json(comment);
   });
 
-  router.post("/issues/:id/comments", validate(addIssueCommentSchema), async (req, res) => {
-    const id = req.params.id as string;
+  const addCommentHandler = async (req: Request, res: Response) => {
+    const id = (req.params.id ?? req.params.issueId) as string;
     const issue = await svc.getById(id);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
@@ -1612,7 +1614,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
     })();
 
     res.status(201).json(comment);
-  });
+  };
+  router.post("/issues/:id/comments", validate(addIssueCommentSchema), addCommentHandler);
+  router.post("/companies/:companyId/issues/:issueId/comments", validate(addIssueCommentSchema), addCommentHandler);
 
   router.get("/issues/:id/attachments", async (req, res) => {
     const issueId = req.params.id as string;

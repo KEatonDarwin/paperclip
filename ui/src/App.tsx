@@ -41,8 +41,11 @@ import { Voice } from "./pages/Voice";
 import { YouTube } from "./pages/YouTube";
 import { ApiRunner } from "./pages/ApiRunner";
 import { ShimRunner } from "./pages/ShimRunner";
+import { PluginRunner } from "./pages/PluginRunner";
 import { CalendarPage } from "./pages/CalendarPage";
 import { DigestPlayerPage } from "./pages/DigestPlayerPage";
+import { Secrets } from "./pages/Secrets";
+import { Webhooks } from "./pages/Webhooks";
 import { NewAgent } from "./pages/NewAgent";
 import { AuthPage } from "./pages/Auth";
 import { BoardClaimPage } from "./pages/BoardClaim";
@@ -133,6 +136,8 @@ function boardRoutes() {
       <Route path="company/export/*" element={<CompanyExport />} />
       <Route path="company/import" element={<CompanyImport />} />
       <Route path="skills/*" element={<CompanySkills />} />
+      <Route path="secrets" element={<Secrets />} />
+      <Route path="webhooks" element={<Webhooks />} />
       <Route path="settings" element={<LegacySettingsRedirect />} />
       <Route path="settings/*" element={<LegacySettingsRedirect />} />
       <Route path="plugins/:pluginId" element={<PluginPage />} />
@@ -141,6 +146,7 @@ function boardRoutes() {
       <Route path="youtube" element={<YouTube />} />
       <Route path="api-runner" element={<ApiRunner />} />
       <Route path="shim-runner" element={<ShimRunner />} />
+      <Route path="plugin-runner" element={<PluginRunner />} />
       <Route path="calendar" element={<CalendarPage />} />
       <Route path="digest-player" element={<DigestPlayerPage />} />
       <Route path="agents" element={<Navigate to="/agents/all" replace />} />
@@ -340,6 +346,8 @@ export function App() {
           <Route path="routines" element={<UnprefixedBoardRedirect />} />
           <Route path="routines/:routineId" element={<UnprefixedBoardRedirect />} />
           <Route path="calendar" element={<UnprefixedBoardRedirect />} />
+          <Route path="secrets" element={<UnprefixedBoardRedirect />} />
+          <Route path="webhooks" element={<UnprefixedBoardRedirect />} />
           <Route path="skills/*" element={<UnprefixedBoardRedirect />} />
           <Route path="settings" element={<LegacySettingsRedirect />} />
           <Route path="settings/*" element={<LegacySettingsRedirect />} />

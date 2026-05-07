@@ -4,6 +4,7 @@ import { createSlackApp, sendDailyBriefing } from './handlers/slack.js';
 import { createWebhookRouter } from './handlers/webhook.js';
 import { startCheckinWorker } from './checkin-worker.js';
 import { enqueueCalendarCheckins } from './briefing.js';
+import { startUiServer } from './ui-server.js';
 
 const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT ?? '3200', 10);
 const SLACK_ENABLED = !!(process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN);
@@ -53,6 +54,8 @@ async function main() {
     console.log(`  POST http://localhost:${WEBHOOK_PORT}/api/intake`);
     console.log(`  GET  http://localhost:${WEBHOOK_PORT}/api/health`);
   });
+
+  startUiServer();
 
   if (SLACK_ENABLED) {
     const slackApp = createSlackApp();

@@ -1,0 +1,28 @@
+{
+  "name": "darwin-assistant",
+  "version": "0.1.0",
+  "description": "External Darwin AI assistant — voice intake, Slack bot, full Paperclip access",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsc",
+    "build:run": "tsc && node dist/index.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^4.0.0",
+    "better-sqlite3": "^12.9.0",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.0",
+    "pg": "^8.11.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}

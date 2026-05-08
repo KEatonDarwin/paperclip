@@ -1,10 +1,22 @@
 import express from 'express';
 import { processMessage } from '../agent.js';
+import { handlePaperclipWebhook } from './paperclip-webhook.js';
 
 export function createWebhookRouter() {
   const router = express.Router();
 
   router.use(express.json());
+
+  router.post('/paperclip-webhook', async (req, res) => {
+    try {
+      const result = await handlePaperclipWebhook(req.body);
+      res.json(result);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error('[paperclip-webhook] Error:', errMsg);
+      res.status(500).json({ error: errMsg });
+    }
+  });
 
   router.post('/intake', async (req, res) => {
     const { text, source = 'webhook', sessionId } = req.body as {

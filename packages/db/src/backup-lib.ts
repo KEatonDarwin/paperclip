@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import postgres from "postgres";
 
@@ -153,14 +153,28 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   try {
     await sql`SELECT 1`;
 
-    const lines: string[] = [];
-    const emit = (line: string) => lines.push(line);
+    mkdirSync(opts.backupDir, { recursive: true });
+    const backupFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
+    const stream = createWriteStream(backupFile, { encoding: "utf8" });
+    let streamError: Error | null = null;
+    stream.on("error", (err) => { streamError = err; });
+
+    const emit = (line: string) => { stream.write(line + "\n"); };
     const emitStatement = (statement: string) => {
       emit(statement);
       emit(STATEMENT_BREAKPOINT);
     };
     const emitStatementBoundary = () => {
       emit(STATEMENT_BREAKPOINT);
+    };
+    const flushIfNeeded = async () => {
+      if (streamError) throw streamError;
+      if (stream.writableNeedDrain) {
+        await new Promise<void>((res, rej) => {
+          stream.once("drain", res);
+          stream.once("error", rej);
+        });
+      }
     };
 
     emit("-- Paperclip database backup");
@@ -479,6 +493,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         });
         emitStatement(`INSERT INTO ${qualifiedTableName} (${colNames}) VALUES (${values.join(", ")});`);
       }
+      await flushIfNeeded();
       emit("");
     }
 
@@ -503,10 +518,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     emitStatement("COMMIT;");
     emit("");
 
-    // Write the backup file
-    mkdirSync(opts.backupDir, { recursive: true });
-    const backupFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
-    await writeFile(backupFile, lines.join("\n"), "utf8");
+    await new Promise<void>((res, rej) => {
+      stream.end((err?: Error | null) => err ? rej(err) : res());
+    });
+    if (streamError) throw streamError;
 
     const sizeBytes = statSync(backupFile).size;
     const prunedCount = pruneOldBackups(opts.backupDir, retentionDays, filenamePrefix);

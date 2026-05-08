@@ -11,6 +11,7 @@ import {
   type ConversationRow,
   type TurnMetadata,
 } from './conversation-db.js';
+import { sseBus, type StatusEvent } from './sse-bus.js';
 
 const MAX_TOOL_TURNS = 50;
 
@@ -257,11 +258,14 @@ export async function processMessage(
   activeConversationId = conv.id;
   activeStartedAt = Date.now();
 
+  sseBus.emit('sse', { type: 'status', running: true, activeConversationId: conv.id } satisfies StatusEvent);
+
   try {
     return await runConversationTurn(conv, input);
   } finally {
     activeConversationId = null;
     activeStartedAt = null;
+    sseBus.emit('sse', { type: 'status', running: false, activeConversationId: null } satisfies StatusEvent);
   }
 }
 

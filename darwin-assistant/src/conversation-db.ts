@@ -1,6 +1,7 @@
 import Database, { type Database as DatabaseType } from 'better-sqlite3';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { sseBus, type TurnEvent, type ConversationCreatedEvent, type ConversationUpdatedEvent } from './sse-bus.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = process.env.JARVIS_DB_PATH ?? path.join(__dirname, '..', 'jarvis.db');
@@ -148,7 +149,15 @@ export function getOrCreateConversation(externalId: string, slackChannel?: strin
     );
   }
   stmts.createConversation.run(externalId, slackChannel ?? null);
-  return stmts.getConversation.get(externalId)!;
+  const created = stmts.getConversation.get(externalId)!;
+  sseBus.emit('sse', {
+    type: 'conversation_created',
+    conversationId: created.id,
+    externalId: created.external_id,
+    status: created.status,
+    createdAt: created.created_at,
+  } satisfies ConversationCreatedEvent);
+  return created;
 }
 
 export function updateSessionId(conversationId: number, sessionId: string): void {
@@ -179,7 +188,7 @@ export function addTurn(
 ): number {
   const maxRow = stmts.getMaxTurnIndex.get(conversationId);
   const nextIndex = (maxRow?.max_idx ?? -1) + 1;
-  stmts.insertTurn.run(
+  const info = stmts.insertTurn.run(
     conversationId, nextIndex, role, content,
     toolName ?? null, toolArgs ?? null, toolResult ?? null,
     metadata?.timingMs ?? null, metadata?.inputTokens ?? null,
@@ -188,6 +197,40 @@ export function addTurn(
     metadata?.claudeInput ?? null, metadata?.claudeOutput ?? null,
   );
   stmts.touchConversation.run(conversationId);
+
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  sseBus.emit('sse', {
+    type: 'turn',
+    conversationId,
+    turn: {
+      id: Number(info.lastInsertRowid),
+      turn_index: nextIndex,
+      role,
+      content: content ?? null,
+      tool_name: toolName ?? null,
+      tool_args: toolArgs ?? null,
+      tool_result: toolResult ?? null,
+      created_at: now,
+      timing_ms: metadata?.timingMs ?? null,
+      input_tokens: metadata?.inputTokens ?? null,
+      output_tokens: metadata?.outputTokens ?? null,
+      cache_read_tokens: metadata?.cacheReadTokens ?? null,
+      cache_write_tokens: metadata?.cacheWriteTokens ?? null,
+      model: metadata?.model ?? null,
+      claude_input: metadata?.claudeInput ?? null,
+      claude_output: metadata?.claudeOutput ?? null,
+    },
+  } satisfies TurnEvent);
+
+  const turnCount = stmts.countTurns.get(conversationId)?.cnt ?? 0;
+  sseBus.emit('sse', {
+    type: 'conversation_updated',
+    conversationId,
+    status: 'active',
+    updatedAt: now,
+    turnCount,
+  } satisfies ConversationUpdatedEvent);
+
   return nextIndex;
 }
 

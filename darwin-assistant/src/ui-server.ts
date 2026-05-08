@@ -11,6 +11,8 @@ import {
 import { getActiveConversation, getAdapters, getActiveAdapterInfo } from './agent.js';
 import { getAllSettings, getSetting, setSetting } from './conversation-db.js';
 import { query } from './db.js';
+import { sseBus, type SSEEvent } from './sse-bus.js';
+import type { Response } from 'express';
 
 const UI_PORT = parseInt(process.env.JARVIS_UI_PORT ?? '3201', 10);
 
@@ -260,7 +262,7 @@ function groupTurnsIntoExchanges(turns: TurnRow[]): Exchange[] {
 
 // -- Layout --
 
-function renderLayout(title: string, body: string, nav?: string): string {
+function renderLayout(title: string, body: string, nav?: string, scripts?: string): string {
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -286,6 +288,12 @@ function renderLayout(title: string, body: string, nav?: string): string {
     .badge-closed { background: #3d1d26; color: #f85149; }
     .badge-running { background: #1a3a5c; color: #58a6ff; animation: pulse 1.5s infinite; }
     @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+    .conn-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+    .conn-dot.live { background: #3fb950; box-shadow: 0 0 4px #3fb950; }
+    .conn-dot.reconnecting { background: #d29922; animation: pulse 1s infinite; }
+    .conn-dot.lost { background: #f85149; }
+    .fade-in { animation: fadeIn 0.4s ease-in; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
     table { width: 100%; border-collapse: collapse; }
     th { text-align: left; padding: 8px 12px; border-bottom: 2px solid #30363d; color: #8b949e; font-size: 12px; text-transform: uppercase; }
     td { padding: 8px 12px; border-bottom: 1px solid #21262d; font-size: 14px; }
@@ -360,7 +368,8 @@ function renderLayout(title: string, body: string, nav?: string): string {
         &nbsp;·&nbsp;
         <a href="/settings" ${nav === 'settings' ? 'class="active"' : ''}>Settings</a>
       </nav>
-      <div style="margin-left:auto; font-size:12px; color:#8b949e;">
+      <div style="margin-left:auto; font-size:12px; color:#8b949e; display:flex; align-items:center; gap:12px;">
+        <span id="conn-status"><span class="conn-dot" id="conn-dot"></span><span id="conn-label"></span></span>
         ${(() => { const info = getActiveAdapterInfo(); const adapters = getAdapters(); const a = adapters[info.adapter]; return `<span style="color:#d2a8ff;">${escapeHtml(a?.name ?? info.adapter)}</span> · <span style="color:#3fb950;">${escapeHtml(info.model ?? 'default')}</span>`; })()}
       </div>
     </div>
@@ -368,7 +377,26 @@ function renderLayout(title: string, body: string, nav?: string): string {
   <div class="container">${body}</div>
   <script>
   function copyJson(btn){var p=btn.closest('.copy-wrap').querySelector('pre');navigator.clipboard.writeText(p.textContent).then(function(){btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy'},1500)})}
+
+  var _sse=null;
+  function connectSSE(url){
+    var dot=document.getElementById('conn-dot');
+    var label=document.getElementById('conn-label');
+    function setState(s){
+      dot.className='conn-dot '+s;
+      label.textContent=s==='live'?'Live':s==='reconnecting'?'Reconnecting…':'Disconnected';
+    }
+    setState('reconnecting');
+    _sse=new EventSource(url);
+    _sse.onopen=function(){setState('live')};
+    _sse.onerror=function(){
+      if(_sse.readyState===EventSource.CONNECTING) setState('reconnecting');
+      else setState('lost');
+    };
+    return _sse;
+  }
   </script>
+  ${scripts ?? ''}
 </body>
 </html>`;
 }
@@ -415,19 +443,19 @@ function renderConversationList(): string {
     const label = parts[0] === 'slack' ? `#${parts[1]}` : parts[0];
     const threadId = parts[0] === 'slack' ? parts[2]?.slice(0, 10) : c.external_id.slice(0, 20);
 
-    return `<tr>
+    return `<tr data-conv-id="${c.id}">
       <td><a href="/conversations/${c.id}">${label}</a></td>
       <td class="conv-id">${escapeHtml(threadId ?? '')}</td>
-      <td>${statusBadge}</td>
-      <td>${turns}</td>
+      <td class="conv-status">${statusBadge}</td>
+      <td class="conv-turns">${turns}</td>
       <td>${c.claude_session_id ? escapeHtml(c.claude_session_id.slice(0, 12)) + '…' : '—'}</td>
-      <td>${timeAgo(c.updated_at)}</td>
+      <td class="conv-time">${timeAgo(c.updated_at)}</td>
     </tr>`;
   }).join('');
 
   return `<table>
     <thead><tr><th>Source</th><th>Thread</th><th>Status</th><th>Turns</th><th>Session</th><th>Last Active</th></tr></thead>
-    <tbody>${rows}</tbody>
+    <tbody id="conv-tbody">${rows}</tbody>
   </table>`;
 }
 
@@ -605,7 +633,7 @@ function renderConversationDetail(conv: ConversationRow, turns: TurnRow[]): stri
     ? exchanges.map(renderExchange).join('')
     : '<div class="empty">No turns recorded yet.</div>';
 
-  return `<div class="back"><a href="/">← All Conversations</a></div>${meta}<div class="section"><h2>Conversation</h2>${exchangesHtml}</div>`;
+  return `<div class="back"><a href="/">← All Conversations</a></div>${meta}<div class="section"><h2>Conversation</h2><div id="live-turns">${exchangesHtml}</div></div>`;
 }
 
 // -- Check-ins --
@@ -774,7 +802,56 @@ export function startUiServer(): void {
 
   app.get('/', (_req, res) => {
     const body = renderStatusBar() + renderConversationList();
-    res.send(renderLayout('Dashboard', body, 'home'));
+    const scripts = `<script>
+(function(){
+  var es=connectSSE('/api/events');
+
+  es.addEventListener('conversation_updated',function(e){
+    var d=JSON.parse(e.data);
+    var row=document.querySelector('tr[data-conv-id="'+d.conversationId+'"]');
+    if(!row) return;
+    var tc=row.querySelector('.conv-turns');
+    if(tc) tc.textContent=d.turnCount;
+    var ti=row.querySelector('.conv-time');
+    if(ti) ti.textContent='just now';
+  });
+
+  es.addEventListener('conversation_created',function(e){
+    var d=JSON.parse(e.data);
+    var tbody=document.getElementById('conv-tbody');
+    if(!tbody) return;
+    var parts=d.externalId.split(':');
+    var label=parts[0]==='slack'?'#'+parts[1]:parts[0];
+    var threadId=parts[0]==='slack'?(parts[2]||'').slice(0,10):d.externalId.slice(0,20);
+    var tr=document.createElement('tr');
+    tr.setAttribute('data-conv-id',d.conversationId);
+    tr.className='fade-in';
+    tr.innerHTML='<td><a href="/conversations/'+d.conversationId+'">'+label+'</a></td>'
+      +'<td class="conv-id">'+threadId+'</td>'
+      +'<td class="conv-status"><span class="badge badge-active">Active</span></td>'
+      +'<td class="conv-turns">0</td>'
+      +'<td>—</td>'
+      +'<td class="conv-time">just now</td>';
+    tbody.insertBefore(tr,tbody.firstChild);
+  });
+
+  es.addEventListener('status',function(e){
+    var d=JSON.parse(e.data);
+    var rows=document.querySelectorAll('tr[data-conv-id]');
+    rows.forEach(function(row){
+      var cid=parseInt(row.getAttribute('data-conv-id'));
+      var cell=row.querySelector('.conv-status');
+      if(!cell) return;
+      if(d.running && d.activeConversationId===cid){
+        cell.innerHTML='<span class="badge badge-running">Running</span>';
+      } else if(cell.querySelector('.badge-running')){
+        cell.innerHTML='<span class="badge badge-active">Active</span>';
+      }
+    });
+  });
+})();
+</script>`;
+    res.send(renderLayout('Dashboard', body, 'home', scripts));
   });
 
   app.get('/conversations/:id', (req, res) => {
@@ -784,7 +861,114 @@ export function startUiServer(): void {
     if (!conv) { res.status(404).send('Not found'); return; }
     const turns = getTurns(conv.id);
     const body = renderConversationDetail(conv, turns);
-    res.send(renderLayout(`Conv #${id}`, body));
+    const lastTurnIndex = turns.length > 0 ? turns[turns.length - 1].turn_index : -1;
+    const scripts = `<script>
+(function(){
+  var convId=${id};
+  var lastIndex=${lastTurnIndex};
+  var container=document.getElementById('live-turns');
+  var pinnedToBottom=true;
+
+  function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML}
+  function fmtMs(ms){return ms<1000?ms+'ms':(ms/1000).toFixed(1)+'s'}
+
+  window.addEventListener('scroll',function(){
+    pinnedToBottom=(window.innerHeight+window.scrollY)>=document.body.offsetHeight-80;
+  });
+
+  function scrollIfPinned(){
+    if(pinnedToBottom) window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'});
+  }
+
+  function renderUserTurn(t){
+    var ts=t.created_at?new Date(t.created_at+'Z').toLocaleString('en-US',{timeZone:'America/Chicago',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}):'';
+    return '<div class="msg msg-user fade-in">'
+      +'<div class="msg-header"><span>User</span><span>'+esc(ts)+'</span></div>'
+      +'<div class="msg-body">'+esc(t.content||'')+'</div></div>';
+  }
+
+  function renderToolCall(t){
+    var timing=t.timing_ms?'Model: '+fmtMs(t.timing_ms):'';
+    return '<div class="tool-group fade-in">'
+      +'<div class="tool-group-header"><span class="tool-name">'+esc(t.tool_name||'?')+'</span>'
+      +(timing?'<span class="tool-timing">'+timing+'</span>':'')
+      +'</div>'
+      +(t.tool_args?'<details class="tool-detail"><summary>Arguments</summary><pre class="json-block">'+esc(t.tool_args)+'</pre></details>':'')
+      +'</div>';
+  }
+
+  function renderToolResult(t){
+    var timing=t.timing_ms?'Exec: '+fmtMs(t.timing_ms):'';
+    var last=container.querySelector('.tool-group:last-child');
+    if(last){
+      var hdr=last.querySelector('.tool-timing');
+      if(hdr&&timing) hdr.textContent+=' → '+timing;
+      var content=t.tool_result||'';
+      var det=document.createElement('div');
+      det.innerHTML='<details class="tool-detail"><summary>Result</summary><pre class="json-block">'+esc(content)+'</pre></details>';
+      last.appendChild(det.firstElementChild);
+      return '';
+    }
+    return '<div class="tool-group fade-in"><div class="tool-group-header"><span class="tool-name">result</span>'
+      +(timing?'<span class="tool-timing">'+timing+'</span>':'')+'</div>'
+      +(t.tool_result?'<details class="tool-detail"><summary>Result</summary><pre class="json-block">'+esc(t.tool_result)+'</pre></details>':'')
+      +'</div>';
+  }
+
+  function renderAssistant(t){
+    var ts=t.created_at?new Date(t.created_at+'Z').toLocaleString('en-US',{timeZone:'America/Chicago',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}):'';
+    var stats=[];
+    if(t.timing_ms) stats.push('Model: '+fmtMs(t.timing_ms));
+    if(t.input_tokens||t.output_tokens) stats.push((t.input_tokens||0).toLocaleString()+' in / '+(t.output_tokens||0).toLocaleString()+' out');
+    if(t.model) stats.push(esc(t.model));
+    var meta=stats.length?'<div class="debug-panel"><details><summary class="debug-summary"><span class="debug-badge">debug</span>'+stats.map(function(s){return '<span class="debug-stat">'+s+'</span>'}).join('')+'</summary></details></div>':'';
+    return '<div class="msg msg-assistant fade-in">'
+      +'<div class="msg-header"><span>Assistant</span><span>'+esc(ts)+'</span></div>'
+      +(t.content?'<div class="msg-body">'+esc(t.content)+'</div>':'')
+      +meta+'</div>';
+  }
+
+  var es=connectSSE('/api/conversations/'+convId+'/events');
+
+  es.addEventListener('turn',function(e){
+    var d=JSON.parse(e.data);
+    if(d.conversationId!==convId) return;
+    var t=d.turn;
+    if(t.turn_index<=lastIndex) return;
+    lastIndex=t.turn_index;
+
+    var html='';
+    if(t.role==='user') html=renderUserTurn(t);
+    else if(t.role==='tool_call') html=renderToolCall(t);
+    else if(t.role==='tool_result') html=renderToolResult(t);
+    else if(t.role==='assistant') html=renderAssistant(t);
+
+    if(html){
+      var div=document.createElement('div');
+      div.innerHTML=html;
+      while(div.firstChild) container.appendChild(div.firstChild);
+    }
+    scrollIfPinned();
+  });
+
+  es.addEventListener('status',function(e){
+    var d=JSON.parse(e.data);
+    var badges=document.querySelectorAll('.status-bar .badge');
+    badges.forEach(function(b){
+      if(d.running&&d.activeConversationId===convId){
+        if(!b.classList.contains('badge-running')){
+          b.className='badge badge-running';
+          b.textContent='Running';
+        }
+      } else if(b.classList.contains('badge-running')){
+        b.className='badge badge-active';
+        b.textContent='Active';
+      }
+    });
+  });
+})();
+</script>`;
+    res.send(renderLayout(`Conv #${id}`, body, undefined, scripts));
   });
 
   app.get('/checkins', async (_req, res) => {
@@ -851,6 +1035,45 @@ export function startUiServer(): void {
     if (!conv) { res.status(404).json({ error: 'Not found' }); return; }
     const turns = getTurns(conv.id);
     res.json({ ...conv, turns });
+  });
+
+  // -- SSE endpoints --
+
+  function setupSSE(res: Response, filter?: (ev: SSEEvent) => boolean): void {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.write(':\n\n');
+
+    const heartbeat = setInterval(() => res.write(':\n\n'), 15000);
+
+    const handler = (ev: SSEEvent) => {
+      if (filter && !filter(ev)) return;
+      res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+    };
+
+    sseBus.on('sse', handler);
+    res.on('close', () => {
+      clearInterval(heartbeat);
+      sseBus.off('sse', handler);
+    });
+  }
+
+  app.get('/api/events', (_req, res) => {
+    setupSSE(res);
+  });
+
+  app.get('/api/conversations/:id/events', (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) { res.status(400).json({ error: 'Invalid ID' }); return; }
+    setupSSE(res, (ev) => {
+      if (ev.type === 'status') return true;
+      if ('conversationId' in ev && ev.conversationId === id) return true;
+      return false;
+    });
   });
 
   app.listen(UI_PORT, () => {

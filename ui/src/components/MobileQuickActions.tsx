@@ -6,6 +6,7 @@ import {
   MessageCircle,
   CalendarPlus,
   FilePlus,
+  StickyNote,
   Bug,
   Send,
   ChevronRight,
@@ -86,12 +87,22 @@ export function MobileQuickActions({ pattern, onOpenChat }: MobileQuickActionsPr
     },
     {
       id: "create",
-      label: "Create",
+      label: "New Issue",
       icon: FilePlus,
       color: "bg-amber-500",
       action: () => {
         setIsOpen(false);
         openNewIssue();
+      },
+    },
+    {
+      id: "notes",
+      label: "Notes",
+      icon: StickyNote,
+      color: "bg-violet-500",
+      action: () => {
+        setIsOpen(false);
+        window.dispatchEvent(new CustomEvent("paperclip:open-quick-notes"));
       },
     },
     {
@@ -245,14 +256,14 @@ function BottomSheet({
           </div>
 
           {/* Actions grid */}
-          <div className="grid grid-cols-4 gap-4 px-6 pb-6 pt-2">
+          <div className="flex flex-wrap justify-center gap-4 px-6 pb-6 pt-2">
             {actions.map((item) => {
               const Icon = item.icon;
               return (
                 <button
                   key={item.id}
                   onClick={item.action}
-                  className="flex flex-col items-center gap-2 group"
+                  className="flex flex-col items-center gap-2 group w-16"
                 >
                   <div
                     className={cn(

@@ -1,4 +1,5 @@
 import { query } from '../db.js';
+import { getTrackedIssue } from '../conversation-db.js';
 
 const JARVIS_PROJECT_ID = '3e1aab03-f296-4992-b7a9-f6bf74b8f48e';
 
@@ -117,17 +118,30 @@ function buildCheckinReason(identifier: string, title: string): string {
   ].join('\n');
 }
 
-function buildReviewReadyReason(identifier: string, title: string): string {
-  return [
+function buildReviewReadyReason(identifier: string, title: string, originalAsk?: string | null): string {
+  const lines = [
     `Review ready: ${identifier} — "${title}" was moved to in_review by an agent.`,
     '',
+  ];
+
+  if (originalAsk) {
+    lines.push(
+      'This is an issue Kevin asked JARVIS to create. Remind him what he asked for:',
+      `- Original ask: "${originalAsk}"`,
+      '',
+    );
+  }
+
+  lines.push(
     'Let Kevin know briefly:',
     `- ${identifier} is ready for his review.`,
     '- Summarize what was done (check the latest issue comments).',
     '- Include a link to the issue.',
     '',
     'Keep it short — just a heads-up that something is waiting.',
-  ].join('\n');
+  );
+
+  return lines.join('\n');
 }
 
 export async function handlePaperclipWebhook(
@@ -197,12 +211,14 @@ export async function handlePaperclipWebhook(
   }
 
   // review_ready — always notify, fire on next worker poll (~60s)
+  const tracked = getTrackedIssue(issueId);
+
   console.log(
-    `[paperclip-webhook] ${issue.identifier} "${issue.title}" → in_review by agent ${data.actor?.id ?? '?'}`,
+    `[paperclip-webhook] ${issue.identifier} "${issue.title}" → in_review by agent ${data.actor?.id ?? '?'} (jarvis-created=${!!tracked})`,
   );
 
   const fireAt = new Date(Date.now() + 60 * 1000).toISOString();
-  const reason = buildReviewReadyReason(issue.identifier, issue.title);
+  const reason = buildReviewReadyReason(issue.identifier, issue.title, tracked?.original_ask);
 
   const rows = await query<{ id: string; fire_at: string }>(
     `INSERT INTO jarvis_checkins (fire_at, reason, source_type, source_id)

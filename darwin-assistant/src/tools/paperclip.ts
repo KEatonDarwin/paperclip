@@ -1,4 +1,5 @@
 import { query, DARWIN_COMPANY_ID } from '../db.js';
+import { trackCreatedIssue } from '../conversation-db.js';
 import type { ToolDef } from './index.js';
 
 function paperclipApi(): string {
@@ -44,7 +45,7 @@ async function apiPatch(path: string, body: unknown): Promise<unknown> {
 export const createIssue: ToolDef = {
   name: 'create_issue',
   description:
-    'Create a new issue/task in Paperclip. Use for software work, agent tasks, research, or anything that needs to be tracked and potentially delegated to an AI agent.',
+    'Create a new issue/task in Paperclip. Use for software work, agent tasks, research, or anything that needs to be tracked and potentially delegated to an AI agent. Always include originalAsk when creating on Kevin\'s behalf — a brief summary of what he asked for, so he gets context when the task is ready for review.',
   parameters: {
     type: 'object',
     properties: {
@@ -58,11 +59,12 @@ export const createIssue: ToolDef = {
       status: { type: 'string', enum: ['backlog', 'todo'], default: 'todo' },
       projectId: { type: 'string', description: 'UUID of the project this belongs to' },
       assigneeAgentId: { type: 'string', description: 'UUID of the agent to assign this to' },
+      originalAsk: { type: 'string', description: 'Brief summary of what Kevin originally asked for (e.g. "fix the webhook bug that drops events")' },
     },
     required: ['title'],
   },
   execute: async (args) => {
-    const { title, description, priority = 'medium', status = 'todo', projectId, assigneeAgentId } =
+    const { title, description, priority = 'medium', status = 'todo', projectId, assigneeAgentId, originalAsk } =
       args as {
         title: string;
         description?: string;
@@ -70,6 +72,7 @@ export const createIssue: ToolDef = {
         status?: string;
         projectId?: string;
         assigneeAgentId?: string;
+        originalAsk?: string;
       };
     const result = (await apiPost(`/api/companies/${DARWIN_COMPANY_ID}/issues`, {
       title,
@@ -79,6 +82,9 @@ export const createIssue: ToolDef = {
       projectId,
       assigneeAgentId,
     })) as { identifier: string; id: string };
+
+    trackCreatedIssue(result.id, result.identifier, title, originalAsk);
+
     return { identifier: result.identifier, id: result.id, title };
   },
 };

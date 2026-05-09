@@ -250,6 +250,37 @@ export function countTurns(conversationId: number): number {
   return stmts.countTurns.get(conversationId)?.cnt ?? 0;
 }
 
+// -- JARVIS-created issues tracking (for review-ready notifications) --
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS jarvis_created_issues (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id      TEXT NOT NULL UNIQUE,
+    identifier    TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    original_ask  TEXT,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_jci_issue_id ON jarvis_created_issues(issue_id);
+`);
+
+const jciStmts = {
+  track: db.prepare<[string, string, string, string | null]>(
+    `INSERT OR IGNORE INTO jarvis_created_issues (issue_id, identifier, title, original_ask) VALUES (?, ?, ?, ?)`,
+  ),
+  get: db.prepare<[string], { issue_id: string; identifier: string; title: string; original_ask: string | null; created_at: string }>(
+    `SELECT * FROM jarvis_created_issues WHERE issue_id = ?`,
+  ),
+};
+
+export function trackCreatedIssue(issueId: string, identifier: string, title: string, originalAsk?: string): void {
+  jciStmts.track.run(issueId, identifier, title, originalAsk ?? null);
+}
+
+export function getTrackedIssue(issueId: string) {
+  return jciStmts.get.get(issueId) ?? null;
+}
+
 // -- Settings table --
 
 db.exec(`

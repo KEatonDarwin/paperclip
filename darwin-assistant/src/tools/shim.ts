@@ -112,6 +112,28 @@ export const listShimProjects: ToolDef = {
     shimCall('list-projects-tool', { include_counts: true, ...args }),
 };
 
+export const createShimProject: ToolDef = {
+  name: 'create_shim_project',
+  description:
+    "Create a new project in SHIM. Use when Kevin wants to organize tasks under a new project (e.g. 'Honey Do', 'Home Improvement').",
+  parameters: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: 'Project name' },
+      description: { type: 'string', description: 'Optional project description' },
+      status: {
+        type: 'string',
+        enum: ['active', 'archived', 'on_hold'],
+        description: 'Project status. Defaults to active.',
+        default: 'active',
+      },
+    },
+    required: ['name'],
+  },
+  execute: async (args) =>
+    shimCall('create-project-tool', { status: 'active', ...args }),
+};
+
 export const listShimFridge: ToolDef = {
   name: 'list_shim_fridge',
   description:

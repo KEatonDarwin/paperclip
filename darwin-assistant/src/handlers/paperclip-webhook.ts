@@ -87,6 +87,22 @@ function qualifyIssue(
   return { qualified: true, reason: 'default: qualifying (better to over-nudge)' };
 }
 
+type TransitionKind = 'graduation' | 'review_ready';
+
+function classifyTransition(
+  oldStatus: string | undefined,
+  newStatus: string | undefined,
+  actorType: string,
+): TransitionKind | null {
+  if (newStatus === 'done' && oldStatus !== 'done') {
+    return 'graduation';
+  }
+  if (newStatus === 'in_review' && oldStatus === 'in_progress' && actorType === 'agent') {
+    return 'review_ready';
+  }
+  return null;
+}
+
 function buildCheckinReason(identifier: string, title: string): string {
   return [
     `Graduation check-in: ${identifier} — "${title}" was marked done.`,
@@ -98,6 +114,19 @@ function buildCheckinReason(identifier: string, title: string): string {
     '4. Should this be mentioned in the morning briefing or noted anywhere?',
     '',
     'If the feature is purely internal (agent-only, backend plumbing), a quick acknowledgement is fine.',
+  ].join('\n');
+}
+
+function buildReviewReadyReason(identifier: string, title: string): string {
+  return [
+    `Review ready: ${identifier} — "${title}" was moved to in_review by an agent.`,
+    '',
+    'Let Kevin know briefly:',
+    `- ${identifier} is ready for his review.`,
+    '- Summarize what was done (check the latest issue comments).',
+    '- Include a link to the issue.',
+    '',
+    'Keep it short — just a heads-up that something is waiting.',
   ].join('\n');
 }
 
@@ -113,12 +142,15 @@ export async function handlePaperclipWebhook(
 
   const newStatus = data.status;
   const oldStatus = data._previous?.status as string | undefined;
+  const actorType = data.actor?.type ?? 'unknown';
 
-  if (newStatus !== 'done' || oldStatus === 'done') {
+  const kind = classifyTransition(oldStatus, newStatus, actorType);
+
+  if (!kind) {
     console.log(
-      `[paperclip-webhook] Skipped: status ${oldStatus ?? '?'} → ${newStatus ?? '?'} (not a done transition)`,
+      `[paperclip-webhook] Skipped: status ${oldStatus ?? '?'} → ${newStatus ?? '?'} (actor=${actorType}, no matching transition)`,
     );
-    return { action: 'skipped', detail: 'not a done transition' };
+    return { action: 'skipped', detail: 'no matching transition' };
   }
 
   const issueId = data.entityId;
@@ -129,37 +161,63 @@ export async function handlePaperclipWebhook(
     return { action: 'skipped', detail: 'issue not found' };
   }
 
-  const qualification = qualifyIssue(issue.title, issue.project_id, issue.description);
+  if (kind === 'graduation') {
+    const qualification = qualifyIssue(issue.title, issue.project_id, issue.description);
 
-  console.log(
-    `[paperclip-webhook] ${issue.identifier} "${issue.title}" → done | qualified=${qualification.qualified} (${qualification.reason})`,
-  );
+    console.log(
+      `[paperclip-webhook] ${issue.identifier} "${issue.title}" → done | qualified=${qualification.qualified} (${qualification.reason})`,
+    );
 
-  if (!qualification.qualified) {
+    if (!qualification.qualified) {
+      return {
+        action: 'skipped',
+        detail: `${issue.identifier} did not qualify: ${qualification.reason}`,
+      };
+    }
+
+    const fireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const reason = buildCheckinReason(issue.identifier, issue.title);
+
+    const rows = await query<{ id: string; fire_at: string }>(
+      `INSERT INTO jarvis_checkins (fire_at, reason, source_type, source_id)
+       VALUES ($1, $2, 'paperclip', $3)
+       RETURNING id, fire_at`,
+      [fireAt, reason, issue.identifier],
+    );
+
+    const checkin = rows[0];
+    console.log(
+      `[paperclip-webhook] Enqueued graduation check-in ${checkin.id} for ${issue.identifier} at ${checkin.fire_at}`,
+    );
+
     return {
-      action: 'skipped',
-      detail: `${issue.identifier} did not qualify: ${qualification.reason}`,
+      action: 'enqueued',
+      detail: `Graduation check-in ${checkin.id} for ${issue.identifier} fires at ${checkin.fire_at}`,
     };
   }
 
-  // Fire 24h from now
-  const fireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-  const reason = buildCheckinReason(issue.identifier, issue.title);
+  // review_ready — always notify, fire on next worker poll (~60s)
+  console.log(
+    `[paperclip-webhook] ${issue.identifier} "${issue.title}" → in_review by agent ${data.actor?.id ?? '?'}`,
+  );
+
+  const fireAt = new Date(Date.now() + 60 * 1000).toISOString();
+  const reason = buildReviewReadyReason(issue.identifier, issue.title);
 
   const rows = await query<{ id: string; fire_at: string }>(
     `INSERT INTO jarvis_checkins (fire_at, reason, source_type, source_id)
-     VALUES ($1, $2, 'paperclip', $3)
+     VALUES ($1, $2, 'paperclip_review', $3)
      RETURNING id, fire_at`,
     [fireAt, reason, issue.identifier],
   );
 
   const checkin = rows[0];
   console.log(
-    `[paperclip-webhook] Enqueued graduation check-in ${checkin.id} for ${issue.identifier} at ${checkin.fire_at}`,
+    `[paperclip-webhook] Enqueued review-ready notification ${checkin.id} for ${issue.identifier} at ${checkin.fire_at}`,
   );
 
   return {
     action: 'enqueued',
-    detail: `Graduation check-in ${checkin.id} for ${issue.identifier} fires at ${checkin.fire_at}`,
+    detail: `Review-ready notification ${checkin.id} for ${issue.identifier} fires at ${checkin.fire_at}`,
   };
 }

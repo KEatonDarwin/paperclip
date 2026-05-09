@@ -33,6 +33,7 @@ import { hopperSlackPoller } from "./services/hopper-slack-poller.js";
 import { hopperCalendarPlacer } from "./services/hopper-calendar-placer.js";
 import { hopperDailyBriefing } from "./services/hopper-daily-briefing.js";
 import { createWebhookDeliveryWorker } from "./services/webhook-delivery-worker.js";
+import { issueAutoAssign } from "./services/issue-auto-assign.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -645,6 +646,16 @@ export async function startServer(): Promise<StartedServer> {
         });
       }, 60_000);
       logger.info("hopper daily briefing registered (fires at configured time, default 05:30)");
+    }
+
+    {
+      const autoAssign = issueAutoAssign(db as any);
+      setInterval(() => {
+        void autoAssign.tick().catch((err) => {
+          logger.error({ err }, "issue auto-assign tick failed");
+        });
+      }, 60_000);
+      logger.info("issue auto-assign registered (60s interval, grace period from ISSUE_AUTO_ASSIGN_GRACE_MINUTES)");
     }
   }
 

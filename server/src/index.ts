@@ -662,13 +662,27 @@ export async function startServer(): Promise<StartedServer> {
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
     let backupInFlight = false;
-  
+
+    const isInQuietHours = (): boolean => {
+      const hour = new Date().getHours();
+      const start = config.databaseBackupQuietStart;
+      const end = config.databaseBackupQuietEnd;
+      return start > end
+        ? (hour >= start || hour < end)
+        : (hour >= start && hour < end);
+    };
+
     const runScheduledBackup = async () => {
       if (backupInFlight) {
         logger.warn("Skipping scheduled database backup because a previous backup is still running");
         return;
       }
-  
+
+      if (isInQuietHours()) {
+        logger.debug(`Skipping scheduled backup during quiet hours (${config.databaseBackupQuietStart}:00-${config.databaseBackupQuietEnd}:00)`);
+        return;
+      }
+
       backupInFlight = true;
       try {
         const result = await runDatabaseBackup({
@@ -676,29 +690,43 @@ export async function startServer(): Promise<StartedServer> {
           backupDir: config.databaseBackupDir,
           retentionDays: config.databaseBackupRetentionDays,
           filenamePrefix: "paperclip",
+          compress: config.databaseBackupCompress,
+          skipIfUnchanged: config.databaseBackupSkipIfUnchanged,
+          excludeTables: config.databaseBackupExcludeTables,
         });
-        logger.info(
-          {
-            backupFile: result.backupFile,
-            sizeBytes: result.sizeBytes,
-            prunedCount: result.prunedCount,
-            backupDir: config.databaseBackupDir,
-            retentionDays: config.databaseBackupRetentionDays,
-          },
-          `Automatic database backup complete: ${formatDatabaseBackupResult(result)}`,
-        );
+        if (result.skipped) {
+          logger.debug(
+            { prunedCount: result.prunedCount },
+            `Automatic database backup: ${formatDatabaseBackupResult(result)}`,
+          );
+        } else {
+          logger.info(
+            {
+              backupFile: result.backupFile,
+              sizeBytes: result.sizeBytes,
+              prunedCount: result.prunedCount,
+              backupDir: config.databaseBackupDir,
+              retentionDays: config.databaseBackupRetentionDays,
+            },
+            `Automatic database backup complete: ${formatDatabaseBackupResult(result)}`,
+          );
+        }
       } catch (err) {
         logger.error({ err, backupDir: config.databaseBackupDir }, "Automatic database backup failed");
       } finally {
         backupInFlight = false;
       }
     };
-  
+
     logger.info(
       {
         intervalMinutes: config.databaseBackupIntervalMinutes,
         retentionDays: config.databaseBackupRetentionDays,
         backupDir: config.databaseBackupDir,
+        compress: config.databaseBackupCompress,
+        skipIfUnchanged: config.databaseBackupSkipIfUnchanged,
+        excludeTables: config.databaseBackupExcludeTables,
+        quietHours: `${config.databaseBackupQuietStart}:00-${config.databaseBackupQuietEnd}:00`,
       },
       "Automatic database backups enabled",
     );

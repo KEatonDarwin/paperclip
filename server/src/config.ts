@@ -58,6 +58,11 @@ export interface Config {
   databaseBackupIntervalMinutes: number;
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
+  databaseBackupCompress: boolean;
+  databaseBackupSkipIfUnchanged: boolean;
+  databaseBackupExcludeTables: string[];
+  databaseBackupQuietStart: number;
+  databaseBackupQuietEnd: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -205,13 +210,28 @@ export function loadConfig(): Config {
     1,
     Number(process.env.PAPERCLIP_DB_BACKUP_RETENTION_DAYS) ||
       fileDatabaseBackup?.retentionDays ||
-      30,
+      7,
   );
   const databaseBackupDir = resolveHomeAwarePath(
     process.env.PAPERCLIP_DB_BACKUP_DIR ??
       fileDatabaseBackup?.dir ??
       resolveDefaultBackupDir(),
   );
+  const databaseBackupCompress =
+    process.env.PAPERCLIP_DB_BACKUP_COMPRESS !== undefined
+      ? process.env.PAPERCLIP_DB_BACKUP_COMPRESS !== "false"
+      : true;
+  const databaseBackupSkipIfUnchanged =
+    process.env.PAPERCLIP_DB_BACKUP_SKIP_UNCHANGED !== undefined
+      ? process.env.PAPERCLIP_DB_BACKUP_SKIP_UNCHANGED !== "false"
+      : true;
+  const databaseBackupExcludeTables = (
+    process.env.PAPERCLIP_DB_BACKUP_EXCLUDE_TABLES ?? "agent_wakeup_requests"
+  ).split(",").map((t) => t.trim()).filter(Boolean);
+  const quietStartRaw = Number(process.env.PAPERCLIP_DB_BACKUP_QUIET_START);
+  const quietEndRaw = Number(process.env.PAPERCLIP_DB_BACKUP_QUIET_END);
+  const databaseBackupQuietStart = !isNaN(quietStartRaw) && quietStartRaw >= 0 && quietStartRaw <= 23 ? quietStartRaw : 20;
+  const databaseBackupQuietEnd = !isNaN(quietEndRaw) && quietEndRaw >= 0 && quietEndRaw <= 23 ? quietEndRaw : 3;
 
   return {
     deploymentMode,
@@ -232,6 +252,11 @@ export function loadConfig(): Config {
     databaseBackupIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
+    databaseBackupCompress,
+    databaseBackupSkipIfUnchanged,
+    databaseBackupExcludeTables,
+    databaseBackupQuietStart,
+    databaseBackupQuietEnd,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

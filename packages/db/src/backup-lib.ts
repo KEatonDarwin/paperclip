@@ -1,6 +1,7 @@
-import { createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
+import { createGzip, gunzipSync } from "node:zlib";
 import postgres from "postgres";
 
 export type RunDatabaseBackupOptions = {
@@ -12,12 +13,15 @@ export type RunDatabaseBackupOptions = {
   includeMigrationJournal?: boolean;
   excludeTables?: string[];
   nullifyColumns?: Record<string, string[]>;
+  compress?: boolean;
+  skipIfUnchanged?: boolean;
 };
 
 export type RunDatabaseBackupResult = {
   backupFile: string;
   sizeBytes: number;
   prunedCount: number;
+  skipped?: boolean;
 };
 
 export type RunDatabaseRestoreOptions = {
@@ -76,7 +80,8 @@ function pruneOldBackups(backupDir: string, retentionDays: number, filenamePrefi
   let pruned = 0;
 
   for (const name of readdirSync(backupDir)) {
-    if (!name.startsWith(`${filenamePrefix}-`) || !name.endsWith(".sql")) continue;
+    if (!name.startsWith(`${filenamePrefix}-`)) continue;
+    if (!name.endsWith(".sql") && !name.endsWith(".sql.gz")) continue;
     const fullPath = resolve(backupDir, name);
     const stat = statSync(fullPath);
     if (stat.mtimeMs < cutoff) {
@@ -154,10 +159,44 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await sql`SELECT 1`;
 
     mkdirSync(opts.backupDir, { recursive: true });
-    const backupFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
-    const stream = createWriteStream(backupFile, { encoding: "utf8" });
+
+    if (opts.skipIfUnchanged) {
+      const dmlCountFile = resolve(opts.backupDir, `${filenamePrefix}.dml-count`);
+      try {
+        const excludeArr = [...excludedTableNames];
+        const dmlResult = excludeArr.length > 0
+          ? await sql`
+              SELECT COALESCE(SUM(n_tup_ins + n_tup_upd + n_tup_del), 0)::text AS dml_total
+              FROM pg_stat_user_tables
+              WHERE relname NOT IN ${sql(excludeArr)}
+            `
+          : await sql`
+              SELECT COALESCE(SUM(n_tup_ins + n_tup_upd + n_tup_del), 0)::text AS dml_total
+              FROM pg_stat_user_tables
+            `;
+        const currentDml = dmlResult[0]?.dml_total ?? null;
+        if (currentDml !== null && existsSync(dmlCountFile)) {
+          const lastDml = readFileSync(dmlCountFile, "utf8").trim();
+          if (lastDml === currentDml) {
+            const prunedCount = pruneOldBackups(opts.backupDir, retentionDays, filenamePrefix);
+            return { backupFile: "", sizeBytes: 0, prunedCount, skipped: true };
+          }
+        }
+      } catch {
+        // DML count check failed — proceed with backup anyway
+      }
+    }
+
+    const extension = opts.compress ? ".sql.gz" : ".sql";
+    const backupFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}${extension}`);
+    const fileStream = createWriteStream(backupFile);
+    const gzipStream = opts.compress ? createGzip() : null;
+    if (gzipStream) gzipStream.pipe(fileStream);
+    const stream = gzipStream ?? fileStream;
     let streamError: Error | null = null;
-    stream.on("error", (err) => { streamError = err; });
+    const onStreamError = (err: Error) => { streamError = err; };
+    fileStream.on("error", onStreamError);
+    if (gzipStream) gzipStream.on("error", onStreamError);
 
     const emit = (line: string) => { stream.write(line + "\n"); };
     const emitStatement = (statement: string) => {
@@ -518,13 +557,45 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     emitStatement("COMMIT;");
     emit("");
 
-    await new Promise<void>((res, rej) => {
-      stream.end((err?: Error | null) => err ? rej(err) : res());
-    });
+    if (gzipStream) {
+      await new Promise<void>((res, rej) => {
+        fileStream.on("finish", () => res());
+        fileStream.on("error", rej);
+        gzipStream.on("error", rej);
+        gzipStream.end();
+      });
+    } else {
+      await new Promise<void>((res, rej) => {
+        stream.end((err?: Error | null) => err ? rej(err) : res());
+      });
+    }
     if (streamError) throw streamError;
 
     const sizeBytes = statSync(backupFile).size;
     const prunedCount = pruneOldBackups(opts.backupDir, retentionDays, filenamePrefix);
+
+    if (opts.skipIfUnchanged) {
+      try {
+        const excludeArr = [...excludedTableNames];
+        const dmlResult = excludeArr.length > 0
+          ? await sql`
+              SELECT COALESCE(SUM(n_tup_ins + n_tup_upd + n_tup_del), 0)::text AS dml_total
+              FROM pg_stat_user_tables
+              WHERE relname NOT IN ${sql(excludeArr)}
+            `
+          : await sql`
+              SELECT COALESCE(SUM(n_tup_ins + n_tup_upd + n_tup_del), 0)::text AS dml_total
+              FROM pg_stat_user_tables
+            `;
+        const currentDml = dmlResult[0]?.dml_total ?? null;
+        if (currentDml !== null) {
+          const dmlCountFile = resolve(opts.backupDir, `${filenamePrefix}.dml-count`);
+          writeFileSync(dmlCountFile, currentDml, "utf8");
+        }
+      } catch {
+        // Non-critical — skip saving DML count
+      }
+    }
 
     return {
       backupFile,
@@ -542,7 +613,10 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
 
   try {
     await sql`SELECT 1`;
-    const contents = await readFile(opts.backupFile, "utf8");
+    const raw = await readFile(opts.backupFile);
+    const contents = opts.backupFile.endsWith(".gz")
+      ? gunzipSync(raw).toString("utf8")
+      : raw.toString("utf8");
     const statements = contents
       .split(STATEMENT_BREAKPOINT)
       .map((statement) => statement.trim())
@@ -567,6 +641,10 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
 }
 
 export function formatDatabaseBackupResult(result: RunDatabaseBackupResult): string {
+  if (result.skipped) {
+    const pruned = result.prunedCount > 0 ? `; pruned ${result.prunedCount} old backup(s)` : "";
+    return `skipped (no changes since last backup${pruned})`;
+  }
   const size = formatBackupSize(result.sizeBytes);
   const pruned = result.prunedCount > 0 ? `; pruned ${result.prunedCount} old backup(s)` : "";
   return `${result.backupFile} (${size}${pruned})`;

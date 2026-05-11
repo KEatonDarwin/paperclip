@@ -1,11 +1,13 @@
 import express from 'express';
 import { processMessage } from '../agent.js';
 import { handlePaperclipWebhook } from './paperclip-webhook.js';
+import { createVoiceRouter } from './voice.js';
 
 export function createWebhookRouter() {
   const router = express.Router();
 
   router.use(express.json());
+  router.use(createVoiceRouter());
 
   router.post('/paperclip-webhook', async (req, res) => {
     try {

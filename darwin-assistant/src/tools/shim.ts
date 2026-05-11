@@ -86,6 +86,7 @@ export const listShimTasks: ToolDef = {
         description: '0=none, 1=low, 2=medium, 3=high, 4=urgent',
       },
       project_id: { type: 'number', description: 'Filter by project ID' },
+      mode: { type: 'string', enum: ['darwin', 'personal'], description: 'Filter by mode. Omit for all.' },
       limit: { type: 'number', default: 20 },
     },
   },
@@ -104,6 +105,7 @@ export const createShimTask: ToolDef = {
       priority: { type: 'number', description: '0=none, 1=low, 2=medium, 3=high, 4=urgent', default: 2 },
       project_id: { type: 'number', description: 'Optional project ID' },
       due_date: { type: 'string', description: 'Optional due date ISO 8601' },
+      mode: { type: 'string', enum: ['darwin', 'personal'], description: "Task mode. Omit to leave untagged." },
     },
     required: ['title'],
   },
@@ -120,6 +122,7 @@ export const updateShimTask: ToolDef = {
       title: { type: 'string' },
       status: { type: 'string', enum: ['open', 'in_progress', 'completed', 'blocked'] },
       priority: { type: 'number' },
+      mode: { type: 'string', enum: ['darwin', 'personal'], description: 'Change the task mode.' },
       mark_complete: { type: 'boolean', description: 'Set true to mark done (cascades to subtasks)' },
     },
     required: ['id'],
@@ -134,6 +137,7 @@ export const listShimProjects: ToolDef = {
     type: 'object',
     properties: {
       status: { type: 'string', enum: ['active', 'archived', 'on_hold'] },
+      mode: { type: 'string', enum: ['darwin', 'personal'], description: 'Filter by mode. Omit for all.' },
       include_counts: { type: 'boolean', default: true },
     },
   },
@@ -150,6 +154,7 @@ export const createShimProject: ToolDef = {
     properties: {
       name: { type: 'string', description: 'Project name' },
       description: { type: 'string', description: 'Optional project description' },
+      mode: { type: 'string', enum: ['darwin', 'personal'], description: "Project mode. Omit to leave untagged." },
       status: {
         type: 'string',
         enum: ['active', 'archived', 'on_hold'],
@@ -171,6 +176,7 @@ export const listShimFridge: ToolDef = {
     type: 'object',
     properties: {
       status: { type: 'string', description: 'fresh, stale, promoted, archived' },
+      mode: { type: 'string', enum: ['darwin', 'personal'], description: 'Filter by mode. Omit for all.' },
       limit: { type: 'number', default: 20 },
     },
   },
@@ -186,6 +192,7 @@ export const createShimFridgeItem: ToolDef = {
     properties: {
       title: { type: 'string', description: 'Idea title' },
       body: { type: 'string', description: 'Idea details' },
+      mode: { type: 'string', enum: ['darwin', 'personal'], description: "Fridge item mode. Omit to leave untagged." },
       priority: { type: 'number', default: 2 },
       freshness_duration: {
         type: 'number',

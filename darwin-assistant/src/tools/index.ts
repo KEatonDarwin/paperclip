@@ -39,6 +39,10 @@ export {
   listFocusSessions,
   startFocusSession,
   stopFocusSession,
+  shimDeployStatus,
+  shimDeploySwitch,
+  shimDeployApprove,
+  shimDeployReject,
 } from './shim.js';
 
 export {
@@ -78,6 +82,10 @@ import {
   listFocusSessions,
   startFocusSession,
   stopFocusSession,
+  shimDeployStatus,
+  shimDeploySwitch,
+  shimDeployApprove,
+  shimDeployReject,
 } from './shim.js';
 import {
   enqueueCheckin,
@@ -112,6 +120,10 @@ export const ALL_TOOLS: ToolDef[] = [
   listFocusSessions,
   startFocusSession,
   stopFocusSession,
+  shimDeployStatus,
+  shimDeploySwitch,
+  shimDeployApprove,
+  shimDeployReject,
   enqueueCheckin,
   listCheckins,
   cancelCheckin,

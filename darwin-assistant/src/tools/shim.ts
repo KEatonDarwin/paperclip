@@ -4,6 +4,35 @@ function shimUrl(): string {
   return process.env.SHIM_MCP_URL ?? 'https://somehow.thedarwinhub.com/mcp';
 }
 
+function shimBaseUrl(): string {
+  return shimUrl().replace(/\/mcp$/, '');
+}
+
+async function shimApi(method: string, path: string, body?: Record<string, unknown>): Promise<unknown> {
+  const token = process.env.SHIM_MCP_TOKEN;
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const opts: RequestInit = { method, headers };
+  if (body) opts.body = JSON.stringify(body);
+
+  const res = await fetch(`${shimBaseUrl()}/api/v1${path}`, opts);
+  if (!res.ok) {
+    const text = await res.text();
+    let msg: string;
+    try {
+      const json = JSON.parse(text) as { error?: string };
+      msg = json.error ?? text;
+    } catch { msg = text; }
+    throw new Error(`SHIM deploy error (${res.status}): ${msg}`);
+  }
+
+  return (await res.json()) as unknown;
+}
+
 async function shimCall(toolName: string, args: Record<string, unknown> = {}): Promise<unknown> {
   const token = process.env.SHIM_MCP_TOKEN;
   const headers: Record<string, string> = {
@@ -213,4 +242,42 @@ export const stopFocusSession: ToolDef = {
   description: 'Stop the currently active focus session in SHIM.',
   parameters: { type: 'object', properties: {} },
   execute: async () => shimCall('stop-focus-session-tool', {}),
+};
+
+export const shimDeployStatus: ToolDef = {
+  name: 'shim_deploy_status',
+  description:
+    "Check SHIM's current deployment status — which branch is live, recent commits, and whether it's running a review branch or master.",
+  parameters: { type: 'object', properties: {} },
+  execute: async () => shimApi('GET', '/deploy/status'),
+};
+
+export const shimDeploySwitch: ToolDef = {
+  name: 'shim_deploy_switch',
+  description:
+    'Switch SHIM production to a named branch for review. Fetches latest, checks out the branch, runs migrations, and clears caches.',
+  parameters: {
+    type: 'object',
+    properties: {
+      branch: { type: 'string', description: 'Git branch name to switch to' },
+    },
+    required: ['branch'],
+  },
+  execute: async (args) => shimApi('POST', '/deploy/switch', args),
+};
+
+export const shimDeployApprove: ToolDef = {
+  name: 'shim_deploy_approve',
+  description:
+    'Approve the current review branch — merges it into master, deletes the branch, and refreshes caches. Only works when SHIM is on a review branch.',
+  parameters: { type: 'object', properties: {} },
+  execute: async () => shimApi('POST', '/deploy/approve'),
+};
+
+export const shimDeployReject: ToolDef = {
+  name: 'shim_deploy_reject',
+  description:
+    'Reject the current review branch — switches back to master without merging. The branch is preserved on GitHub for future reference.',
+  parameters: { type: 'object', properties: {} },
+  execute: async () => shimApi('POST', '/deploy/reject'),
 };

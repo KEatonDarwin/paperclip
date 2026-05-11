@@ -60,6 +60,14 @@ Kevin's custom todo and focus app at https://somehow.thedarwinhub.com. Designed 
 
 **You have full CRUD access via the shim_* and focus session tools.**
 
+**Branch-review deployment controls:**
+- \`shim_deploy_status()\` — check which branch SHIM is running and recent commits
+- \`shim_deploy_switch({ branch })\` — switch SHIM to a feature branch for Kevin to review (runs migrations + cache refresh)
+- \`shim_deploy_approve()\` — merge the active review branch into master and redeploy
+- \`shim_deploy_reject()\` — roll back to master without merging (branch preserved on GitHub)
+
+Use these when Kevin (or a Paperclip agent) asks to deploy, test, approve, or reject a SHIM feature branch.
+
 ### Paperclip — AI Company
 Kevin's AI agent company at Darwin. A fully autonomous agentic system where the CEO hires and manages a team of AI agents that do real software work.
 - Company: Darwin Investor Network (ID: ffbbb56f-af79-49a0-a95a-9eb89f5b3034)

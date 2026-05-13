@@ -125,7 +125,7 @@ interface ClaudeUsage {
   cacheWriteTokens?: number;
 }
 
-interface ClaudeResult {
+export interface ClaudeResult {
   text: string;
   sessionId: string | null;
   usage?: ClaudeUsage;
@@ -193,7 +193,7 @@ function parseClaudeOutput(stdout: string): ClaudeResult {
   return { text: texts.join('').trim() || stdout.trim(), sessionId, usage, model, rawOutput: stdout };
 }
 
-function parseToolCall(
+export function parseToolCall(
   text: string,
 ): { name: string; arguments: Record<string, unknown> } | null {
   const match = text.match(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/);
@@ -208,7 +208,7 @@ function parseToolCall(
 
 const UNKNOWN_SESSION_RE = /no conversation found with session id|unknown session|session .* not found/i;
 
-async function runClaude(input: string, sessionId?: string | null): Promise<ClaudeResult> {
+export async function runClaude(input: string, sessionId?: string | null): Promise<ClaudeResult> {
   const adapter = getActiveAdapter();
   const model = getSetting('model');
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };

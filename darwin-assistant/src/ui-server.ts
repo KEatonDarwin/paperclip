@@ -12,6 +12,7 @@ import { getActiveConversation, getAdapters, getActiveAdapterInfo } from './agen
 import { getAllSettings, getSetting, setSetting } from './conversation-db.js';
 import { query } from './db.js';
 import { sseBus, type SSEEvent } from './sse-bus.js';
+import { createVaultRouter } from './vault-page.js';
 import type { Response } from 'express';
 
 const UI_PORT = parseInt(process.env.JARVIS_UI_PORT ?? '3201', 10);
@@ -367,6 +368,8 @@ function renderLayout(title: string, body: string, nav?: string, scripts?: strin
         <a href="/checkins" ${nav === 'checkins' ? 'class="active"' : ''}>Check-ins</a>
         &nbsp;·&nbsp;
         <a href="/settings" ${nav === 'settings' ? 'class="active"' : ''}>Settings</a>
+        &nbsp;·&nbsp;
+        <a href="/vault" ${nav === 'vault' ? 'class="active"' : ''}>Memory Vault</a>
       </nav>
       <div style="margin-left:auto; font-size:12px; color:#8b949e; display:flex; align-items:center; gap:12px;">
         <span id="conn-status"><span class="conn-dot" id="conn-dot"></span><span id="conn-label"></span></span>
@@ -799,6 +802,7 @@ function renderSettingsPage(): string {
 export function startUiServer(): void {
   const app = express();
   app.use(express.json());
+  app.use(createVaultRouter(renderLayout));
 
   app.get('/', (_req, res) => {
     const body = renderStatusBar() + renderConversationList();

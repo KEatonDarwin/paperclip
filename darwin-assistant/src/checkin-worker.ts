@@ -1,6 +1,7 @@
 import type { App } from '@slack/bolt';
 import { query } from './db.js';
 import { processMessage } from './agent.js';
+import { isMuted } from './mute-check.js';
 
 const POLL_INTERVAL_MS = 60_000;
 const CHECKIN_CONV_PREFIX = 'checkin:';
@@ -37,6 +38,12 @@ async function processDueCheckins(slackApp: App): Promise<void> {
 
   for (const checkin of due) {
     try {
+      if (checkin.source_id && await isMuted(checkin.source_type, checkin.source_id)) {
+        await query(`UPDATE jarvis_checkins SET status = 'skipped' WHERE id = $1`, [checkin.id]);
+        console.log(`[checkin-worker] Muted — skipped ${checkin.id}: ${checkin.reason.slice(0, 60)}`);
+        continue;
+      }
+
       const prompt = [
         `[CHECK-IN REMINDER — ${checkin.source_type}]`,
         checkin.reason,

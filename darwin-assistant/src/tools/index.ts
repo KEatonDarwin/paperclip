@@ -51,6 +51,12 @@ export {
   cancelCheckin,
 } from './checkin.js';
 
+export {
+  muteReminders,
+  unmuteReminders,
+  listMuted,
+} from './mute.js';
+
 import {
   createIssue,
   searchIssues,
@@ -92,6 +98,11 @@ import {
   listCheckins,
   cancelCheckin,
 } from './checkin.js';
+import {
+  muteReminders,
+  unmuteReminders,
+  listMuted,
+} from './mute.js';
 
 export const ALL_TOOLS: ToolDef[] = [
   createIssue,
@@ -127,6 +138,9 @@ export const ALL_TOOLS: ToolDef[] = [
   enqueueCheckin,
   listCheckins,
   cancelCheckin,
+  muteReminders,
+  unmuteReminders,
+  listMuted,
 ];
 
 export const TOOL_MAP: Map<string, ToolDef> = new Map(

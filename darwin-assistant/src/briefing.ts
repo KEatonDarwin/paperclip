@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { query, DARWIN_COMPANY_ID } from './db.js';
+import { getMutedSourceIds } from './mute-check.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -85,10 +86,22 @@ function formatCalendarEvents(events: CalendarEvent[]): string {
 async function getTodayCalendarEvents(): Promise<string> {
   try {
     const events = await fetchTodayCalendarEvents();
-    return formatCalendarEvents(events);
+    const mutedIds = await getMutedSourceIds('calendar');
+    const visible = events.filter(
+      (ev) => !ev.eventId || !isMutedCalendarEvent(ev.eventId, mutedIds),
+    );
+    return formatCalendarEvents(visible);
   } catch {
     return '(could not fetch calendar)';
   }
+}
+
+function isMutedCalendarEvent(eventId: string, mutedIds: Set<string>): boolean {
+  if (mutedIds.has(eventId)) return true;
+  for (const mid of mutedIds) {
+    if (eventId.startsWith(mid)) return true;
+  }
+  return false;
 }
 
 // ─── Paperclip helpers ────────────────────────────────────────────────────────
@@ -184,7 +197,9 @@ async function getTopPriorities(): Promise<string> {
     const data = JSON.parse(text) as { tasks?: Array<{ id: number; title: string; priority: number }> };
     const tasks = data?.tasks ?? [];
 
-    const sorted = [...tasks].sort((a, b) => b.priority - a.priority).slice(0, 3);
+    const mutedTaskIds = await getMutedSourceIds('shim_task');
+    const unmuted = tasks.filter((t) => !mutedTaskIds.has(String(t.id)));
+    const sorted = [...unmuted].sort((a, b) => b.priority - a.priority).slice(0, 3);
     if (!sorted.length) return 'No open tasks.';
     return sorted.map((t, i) => `${i + 1}. ${t.title}`).join('\n');
   } catch {
@@ -240,7 +255,11 @@ export async function enqueueCalendarCheckins(): Promise<number> {
     return 0;
   }
 
-  const timed = events.filter((ev) => ev.startIso && ev.endIso && !ev.allDay);
+  const mutedIds = await getMutedSourceIds('calendar');
+  const timed = events.filter(
+    (ev) => ev.startIso && ev.endIso && !ev.allDay
+      && !(ev.eventId && isMutedCalendarEvent(ev.eventId, mutedIds)),
+  );
   if (!timed.length) return 0;
 
   let enqueued = 0;

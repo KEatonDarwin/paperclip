@@ -1,5 +1,6 @@
 import { query } from '../db.js';
 import { getTrackedIssue } from '../conversation-db.js';
+import { isMuted } from '../mute-check.js';
 
 const JARVIS_PROJECT_ID = '3e1aab03-f296-4992-b7a9-f6bf74b8f48e';
 
@@ -189,6 +190,11 @@ export async function handlePaperclipWebhook(
       };
     }
 
+    if (await isMuted('paperclip', issue.identifier)) {
+      console.log(`[paperclip-webhook] ${issue.identifier} is muted — skipping graduation check-in`);
+      return { action: 'skipped', detail: `${issue.identifier} is muted` };
+    }
+
     const fireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
     const reason = buildCheckinReason(issue.identifier, issue.title);
 
@@ -216,6 +222,11 @@ export async function handlePaperclipWebhook(
   console.log(
     `[paperclip-webhook] ${issue.identifier} "${issue.title}" → in_review by agent ${data.actor?.id ?? '?'} (jarvis-created=${!!tracked})`,
   );
+
+  if (await isMuted('paperclip', issue.identifier)) {
+    console.log(`[paperclip-webhook] ${issue.identifier} is muted — skipping review-ready notification`);
+    return { action: 'skipped', detail: `${issue.identifier} is muted` };
+  }
 
   const fireAt = new Date(Date.now() + 60 * 1000).toISOString();
   const reason = buildReviewReadyReason(issue.identifier, issue.title, tracked?.original_ask);

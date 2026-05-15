@@ -2,6 +2,7 @@ import type { App } from '@slack/bolt';
 import { query } from './db.js';
 import { processMessage } from './agent.js';
 import { isMuted } from './mute-check.js';
+import { getConversation, getOrCreateConversation, addTurn, updateSessionId } from './conversation-db.js';
 
 const POLL_INTERVAL_MS = 60_000;
 const CHECKIN_CONV_PREFIX = 'checkin:';
@@ -62,8 +63,20 @@ async function processDueCheckins(slackApp: App): Promise<void> {
         continue;
       }
 
-      await slackApp.client.chat.postMessage({ channel: userId, text: response });
+      const postResult = await slackApp.client.chat.postMessage({ channel: userId, text: response });
       console.log(`[checkin-worker] Fired ${checkin.id}: ${checkin.reason.slice(0, 60)}`);
+
+      // Link the posted message to a Slack-keyed conversation so that when Kevin
+      // replies in the thread, JARVIS has context of what it said.
+      const slackTs = typeof postResult.ts === 'string' ? postResult.ts : null;
+      if (slackTs) {
+        const checkinConv = getConversation(conversationId);
+        const slackConv = getOrCreateConversation(`slack:${userId}:${slackTs}`, userId);
+        if (checkinConv?.claude_session_id) {
+          updateSessionId(slackConv.id, checkinConv.claude_session_id);
+        }
+        addTurn(slackConv.id, 'assistant', response);
+      }
     } catch (err) {
       console.error(`[checkin-worker] Error processing ${checkin.id}:`, err);
     }

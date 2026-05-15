@@ -1,6 +1,7 @@
 import { App, LogLevel } from '@slack/bolt';
 import { processMessage, clearConversation } from '../agent.js';
 import { buildMorningBriefing } from '../briefing.js';
+import { getOrCreateConversation, addTurn } from '../conversation-db.js';
 
 const BRIEFING_TRIGGERS = /\b(morning briefing|good morning|briefing|morning|wake up|what's my day|what is my day|day look like)\b/i;
 
@@ -67,8 +68,15 @@ export async function sendDailyBriefing(app: App): Promise<void> {
   }
   try {
     const briefing = await buildMorningBriefing();
-    await app.client.chat.postMessage({ channel: userId, text: briefing });
+    const postResult = await app.client.chat.postMessage({ channel: userId, text: briefing });
     console.log('[briefing] Morning briefing sent to Kevin');
+
+    // Persist the briefing as an assistant turn so that Kevin's reply has context.
+    const slackTs = typeof postResult.ts === 'string' ? postResult.ts : null;
+    if (slackTs) {
+      const conv = getOrCreateConversation(`slack:${userId}:${slackTs}`, userId);
+      addTurn(conv.id, 'assistant', briefing);
+    }
   } catch (err) {
     console.error('[briefing] Failed to send morning briefing:', err);
   }

@@ -55,10 +55,11 @@ async function main() {
     console.log(`  GET  http://localhost:${WEBHOOK_PORT}/api/health`);
   });
 
-  startUiServer();
+  const slackApp = SLACK_ENABLED ? createSlackApp() : null;
 
-  if (SLACK_ENABLED) {
-    const slackApp = createSlackApp();
+  startUiServer(slackApp ?? undefined);
+
+  if (slackApp) {
     await slackApp.start();
     console.log('Darwin Assistant Slack bot connected (Socket Mode)');
     scheduleDailyBriefing(slackApp);

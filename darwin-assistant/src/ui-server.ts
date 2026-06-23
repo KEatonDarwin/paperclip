@@ -5,15 +5,20 @@ import {
   getConversationById,
   getTurns,
   countTurns,
+  getOrCreateConversation,
+  addTurn,
+  linkContinuedThreads,
   type ConversationRow,
   type TurnRow,
 } from './conversation-db.js';
-import { getActiveConversation, getAdapters, getActiveAdapterInfo } from './agent.js';
+import { getActiveConversation, getAdapters, getActiveAdapterInfo, runClaude, buildToolsBlock } from './agent.js';
+import { buildSystemPrompt, loadMemoryBlock } from './prompt.js';
 import { getAllSettings, getSetting, setSetting } from './conversation-db.js';
 import { query } from './db.js';
 import { sseBus, type SSEEvent } from './sse-bus.js';
 import { createVaultRouter } from './vault-page.js';
 import type { Response } from 'express';
+import type { App as SlackApp } from '@slack/bolt';
 
 const UI_PORT = parseInt(process.env.JARVIS_UI_PORT ?? '3201', 10);
 
@@ -353,9 +358,26 @@ function renderLayout(title: string, body: string, nav?: string, scripts?: strin
     .checkin-item { padding: 8px 12px; border: 1px solid #30363d; border-radius: 6px; margin-bottom: 6px; font-size: 13px; }
     .checkin-time { color: #d29922; font-weight: 500; }
     .empty { color: #484f58; font-style: italic; padding: 16px; }
+    .msg-streaming .msg-body::after { content: '\\25CB'; animation: blink 1s step-end infinite; margin-left: 2px; color: #58a6ff; }
+    @keyframes blink { 50% { opacity: 0; } }
     .mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; }
     .back { margin-bottom: 12px; font-size: 14px; }
     .conv-id { color: #8b949e; font-size: 12px; font-family: monospace; }
+    .lineage-bar { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 14px; margin-bottom: 12px; font-size: 13px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .lineage-sep { color: #484f58; }
+    .actions-bar { display: flex; gap: 8px; margin-bottom: 16px; align-items: center; flex-wrap: wrap; }
+    .action-btn { display: inline-block; padding: 6px 14px; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-size: 13px; text-decoration: none; cursor: pointer; font-family: inherit; }
+    .action-btn:hover { background: #30363d; color: #f0f6fc; text-decoration: none; }
+    .action-btn-primary { background: #1f6f2b; border-color: #2ea043; color: #f0f6fc; }
+    .action-btn-primary:hover { background: #2ea043; }
+    .action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .action-note { font-size: 12px; color: #8b949e; }
+    .continue-status { font-size: 12px; color: #8b949e; }
+    .continue-status.ok { color: #3fb950; }
+    .continue-status.err { color: #f85149; }
+    .conv-actions { white-space: nowrap; }
+    .conv-actions a { color: #58a6ff; text-decoration: none; font-size: 12px; padding: 2px 6px; border-radius: 4px; }
+    .conv-actions a:hover { background: #30363d; }
   </style>
 </head>
 <body>
@@ -446,18 +468,24 @@ function renderConversationList(): string {
     const label = parts[0] === 'slack' ? `#${parts[1]}` : parts[0];
     const threadId = parts[0] === 'slack' ? parts[2]?.slice(0, 10) : c.external_id.slice(0, 20);
 
+    const continuedTo = c.continued_to_id ? ` <a href="/conversations/${c.continued_to_id}" title="Continued in #${c.continued_to_id}" style="color:#d2a8ff;">→</a>` : '';
+    const continuedFrom = c.continued_from_id ? `<a href="/conversations/${c.continued_from_id}" title="Continued from #${c.continued_from_id}" style="color:#d2a8ff;">←</a> ` : '';
     return `<tr data-conv-id="${c.id}">
-      <td><a href="/conversations/${c.id}">${label}</a></td>
+      <td>${continuedFrom}<a href="/conversations/${c.id}">${label}</a>${continuedTo}</td>
       <td class="conv-id">${escapeHtml(threadId ?? '')}</td>
       <td class="conv-status">${statusBadge}</td>
       <td class="conv-turns">${turns}</td>
       <td>${c.claude_session_id ? escapeHtml(c.claude_session_id.slice(0, 12)) + '…' : '—'}</td>
       <td class="conv-time">${timeAgo(c.updated_at)}</td>
+      <td class="conv-actions">
+        <a href="/api/conversations/${c.id}/markdown" download title="Download chat log (readable transcript)">⬇ log</a>
+        <a href="/api/conversations/${c.id}/session-clone" download title="Download session clone (system prompt + tools + history + memory)">⬇ clone</a>
+      </td>
     </tr>`;
   }).join('');
 
   return `<table>
-    <thead><tr><th>Source</th><th>Thread</th><th>Status</th><th>Turns</th><th>Session</th><th>Last Active</th></tr></thead>
+    <thead><tr><th>Source</th><th>Thread</th><th>Status</th><th>Turns</th><th>Session</th><th>Last Active</th><th></th></tr></thead>
     <tbody id="conv-tbody">${rows}</tbody>
   </table>`;
 }
@@ -632,11 +660,36 @@ function renderConversationDetail(conv: ConversationRow, turns: TurnRow[]): stri
     <div><span class="label">Tool calls:</span> <span class="value">${turns.filter(t => t.role === 'tool_call').length}</span></div>
   </div>`;
 
+  const lineageParts: string[] = [];
+  if (conv.continued_from_id) {
+    lineageParts.push(`<a href="/conversations/${conv.continued_from_id}">← Previous thread (#${conv.continued_from_id})</a>`);
+  }
+  if (conv.continued_to_id) {
+    lineageParts.push(`<a href="/conversations/${conv.continued_to_id}">Continued thread (#${conv.continued_to_id}) →</a>`);
+  }
+  const lineageHtml = lineageParts.length
+    ? `<div class="lineage-bar">${lineageParts.join('<span class="lineage-sep">·</span>')}</div>`
+    : '';
+
+  const canContinue = slackChannelFromExternalId(conv.external_id) !== null && !conv.continued_to_id;
+  const continueBtn = canContinue
+    ? `<button type="button" class="action-btn action-btn-primary" id="continue-btn" data-conv-id="${conv.id}">Continue in new Slack thread</button>`
+    : conv.continued_to_id
+      ? `<span class="action-note">Already continued in <a href="/conversations/${conv.continued_to_id}">#${conv.continued_to_id}</a></span>`
+      : '';
+
+  const actionsHtml = `<div class="actions-bar">
+    <a class="action-btn" href="/api/conversations/${conv.id}/markdown" download title="Full chat log — readable transcript">⬇ Download chat log</a>
+    <a class="action-btn" href="/api/conversations/${conv.id}/session-clone" download title="System prompt + tools + replayed history + current memory — paste into a blank Claude chat to clone this session's state">⬇ Download session clone</a>
+    ${continueBtn}
+    <span id="continue-status" class="continue-status"></span>
+  </div>`;
+
   const exchangesHtml = exchanges.length
     ? exchanges.map(renderExchange).join('')
     : '<div class="empty">No turns recorded yet.</div>';
 
-  return `<div class="back"><a href="/">← All Conversations</a></div>${meta}<div class="section"><h2>Conversation</h2><div id="live-turns">${exchangesHtml}</div></div>`;
+  return `<div class="back"><a href="/">← All Conversations</a></div>${lineageHtml}${meta}${actionsHtml}<div class="section"><h2>Conversation</h2><div id="live-turns">${exchangesHtml}</div></div>`;
 }
 
 // -- Check-ins --
@@ -797,9 +850,260 @@ function renderSettingsPage(): string {
     </script>`;
 }
 
+// -- Markdown transcript + primer prompt --
+
+function slackChannelFromExternalId(externalId: string): string | null {
+  const parts = externalId.split(':');
+  if (parts[0] !== 'slack' || !parts[1]) return null;
+  return parts[1];
+}
+
+function buildTranscriptMarkdown(conv: ConversationRow, turns: TurnRow[]): string {
+  const lines: string[] = [];
+  lines.push(`# JARVIS Conversation #${conv.id}`);
+  lines.push('');
+  lines.push(`- **External ID:** \`${conv.external_id}\``);
+  lines.push(`- **Created:** ${conv.created_at} UTC`);
+  lines.push(`- **Last updated:** ${conv.updated_at} UTC`);
+  lines.push(`- **Status:** ${conv.status}`);
+  if (conv.claude_session_id) lines.push(`- **Claude session:** \`${conv.claude_session_id}\``);
+  if (conv.continued_from_id) lines.push(`- **Continued from:** conversation #${conv.continued_from_id}`);
+  if (conv.continued_to_id) lines.push(`- **Continued in:** conversation #${conv.continued_to_id}`);
+  lines.push(`- **Total turns:** ${turns.length}`);
+  lines.push('');
+  lines.push('---');
+  lines.push('');
+
+  for (const t of turns) {
+    const ts = `${t.created_at} UTC`;
+    if (t.role === 'user') {
+      lines.push(`## 👤 User — ${ts}`);
+      lines.push('');
+      lines.push(t.content ?? '');
+      lines.push('');
+    } else if (t.role === 'assistant') {
+      lines.push(`## 🤖 JARVIS — ${ts}`);
+      lines.push('');
+      lines.push(t.content ?? '');
+      lines.push('');
+    } else if (t.role === 'tool_call') {
+      lines.push(`### 🔧 Tool call: \`${t.tool_name ?? 'unknown'}\` — ${ts}`);
+      if (t.tool_args) {
+        lines.push('');
+        lines.push('```json');
+        lines.push(t.tool_args);
+        lines.push('```');
+      }
+      lines.push('');
+    } else if (t.role === 'tool_result') {
+      lines.push(`### ✅ Tool result: \`${t.tool_name ?? 'unknown'}\` — ${ts}`);
+      if (t.tool_result) {
+        lines.push('');
+        lines.push('```json');
+        lines.push(t.tool_result.slice(0, 4000) + (t.tool_result.length > 4000 ? '\n…[truncated]' : ''));
+        lines.push('```');
+      }
+      lines.push('');
+    }
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Builds a condensed user/assistant-only transcript for primer generation.
+ * Trims to the first 5 and last 20 exchanges to keep Claude's input bounded
+ * regardless of conversation length.
+ */
+function buildPrimerSourceTranscript(turns: TurnRow[]): string {
+  type Exch = { user?: string; assistant?: string; ts: string };
+  const exchanges: Exch[] = [];
+  let current: Exch = { ts: '' };
+
+  for (const t of turns) {
+    if (t.role === 'user') {
+      if (current.user || current.assistant) {
+        exchanges.push(current);
+        current = { ts: t.created_at };
+      }
+      current.user = t.content ?? '';
+      current.ts = t.created_at;
+    } else if (t.role === 'assistant' && t.content) {
+      current.assistant = t.content;
+      exchanges.push(current);
+      current = { ts: '' };
+    }
+  }
+  if (current.user || current.assistant) exchanges.push(current);
+
+  const HEAD_KEEP = 5;
+  const TAIL_KEEP = 20;
+  let working: (Exch | 'elision')[];
+  if (exchanges.length <= HEAD_KEEP + TAIL_KEEP) {
+    working = exchanges;
+  } else {
+    const head = exchanges.slice(0, HEAD_KEEP);
+    const tail = exchanges.slice(-TAIL_KEEP);
+    const elided = exchanges.length - HEAD_KEEP - TAIL_KEEP;
+    working = [...head, 'elision' as const, ...tail];
+    void elided;
+  }
+
+  const out: string[] = [];
+  for (const ex of working) {
+    if (ex === 'elision') {
+      const elided = exchanges.length - HEAD_KEEP - TAIL_KEEP;
+      out.push(`\n[... ${elided} exchanges elided for brevity ...]\n`);
+      continue;
+    }
+    if (ex.user) {
+      out.push(`USER (${ex.ts} UTC): ${ex.user.trim()}`);
+    }
+    if (ex.assistant) {
+      const trimmed = ex.assistant.trim();
+      const capped = trimmed.length > 2000 ? trimmed.slice(0, 2000) + '…[truncated]' : trimmed;
+      out.push(`JARVIS (${ex.ts} UTC): ${capped}`);
+    }
+    out.push('');
+  }
+
+  return out.join('\n');
+}
+
+/**
+ * Builds a "session clone" — a single markdown document that contains every
+ * piece of context a fresh Claude chat would need to behave like the current
+ * JARVIS mid-conversation: system prompt, tool definitions, replayed user/
+ * assistant/tool history, and the current memory block. Paste into any
+ * blank Claude/ChatGPT chat and say "continue from here."
+ */
+function buildSessionClone(conv: ConversationRow, turns: TurnRow[]): string {
+  const systemPrompt = buildSystemPrompt();
+  const toolsBlock = buildToolsBlock();
+  const memoryBlock = loadMemoryBlock();
+
+  const exchanges = groupTurnsIntoExchanges(turns);
+
+  const historyParts: string[] = [];
+  for (const ex of exchanges) {
+    if (ex.user) {
+      historyParts.push(`### Human\n\n${ex.user.content ?? ''}`);
+    }
+    if (ex.toolCalls.length || ex.assistant) {
+      const blocks: string[] = [];
+      for (const tc of ex.toolCalls) {
+        const argsStr = tc.call.tool_args ?? '{}';
+        blocks.push(
+          `<tool_call>\n{"name": "${tc.call.tool_name ?? 'unknown'}", "arguments": ${argsStr}}\n</tool_call>`
+        );
+        if (tc.result?.tool_result) {
+          const r = tc.result.tool_result;
+          const capped = r.length > 6000 ? r.slice(0, 6000) + '\n…[truncated]' : r;
+          blocks.push(`<tool_result name="${tc.call.tool_name ?? 'unknown'}">\n${capped}\n</tool_result>`);
+        }
+      }
+      if (ex.assistant?.content) {
+        blocks.push(ex.assistant.content);
+      }
+      historyParts.push(`### Assistant\n\n${blocks.join('\n\n')}`);
+    }
+  }
+
+  return [
+    `# JARVIS Session Clone — Conversation #${conv.id}`,
+    '',
+    '> **What this is:** Everything a blank Claude chat would need to pick up where JARVIS left off — system prompt, available tools, full conversation history, and the live memory block. Paste this entire document into a fresh Claude chat (claude.ai, Claude Code, the API, etc.) and follow it with your next message. The new chat will respond as JARVIS would have.',
+    '>',
+    `> Snapshot taken: ${new Date().toISOString()}`,
+    `> Source: conversation \`${conv.external_id}\` (internal id #${conv.id}, ${turns.length} turns)`,
+    '>',
+    '> **Caveats:**',
+    '> - Tool definitions are listed but a blank chat *cannot actually call them* — it can only describe what it would do. Run it inside the real JARVIS pipeline if you need actual tool execution.',
+    '> - The memory block reflects the wiki file at the moment this snapshot was generated. It changes on every real JARVIS turn.',
+    '> - Tool results longer than 6KB are truncated for size.',
+    '',
+    '---',
+    '',
+    '## 1. System Prompt',
+    '',
+    '```',
+    systemPrompt,
+    '```',
+    '',
+    '---',
+    '',
+    '## 2. Tool Definitions',
+    '',
+    '```',
+    toolsBlock,
+    '```',
+    '',
+    '---',
+    '',
+    '## 3. Conversation History (replay)',
+    '',
+    '_Below is the full Human / Assistant exchange from this thread, including tool calls and results, in the format JARVIS uses internally._',
+    '',
+    historyParts.length ? historyParts.join('\n\n---\n\n') : '_(no turns recorded yet)_',
+    '',
+    '---',
+    '',
+    '## 4. Current Memory Block (live, as of snapshot)',
+    '',
+    '_This is what JARVIS would re-inject as `<memory_refresh>` on the very next turn._',
+    '',
+    '```',
+    memoryBlock,
+    '```',
+    '',
+    '---',
+    '',
+    '## 5. How to Use This',
+    '',
+    'In a fresh Claude chat:',
+    '1. Paste this entire document as your first message.',
+    '2. Add your next instruction after it, e.g. *"Continue from here. My next message is: …"*',
+    '3. The new chat will respond in JARVIS voice with full awareness of everything above.',
+    '',
+    'For richest fidelity, use Claude Opus (or whatever model JARVIS is currently configured for — see the snapshot header).',
+    '',
+  ].join('\n');
+}
+
+function buildPrimerPrompt(conv: ConversationRow, turns: TurnRow[]): string {
+  const transcript = buildPrimerSourceTranscript(turns);
+  return [
+    'You are JARVIS, Kevin\'s personal AI life coach and chief of staff. You\'re posting the FIRST message in a brand-new Slack thread because the previous thread got too long. Kevin will see this message when he opens the new thread, and he\'ll reply in-thread to keep the conversation going.',
+    '',
+    'Write a concise primer message. Structure:',
+    '- ONE warm opening line (e.g. "Continuing from our last thread —")',
+    '- A short "*What we were working on:*" section (1–3 bullets)',
+    '- A short "*Where we left off:*" section (1–3 bullets) — last decisions made, last actions taken',
+    '- A short "*Open / next:*" section (1–3 bullets) — any open questions, pending decisions, or the obvious next step',
+    '',
+    'Style rules:',
+    '- Warm, direct, JARVIS voice. Slack mrkdwn (use *bold* not **bold**).',
+    '- Keep under 250 words total. Tight bullets, not paragraphs.',
+    '- Do NOT suggest Kevin "take a break" or "wrap up" — just tee up the resume.',
+    '- Do NOT include any preamble, commentary, or instructions in your output. Output ONLY the primer message text that will be posted to Slack verbatim.',
+    '',
+    `Prior thread external id: ${conv.external_id}`,
+    `Prior thread created: ${conv.created_at} UTC`,
+    `Prior thread turn count: ${turns.length}`,
+    '',
+    '--- PRIOR THREAD TRANSCRIPT (user + JARVIS messages, condensed) ---',
+    '',
+    transcript,
+    '',
+    '--- END TRANSCRIPT ---',
+    '',
+    'Now write the primer message:',
+  ].join('\n');
+}
+
 // -- Server --
 
-export function startUiServer(): void {
+export function startUiServer(slackApp?: SlackApp): void {
   const app = express();
   app.use(express.json());
   app.use(createVaultRouter(renderLayout));
@@ -835,7 +1139,8 @@ export function startUiServer(): void {
       +'<td class="conv-status"><span class="badge badge-active">Active</span></td>'
       +'<td class="conv-turns">0</td>'
       +'<td>—</td>'
-      +'<td class="conv-time">just now</td>';
+      +'<td class="conv-time">just now</td>'
+      +'<td class="conv-actions"><a href="/api/conversations/'+d.conversationId+'/markdown" download title="Download chat log">⬇ log</a> <a href="/api/conversations/'+d.conversationId+'/session-clone" download title="Download session clone">⬇ clone</a></td>';
     tbody.insertBefore(tr,tbody.firstChild);
   });
 
@@ -934,12 +1239,40 @@ export function startUiServer(): void {
 
   var es=connectSSE('/api/conversations/'+convId+'/events');
 
+  var streamCard=null;
+  var streamBody=null;
+
+  function removeStreamCard(){
+    if(streamCard){streamCard.remove();streamCard=null;streamBody=null;}
+  }
+
+  es.addEventListener('stream_start',function(e){
+    var d=JSON.parse(e.data);
+    if(d.conversationId!==convId) return;
+    removeStreamCard();
+    streamCard=document.createElement('div');
+    streamCard.className='msg msg-assistant msg-streaming fade-in';
+    streamCard.innerHTML='<div class="msg-header"><span>Assistant</span><span class="badge badge-running" style="font-size:11px">Streaming</span></div><div class="msg-body"></div>';
+    streamBody=streamCard.querySelector('.msg-body');
+    container.appendChild(streamCard);
+    scrollIfPinned();
+  });
+
+  es.addEventListener('stream_delta',function(e){
+    var d=JSON.parse(e.data);
+    if(d.conversationId!==convId||!streamBody) return;
+    streamBody.textContent+=d.delta;
+    scrollIfPinned();
+  });
+
   es.addEventListener('turn',function(e){
     var d=JSON.parse(e.data);
     if(d.conversationId!==convId) return;
     var t=d.turn;
     if(t.turn_index<=lastIndex) return;
     lastIndex=t.turn_index;
+
+    if(t.role==='tool_call'||t.role==='assistant') removeStreamCard();
 
     var html='';
     if(t.role==='user') html=renderUserTurn(t);
@@ -957,6 +1290,7 @@ export function startUiServer(): void {
 
   es.addEventListener('status',function(e){
     var d=JSON.parse(e.data);
+    if(!d.running) removeStreamCard();
     var badges=document.querySelectorAll('.status-bar .badge');
     badges.forEach(function(b){
       if(d.running&&d.activeConversationId===convId){
@@ -970,6 +1304,35 @@ export function startUiServer(): void {
       }
     });
   });
+
+  var continueBtn=document.getElementById('continue-btn');
+  var continueStatus=document.getElementById('continue-status');
+  if(continueBtn){
+    continueBtn.addEventListener('click',function(){
+      if(!confirm('Start a new Slack thread? JARVIS will post a primer summary as a new top-level message in the same channel. This may take 10–20 seconds.')) return;
+      continueBtn.disabled=true;
+      continueStatus.className='continue-status';
+      continueStatus.textContent='Generating primer + posting to Slack…';
+      fetch('/api/conversations/'+convId+'/continue',{method:'POST'})
+        .then(function(r){return r.json().then(function(d){return{ok:r.ok,data:d}})})
+        .then(function(o){
+          if(!o.ok){
+            continueStatus.className='continue-status err';
+            continueStatus.textContent='Failed: '+(o.data.error||'unknown error');
+            continueBtn.disabled=false;
+            return;
+          }
+          continueStatus.className='continue-status ok';
+          continueStatus.innerHTML='Posted! New thread: <a href="/conversations/'+o.data.newConversationId+'">#'+o.data.newConversationId+'</a>';
+          setTimeout(function(){location.reload()},2000);
+        })
+        .catch(function(err){
+          continueStatus.className='continue-status err';
+          continueStatus.textContent='Network error: '+err.message;
+          continueBtn.disabled=false;
+        });
+    });
+  }
 })();
 </script>`;
     res.send(renderLayout(`Conv #${id}`, body, undefined, scripts));
@@ -1039,6 +1402,105 @@ export function startUiServer(): void {
     if (!conv) { res.status(404).json({ error: 'Not found' }); return; }
     const turns = getTurns(conv.id);
     res.json({ ...conv, turns });
+  });
+
+  app.get('/api/conversations/:id/markdown', (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) { res.status(400).json({ error: 'Invalid ID' }); return; }
+    const conv = getConversationById(id);
+    if (!conv) { res.status(404).json({ error: 'Not found' }); return; }
+    const turns = getTurns(conv.id);
+    const md = buildTranscriptMarkdown(conv, turns);
+    const safeExternal = conv.external_id.replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 80);
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="jarvis-conv-${conv.id}-${safeExternal}.md"`);
+    res.send(md);
+  });
+
+  app.get('/api/conversations/:id/session-clone', (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) { res.status(400).json({ error: 'Invalid ID' }); return; }
+    const conv = getConversationById(id);
+    if (!conv) { res.status(404).json({ error: 'Not found' }); return; }
+    const turns = getTurns(conv.id);
+    const md = buildSessionClone(conv, turns);
+    const safeExternal = conv.external_id.replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 80);
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="jarvis-session-clone-${conv.id}-${safeExternal}.md"`);
+    res.send(md);
+  });
+
+  app.post('/api/conversations/:id/continue', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) { res.status(400).json({ error: 'Invalid ID' }); return; }
+    const conv = getConversationById(id);
+    if (!conv) { res.status(404).json({ error: 'Not found' }); return; }
+
+    if (conv.continued_to_id) {
+      res.status(409).json({
+        error: `Already continued to conversation #${conv.continued_to_id}`,
+        nextConversationId: conv.continued_to_id,
+      });
+      return;
+    }
+
+    const channel = slackChannelFromExternalId(conv.external_id);
+    if (!channel) {
+      res.status(400).json({ error: 'Only Slack conversations can be continued (external_id must be "slack:CHANNEL:THREAD_TS")' });
+      return;
+    }
+    if (!slackApp) {
+      res.status(503).json({ error: 'Slack is not configured — cannot post continuation message' });
+      return;
+    }
+
+    const turns = getTurns(conv.id);
+    if (turns.length === 0) {
+      res.status(400).json({ error: 'Conversation is empty — nothing to continue' });
+      return;
+    }
+
+    let primerText: string;
+    try {
+      const primerPrompt = buildPrimerPrompt(conv, turns);
+      const claudeRes = await runClaude(primerPrompt, null);
+      primerText = (claudeRes.text ?? '').trim();
+      if (!primerText) {
+        res.status(500).json({ error: 'Primer generation returned empty text' });
+        return;
+      }
+    } catch (err) {
+      res.status(500).json({ error: `Primer generation failed: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
+    let newTs: string;
+    try {
+      const post = await slackApp.client.chat.postMessage({ channel, text: primerText });
+      const ts = typeof post.ts === 'string' ? post.ts : null;
+      if (!ts) {
+        res.status(500).json({ error: 'Slack post returned no ts' });
+        return;
+      }
+      newTs = ts;
+    } catch (err) {
+      res.status(500).json({ error: `Slack post failed: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
+    const newExternalId = `slack:${channel}:${newTs}`;
+    const newConv = getOrCreateConversation(newExternalId, channel);
+    addTurn(newConv.id, 'assistant', primerText);
+    linkContinuedThreads(conv.id, newConv.id);
+
+    res.json({
+      ok: true,
+      previousConversationId: conv.id,
+      newConversationId: newConv.id,
+      newExternalId,
+      newThreadTs: newTs,
+      primerPreview: primerText.slice(0, 240),
+    });
   });
 
   // -- SSE endpoints --

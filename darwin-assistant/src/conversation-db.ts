@@ -18,7 +18,9 @@ db.exec(`
     claude_session_id TEXT,
     status        TEXT NOT NULL DEFAULT 'active',
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    continued_from_id INTEGER REFERENCES conversations(id),
+    continued_to_id   INTEGER REFERENCES conversations(id)
   );
 
   CREATE TABLE IF NOT EXISTS turns (
@@ -52,6 +54,14 @@ for (const col of [
   try { db.exec(`ALTER TABLE turns ADD COLUMN ${col}`); } catch {}
 }
 
+// Migrate: add lineage columns to conversations table (for "continue in new thread" feature)
+for (const col of [
+  'continued_from_id INTEGER REFERENCES conversations(id)',
+  'continued_to_id INTEGER REFERENCES conversations(id)',
+]) {
+  try { db.exec(`ALTER TABLE conversations ADD COLUMN ${col}`); } catch {}
+}
+
 export interface ConversationRow {
   id: number;
   external_id: string;
@@ -60,6 +70,8 @@ export interface ConversationRow {
   status: string;
   created_at: string;
   updated_at: string;
+  continued_from_id: number | null;
+  continued_to_id: number | null;
 }
 
 export interface TurnRow {
@@ -248,6 +260,28 @@ export function listAllConversations(): ConversationRow[] {
 
 export function countTurns(conversationId: number): number {
   return stmts.countTurns.get(conversationId)?.cnt ?? 0;
+}
+
+const lineageStmts = {
+  linkContinuation: db.prepare<[number, number]>(
+    `UPDATE conversations SET continued_to_id = ?, updated_at = datetime('now') WHERE id = ?`,
+  ),
+  linkPredecessor: db.prepare<[number, number]>(
+    `UPDATE conversations SET continued_from_id = ?, updated_at = datetime('now') WHERE id = ?`,
+  ),
+};
+
+/**
+ * Mark `predecessorId` as having been continued by `successorId`. Sets both
+ * directions atomically. Use after posting the primer message that starts the
+ * new Slack thread.
+ */
+export function linkContinuedThreads(predecessorId: number, successorId: number): void {
+  const txn = db.transaction(() => {
+    lineageStmts.linkContinuation.run(successorId, predecessorId);
+    lineageStmts.linkPredecessor.run(predecessorId, successorId);
+  });
+  txn();
 }
 
 // -- JARVIS-created issues tracking (for review-ready notifications) --

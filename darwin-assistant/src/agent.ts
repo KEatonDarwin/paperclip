@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { buildSystemPrompt } from './prompt.js';
+import { buildSystemPrompt, loadMemoryBlock } from './prompt.js';
 import { ALL_TOOLS, TOOL_MAP } from './tools/index.js';
 import {
   getOrCreateConversation,
@@ -11,7 +11,7 @@ import {
   type ConversationRow,
   type TurnMetadata,
 } from './conversation-db.js';
-import { sseBus, type StatusEvent } from './sse-bus.js';
+import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent, type StreamEndEvent } from './sse-bus.js';
 
 const MAX_TOOL_TURNS = 50;
 
@@ -66,8 +66,11 @@ const ADAPTERS: Record<string, AdapterConfig> = {
     models: [
       { id: 'default', label: 'Default' },
     ],
-    buildArgs() {
-      return ['--dangerously-skip-permissions'];
+    buildArgs({ sessionId, model }) {
+      const args = ['--print', '--output-format', 'json'];
+      if (sessionId) args.push('--resume', sessionId);
+      if (model && model !== 'default') args.push('--model', model);
+      return args;
     },
   },
 };
@@ -96,7 +99,7 @@ export function getActiveConversation(): { conversationId: number; startedAt: nu
   return { conversationId: activeConversationId, startedAt: activeStartedAt };
 }
 
-function buildToolsBlock(): string {
+export function buildToolsBlock(): string {
   const defs = ALL_TOOLS.map(
     (t) =>
       `### ${t.name}\n${t.description}\nParameters: ${JSON.stringify(t.parameters, null, 2)}`,
@@ -208,7 +211,11 @@ export function parseToolCall(
 
 const UNKNOWN_SESSION_RE = /no conversation found with session id|unknown session|session .* not found/i;
 
-export async function runClaude(input: string, sessionId?: string | null): Promise<ClaudeResult> {
+export async function runClaude(
+  input: string,
+  sessionId?: string | null,
+  onEvent?: (event: Record<string, unknown>) => void,
+): Promise<ClaudeResult> {
   const adapter = getActiveAdapter();
   const model = getSetting('model');
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
@@ -220,11 +227,32 @@ export async function runClaude(input: string, sessionId?: string | null): Promi
     const child = spawn(adapter.bin, args, { env });
     const outChunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
+    let lineBuffer = '';
 
-    child.stdout.on('data', (chunk: Buffer) => outChunks.push(chunk));
+    child.stdout.on('data', (chunk: Buffer) => {
+      outChunks.push(chunk);
+
+      if (onEvent) {
+        lineBuffer += chunk.toString('utf8');
+        const lines = lineBuffer.split('\n');
+        lineBuffer = lines.pop() ?? '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            onEvent(JSON.parse(trimmed) as Record<string, unknown>);
+          } catch {}
+        }
+      }
+    });
+
     child.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
     child.on('error', reject);
     child.on('close', (code) => {
+      if (onEvent && lineBuffer.trim()) {
+        try { onEvent(JSON.parse(lineBuffer.trim()) as Record<string, unknown>); } catch {}
+      }
+
       const stdout = Buffer.concat(outChunks).toString('utf8');
       const stderr = Buffer.concat(errChunks).toString('utf8');
 
@@ -276,21 +304,53 @@ async function runConversationTurn(conv: ConversationRow, input: string): Promis
   let stdinContent: string;
 
   if (sessionId) {
-    stdinContent = input;
+    const freshMemory = loadMemoryBlock();
+    stdinContent = `<memory_refresh>\n${freshMemory}\n</memory_refresh>\n\n${input}`;
   } else {
     stdinContent = buildInitialPrompt(input);
   }
 
   for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
+    let accumulatedText = '';
+    const onStreamEvent = (event: Record<string, unknown>) => {
+      if (event.type === 'content_block_delta') {
+        const delta = event.delta as Record<string, unknown> | undefined;
+        if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+          sseBus.emit('sse', { type: 'stream_delta', conversationId: conv.id, delta: delta.text } satisfies StreamDeltaEvent);
+          accumulatedText += delta.text;
+          return;
+        }
+      }
+      if (event.type === 'assistant') {
+        const content = (event.message as Record<string, unknown> | null)?.content;
+        if (Array.isArray(content)) {
+          let fullText = '';
+          for (const block of content) {
+            const b = block as Record<string, unknown>;
+            if (b.type === 'text' && typeof b.text === 'string') fullText += b.text;
+          }
+          if (fullText.length > accumulatedText.length) {
+            sseBus.emit('sse', { type: 'stream_delta', conversationId: conv.id, delta: fullText.slice(accumulatedText.length) } satisfies StreamDeltaEvent);
+            accumulatedText = fullText;
+          }
+        }
+      }
+    };
+
+    sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
     const claudeT0 = Date.now();
-    let result = await runClaude(stdinContent, sessionId);
+    let result = await runClaude(stdinContent, sessionId, onStreamEvent);
+    sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
 
     // Session expired or unknown — retry without resume
     if (sessionId && !result.text && !result.sessionId) {
       console.log(`[agent] Session ${sessionId} expired, starting fresh`);
       sessionId = null;
       stdinContent = buildInitialPrompt(input);
-      result = await runClaude(stdinContent, null);
+      accumulatedText = '';
+      sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
+      result = await runClaude(stdinContent, null, onStreamEvent);
+      sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
     }
     const claudeMs = Date.now() - claudeT0;
 

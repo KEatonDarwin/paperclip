@@ -17,6 +17,7 @@ import { getAllSettings, getSetting, setSetting } from './conversation-db.js';
 import { query } from './db.js';
 import { sseBus, type SSEEvent } from './sse-bus.js';
 import { createVaultRouter } from './vault-page.js';
+import { createApiV1Router } from './handlers/api-v1.js';
 import type { Response } from 'express';
 import type { App as SlackApp } from '@slack/bolt';
 
@@ -1107,6 +1108,7 @@ export function startUiServer(slackApp?: SlackApp): void {
   const app = express();
   app.use(express.json());
   app.use(createVaultRouter(renderLayout));
+  app.use('/api/v1', createApiV1Router());
 
   app.get('/', (_req, res) => {
     const body = renderStatusBar() + renderConversationList();

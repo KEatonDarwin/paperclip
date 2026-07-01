@@ -45,7 +45,25 @@ export interface StatusEvent {
   activeConversationId: number | null;
 }
 
-export type SSEEvent = TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent;
+export interface StreamStartEvent {
+  type: 'stream_start';
+  conversationId: number;
+}
+
+export interface StreamDeltaEvent {
+  type: 'stream_delta';
+  conversationId: number;
+  delta: string;
+}
+
+export interface StreamEndEvent {
+  type: 'stream_end';
+  conversationId: number;
+}
+
+export type SSEEvent =
+  | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
+  | StreamStartEvent | StreamDeltaEvent | StreamEndEvent;
 
 class SSEBus extends EventEmitter {}
 

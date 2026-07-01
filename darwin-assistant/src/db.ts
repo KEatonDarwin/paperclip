@@ -8,6 +8,7 @@ export const db = new Pool({
 });
 
 export const DARWIN_COMPANY_ID = 'ffbbb56f-af79-49a0-a95a-9eb89f5b3034';
+export const DARWIN_USER_ID = process.env.DARWIN_USER_ID ?? 'k3fIWc0qggWURqzdgHm72nItUMwbxzYj';
 
 export async function query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]> {
   const result = await db.query(sql, params);

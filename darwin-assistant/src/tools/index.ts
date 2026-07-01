@@ -57,6 +57,14 @@ export {
   listMuted,
 } from './mute.js';
 
+export {
+  createScheduledTask,
+  listScheduledTasks,
+  getScheduledTask,
+  updateScheduledTask,
+  cancelScheduledTask,
+} from './scheduled-tasks.js';
+
 import {
   createIssue,
   searchIssues,
@@ -103,6 +111,13 @@ import {
   unmuteReminders,
   listMuted,
 } from './mute.js';
+import {
+  createScheduledTask,
+  listScheduledTasks,
+  getScheduledTask,
+  updateScheduledTask,
+  cancelScheduledTask,
+} from './scheduled-tasks.js';
 
 export const ALL_TOOLS: ToolDef[] = [
   createIssue,
@@ -141,6 +156,11 @@ export const ALL_TOOLS: ToolDef[] = [
   muteReminders,
   unmuteReminders,
   listMuted,
+  createScheduledTask,
+  listScheduledTasks,
+  getScheduledTask,
+  updateScheduledTask,
+  cancelScheduledTask,
 ];
 
 export const TOOL_MAP: Map<string, ToolDef> = new Map(

@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import postgres from "postgres";
 
@@ -150,18 +150,29 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   const nullifiedColumnsByTable = normalizeNullifyColumnMap(opts.nullifyColumns);
   const sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
 
+  mkdirSync(opts.backupDir, { recursive: true });
+  const backupFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
+  const stream = createWriteStream(backupFile, { encoding: "utf8" });
+  const streamClosed = new Promise<void>((resolvePromise, rejectPromise) => {
+    stream.once("error", rejectPromise);
+    stream.once("close", () => resolvePromise());
+  });
+
+  const emit = (line: string): void => {
+    if (!stream.write(`${line}\n`)) {
+      // backpressure – waited on at end via streamClosed
+    }
+  };
+  const emitStatement = (statement: string) => {
+    emit(statement);
+    emit(STATEMENT_BREAKPOINT);
+  };
+  const emitStatementBoundary = () => {
+    emit(STATEMENT_BREAKPOINT);
+  };
+
   try {
     await sql`SELECT 1`;
-
-    const lines: string[] = [];
-    const emit = (line: string) => lines.push(line);
-    const emitStatement = (statement: string) => {
-      emit(statement);
-      emit(STATEMENT_BREAKPOINT);
-    };
-    const emitStatementBoundary = () => {
-      emit(STATEMENT_BREAKPOINT);
-    };
 
     emit("-- Paperclip database backup");
     emit(`-- Created: ${new Date().toISOString()}`);
@@ -447,13 +458,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("");
     }
 
-    // Dump data for each table
+    // Dump data for each table (streamed via cursor to bound memory)
     for (const { schema_name, tablename } of tables) {
       const qualifiedTableName = quoteQualifiedName(schema_name, tablename);
       const count = await sql.unsafe<{ n: number }[]>(`SELECT count(*)::int AS n FROM ${qualifiedTableName}`);
       if (excludedTableNames.has(tablename) || (count[0]?.n ?? 0) === 0) continue;
 
-      // Get column info for this table
       const cols = await sql<{ column_name: string; data_type: string }[]>`
         SELECT column_name, data_type
         FROM information_schema.columns
@@ -464,20 +474,27 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
       emit(`-- Data for: ${schema_name}.${tablename} (${count[0]!.n} rows)`);
 
-      const rows = await sql.unsafe(`SELECT * FROM ${qualifiedTableName}`).values();
       const nullifiedColumns = nullifiedColumnsByTable.get(tablename) ?? new Set<string>();
-      for (const row of rows) {
-        const values = row.map((rawValue: unknown, index) => {
-          const columnName = cols[index]?.column_name;
-          const val = columnName && nullifiedColumns.has(columnName) ? null : rawValue;
-          if (val === null || val === undefined) return "NULL";
-          if (typeof val === "boolean") return val ? "true" : "false";
-          if (typeof val === "number") return String(val);
-          if (val instanceof Date) return formatSqlLiteral(val.toISOString());
-          if (typeof val === "object") return formatSqlLiteral(JSON.stringify(val));
-          return formatSqlLiteral(String(val));
-        });
-        emitStatement(`INSERT INTO ${qualifiedTableName} (${colNames}) VALUES (${values.join(", ")});`);
+      const cursor = sql.unsafe(`SELECT * FROM ${qualifiedTableName}`).cursor(1000);
+      for await (const batch of cursor) {
+        for (const row of batch) {
+          const rowRecord = row as Record<string, unknown>;
+          const values = cols.map((col) => {
+            const columnName = col.column_name;
+            const rawValue = rowRecord[columnName];
+            const val = nullifiedColumns.has(columnName) ? null : rawValue;
+            if (val === null || val === undefined) return "NULL";
+            if (typeof val === "boolean") return val ? "true" : "false";
+            if (typeof val === "number") return String(val);
+            if (val instanceof Date) return formatSqlLiteral(val.toISOString());
+            if (typeof val === "object") return formatSqlLiteral(JSON.stringify(val));
+            return formatSqlLiteral(String(val));
+          });
+          emitStatement(`INSERT INTO ${qualifiedTableName} (${colNames}) VALUES (${values.join(", ")});`);
+          if (stream.writableNeedDrain) {
+            await new Promise<void>((r) => stream.once("drain", r));
+          }
+        }
       }
       emit("");
     }
@@ -503,10 +520,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     emitStatement("COMMIT;");
     emit("");
 
-    // Write the backup file
-    mkdirSync(opts.backupDir, { recursive: true });
-    const backupFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
-    await writeFile(backupFile, lines.join("\n"), "utf8");
+    stream.end();
+    await streamClosed;
 
     const sizeBytes = statSync(backupFile).size;
     const prunedCount = pruneOldBackups(opts.backupDir, retentionDays, filenamePrefix);
@@ -517,6 +532,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       prunedCount,
     };
   } finally {
+    if (!stream.destroyed) {
+      stream.destroy();
+    }
     await sql.end();
   }
 }

@@ -22,6 +22,14 @@ export interface AdapterConfig {
   models: { id: string; label: string }[];
   buildArgs: (opts: { sessionId?: string | null; model?: string | null }) => string[];
   envOverrides?: (env: Record<string, string>) => void;
+  // Optional adapter-specific stdout parser. Defaults to the claude JSONL parser.
+  parseOutput?: (stdout: string) => ClaudeResult;
+  // Optional per-line event mapper to translate adapter-native JSONL into claude-shaped
+  // events for the SSE stream. Return null to drop an event from the stream.
+  mapStreamEvent?: (event: Record<string, unknown>) => Record<string, unknown> | null;
+  // Optional adapter-specific pattern used to detect "unknown/expired session" stderr,
+  // so runConversationTurn can retry without --resume.
+  unknownSessionPattern?: RegExp;
 }
 
 const ADAPTERS: Record<string, AdapterConfig> = {
@@ -49,15 +57,27 @@ const ADAPTERS: Record<string, AdapterConfig> = {
     name: 'Codex (OpenAI)',
     bin: process.env.CODEX_BIN ?? 'codex',
     models: [
+      { id: 'gpt-5.1-codex', label: 'GPT-5.1 Codex' },
+      { id: 'gpt-5.1', label: 'GPT-5.1' },
+      { id: 'gpt-5.5', label: 'GPT-5.5' },
       { id: 'o4-mini', label: 'o4-mini' },
-      { id: 'o3', label: 'o3' },
-      { id: 'gpt-4.1', label: 'GPT-4.1' },
     ],
-    buildArgs({ model }) {
-      const args = ['--full-auto'];
-      if (model) args.push('--model', model);
+    buildArgs({ sessionId, model }) {
+      const args: string[] = ['exec'];
+      if (sessionId) args.push('resume', sessionId);
+      args.push(
+        '--json',
+        '--dangerously-bypass-approvals-and-sandbox',
+        '--skip-git-repo-check',
+      );
+      if (model) args.push('-m', model);
+      // Prompt argument `-` explicitly tells codex to read the prompt from stdin.
+      args.push('-');
       return args;
     },
+    parseOutput: parseCodexOutput,
+    mapStreamEvent: codexMapStreamEvent,
+    unknownSessionPattern: /(session|thread)[^\n]*not found|no such (session|thread)|unknown (session|thread)/i,
   },
   auggie: {
     id: 'auggie',
@@ -196,6 +216,59 @@ function parseClaudeOutput(stdout: string): ClaudeResult {
   return { text: texts.join('').trim() || stdout.trim(), sessionId, usage, model, rawOutput: stdout };
 }
 
+function parseCodexOutput(stdout: string): ClaudeResult {
+  const texts: string[] = [];
+  let sessionId: string | null = null;
+  let usage: ClaudeUsage | undefined;
+
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+
+    if (event.type === 'thread.started' && typeof event.thread_id === 'string' && event.thread_id) {
+      sessionId = event.thread_id;
+    }
+
+    if (event.type === 'item.completed') {
+      const item = event.item as Record<string, unknown> | undefined;
+      if (item && item.type === 'agent_message' && typeof item.text === 'string') {
+        texts.push(item.text);
+      }
+    }
+
+    if (event.type === 'turn.completed') {
+      const u = event.usage as Record<string, unknown> | undefined;
+      if (u) {
+        usage = {
+          inputTokens: typeof u.input_tokens === 'number' ? u.input_tokens : 0,
+          outputTokens: typeof u.output_tokens === 'number' ? u.output_tokens : 0,
+          cacheReadTokens: typeof u.cached_input_tokens === 'number' ? u.cached_input_tokens : undefined,
+        };
+      }
+    }
+  }
+
+  return { text: texts.join('\n').trim(), sessionId, usage, rawOutput: stdout };
+}
+
+// Codex's `--json` stream emits `item.completed` with `agent_message` at the end of a
+// turn rather than incremental deltas. We surface that as a single claude-shaped
+// `content_block_delta` so the existing SSE bridge in runConversationTurn keeps working.
+function codexMapStreamEvent(event: Record<string, unknown>): Record<string, unknown> | null {
+  if (event.type === 'item.completed') {
+    const item = event.item as Record<string, unknown> | undefined;
+    if (item && item.type === 'agent_message' && typeof item.text === 'string') {
+      return {
+        type: 'content_block_delta',
+        delta: { type: 'text_delta', text: item.text },
+      };
+    }
+  }
+  return null;
+}
+
 export function parseToolCall(
   text: string,
 ): { name: string; arguments: Record<string, unknown> } | null {
@@ -229,6 +302,12 @@ export async function runClaude(
     const errChunks: Buffer[] = [];
     let lineBuffer = '';
 
+    const forwardEvent = (event: Record<string, unknown>) => {
+      if (!onEvent) return;
+      const mapped = adapter.mapStreamEvent ? adapter.mapStreamEvent(event) : event;
+      if (mapped) onEvent(mapped);
+    };
+
     child.stdout.on('data', (chunk: Buffer) => {
       outChunks.push(chunk);
 
@@ -240,7 +319,7 @@ export async function runClaude(
           const trimmed = line.trim();
           if (!trimmed) continue;
           try {
-            onEvent(JSON.parse(trimmed) as Record<string, unknown>);
+            forwardEvent(JSON.parse(trimmed) as Record<string, unknown>);
           } catch {}
         }
       }
@@ -250,7 +329,7 @@ export async function runClaude(
     child.on('error', reject);
     child.on('close', (code) => {
       if (onEvent && lineBuffer.trim()) {
-        try { onEvent(JSON.parse(lineBuffer.trim()) as Record<string, unknown>); } catch {}
+        try { forwardEvent(JSON.parse(lineBuffer.trim()) as Record<string, unknown>); } catch {}
       }
 
       const stdout = Buffer.concat(outChunks).toString('utf8');
@@ -258,15 +337,17 @@ export async function runClaude(
 
       if ((code ?? 0) !== 0 && !stdout.trim()) {
         const combined = stderr + '\n' + stdout;
-        if (sessionId && UNKNOWN_SESSION_RE.test(combined)) {
+        const unknownSessionRe = adapter.unknownSessionPattern ?? UNKNOWN_SESSION_RE;
+        if (sessionId && unknownSessionRe.test(combined)) {
           resolve({ text: '', sessionId: null });
           return;
         }
         const firstErr = stderr.split('\n').find((l) => l.trim()) ?? `exit code ${code}`;
-        reject(new Error(`claude: ${firstErr}`));
+        reject(new Error(`${adapter.id}: ${firstErr}`));
         return;
       }
-      resolve(parseClaudeOutput(stdout));
+      const parse = adapter.parseOutput ?? parseClaudeOutput;
+      resolve(parse(stdout));
     });
 
     child.stdin.write(input, 'utf8');

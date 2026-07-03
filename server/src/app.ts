@@ -35,6 +35,7 @@ import { digestRoutes } from "./routes/digests.js";
 import { quickNoteRoutes } from "./routes/quick-notes.js";
 import { hopperRoutes } from "./routes/hopper.js";
 import { scheduledTaskRoutes } from "./routes/scheduled-tasks.js";
+import { buildInfoRoutes } from "./routes/build-info.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -169,6 +170,7 @@ export async function createApp(
   api.use(quickNoteRoutes(db));
   api.use(hopperRoutes(db));
   api.use(scheduledTaskRoutes(db));
+  api.use("/build-info", buildInfoRoutes());
   const hostServicesDisposers = new Map<string, () => void>();
   const workerManager = createPluginWorkerManager();
   const pluginRegistry = pluginRegistryService(db);
@@ -271,9 +273,23 @@ export async function createApp(
     const uiRoot = path.resolve(__dirname, "../../ui");
     const hmrPort = resolveViteHmrPort(opts.serverPort);
     const { createServer: createViteServer } = await import("vite");
+    // Compile-time globals referenced by ui/src/components/VersionInfoModal.tsx.
+    // Declared in ui/src/globals.d.ts; if not defined here, the UI throws
+    // ReferenceError at render → blank page.
+    let uiGitHash = "dev";
+    try {
+      const { execSync } = await import("child_process");
+      uiGitHash = execSync("git rev-parse --short HEAD", { cwd: uiRoot }).toString().trim();
+    } catch {
+      // fall back to "dev"
+    }
     const vite = await createViteServer({
       root: uiRoot,
       appType: "custom",
+      define: {
+        __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
+        __UI_GIT_HASH__: JSON.stringify(uiGitHash),
+      },
       server: {
         middlewareMode: true,
         hmr: {

@@ -35,6 +35,7 @@ import { digestRoutes } from "./routes/digests.js";
 import { quickNoteRoutes } from "./routes/quick-notes.js";
 import { hopperRoutes } from "./routes/hopper.js";
 import { scheduledTaskRoutes } from "./routes/scheduled-tasks.js";
+import { jobRoutes } from "./routes/jobs.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -169,6 +170,7 @@ export async function createApp(
   api.use(quickNoteRoutes(db));
   api.use(hopperRoutes(db));
   api.use(scheduledTaskRoutes(db));
+  api.use(jobRoutes(db));
   const hostServicesDisposers = new Map<string, () => void>();
   const workerManager = createPluginWorkerManager();
   const pluginRegistry = pluginRegistryService(db);

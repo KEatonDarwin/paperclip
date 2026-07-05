@@ -5,8 +5,13 @@
 -- fallback (packages/db/src/client.ts) scans the migrations folder and applies any
 -- on-disk .sql not yet recorded (deduped by content hash), on both fresh and existing
 -- DBs — the same path that already applies the un-journaled 0063/0064 files.
+--
+-- IDEMPOTENT: the manual apply path re-runs statements raw (no already-applied guard),
+-- so any content edit to this file changes its hash, marks it "pending" again, and
+-- re-executes every statement. All statements below use IF NOT EXISTS so a re-apply on
+-- an existing DB is a harmless no-op instead of a boot-killing "relation already exists".
 
-CREATE TABLE "jobs" (
+CREATE TABLE IF NOT EXISTS "jobs" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"company_id" uuid NOT NULL REFERENCES "companies"("id") ON DELETE CASCADE,
 	"external_ref" text,
@@ -29,7 +34,7 @@ CREATE TABLE "jobs" (
 	"completed_at" timestamp with time zone
 );
 --> statement-breakpoint
-CREATE TABLE "job_tasks" (
+CREATE TABLE IF NOT EXISTS "job_tasks" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"job_id" uuid NOT NULL REFERENCES "jobs"("id") ON DELETE CASCADE,
 	"seq" integer DEFAULT 0 NOT NULL,
@@ -51,10 +56,10 @@ CREATE TABLE "job_tasks" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE INDEX "jobs_company_status_idx" ON "jobs" USING btree ("company_id","status");
+CREATE INDEX IF NOT EXISTS "jobs_company_status_idx" ON "jobs" USING btree ("company_id","status");
 --> statement-breakpoint
-CREATE INDEX "jobs_company_created_idx" ON "jobs" USING btree ("company_id","created_at");
+CREATE INDEX IF NOT EXISTS "jobs_company_created_idx" ON "jobs" USING btree ("company_id","created_at");
 --> statement-breakpoint
-CREATE INDEX "job_tasks_job_seq_idx" ON "job_tasks" USING btree ("job_id","seq");
+CREATE INDEX IF NOT EXISTS "job_tasks_job_seq_idx" ON "job_tasks" USING btree ("job_id","seq");
 --> statement-breakpoint
-CREATE INDEX "job_tasks_job_status_idx" ON "job_tasks" USING btree ("job_id","status");
+CREATE INDEX IF NOT EXISTS "job_tasks_job_status_idx" ON "job_tasks" USING btree ("job_id","status");

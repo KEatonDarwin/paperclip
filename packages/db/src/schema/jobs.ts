@@ -58,6 +58,14 @@ export const jobTasks = pgTable(
     verifyResult: text("verify_result"), // 'pass' | 'fail' | 'skipped'
     artifactDiff: text("artifact_diff"), // short summary of the produced diff (files/±lines)
     retryCount: integer("retry_count").notNull().default(0), // Phase-1 caps at 1 retry
+    // HORIZON two-level-gate hinge (Phase 2): split acceptance so a worker can't game the gate.
+    // repair_signal = diagnostics SHOWN to the worker during retry; final_gate = the HELD-OUT
+    // check (extra tests / independent review / UX-reviewer) the worker never optimizes against.
+    repairSignal: text("repair_signal"),
+    finalGate: text("final_gate"),
+    // HORIZON cost/latency metrics, first-class per Task (populated by the real Verifier/dispatcher).
+    tokenSpend: integer("token_spend"),
+    verifyLatencyMs: integer("verify_latency_ms"),
     errorMessage: text("error_message"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

@@ -134,6 +134,48 @@ export function runVerify(repo: string, command: string | null | undefined, time
   }
 }
 
+// --- Git-notes repair trail (DAR-687, HORIZON prior-art §1) -------------------
+// "The repository's own history is the experience buffer rather than a separate
+// datastore." Each task's verify verdict + repair context is attached as a git note
+// on the task commit, under a dedicated `refs/notes/foreman` ref so it never pollutes
+// the default notes namespace. `git log --notes=foreman` then replays the whole trail,
+// and the worktree/PR is self-describing when a human or JARVIS opens it — no extra DB.
+export const FOREMAN_NOTES_REF = "foreman";
+
+// Resolve a branch (or any commit-ish) to its HEAD sha. Empty string if unresolvable.
+export function resolveHead(repo: string, commitish: string): string {
+  const res = git(repo, ["rev-parse", "--verify", "--quiet", `${commitish}^{commit}`]);
+  return res.ok ? res.stdout.trim() : "";
+}
+
+// Attach (force-overwrite) a Foreman note on a commit. `-f` makes it idempotent across
+// retries so re-running a task replaces its note rather than erroring on an existing one.
+export function addForemanNote(repo: string, commitish: string, note: string): GitResult {
+  const sha = resolveHead(repo, commitish);
+  if (!sha) return { ok: false, stdout: "", stderr: `cannot resolve commit ${commitish}` };
+  return git(repo, ["notes", `--ref=${FOREMAN_NOTES_REF}`, "add", "-f", "-m", note, sha]);
+}
+
+// Read back the Foreman note on a commit (empty string if none).
+export function readForemanNote(repo: string, commitish: string): string {
+  const sha = resolveHead(repo, commitish);
+  if (!sha) return "";
+  const res = git(repo, ["notes", `--ref=${FOREMAN_NOTES_REF}`, "show", sha]);
+  return res.ok ? res.stdout.trim() : "";
+}
+
+// Replay the whole repair trail across a branch's new history (base..branch), with the
+// Foreman notes inlined — the self-describing experience buffer for the PR / report.
+export function replayTrail(repo: string, baseBranch: string, branch: string): string {
+  const res = git(repo, [
+    "log",
+    `--notes=${FOREMAN_NOTES_REF}`,
+    "--format=* %h %s",
+    `${baseBranch}..${branch}`,
+  ]);
+  return res.ok ? res.stdout.trim() : `trail unavailable: ${res.stderr}`;
+}
+
 // Short diff summary for a task branch vs the base (files + ± lines).
 export function diffSummary(repo: string, baseBranch: string, taskBranch: string): string {
   const res = git(repo, ["diff", "--stat", `${baseBranch}...${taskBranch}`]);

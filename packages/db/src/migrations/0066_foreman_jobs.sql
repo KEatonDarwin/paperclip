@@ -46,6 +46,10 @@ CREATE TABLE "job_tasks" (
 	"verify_result" text,
 	"artifact_diff" text,
 	"retry_count" integer DEFAULT 0 NOT NULL,
+	"repair_signal" text,
+	"final_gate" text,
+	"token_spend" integer,
+	"verify_latency_ms" integer,
 	"error_message" text,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL

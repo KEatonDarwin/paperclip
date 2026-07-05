@@ -7,7 +7,14 @@
 import { and, desc, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { jobs, jobTasks } from "@paperclipai/db";
-import { integrateBranches, runVerify, diffSummary, type IntegrationResult } from "./foreman-git.js";
+import {
+  integrateBranches,
+  runVerify,
+  diffSummary,
+  addForemanNote,
+  type IntegrationResult,
+  type VerifyResult,
+} from "./foreman-git.js";
 
 export type JobRow = typeof jobs.$inferSelect;
 export type JobTaskRow = typeof jobTasks.$inferSelect;
@@ -60,6 +67,33 @@ export interface RunJobOptions {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// --- Git-notes trail rendering (HORIZON §1) — pure, so unit-exercisable ------------
+function clip(s: string, max: number): string {
+  const t = (s ?? "").trim();
+  return t.length <= max ? t : `${t.slice(0, max)}…`;
+}
+
+// The per-task note: seq, instruction, how many attempts it took, and the produced diff.
+// Passed attempts are 0-based (attempt 0 = first try), so attempts = attempt + 1.
+export function renderTaskNote(task: JobTaskRow, attempt: number, diff: string): string {
+  return [
+    `foreman-task seq=${task.seq} flavor=${task.flavor} status=committed`,
+    `attempts: ${attempt + 1}${attempt > 0 ? " (retried)" : ""}`,
+    `instruction: ${clip(task.instruction, 200)}`,
+    `diff:`,
+    clip(diff || "(no diff)", 1200),
+  ].join("\n");
+}
+
+// The verify note on the integration commit: the gate verdict + latency + output tail.
+export function renderVerifyNote(result: string, verify: VerifyResult, latencyMs: number): string {
+  return [
+    `foreman-verify result=${result} exit=${verify.exitCode ?? "null"} latency_ms=${latencyMs}`,
+    `output:`,
+    clip(verify.output || "(no output)", 2000),
+  ].join("\n");
+}
 
 export function foremanService(db: Db) {
   const store = {
@@ -184,8 +218,13 @@ export function foremanService(db: Db) {
 
       // 3. Verify the integrated result (build/typecheck/test gate).
       await store.updateJob(jobId, { status: "verifying" });
+      const verifyStart = now().getTime();
       const verify = runVerify(job.repo, opts.verifyCommand, taskTimeout);
+      const verifyLatencyMs = Math.max(0, now().getTime() - verifyStart);
       const verifyResult = verify.skipped ? "skipped" : verify.pass ? "pass" : "fail";
+      // HORIZON §1: attach the job's verify verdict to the integration commit, so the
+      // trail (git log --notes=foreman) is complete end-to-end. §3: latency is first-class.
+      addForemanNote(job.repo, integrationBranch, renderVerifyNote(verifyResult, verify, verifyLatencyMs));
       if (!verify.pass && !verify.skipped) {
         return await finishJob(
           jobId,
@@ -231,11 +270,14 @@ export function foremanService(db: Db) {
         const outcome = await pollToCompletion(j, task, handle);
         if (outcome.state === "done") {
           const diff = outcome.diff ?? diffSummary(j.repo, j.baseBranch, outcome.branch);
-          return (await store.updateTask(task.id, {
+          const updated = (await store.updateTask(task.id, {
             status: "committed",
             branch: outcome.branch,
             artifactDiff: diff,
           })) as JobTaskRow;
+          // HORIZON §1: git-notes repair trail — the task commit records its own outcome.
+          addForemanNote(j.repo, outcome.branch, renderTaskNote(task, attempt, diff));
+          return updated;
         }
         // failed
         await store.updateTask(task.id, {

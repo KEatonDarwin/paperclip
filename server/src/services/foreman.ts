@@ -12,6 +12,7 @@ import {
   runVerify,
   diffSummary,
   addForemanNote,
+  replayTrail,
   type IntegrationResult,
   type VerifyResult,
 } from "./foreman-git.js";
@@ -235,9 +236,14 @@ export function foremanService(db: Db) {
       }
 
       // 4. Report. Agents never merge to main — hand back the integration branch for human/JARVIS PR.
+      // HORIZON §1: embed the repair trail in the DB-backed summary too, not only in git notes —
+      // notes under refs/notes/foreman are NOT pushed by a plain `git push`, so the trail would be
+      // invisible to a PR-opener that forgets to push the ref. The summary reaches JARVIS via the Job API.
+      const trail = replayTrail(job.repo, job.baseBranch, integrationBranch);
       const summary =
         `Foreman job complete. ${committed.length} task(s) integrated into ${integrationBranch}. ` +
-        `Verify: ${verifyResult}. Open a PR from ${integrationBranch} → ${job.baseBranch}; a human/JARVIS merges.`;
+        `Verify: ${verifyResult}. Open a PR from ${integrationBranch} → ${job.baseBranch}; a human/JARVIS merges.` +
+        (trail ? `\n\nRepair trail (git log --notes=foreman):\n${trail}` : "");
       const finished = await store.updateJob(jobId, {
         status: "completed",
         verifyResult,

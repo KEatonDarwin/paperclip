@@ -21,6 +21,7 @@ const createSchema = z.object({
   repo: z.string().min(1),
   ask: z.string().min(1),
   base_branch: z.string().optional(),
+  job_type: z.enum(["build", "bug_fix"]).optional(), // sideloads a playbook (default 'build')
   context: z.string().nullable().optional(),
   worker_type: z.string().optional(),
   workers: z.number().int().min(1).max(3).optional(), // Phase-1 fan-out cap: 2-3 workers
@@ -54,6 +55,7 @@ export function jobRoutes(db: Db) {
       repo: req.body.repo,
       ask: req.body.ask,
       baseBranch: req.body.base_branch,
+      jobType: req.body.job_type ?? null,
       context: req.body.context ?? null,
       workerType: req.body.worker_type ?? null,
       maxWorkers: req.body.workers ?? 1,

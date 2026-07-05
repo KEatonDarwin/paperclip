@@ -14,7 +14,24 @@ import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issues } from "@paperclipai/db";
 import { issueService, heartbeatService } from "./index.js";
 import { listBranchesMatching, branchHasCommitsAhead } from "./foreman-git.js";
+import { getPlaybook } from "./foreman-playbooks.js";
 import type { WorkerDispatcher, DispatchHandle, PollState, JobRow, JobTaskRow } from "./foreman.js";
+
+// Build the worker's brief. Pure + exported so the job_type playbook injection is unit-testable
+// without the live agent runtime. The playbook (bug_fix vs build) is sideloaded up top so the
+// worker follows the right process; the task instruction + repo/base + retry context follow.
+export function composeWorkerBrief(job: JobRow, task: JobTaskRow, retryContext?: string): string {
+  const playbook = getPlaybook(job.jobType);
+  return (
+    `Foreman task for job ${job.id} (seq ${task.seq}).\n\n` +
+    `Repo: ${job.repo}\nBase: ${job.baseBranch}\n\n` +
+    `--- PLAYBOOK (${playbook.label}) ---\n${playbook.instructions}\n---\n\n` +
+    `Instruction:\n${task.instruction}\n\n` +
+    (job.context ? `Context:\n${job.context}\n\n` : "") +
+    (retryContext ? `RETRY — ${retryContext}\n\n` : "") +
+    `Commit your work to this issue's worktree branch. Do NOT merge to ${job.baseBranch}.`
+  );
+}
 
 // Generic coder worker agents (Darwin company). worker_type -> agentId.
 export const DEFAULT_WORKER_AGENTS: Record<string, string> = {
@@ -45,11 +62,7 @@ export function paperclipAgentDispatcher(db: Db, config: PaperclipDispatcherConf
   return {
     async dispatch(job: JobRow, task: JobTaskRow, retryContext?: string): Promise<DispatchHandle> {
       const agentId = resolveAgentId(task.workerType);
-      const description =
-        `Foreman task for job ${job.id} (seq ${task.seq}).\n\nRepo: ${job.repo}\nBase: ${job.baseBranch}\n\n` +
-        `Instruction:\n${task.instruction}\n\n` +
-        (retryContext ? `RETRY — ${retryContext}\n\n` : "") +
-        `Commit your work to this issue's worktree branch. Do NOT merge to ${job.baseBranch}.`;
+      const description = composeWorkerBrief(job, task, retryContext);
 
       const issue = await issuesSvc.create(config.companyId, {
         projectId: config.foremanProjectId,

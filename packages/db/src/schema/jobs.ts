@@ -15,6 +15,9 @@ export const jobs = pgTable(
     repo: text("repo").notNull(), // absolute repo path (Phase 1) or registered repo key
     baseBranch: text("base_branch").notNull().default("master"),
     ask: text("ask").notNull(), // the natural-language job
+    // Sideloads a playbook into worker/decomposition instructions (DAR-687 — Kevin 2026-07-05).
+    // 'build' (default) | 'bug_fix'. Same orchestration core, different playbook (foreman-playbooks.ts).
+    jobType: text("job_type").notNull().default("build"),
     context: text("context"), // optional extra context bundle
     workerType: text("worker_type"), // default worker adapter for tasks (e.g. 'claude_local')
     maxWorkers: integer("max_workers").notNull().default(1), // Phase-1 fan-out cap (2-3 typical)

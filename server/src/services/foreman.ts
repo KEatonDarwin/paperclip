@@ -16,6 +16,7 @@ import {
   type IntegrationResult,
   type VerifyResult,
 } from "./foreman-git.js";
+import { normalizeJobType } from "./foreman-playbooks.js";
 
 export type JobRow = typeof jobs.$inferSelect;
 export type JobTaskRow = typeof jobTasks.$inferSelect;
@@ -24,6 +25,7 @@ export interface CreateJobInput {
   repo: string;
   ask: string;
   baseBranch?: string;
+  jobType?: string | null; // 'build' (default) | 'bug_fix' — sideloads a playbook (foreman-playbooks.ts)
   context?: string | null;
   workerType?: string | null;
   maxWorkers?: number;
@@ -106,6 +108,7 @@ export function foremanService(db: Db) {
           repo: input.repo,
           ask: input.ask,
           baseBranch: input.baseBranch ?? "master",
+          jobType: normalizeJobType(input.jobType),
           context: input.context ?? null,
           workerType: input.workerType ?? null,
           maxWorkers: input.maxWorkers ?? 1,

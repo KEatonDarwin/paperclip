@@ -334,6 +334,15 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     enabled: Boolean(selectedCompanyId),
   });
   const models = fetchedModels ?? externalModels ?? [];
+
+  const handleRefreshModels = useCallback(async () => {
+    if (!selectedCompanyId) return;
+    const fresh = await agentsApi.adapterModels(selectedCompanyId, adapterType, { force: true });
+    queryClient.setQueryData(
+      queryKeys.agents.adapterModels(selectedCompanyId, adapterType),
+      fresh,
+    );
+  }, [selectedCompanyId, adapterType, queryClient]);
   const {
     data: detectedModelData,
     refetch: refetchDetectedModel,
@@ -758,6 +767,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                     }
                   : undefined}
                 detectModelLabel={adapterType === "hermes_local" ? "Detect from Hermes config" : undefined}
+                onRefreshModels={selectedCompanyId ? handleRefreshModels : undefined}
               />
               {fetchedModelsError && (
                 <p className="text-xs text-destructive">
@@ -1356,9 +1366,11 @@ function ModelDropdown({
   detectedModel?: string | null;
   onDetectModel?: () => Promise<string | null>;
   detectModelLabel?: string;
+  onRefreshModels?: () => Promise<void>;
 }) {
   const [modelSearch, setModelSearch] = useState("");
   const [detectingModel, setDetectingModel] = useState(false);
+  const [refreshingModels, setRefreshingModels] = useState(false);
   const selected = models.find((m) => m.id === value);
   const manualModel = modelSearch.trim();
   const canCreateManualModel = Boolean(
@@ -1472,6 +1484,23 @@ function ModelDropdown({
                 <path d="M3 3v5h5" />
               </svg>
               {detectingModel ? "Detecting..." : (detectModelLabel ?? "Detect from config")}
+            </button>
+          )}
+          {onRefreshModels && !modelSearch.trim() && (
+            <button
+              type="button"
+              className="flex items-center gap-1.5 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-muted-foreground"
+              onClick={async () => {
+                setRefreshingModels(true);
+                try { await onRefreshModels(); } finally { setRefreshingModels(false); }
+              }}
+              disabled={refreshingModels}
+            >
+              <svg aria-hidden="true" focusable="false" className={cn("h-3 w-3", refreshingModels && "animate-spin")} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                <path d="M3 3v5h5" />
+              </svg>
+              {refreshingModels ? "Refreshing..." : "Refresh model list"}
             </button>
           )}
           {value && !models.some((m) => m.id === value) && (

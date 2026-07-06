@@ -14,6 +14,8 @@ import { Bug, Loader2, ExternalLink, ArrowUpRight } from "lucide-react";
 
 const REPO_STORAGE_KEY = "paperclip.intake.repo";
 const DEFAULT_REPO = "paperclip";
+// Foreman Workers project — Ctrl+Shift+B submissions auto-dispatch to this project.
+const FOREMAN_PROJECT_ID = "abf02259-3a00-4db7-ac92-cc75435e5d1d";
 
 // Foreman job status → badge styling. Terminal-good is emphasized; failures are destructive.
 function statusClasses(status: string): string {
@@ -89,7 +91,7 @@ export function BugIntakeWidget() {
   const submit = useMutation({
     mutationFn: async () => {
       if (!selectedCompanyId) throw new Error("No company selected");
-      return intakeApi.submit({ companyId: selectedCompanyId, repo: repo.trim() || DEFAULT_REPO, text: text.trim(), jobType, source: "hotkey" });
+      return intakeApi.submit({ companyId: selectedCompanyId, repo: repo.trim() || DEFAULT_REPO, text: text.trim(), jobType, source: "hotkey", run: true, foremanProjectId: FOREMAN_PROJECT_ID });
     },
     onSuccess: (result: IntakeSubmitResponse) => {
       setText("");

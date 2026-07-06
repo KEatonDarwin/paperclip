@@ -12,6 +12,8 @@ export interface IntakeSubmitInput {
   context?: string | null;
   source?: string;
   ref?: string | null;
+  run?: boolean;
+  foremanProjectId?: string;
 }
 
 export interface IntakeSubmitResponse {
@@ -64,6 +66,8 @@ export const intakeApi = {
         source: input.source ?? "hotkey",
         ref: input.ref ?? null,
         context: input.context ?? null,
+        ...(input.run != null ? { run: input.run } : {}),
+        ...(input.foremanProjectId ? { foreman_project_id: input.foremanProjectId } : {}),
       }),
     });
     if (!res.ok) return parseError(res, "Failed to submit intake");

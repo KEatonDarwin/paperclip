@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -1496,6 +1496,24 @@ export function issueService(db: Db) {
         .where(eq(issues.id, issueId));
 
       return redactIssueComment(comment, currentUserRedactionOptions.enabled);
+    },
+
+    // Returns true if the given agent has authored a comment on this issue at or
+    // after `since`. Used to avoid double-posting an agent's run summary when the
+    // agent already self-posted its result as a comment during the run.
+    hasAgentCommentSince: async (issueId: string, agentId: string, since: Date): Promise<boolean> => {
+      const rows = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, issueId),
+            eq(issueComments.authorAgentId, agentId),
+            gte(issueComments.createdAt, since),
+          ),
+        )
+        .limit(1);
+      return rows.length > 0;
     },
 
     createAttachment: async (input: {

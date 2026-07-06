@@ -15,6 +15,7 @@ import { NewAgentDialog } from "./NewAgentDialog";
 import { ToastViewport } from "./ToastViewport";
 import { GlobalChatBubble } from "./GlobalChatBubble";
 import { CommandModal } from "./CommandModal";
+import { BugIntakeWidget } from "./BugIntakeWidget";
 import { QuickNotesModal } from "./QuickNotesModal";
 import { HopperModal } from "./HopperModal";
 import { HopperWidget } from "./HopperWidget";
@@ -463,6 +464,7 @@ export function Layout() {
       <GlobalChatBubble />
       <MobileScheduleBubble />
       <CommandModal />
+      <BugIntakeWidget />
       <QuickNotesModal />
       <HopperModal />
       <HopperWidget />

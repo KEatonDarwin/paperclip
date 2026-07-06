@@ -21,7 +21,6 @@ import { HopperWidget } from "./HopperWidget";
 import { ScheduledTaskModal } from "./ScheduledTaskModal";
 import { ScheduledTasksWidget } from "./ScheduledTasksWidget";
 import { KeyboardShortcutsModal } from "./KeyboardShortcutsModal";
-import { VersionInfoModal } from "./VersionInfoModal";
 import { MobileScheduleBubble } from "./MobileScheduleBubble";
 import { MobileBottomNav } from "./MobileBottomNav";
 import { WorktreeBanner } from "./WorktreeBanner";
@@ -470,7 +469,6 @@ export function Layout() {
       <ScheduledTaskModal />
       <ScheduledTasksWidget />
       <KeyboardShortcutsModal />
-      <VersionInfoModal />
     </div>
   );
 }

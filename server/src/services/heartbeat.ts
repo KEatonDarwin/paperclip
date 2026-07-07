@@ -77,6 +77,12 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "opencode_local",
   "pi_local",
 ]);
+// Statuses that count as "actionable work" for the timer-triggered inbox gate.
+// "blocked" is deliberately excluded: a stale blocked issue would otherwise satisfy
+// this gate forever, firing hourly timer heartbeats with zero new information.
+// Event-driven wakes (assignment, comment, reassignment) bypass this gate entirely
+// via queueIssueAssignmentWakeup, so unblocking an issue still wakes the agent immediately.
+export const TIMER_INBOX_GATE_STATUSES: string[] = ["todo", "in_progress"];
 
 export function applyPersistedExecutionWorkspaceConfig(input: {
   config: Record<string, unknown>;
@@ -3202,7 +3208,7 @@ export function heartbeatService(db: Db) {
           and(
             eq(issues.companyId, agent.companyId),
             eq(issues.assigneeAgentId, agentId),
-            inArray(issues.status, ["todo", "in_progress", "blocked"]),
+            inArray(issues.status, TIMER_INBOX_GATE_STATUSES),
           ),
         )
         .limit(1)

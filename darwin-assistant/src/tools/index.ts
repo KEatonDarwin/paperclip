@@ -1,8 +1,10 @@
+import { maybeRecordToolAction, type ToolExecutionContext } from '../autonomy-ledger.js';
+
 export interface ToolDef {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
-  execute: (args: Record<string, unknown>) => Promise<unknown>;
+  execute: (args: Record<string, unknown>, context?: ToolExecutionContext) => Promise<unknown>;
 }
 
 export {
@@ -65,6 +67,10 @@ export {
   cancelScheduledTask,
 } from './scheduled-tasks.js';
 
+export { mcpCall, lovableSendMessage, supabaseExecuteSql } from './mcp.js';
+
+export { logDecision } from './decisions.js';
+
 import {
   createIssue,
   searchIssues,
@@ -118,6 +124,22 @@ import {
   updateScheduledTask,
   cancelScheduledTask,
 } from './scheduled-tasks.js';
+import { mcpCall, lovableSendMessage, supabaseExecuteSql } from './mcp.js';
+import { logDecision } from './decisions.js';
+import { threadTodos } from './thread-todos-tool.js';
+import { intakeDeploy } from './intake-deploy.js';
+import { cockpitDeploy } from './cockpit-deploy.js';
+
+function instrumentTool(tool: ToolDef): ToolDef {
+  return {
+    ...tool,
+    execute: async (args, context) => {
+      const result = await tool.execute(args, context);
+      maybeRecordToolAction(tool.name, args, result, context);
+      return result;
+    },
+  };
+}
 
 export const ALL_TOOLS: ToolDef[] = [
   createIssue,
@@ -161,7 +183,14 @@ export const ALL_TOOLS: ToolDef[] = [
   getScheduledTask,
   updateScheduledTask,
   cancelScheduledTask,
-];
+  mcpCall,
+  lovableSendMessage,
+  supabaseExecuteSql,
+  logDecision,
+  threadTodos,
+  intakeDeploy,
+  cockpitDeploy,
+].map(instrumentTool);
 
 export const TOOL_MAP: Map<string, ToolDef> = new Map(
   ALL_TOOLS.map((t) => [t.name, t]),

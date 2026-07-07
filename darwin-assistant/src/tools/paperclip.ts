@@ -213,9 +213,9 @@ export const updateIssueStatus: ToolDef = {
     if (!issues.length) return { error: `Issue ${identifier} not found` };
     const issueId = issues[0].id;
 
-    await apiPatch(`/api/companies/${DARWIN_COMPANY_ID}/issues/${issueId}`, { status });
+    await apiPatch(`/api/issues/${issueId}`, { status });
     if (comment) {
-      await apiPost(`/api/companies/${DARWIN_COMPANY_ID}/issues/${issueId}/comments`, { body: comment });
+      await apiPost(`/api/issues/${issueId}/comments`, { body: comment });
     }
 
     return { identifier, status, updated: true };
@@ -270,7 +270,7 @@ export const updateIssue: ToolDef = {
 
     if (!Object.keys(patch).length) return { error: 'No fields to update' };
 
-    await apiPatch(`/api/companies/${DARWIN_COMPANY_ID}/issues/${issueId}`, patch);
+    await apiPatch(`/api/issues/${issueId}`, patch);
     return { identifier, updated: true, fields: Object.keys(patch) };
   },
 };
@@ -293,7 +293,7 @@ export const addComment: ToolDef = {
       [DARWIN_COMPANY_ID, identifier],
     );
     if (!issues.length) return { error: `Issue ${identifier} not found` };
-    await apiPost(`/api/companies/${DARWIN_COMPANY_ID}/issues/${issues[0].id}/comments`, { body });
+    await apiPost(`/api/issues/${issues[0].id}/comments`, { body });
     return { identifier, commented: true };
   },
 };

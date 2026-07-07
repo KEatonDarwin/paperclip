@@ -1,0 +1,21 @@
+[Unit]
+Description=JARVIS — Darwin AI Assistant (webhook + Slack + UI)
+After=network-online.target postgresql.service paperclip-dev.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kevin
+WorkingDirectory=/home/kevin/paperclip/darwin-assistant
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+Environment="PATH=/home/kevin/.local/bin:/home/kevin/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+
+# GOG CLI needs file-based keyring for non-interactive use
+Environment=GOG_KEYRING_BACKEND=file
+Environment=GOG_KEYRING_PASSWORD=
+
+[Install]
+WantedBy=multi-user.target

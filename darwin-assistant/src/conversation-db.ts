@@ -1,7 +1,14 @@
 import Database, { type Database as DatabaseType } from 'better-sqlite3';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { sseBus, type TurnEvent, type ConversationCreatedEvent, type ConversationUpdatedEvent } from './sse-bus.js';
+import {
+  sseBus,
+  type TurnEvent,
+  type ConversationCreatedEvent,
+  type ConversationUpdatedEvent,
+  type ConversationRenamedEvent,
+  type ConversationDeletedEvent,
+} from './sse-bus.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = process.env.JARVIS_DB_PATH ?? path.join(__dirname, '..', 'jarvis.db');
@@ -16,6 +23,7 @@ db.exec(`
     external_id   TEXT NOT NULL UNIQUE,
     slack_channel TEXT,
     claude_session_id TEXT,
+    session_adapter TEXT,
     status        TEXT NOT NULL DEFAULT 'active',
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
@@ -50,14 +58,27 @@ for (const col of [
   'model TEXT',
   'claude_input TEXT',
   'claude_output TEXT',
+  // Raw error message + stack captured when a run throws/is interrupted. Surfaced
+  // to the UI as an expandable "Details" on the interrupted assistant turn.
+  'error_detail TEXT',
 ]) {
   try { db.exec(`ALTER TABLE turns ADD COLUMN ${col}`); } catch {}
 }
 
 // Migrate: add lineage columns to conversations table (for "continue in new thread" feature)
+// plus per-thread provider/model override columns (DAR-680 AC#4).
+// NOTE: thread_adapter/thread_model are the USER's per-thread override choice.
+// They are distinct from session_adapter, which records the adapter that owns the
+// current live CLI session (auto-managed by updateSessionState).
 for (const col of [
   'continued_from_id INTEGER REFERENCES conversations(id)',
   'continued_to_id INTEGER REFERENCES conversations(id)',
+  'session_adapter TEXT',
+  'thread_adapter TEXT',
+  'thread_model TEXT',
+  // User-set display name for a thread (rename). Null → fall back to a derived
+  // title (from external_id / first message) on the client.
+  'title TEXT',
 ]) {
   try { db.exec(`ALTER TABLE conversations ADD COLUMN ${col}`); } catch {}
 }
@@ -67,11 +88,39 @@ export interface ConversationRow {
   external_id: string;
   slack_channel: string | null;
   claude_session_id: string | null;
+  session_adapter: string | null;
   status: string;
   created_at: string;
   updated_at: string;
   continued_from_id: number | null;
   continued_to_id: number | null;
+  // Per-thread provider/model override (DAR-680 AC#4). Null → inherit the
+  // global adapter/model settings. Distinct from session_adapter.
+  thread_adapter: string | null;
+  thread_model: string | null;
+  // User-set display name (rename). Null → client derives a title.
+  title: string | null;
+}
+
+/**
+ * Canonical ingress source for a conversation, derived from its external_id
+ * prefix. Slack uses `slack:...`, the cockpit `cockpit:...`, the watch relay
+ * `watch:...`, etc. Used to badge messages by where they came from.
+ */
+export type ConversationSource =
+  | 'slack' | 'cockpit' | 'watch' | 'api' | 'checkin' | 'webhook' | 'other';
+
+export function deriveSource(externalId: string): ConversationSource {
+  const prefix = externalId.split(':', 1)[0]?.toLowerCase() ?? '';
+  switch (prefix) {
+    case 'slack': return 'slack';
+    case 'cockpit': return 'cockpit';
+    case 'watch': return 'watch';
+    case 'api': return 'api';
+    case 'checkin': return 'checkin';
+    case 'webhook': return 'webhook';
+    default: return 'other';
+  }
 }
 
 export interface TurnRow {
@@ -92,6 +141,7 @@ export interface TurnRow {
   model: string | null;
   claude_input: string | null;
   claude_output: string | null;
+  error_detail: string | null;
 }
 
 export interface TurnMetadata {
@@ -103,6 +153,7 @@ export interface TurnMetadata {
   model?: string;
   claudeInput?: string;
   claudeOutput?: string;
+  errorDetail?: string;
 }
 
 const stmts = {
@@ -115,11 +166,18 @@ const stmts = {
   createConversation: db.prepare<[string, string | null]>(
     `INSERT INTO conversations (external_id, slack_channel) VALUES (?, ?)`,
   ),
-  updateSessionId: db.prepare<[string, number]>(
-    `UPDATE conversations SET claude_session_id = ?, updated_at = datetime('now') WHERE id = ?`,
+  updateSessionState: db.prepare<[string | null, string | null, number]>(
+    `UPDATE conversations
+     SET claude_session_id = ?, session_adapter = ?, updated_at = datetime('now')
+     WHERE id = ?`,
   ),
   touchConversation: db.prepare<[number]>(
     `UPDATE conversations SET updated_at = datetime('now') WHERE id = ?`,
+  ),
+  setThreadModelOverride: db.prepare<[string | null, string | null, number]>(
+    `UPDATE conversations
+     SET thread_adapter = ?, thread_model = ?, updated_at = datetime('now')
+     WHERE id = ?`,
   ),
   closeConversation: db.prepare<[string]>(
     `UPDATE conversations SET status = 'closed', updated_at = datetime('now') WHERE external_id = ?`,
@@ -127,8 +185,8 @@ const stmts = {
   getMaxTurnIndex: db.prepare<[number], { max_idx: number | null }>(
     `SELECT MAX(turn_index) as max_idx FROM turns WHERE conversation_id = ?`,
   ),
-  insertTurn: db.prepare<[number, number, string, string | null, string | null, string | null, string | null, number | null, number | null, number | null, number | null, number | null, string | null, string | null, string | null]>(
-    `INSERT INTO turns (conversation_id, turn_index, role, content, tool_name, tool_args, tool_result, timing_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, claude_input, claude_output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  insertTurn: db.prepare<[number, number, string, string | null, string | null, string | null, string | null, number | null, number | null, number | null, number | null, number | null, string | null, string | null, string | null, string | null]>(
+    `INSERT INTO turns (conversation_id, turn_index, role, content, tool_name, tool_args, tool_result, timing_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, claude_input, claude_output, error_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ),
   getTurns: db.prepare<[number], TurnRow>(
     `SELECT * FROM turns WHERE conversation_id = ? ORDER BY turn_index ASC`,
@@ -141,6 +199,39 @@ const stmts = {
   ),
   countTurns: db.prepare<[number], { cnt: number }>(
     `SELECT COUNT(*) as cnt FROM turns WHERE conversation_id = ?`,
+  ),
+  // "Messages" = the human-visible back-and-forth (user + assistant), excluding
+  // tool_call / tool_result plumbing turns. Drives the sidebar message count.
+  countMessages: db.prepare<[number], { cnt: number }>(
+    `SELECT COUNT(*) as cnt FROM turns WHERE conversation_id = ? AND role IN ('user', 'assistant')`,
+  ),
+  // Role of the most recent human-visible message — powers the "who spoke last"
+  // color coding (user = waiting on JARVIS, assistant = ball in Kevin's court).
+  getLastMessageRole: db.prepare<[number], { role: string }>(
+    `SELECT role FROM turns WHERE conversation_id = ? AND role IN ('user', 'assistant') ORDER BY turn_index DESC LIMIT 1`,
+  ),
+  setTurnError: db.prepare<[string | null, number]>(
+    `UPDATE turns SET error_detail = ? WHERE id = ?`,
+  ),
+  getLastAssistantTurnId: db.prepare<[number], { id: number }>(
+    `SELECT id FROM turns WHERE conversation_id = ? AND role = 'assistant' ORDER BY turn_index DESC LIMIT 1`,
+  ),
+  renameConversation: db.prepare<[string | null, number]>(
+    `UPDATE conversations SET title = ?, updated_at = datetime('now') WHERE id = ?`,
+  ),
+  setConversationStatus: db.prepare<[string, number]>(
+    `UPDATE conversations SET status = ?, updated_at = datetime('now') WHERE id = ?`,
+  ),
+  deleteTurnsForConversation: db.prepare<[number]>(
+    `DELETE FROM turns WHERE conversation_id = ?`,
+  ),
+  deleteConversationRow: db.prepare<[number]>(
+    `DELETE FROM conversations WHERE id = ?`,
+  ),
+  copyTurns: db.prepare<[number, number]>(
+    `INSERT INTO turns (conversation_id, turn_index, role, content, tool_name, tool_args, tool_result, created_at, timing_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, claude_input, claude_output, error_detail)
+     SELECT ?, turn_index, role, content, tool_name, tool_args, tool_result, created_at, timing_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, claude_input, claude_output, error_detail
+     FROM turns WHERE conversation_id = ? ORDER BY turn_index ASC`,
   ),
 };
 
@@ -172,12 +263,22 @@ export function getOrCreateConversation(externalId: string, slackChannel?: strin
   return created;
 }
 
-export function updateSessionId(conversationId: number, sessionId: string): void {
-  stmts.updateSessionId.run(sessionId, conversationId);
+export function updateSessionState(conversationId: number, sessionId: string | null, adapterId: string | null): void {
+  stmts.updateSessionState.run(sessionId, adapterId, conversationId);
 }
 
 export function touchConversation(conversationId: number): void {
   stmts.touchConversation.run(conversationId);
+}
+
+// Set (or clear) the per-thread provider/model override. Pass null for both to
+// clear the override so the thread falls back to the global adapter/model.
+export function setThreadModelOverride(
+  conversationId: number,
+  adapterId: string | null,
+  model: string | null,
+): void {
+  stmts.setThreadModelOverride.run(adapterId, model, conversationId);
 }
 
 export function closeConversation(externalId: string): void {
@@ -207,6 +308,7 @@ export function addTurn(
     metadata?.outputTokens ?? null, metadata?.cacheReadTokens ?? null,
     metadata?.cacheWriteTokens ?? null, metadata?.model ?? null,
     metadata?.claudeInput ?? null, metadata?.claudeOutput ?? null,
+    metadata?.errorDetail ?? null,
   );
   stmts.touchConversation.run(conversationId);
 
@@ -246,6 +348,30 @@ export function addTurn(
   return nextIndex;
 }
 
+// Shared with agent.ts so a live-interrupted turn (Fix C) and a boot-healed turn
+// (Fix B) render as the exact same bubble.
+export const INTERRUPTED_MARKER =
+  '_⚠️ This reply was interrupted before it finished saving. Send another message to retry._';
+
+/**
+ * Fix B (DAR-676): on startup, heal assistant turns that were persisted empty
+ * because a run was torn down mid-flight (process restart / subprocess kill).
+ * Empty assistant turns render as a blank bubble and read as "still working";
+ * marking them gives the UI a real terminal state. Scoped to empty assistant
+ * turns only — we do NOT append replies to user-ended threads (that would
+ * pollute the many threads a user legitimately left without a response).
+ * Returns the number of turns healed.
+ */
+export function reconcileInterruptedRuns(): number {
+  const info = db
+    .prepare(
+      `UPDATE turns SET content = ?
+       WHERE role = 'assistant' AND (content IS NULL OR trim(content) = '')`,
+    )
+    .run(INTERRUPTED_MARKER);
+  return info.changes;
+}
+
 export function getTurns(conversationId: number): TurnRow[] {
   return stmts.getTurns.all(conversationId);
 }
@@ -260,6 +386,109 @@ export function listAllConversations(): ConversationRow[] {
 
 export function countTurns(conversationId: number): number {
   return stmts.countTurns.get(conversationId)?.cnt ?? 0;
+}
+
+/** Count of human-visible messages (user + assistant) in a conversation. */
+export function countMessages(conversationId: number): number {
+  return stmts.countMessages.get(conversationId)?.cnt ?? 0;
+}
+
+/** Role ('user' | 'assistant') of the most recent visible message, or null. */
+export function getLastMessageRole(conversationId: number): 'user' | 'assistant' | null {
+  const row = stmts.getLastMessageRole.get(conversationId);
+  return (row?.role as 'user' | 'assistant' | undefined) ?? null;
+}
+
+/** Store the raw error message/stack on a specific turn (expandable UI "Details"). */
+export function setTurnError(turnId: number, detail: string): void {
+  stmts.setTurnError.run(detail, turnId);
+}
+
+/** Id of the most recent assistant turn for a conversation, if any. */
+export function getLastAssistantTurnId(conversationId: number): number | null {
+  return stmts.getLastAssistantTurnId.get(conversationId)?.id ?? null;
+}
+
+/** Rename a thread (user-set display title). Pass null to clear. */
+export function renameConversation(id: number, title: string | null): void {
+  stmts.renameConversation.run(title, id);
+  sseBus.emit('sse', {
+    type: 'conversation_renamed',
+    conversationId: id,
+    title,
+  } satisfies ConversationRenamedEvent);
+}
+
+/** Update a conversation's status (e.g. active/archived) and nudge clients to refresh. */
+export function setConversationStatus(id: number, status: string): void {
+  stmts.setConversationStatus.run(status, id);
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  sseBus.emit('sse', {
+    type: 'conversation_updated',
+    conversationId: id,
+    status,
+    updatedAt: now,
+    turnCount: countTurns(id),
+  } satisfies ConversationUpdatedEvent);
+}
+
+/**
+ * Auto-hide sweep: archive `active` threads that have been idle longer than
+ * `days` — but never one that still has an open (not-done) todo, so nothing
+ * actionable disappears on Kevin. Preserves `updated_at` so the "idle since"
+ * signal stays truthful. Returns the number archived; emits a refresh per row
+ * so open cockpits update live. `days <= 0` disables the sweep.
+ */
+export function autoHideStaleThreads(days: number): number {
+  if (!days || days <= 0) return 0;
+  const cutoff = `-${Math.floor(days)} days`;
+  const candidates = db
+    .prepare<[string], { id: number }>(
+      `SELECT id FROM conversations
+        WHERE status = 'active'
+          AND updated_at < datetime('now', ?)
+          AND id NOT IN (SELECT conversation_id FROM thread_todos WHERE status != 'done')`,
+    )
+    .all(cutoff);
+  if (candidates.length === 0) return 0;
+
+  const markArchived = db.prepare<[number]>(
+    `UPDATE conversations SET status = 'archived' WHERE id = ?`,
+  );
+  const txn = db.transaction(() => {
+    for (const c of candidates) markArchived.run(c.id);
+  });
+  txn();
+
+  for (const c of candidates) {
+    sseBus.emit('sse', {
+      type: 'conversation_updated',
+      conversationId: c.id,
+      status: 'archived',
+      updatedAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
+      turnCount: countTurns(c.id),
+    } satisfies ConversationUpdatedEvent);
+  }
+  return candidates.length;
+}
+
+/** Permanently delete a conversation and all of its turns + todos. */
+export function deleteConversation(id: number): void {
+  const txn = db.transaction(() => {
+    db.prepare(`DELETE FROM thread_todos WHERE conversation_id = ?`).run(id);
+    stmts.deleteTurnsForConversation.run(id);
+    stmts.deleteConversationRow.run(id);
+  });
+  txn();
+  sseBus.emit('sse', {
+    type: 'conversation_deleted',
+    conversationId: id,
+  } satisfies ConversationDeletedEvent);
+}
+
+/** Copy all turns (preserving order + metadata) from one conversation to another. */
+export function copyTurns(fromId: number, toId: number): void {
+  stmts.copyTurns.run(toId, fromId);
 }
 
 const lineageStmts = {

@@ -1,5 +1,5 @@
 import express from 'express';
-import { processMessage } from '../agent.js';
+import { processMessage, ConversationBusyError } from '../agent.js';
 import { handlePaperclipWebhook } from './paperclip-webhook.js';
 
 export function createWebhookRouter() {
@@ -36,6 +36,10 @@ export function createWebhookRouter() {
       const response = await processMessage(text.trim(), conversationId);
       res.json({ response, conversationId, source });
     } catch (err) {
+      if (err instanceof ConversationBusyError) {
+        res.status(409).json({ error: err.message, pending_message_id: err.pendingMessageId });
+        return;
+      }
       const errMsg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: errMsg });
     }
@@ -56,6 +60,10 @@ export function createWebhookRouter() {
       const response = await processMessage(text.trim(), conversationId);
       res.json({ response, conversationId });
     } catch (err) {
+      if (err instanceof ConversationBusyError) {
+        res.status(409).json({ error: err.message, pending_message_id: err.pendingMessageId });
+        return;
+      }
       const errMsg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: errMsg });
     }

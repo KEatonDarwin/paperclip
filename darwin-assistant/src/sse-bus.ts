@@ -1,4 +1,7 @@
 import { EventEmitter } from 'node:events';
+import type { AutonomyLedgerRow } from './autonomy-ledger.js';
+import type { ThreadTodoRow } from './thread-todos.js';
+import type { JarvisDecisionRow } from './jarvis-decisions.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -42,6 +45,11 @@ export interface ConversationCreatedEvent {
 export interface StatusEvent {
   type: 'status';
   running: boolean;
+  // The conversation this status is about. Every ingress emits its own
+  // start/stop, so status is per-conversation — subscribers must key off this
+  // rather than treating it as a single global "is anything running" toggle.
+  conversationId: number;
+  // Back-compat alias (= conversationId while running, null when stopped).
   activeConversationId: number | null;
 }
 
@@ -61,9 +69,59 @@ export interface StreamEndEvent {
   conversationId: number;
 }
 
+export interface AutonomyLedgerEvent {
+  type: 'autonomy_ledger_entry';
+  entry: AutonomyLedgerRow;
+}
+
+export interface AutonomyLedgerReviewEvent {
+  type: 'autonomy_ledger_review';
+  entry: AutonomyLedgerRow;
+}
+
+export interface ThreadTodoEvent {
+  type: 'thread_todo';
+  conversationId: number;
+  action: 'created' | 'updated' | 'deleted';
+  todo: ThreadTodoRow;
+}
+
+export interface ConversationRenamedEvent {
+  type: 'conversation_renamed';
+  conversationId: number;
+  title: string | null;
+}
+
+export interface ConversationDeletedEvent {
+  type: 'conversation_deleted';
+  conversationId: number;
+}
+
+export interface JarvisDecisionEvent {
+  type: 'jarvis_decision';
+  action: 'created' | 'updated';
+  decision: JarvisDecisionRow;
+}
+
+export interface QueuedMessageEvent {
+  type: 'queued_message';
+  conversationId: number;
+  action: 'created' | 'deleted';
+  item: {
+    id: number;
+    conversation_id: number;
+    content: string;
+    created_at: string;
+  };
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
-  | StreamStartEvent | StreamDeltaEvent | StreamEndEvent;
+  | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
+  | AutonomyLedgerEvent | AutonomyLedgerReviewEvent
+  | ThreadTodoEvent | JarvisDecisionEvent
+  | ConversationRenamedEvent | ConversationDeletedEvent
+  | QueuedMessageEvent;
 
 class SSEBus extends EventEmitter {}
 

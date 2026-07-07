@@ -24,6 +24,31 @@ function safePath(userPath: string): string {
   return resolved;
 }
 
+// -- Reusable vault accessors (shared by the legacy /api/vault/* routes below
+// and the auth'd /api/v1/vault/* cockpit routes in handlers/api-v1.ts). Same
+// path-safety contract; throw on escape so callers can 400/500 uniformly.
+export type VaultEntry = { name: string; type: 'directory' | 'file' };
+
+export async function listVaultTree(path: string): Promise<{ path: string; items: VaultEntry[] }> {
+  const abs = safePath(path || '');
+  const entries = await readdir(abs, { withFileTypes: true });
+  const items: VaultEntry[] = entries
+    .filter(e => !e.name.startsWith('.'))
+    .map(e => ({ name: e.name, type: e.isDirectory() ? 'directory' : 'file' }));
+  return { path: path || '/', items };
+}
+
+export async function readVaultFile(path: string): Promise<{ path: string; content: string }> {
+  const abs = safePath(path);
+  const content = await readFile(abs, 'utf-8');
+  return { path, content };
+}
+
+export async function searchVault(q: string): Promise<{ query: string; results: { path: string; matchLine: string }[] }> {
+  const result = await searchWiki.execute({ keyword: q, max_results: 30 }) as { results?: { path: string; matchLine: string }[] };
+  return { query: q, results: result.results ?? [] };
+}
+
 // ——— Hollow JARVIS Chat Engine ———
 
 const HOLLOW_TOOLS: ToolDef[] = [

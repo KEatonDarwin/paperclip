@@ -84,16 +84,34 @@ export function authenticateBearer(bearer: string): ApiKeyRow | null {
 }
 
 /**
+ * Scopes that grant cross-thread visibility. An admin/cockpit key is the
+ * command-center identity: it can list, read, and post into every thread
+ * regardless of the ingress that created it (Slack, API, cockpit). Ordinary
+ * `jarvis`/`api` keys remain strictly isolated to their own `api:{id}:` prefix.
+ */
+const ADMIN_SCOPES = new Set(['admin', 'cockpit']);
+
+export function isAdminScope(scope: string | undefined | null): boolean {
+  return scope != null && ADMIN_SCOPES.has(scope);
+}
+
+/**
  * The external_id prefix used for threads owned by this caller.
  * Shape: `api:{caller_key_id}:` — subsequent path segment is the per-thread UUID.
+ * Admin/cockpit keys mint new threads under the `cockpit:` prefix instead.
  */
 export function callerExternalIdPrefix(callerKeyId: number): string {
+  const row = getApiKey(callerKeyId);
+  if (row && isAdminScope(row.scope)) return 'cockpit:';
   return `api:${callerKeyId}:`;
 }
 
 /**
  * Check whether the given external_id belongs to the given caller.
+ * Admin/cockpit keys own every thread; ordinary keys own only their own prefix.
  */
 export function callerOwnsExternalId(callerKeyId: number, externalId: string): boolean {
-  return externalId.startsWith(callerExternalIdPrefix(callerKeyId));
+  const row = getApiKey(callerKeyId);
+  if (row && isAdminScope(row.scope)) return true;
+  return externalId.startsWith(`api:${callerKeyId}:`);
 }

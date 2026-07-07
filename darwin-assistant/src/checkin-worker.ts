@@ -2,7 +2,7 @@ import type { App } from '@slack/bolt';
 import { query } from './db.js';
 import { processMessage } from './agent.js';
 import { isMuted } from './mute-check.js';
-import { getConversation, getOrCreateConversation, addTurn, updateSessionId } from './conversation-db.js';
+import { getConversation, getOrCreateConversation, addTurn, updateSessionState } from './conversation-db.js';
 
 const POLL_INTERVAL_MS = 60_000;
 const CHECKIN_CONV_PREFIX = 'checkin:';
@@ -73,7 +73,7 @@ async function processDueCheckins(slackApp: App): Promise<void> {
         const checkinConv = getConversation(conversationId);
         const slackConv = getOrCreateConversation(`slack:${userId}:${slackTs}`, userId);
         if (checkinConv?.claude_session_id) {
-          updateSessionId(slackConv.id, checkinConv.claude_session_id);
+          updateSessionState(slackConv.id, checkinConv.claude_session_id, checkinConv.session_adapter);
         }
         addTurn(slackConv.id, 'assistant', response);
       }

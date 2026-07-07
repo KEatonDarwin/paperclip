@@ -1,8 +1,44 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ToolDef } from './index.js';
+import { nativeCall, resolveNativeServer } from './mcp-native.js';
 
 const execFileAsync = promisify(execFile);
+
+// DAR-680 Slice 4 / DAR-677 Phase 2: prefer the native Streamable-HTTP client
+// for servers JARVIS can reach directly (currently only smarty-pants), and only
+// shell to the claude CLI for auth-brokered claude.ai connectors. Set
+// JARVIS_MCP_NATIVE_DISABLE=1 to force everything back onto the bridge.
+const NATIVE_DISABLED =
+  process.env.JARVIS_MCP_NATIVE_DISABLE === '1' || process.env.JARVIS_MCP_NATIVE_DISABLE === 'true';
+
+// Strip a fully-qualified `mcp__<prefix>__<tool>` id down to the bare tool name
+// the native JSON-RPC transport expects (the prefix framing is a claude-CLI concept).
+function bareToolName(tool: string): string {
+  if (!tool.startsWith('mcp__')) return tool;
+  const parts = tool.split('__');
+  return parts.length >= 3 ? parts.slice(2).join('__') : tool;
+}
+
+/**
+ * Route a single MCP tool call. Native transport first for reachable servers,
+ * with a transparent fall-through to the CLI bridge if the native call errors
+ * (so a transient native failure never breaks a call the bridge could serve).
+ */
+async function dispatchCall(
+  server: string,
+  tool: string,
+  args: Record<string, unknown>,
+): Promise<BridgeResult> {
+  if (!NATIVE_DISABLED && resolveNativeServer(server)) {
+    const native = await nativeCall(server, bareToolName(tool), args);
+    if (native.ok) {
+      return { ok: true, tool: native.tool, result: native.result, duration_ms: native.duration_ms };
+    }
+    // Native path failed — degrade gracefully to the bridge.
+  }
+  return bridgeCall(server, tool, args);
+}
 
 // Phase 1 "fast-path bridge" (DAR-677): JARVIS makes MCP tool calls by shelling
 // to the pi's `claude` binary, which is already authenticated to every MCP
@@ -144,7 +180,7 @@ export const mcpCall: ToolDef = {
       tool: string;
       args?: Record<string, unknown>;
     };
-    return bridgeCall(server, tool, args ?? {});
+    return dispatchCall(server, tool, args ?? {});
   },
 };
 

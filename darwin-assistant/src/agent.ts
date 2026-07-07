@@ -616,13 +616,13 @@ function codexMapStreamEvent(event: Record<string, unknown>): Record<string, unk
 
 export function parseToolCall(
   text: string,
-): { name: string; arguments: Record<string, unknown> } | null {
+): { name: string; arguments: Record<string, unknown>; precedingText: string } | null {
   const match = text.match(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/);
   if (!match) return null;
   try {
     const parsed = JSON.parse(match[1]) as { name: string; arguments: Record<string, unknown> };
     if (typeof parsed.name === 'string' && parsed.arguments && typeof parsed.arguments === 'object')
-      return parsed;
+      return { ...parsed, precedingText: text.slice(0, match.index ?? 0).trim() };
   } catch {}
   return null;
 }
@@ -928,7 +928,15 @@ async function runConversationTurn(conv: ConversationRow, input: string, signal?
       return persistedText;
     }
 
-    addTurn(conv.id, 'tool_call', null, toolCall.name, JSON.stringify(toolCall.arguments), undefined, claudeMeta);
+    addTurn(
+      conv.id,
+      'tool_call',
+      toolCall.precedingText || null,
+      toolCall.name,
+      JSON.stringify(toolCall.arguments),
+      undefined,
+      claudeMeta,
+    );
 
     const tool = TOOL_MAP.get(toolCall.name);
     const toolT0 = Date.now();

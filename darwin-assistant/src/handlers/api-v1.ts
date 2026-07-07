@@ -1,6 +1,7 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { randomUUID } from 'node:crypto';
 import { statSync, readFileSync } from 'node:fs';
+import { parseTurnSteps } from '../turn-steps.js';
 import {
   getOrCreateConversation,
   getConversation,
@@ -206,6 +207,11 @@ function serializeTurn(turn: TurnRow, convSource?: string): Record<string, unkno
     // The cockpit shows it behind an expandable "Details" (Kevin's own tool → he
     // gets the real error, not just the friendly sentence).
     error_detail: turn.error_detail,
+    // Structured thinking/text/tool-call timeline derived from the raw stream
+    // that was already being persisted (claude_output) — lets the Details view
+    // render a full trace after refresh instead of just the flattened content.
+    // Null when there's nothing to derive (older turns, non-model turns).
+    steps: parseTurnSteps(turn.claude_output),
   };
 }
 

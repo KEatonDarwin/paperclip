@@ -1353,6 +1353,7 @@ function ModelDropdown({
   detectedModel,
   onDetectModel,
   detectModelLabel,
+  onRefreshModels,
 }: {
   models: AdapterModel[];
   value: string;

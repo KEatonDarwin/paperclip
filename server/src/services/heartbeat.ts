@@ -2811,6 +2811,28 @@ export function heartbeatService(db: Db) {
         }
       }
 
+      // Post the agent's final response back to the issue thread so it's visible
+      // inline (not buried in the run transcript). The server has no runId on
+      // comments, so we guard against double-posting when the agent already
+      // self-posted a comment during this run.
+      if (outcome === "succeeded" && issueId) {
+        const issueResponseText =
+          typeof adapterResult.summary === "string" ? adapterResult.summary.trim() : "";
+        if (issueResponseText) {
+          try {
+            const runStartedAt = finalizedRun?.startedAt ?? run.startedAt ?? null;
+            const alreadyPosted = runStartedAt
+              ? await issuesSvc.hasAgentCommentSince(issueId, agent.id, runStartedAt)
+              : false;
+            if (!alreadyPosted) {
+              await issuesSvc.addComment(issueId, issueResponseText, { agentId: agent.id });
+            }
+          } catch (err) {
+            logger.warn({ err, runId: run.id }, "failed to write issue agent comment");
+          }
+        }
+      }
+
       // Fire shadow runs for split testing (non-blocking)
       if (outcome === "succeeded") {
         const agentRtCfg = parseObject(agent.runtimeConfig);

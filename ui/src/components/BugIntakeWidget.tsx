@@ -20,6 +20,7 @@ const FOREMAN_PROJECT_ID = "abf02259-3a00-4db7-ac92-cc75435e5d1d";
 // Foreman job status → badge styling. Terminal-good is emphasized; failures are destructive.
 function statusClasses(status: string): string {
   switch (status) {
+    case "merged":
     case "completed":
     case "succeeded":
       return "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400";
@@ -44,7 +45,12 @@ function OutcomeRow({ o }: { o: IntakeOutcome }) {
         </span>
         <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{o.job_type}</span>
         <span className="text-[10px] text-muted-foreground">· {o.source}</span>
-        {o.pr_url && (
+        {o.merge_commit_sha && (
+          <span className="ml-auto inline-flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+            merged → {o.base_branch ?? "base"} @ {o.merge_commit_sha.slice(0, 8)}
+          </span>
+        )}
+        {!o.merge_commit_sha && o.pr_url && (
           <a
             href={o.pr_url}
             target="_blank"

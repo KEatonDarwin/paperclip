@@ -36,6 +36,8 @@ export interface IntakeOutcome {
   status: string;
   verify_result: string | null;
   pr_url: string | null;
+  merge_commit_sha: string | null;
+  base_branch: string | null;
   summary: string | null;
   error: string | null;
   created_at: string;

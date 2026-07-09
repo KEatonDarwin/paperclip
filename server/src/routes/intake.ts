@@ -16,7 +16,7 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import type { JobRow } from "../services/foreman.js";
 import { validate } from "../middleware/validate.js";
-import { foremanService } from "../services/foreman.js";
+import { foremanService, DEFAULT_VERIFY_COMMAND } from "../services/foreman.js";
 import { paperclipAgentDispatcher, DEFAULT_WORKER_AGENTS } from "../services/foreman-dispatch.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 
@@ -51,6 +51,8 @@ function toOutcome(job: JobRow) {
     status: job.status,
     verify_result: job.verifyResult,
     pr_url: job.prUrl,
+    merge_commit_sha: job.mergeCommitSha,
+    base_branch: job.baseBranch,
     summary: job.summary,
     error: job.errorMessage,
     created_at: job.createdAt,
@@ -116,7 +118,7 @@ export function intakeRoutes(db: Db) {
         foremanAgentId: req.body.foreman_agent_id,
       });
       foreman
-        .runJob(job.id, { dispatcher, verifyCommand: req.body.verify_command ?? null })
+        .runJob(job.id, { dispatcher, verifyCommand: req.body.verify_command ?? DEFAULT_VERIFY_COMMAND })
         .catch((err: unknown) => console.error("[intake] runJob unhandled error", err));
     }
 

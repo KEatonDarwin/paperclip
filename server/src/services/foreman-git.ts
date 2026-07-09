@@ -134,6 +134,50 @@ export function runVerify(repo: string, command: string | null | undefined, time
   }
 }
 
+export interface MergeToBaseResult {
+  merged: boolean;
+  conflict: boolean;
+  pushed: boolean;
+  commitSha: string;
+  message: string;
+}
+
+// Merge the (already-verified) integration branch directly into baseBranch and push it —
+// Phase 2 (DAR-711): Foreman merges its own verified work, no PR/human hand-off. Only ever
+// called after runVerify has passed, so this is the last gate before the change is live.
+// Push failure (e.g. no remote configured, or a race with someone else's push) is reported
+// as merged-but-not-pushed rather than silently discarded, so callers can flag needs_review.
+export function mergeToBase(repo: string, baseBranch: string, integrationBranch: string): MergeToBaseResult {
+  const co = git(repo, ["checkout", baseBranch]);
+  if (!co.ok) {
+    return { merged: false, conflict: false, pushed: false, commitSha: "", message: `checkout ${baseBranch} failed: ${co.stderr}` };
+  }
+  const merge = git(repo, ["merge", "--no-ff", "--no-edit", integrationBranch]);
+  if (!merge.ok) {
+    const status = git(repo, ["status", "--porcelain"]);
+    const conflict = /^(?:UU|AA|DD|AU|UA|DU|UD) /m.test(status.stdout);
+    git(repo, ["merge", "--abort"]);
+    return {
+      merged: false,
+      conflict,
+      pushed: false,
+      commitSha: "",
+      message: conflict ? `merge conflict merging ${integrationBranch} into ${baseBranch}` : `merge failed: ${merge.stderr || merge.stdout}`,
+    };
+  }
+  const commitSha = resolveHead(repo, baseBranch);
+  const remotes = git(repo, ["remote"]);
+  if (!remotes.ok || !remotes.stdout.trim()) {
+    // No remote configured (e.g. local-only test repo) — merge landed locally, nothing to push.
+    return { merged: true, conflict: false, pushed: false, commitSha, message: `merged into ${baseBranch} (no remote to push)` };
+  }
+  const push = git(repo, ["push", "origin", baseBranch]);
+  if (!push.ok) {
+    return { merged: true, conflict: false, pushed: false, commitSha, message: `merged into ${baseBranch} but push failed: ${push.stderr}` };
+  }
+  return { merged: true, conflict: false, pushed: true, commitSha, message: `merged and pushed into ${baseBranch}` };
+}
+
 // --- Git-notes repair trail (DAR-687, HORIZON prior-art §1) -------------------
 // "The repository's own history is the experience buffer rather than a separate
 // datastore." Each task's verify verdict + repair context is attached as a git note

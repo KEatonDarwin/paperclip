@@ -5,7 +5,7 @@ import { Router } from "express";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
-import { foremanService } from "../services/foreman.js";
+import { foremanService, DEFAULT_VERIFY_COMMAND } from "../services/foreman.js";
 import { paperclipAgentDispatcher, DEFAULT_WORKER_AGENTS } from "../services/foreman-dispatch.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 
@@ -102,7 +102,7 @@ export function jobRoutes(db: Db) {
     });
 
     foreman
-      .runJob(id, { dispatcher, verifyCommand: req.body.verify_command ?? null })
+      .runJob(id, { dispatcher, verifyCommand: req.body.verify_command ?? DEFAULT_VERIFY_COMMAND })
       .catch((err: unknown) => console.error("[foreman] runJob unhandled error", err));
 
     res.status(202).json({ job_id: id, status: "dispatching", status_url: `/api/v1/jobs/${id}` });

@@ -21,10 +21,12 @@ export const jobs = pgTable(
     context: text("context"), // optional extra context bundle
     workerType: text("worker_type"), // default worker adapter for tasks (e.g. 'claude_local')
     maxWorkers: integer("max_workers").notNull().default(1), // Phase-1 fan-out cap (2-3 typical)
-    // planning -> dispatching -> integrating -> verifying -> completed | needs_review | failed
+    // planning -> dispatching -> integrating -> verifying -> merged | needs_review | failed
     status: text("status").notNull().default("planning"),
     integrationBranch: text("integration_branch"), // branch the task branches merge into
-    prUrl: text("pr_url"),
+    prUrl: text("pr_url"), // legacy Phase-1 field, unused since Phase 2 (DAR-711) auto-merges with no PR
+    mergeCommitSha: text("merge_commit_sha"), // set once the integration branch is merged into baseBranch
+    mergedAt: timestamp("merged_at", { withTimezone: true }),
     verifyResult: text("verify_result"), // 'pass' | 'fail' | 'skipped'
     summary: text("summary"), // human-readable report
     errorMessage: text("error_message"),

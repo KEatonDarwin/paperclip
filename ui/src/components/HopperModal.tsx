@@ -29,7 +29,9 @@ export function HopperModal() {
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key.toLowerCase() === "b" && e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
+      // Ctrl+Shift+H — was Ctrl+Shift+B, which collided with BugIntakeWidget's shortcut and
+      // caused both modals to open on top of each other (DAR-711). Bug intake keeps Ctrl+Shift+B.
+      if (e.key.toLowerCase() === "h" && e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
         e.preventDefault();
         setOpen((prev) => !prev);
       }

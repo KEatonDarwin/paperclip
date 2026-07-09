@@ -1,5 +1,7 @@
-// Foreman — Universal Coding Orchestrator (DAR-687, Phase 1).
-// Job → Plan → Tasks → Integrate → Verify → Report. Serial-first. Agents never merge to main.
+// Foreman — Universal Coding Orchestrator (DAR-687 Phase 1, DAR-711 Phase 2 auto-merge).
+// Job → Plan → Tasks → Integrate → Verify → Merge. Serial-first. Worker agents never merge to
+// main directly — only Foreman itself does, and only after the integration branch has passed
+// the verify gate (see DEFAULT_VERIFY_COMMAND). No PR step; the merge commit is the report.
 //
 // The orchestrator is dispatcher-agnostic: `runJob` takes a WorkerDispatcher, so the loop
 // can be exercised end-to-end with a scripted in-test worker on a scratch repo, and run in
@@ -13,6 +15,7 @@ import {
   diffSummary,
   addForemanNote,
   replayTrail,
+  mergeToBase,
   type IntegrationResult,
   type VerifyResult,
 } from "./foreman-git.js";
@@ -20,6 +23,11 @@ import { normalizeJobType } from "./foreman-playbooks.js";
 
 export type JobRow = typeof jobs.$inferSelect;
 export type JobTaskRow = typeof jobTasks.$inferSelect;
+
+// Phase 2 (DAR-711): auto-merge has no PR/human review left as a safety net, so a caller-omitted
+// verify_command must NOT fall through to "skipped" (that would auto-merge unverified changes).
+// Callers can still override with a stricter/different command; this is only the floor.
+export const DEFAULT_VERIFY_COMMAND = "pnpm typecheck && pnpm build";
 
 export interface CreateJobInput {
   repo: string;
@@ -237,20 +245,41 @@ export function foremanService(db: Db) {
           { integrationBranch, verifyResult },
         );
       }
+      // A skipped verify (no verify command supplied/configured) is not a passing gate — with
+      // no PR/human review downstream, merging on a skip would ship unverified changes. Routes
+      // default verifyCommand to DEFAULT_VERIFY_COMMAND so this should be rare in practice; a
+      // caller that explicitly passes an empty verify_command lands here instead of auto-merging.
+      if (verify.skipped) {
+        return await finishJob(
+          jobId,
+          "needs_review",
+          "verify was skipped (no verify command) — auto-merge requires a passing verify gate.",
+          { integrationBranch, verifyResult },
+        );
+      }
 
-      // 4. Report. Agents never merge to main — hand back the integration branch for human/JARVIS PR.
-      // HORIZON §1: embed the repair trail in the DB-backed summary too, not only in git notes —
-      // notes under refs/notes/foreman are NOT pushed by a plain `git push`, so the trail would be
-      // invisible to a PR-opener that forgets to push the ref. The summary reaches JARVIS via the Job API.
+      // 4. Merge. Phase 2 (DAR-711): Foreman merges its own verified work directly into
+      // baseBranch — no PR, no human hand-off. Only reachable once verify has actually passed.
       const trail = replayTrail(job.repo, job.baseBranch, integrationBranch);
+      const mergeResult = mergeToBase(job.repo, job.baseBranch, integrationBranch);
+      if (!mergeResult.merged) {
+        return await finishJob(
+          jobId,
+          "needs_review",
+          `verify passed but merge into ${job.baseBranch} failed: ${mergeResult.message}`,
+          { integrationBranch, verifyResult },
+        );
+      }
       const summary =
-        `Foreman job complete. ${committed.length} task(s) integrated into ${integrationBranch}. ` +
-        `Verify: ${verifyResult}. Open a PR from ${integrationBranch} → ${job.baseBranch}; a human/JARVIS merges.` +
+        `Foreman job complete. ${committed.length} task(s) integrated and merged into ${job.baseBranch} ` +
+        `(${mergeResult.commitSha.slice(0, 8)}). Verify: ${verifyResult}. ${mergeResult.message}.` +
         (trail ? `\n\nRepair trail (git log --notes=foreman):\n${trail}` : "");
       const finished = await store.updateJob(jobId, {
-        status: "completed",
+        status: "merged",
         verifyResult,
         integrationBranch,
+        mergeCommitSha: mergeResult.commitSha,
+        mergedAt: now(),
         summary,
         completedAt: now(),
       });

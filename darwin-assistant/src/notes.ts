@@ -1,5 +1,6 @@
 import { runClaude } from './agent.js';
 import { createIssueDirect } from './tools/paperclip.js';
+import { CTO_AGENT_ID } from './db.js';
 import { type NoteRow, markNoteTriaged, markNoteError } from './notes-db.js';
 
 // DAR-701 — triage a quick-capture note in the background: ask the model
@@ -41,6 +42,7 @@ export async function triageNote(note: NoteRow): Promise<void> {
       const issue = await createIssueDirect({
         title,
         description,
+        assigneeAgentId: CTO_AGENT_ID,
         originalAsk: `Captured via cockpit quick-capture: "${note.content}"`,
       });
       markNoteTriaged(note.id, {

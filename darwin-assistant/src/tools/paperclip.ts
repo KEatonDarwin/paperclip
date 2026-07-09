@@ -42,6 +42,30 @@ async function apiPatch(path: string, body: unknown): Promise<unknown> {
   return res.json();
 }
 
+export async function createIssueDirect(args: {
+  title: string;
+  description?: string;
+  priority?: string;
+  status?: string;
+  projectId?: string;
+  assigneeAgentId?: string;
+  originalAsk?: string;
+}): Promise<{ identifier: string; id: string; title: string }> {
+  const { title, description, priority = 'medium', status = 'todo', projectId, assigneeAgentId, originalAsk } = args;
+  const result = (await apiPost(`/api/companies/${DARWIN_COMPANY_ID}/issues`, {
+    title,
+    description,
+    priority,
+    status,
+    projectId,
+    assigneeAgentId,
+  })) as { identifier: string; id: string };
+
+  trackCreatedIssue(result.id, result.identifier, title, originalAsk);
+
+  return { identifier: result.identifier, id: result.id, title };
+}
+
 export const createIssue: ToolDef = {
   name: 'create_issue',
   description:
@@ -64,7 +88,7 @@ export const createIssue: ToolDef = {
     required: ['title'],
   },
   execute: async (args) => {
-    const { title, description, priority = 'medium', status = 'todo', projectId, assigneeAgentId, originalAsk } =
+    return createIssueDirect(
       args as {
         title: string;
         description?: string;
@@ -73,19 +97,8 @@ export const createIssue: ToolDef = {
         projectId?: string;
         assigneeAgentId?: string;
         originalAsk?: string;
-      };
-    const result = (await apiPost(`/api/companies/${DARWIN_COMPANY_ID}/issues`, {
-      title,
-      description,
-      priority,
-      status,
-      projectId,
-      assigneeAgentId,
-    })) as { identifier: string; id: string };
-
-    trackCreatedIssue(result.id, result.identifier, title, originalAsk);
-
-    return { identifier: result.identifier, id: result.id, title };
+      },
+    );
   },
 };
 

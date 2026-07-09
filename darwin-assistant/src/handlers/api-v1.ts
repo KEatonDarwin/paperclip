@@ -25,6 +25,8 @@ import {
 import { listAutonomyLedger } from '../autonomy-ledger.js';
 import { listMcpServers, refreshMcpServers } from '../mcp-registry.js';
 import { resolveNativeServer, nativeListTools } from '../tools/mcp-native.js';
+import { listNotes, createNote } from '../notes-db.js';
+import { triageNote } from '../notes.js';
 import {
   listJarvisDecisions,
   insertJarvisDecision,
@@ -493,6 +495,29 @@ export function createApiV1Router(): Router {
       seesAll || (d.conversation_external_id != null && d.conversation_external_id.startsWith(prefix)),
     );
     res.json({ decisions: visible.map(serializeDecision) });
+  });
+
+  // == Quick-capture notes (DAR-701) ============================================
+  // Hotkey in the cockpit pops a modal -> POST here -> triaged async in the
+  // background (filed as an issue if buildable, or given a short researched take
+  // if it's just an idea). Not thread-scoped; every caller sees the same list.
+
+  router.get('/notes', (_req: AuthedRequest, res) => {
+    const limit = Math.max(1, Math.min(500, parseInt(String(_req.query.limit ?? '100'), 10) || 100));
+    res.json({ notes: listNotes(limit) });
+  });
+
+  router.post('/notes', (req: AuthedRequest, res) => {
+    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    if (!content) {
+      sendError(res, 400, 'content_required', 'content is required');
+      return;
+    }
+    const note = createNote(content);
+    triageNote(note).catch((err) => {
+      console.error('[notes] triage failed unexpectedly', err);
+    });
+    res.status(201).json({ note });
   });
 
   // -- POST /threads: create a new thread ------------------------------------
@@ -1175,7 +1200,7 @@ export function createApiV1Router(): Router {
     const FORWARD = new Set([
       'turn', 'conversation_updated', 'conversation_created',
       'conversation_renamed', 'conversation_deleted', 'status', 'thread_todo',
-      'queued_message',
+      'queued_message', 'note',
     ]);
 
     res.writeHead(200, {

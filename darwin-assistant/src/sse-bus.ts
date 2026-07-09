@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import type { AutonomyLedgerRow } from './autonomy-ledger.js';
 import type { ThreadTodoRow } from './thread-todos.js';
 import type { JarvisDecisionRow } from './jarvis-decisions.js';
+import type { NoteRow } from './notes-db.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -115,13 +116,19 @@ export interface QueuedMessageEvent {
   };
 }
 
+export interface NoteEvent {
+  type: 'note';
+  action: 'created' | 'updated';
+  note: NoteRow;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
   | AutonomyLedgerEvent | AutonomyLedgerReviewEvent
   | ThreadTodoEvent | JarvisDecisionEvent
   | ConversationRenamedEvent | ConversationDeletedEvent
-  | QueuedMessageEvent;
+  | QueuedMessageEvent | NoteEvent;
 
 class SSEBus extends EventEmitter {}
 

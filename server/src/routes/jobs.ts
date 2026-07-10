@@ -6,7 +6,7 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
 import { foremanService, DEFAULT_VERIFY_COMMAND } from "../services/foreman.js";
-import { paperclipAgentDispatcher, DEFAULT_WORKER_AGENTS } from "../services/foreman-dispatch.js";
+import { paperclipAgentDispatcher, resolveRepoPath, DEFAULT_WORKER_AGENTS } from "../services/foreman-dispatch.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 
 const taskSchema = z.object({
@@ -51,8 +51,19 @@ export function jobRoutes(db: Db) {
     assertCompanyAccess(req, companyId);
 
     const actorUserId = (req.actor as { userId?: string }).userId ?? null;
+
+    // DAR-714: resolve the repo *name* the caller submitted to an absolute path up front, so
+    // job.repo is stored as a real path — see resolveRepoPath for why.
+    let repoPath: string;
+    try {
+      repoPath = resolveRepoPath(req.body.repo);
+    } catch (err) {
+      res.status(400).json({ error: { code: "unknown_repo", message: (err as Error).message } });
+      return;
+    }
+
     const { job, tasks } = await foreman.createJob(companyId, {
-      repo: req.body.repo,
+      repo: repoPath,
       ask: req.body.ask,
       baseBranch: req.body.base_branch,
       jobType: req.body.job_type ?? null,

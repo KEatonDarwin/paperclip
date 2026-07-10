@@ -17,7 +17,7 @@ import type { Db } from "@paperclipai/db";
 import type { JobRow } from "../services/foreman.js";
 import { validate } from "../middleware/validate.js";
 import { foremanService, DEFAULT_VERIFY_COMMAND } from "../services/foreman.js";
-import { paperclipAgentDispatcher, DEFAULT_WORKER_AGENTS } from "../services/foreman-dispatch.js";
+import { paperclipAgentDispatcher, resolveRepoPath, DEFAULT_WORKER_AGENTS } from "../services/foreman-dispatch.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 
 const INTAKE_PREFIX = "intake:";
@@ -96,8 +96,19 @@ export function intakeRoutes(db: Db) {
     const source = (req.body.source as string | undefined) ?? "api";
     const actorUserId = (req.actor as { userId?: string }).userId ?? null;
 
+    // DAR-714: resolve the repo *name* the caller submitted (e.g. "darwin-assistant") to an
+    // absolute path up front, so job.repo is stored as a real path — the one thing every
+    // downstream consumer (Foreman's git-engine, and the worker's own execution workspace) needs.
+    let repoPath: string;
+    try {
+      repoPath = resolveRepoPath(req.body.repo);
+    } catch (err) {
+      res.status(400).json({ error: { code: "unknown_repo", message: (err as Error).message } });
+      return;
+    }
+
     const { job } = await foreman.createJob(companyId, {
-      repo: req.body.repo,
+      repo: repoPath,
       ask: req.body.text,
       baseBranch: req.body.base_branch,
       jobType: req.body.job_type ?? "bug_fix",

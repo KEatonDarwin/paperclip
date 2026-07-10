@@ -9,10 +9,11 @@
 //   2. Isolated-workspaces experimental flag ON + the project/issue workspace strategy set to
 //      git_worktree, else workers share one cwd and parallel isolation is lost.
 //   3. The worker agents must be able to reach config.repo on the host.
+import { basename } from "node:path";
 import { and, desc, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issues } from "@paperclipai/db";
-import { issueService, heartbeatService } from "./index.js";
+import { issueService, heartbeatService, projectService } from "./index.js";
 import { listBranchesMatching, branchHasCommitsAhead } from "./foreman-git.js";
 import { getPlaybook } from "./foreman-playbooks.js";
 import type { WorkerDispatcher, DispatchHandle, PollState, JobRow, JobTaskRow } from "./foreman.js";
@@ -40,6 +41,61 @@ export const DEFAULT_WORKER_AGENTS: Record<string, string> = {
   auggie: "e6973adf-d293-4dcb-923a-85b6a946cf33", // AuggieCoder (auggie_local)
 };
 
+// Known repo name -> absolute local path registry (deployment fact, same "operator-owned" shape
+// as DEFAULT_WORKER_AGENTS above). DAR-714: `job.repo` is a public API param (repo *name*, e.g.
+// "darwin-assistant") but every git-engine op in foreman-git.ts, and the worker's own execution
+// workspace, need a real filesystem path. Resolve name -> path once at job-creation time (see
+// resolveRepoPath, called from routes/intake.ts + routes/jobs.ts) so `job.repo` is stored as an
+// absolute path from the start and every downstream consumer — dispatch's workspace resolution
+// below, and Foreman's own integrate/verify/merge steps — sees one consistent, correct value.
+export const DEFAULT_REPO_WORKSPACES: Record<string, string> = {
+  "url-shortener": "/home/kevin/projects/url-shortener",
+  paperclip: "/home/kevin/paperclip",
+  "darwin-assistant": "/home/kevin/projects/darwin-assistant-dar666",
+};
+
+// Resolve a repo API param to an absolute filesystem path. Already-absolute paths pass through
+// unchanged (existing callers — e.g. the DAR-711 auto-merge tests — already submit real repo
+// paths directly). Otherwise looks the name up in the registry; throws on an unknown name rather
+// than silently falling back to something else, since that's exactly the failure mode this
+// ticket exists to close.
+export function resolveRepoPath(repo: string, overrides?: Record<string, string>): string {
+  if (repo.startsWith("/")) return repo;
+  const registry = { ...DEFAULT_REPO_WORKSPACES, ...(overrides ?? {}) };
+  const path = registry[repo.toLowerCase()];
+  if (!path) {
+    throw new Error(
+      `Foreman: unknown repo "${repo}" — add it to the repo workspace registry ` +
+        "(DEFAULT_REPO_WORKSPACES in foreman-dispatch.ts) or submit an absolute repo path instead.",
+    );
+  }
+  return path;
+}
+
+// Resolve the project workspace whose cwd actually points at repoPath (an absolute path by the
+// time it gets here — see resolveRepoPath), instead of letting issue creation silently fall back
+// to the Foreman project's primary/default workspace (DAR-714). Reuses an existing workspace
+// with a matching cwd under the Foreman project if one exists; otherwise creates one. Pure over
+// (db, foremanProjectId, repoPath) — no heartbeat/issue side effects — so it's unit-testable
+// without triggering the live agent runtime, same discipline as composeWorkerBrief above.
+export async function resolveProjectWorkspaceId(db: Db, foremanProjectId: string, repoPath: string): Promise<string> {
+  const projectsSvc = projectService(db);
+  const existingWorkspaces = await projectsSvc.listWorkspaces(foremanProjectId);
+  const existing = existingWorkspaces.find((w) => w.cwd === repoPath);
+  if (existing) return existing.id;
+
+  const created = await projectsSvc.createWorkspace(foremanProjectId, {
+    name: basename(repoPath),
+    cwd: repoPath,
+    sourceType: "local_path",
+    isPrimary: false,
+  });
+  if (!created) {
+    throw new Error(`Foreman: failed to create a project workspace for repo path "${repoPath}"`);
+  }
+  return created.id;
+}
+
 export interface PaperclipDispatcherConfig {
   companyId: string;
   foremanProjectId: string; // project the worker issues are created under
@@ -63,9 +119,11 @@ export function paperclipAgentDispatcher(db: Db, config: PaperclipDispatcherConf
     async dispatch(job: JobRow, task: JobTaskRow, retryContext?: string): Promise<DispatchHandle> {
       const agentId = resolveAgentId(task.workerType);
       const description = composeWorkerBrief(job, task, retryContext);
+      const projectWorkspaceId = await resolveProjectWorkspaceId(db, config.foremanProjectId, job.repo);
 
       const issue = await issuesSvc.create(config.companyId, {
         projectId: config.foremanProjectId,
+        projectWorkspaceId,
         title: `Foreman: ${task.instruction.slice(0, 72)}`,
         description,
         status: "in_progress",

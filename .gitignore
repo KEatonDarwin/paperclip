@@ -51,3 +51,9 @@ tests/release-smoke/playwright-report/
 .superset/
 .claude/worktrees/
 .worktrees
+
+# darwin-assistant runtime DB (SQLite, not source)
+darwin-assistant/jarvis.db
+darwin-assistant/jarvis.db-shm
+darwin-assistant/jarvis.db-wal
+darwin-assistant/jarvis.db.bak-*

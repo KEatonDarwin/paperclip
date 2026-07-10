@@ -1,0 +1,971 @@
+import { spawn, type ChildProcess } from 'node:child_process';
+import { buildSystemPrompt, loadMemoryBlock } from './prompt.js';
+import { ALL_TOOLS, TOOL_MAP } from './tools/index.js';
+import { withToolExecutionContext, type ToolExecutionContext } from './autonomy-ledger.js';
+import {
+  getOrCreateConversation,
+  updateSessionState,
+  addTurn,
+  closeConversation as dbCloseConversation,
+  touchConversation,
+  getTurns,
+  countTurns,
+  getSetting,
+  INTERRUPTED_MARKER,
+  type ConversationRow,
+  type TurnRow,
+  type TurnMetadata,
+} from './conversation-db.js';
+import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent, type StreamEndEvent } from './sse-bus.js';
+
+const MAX_TOOL_TURNS = 50;
+
+// Fix C (DAR-676): appended to whatever streamed when a run is torn down mid-reply,
+// so the user sees the partial answer plus a clear "retry" cue. The fully-empty
+// case reuses INTERRUPTED_MARKER (shared with Fix B) instead.
+const INTERRUPTED_SUFFIX =
+  '_⚠️ This reply was interrupted before it finished. Send another message to continue._';
+
+// Fix C (DAR-676): durable run lifecycle. A model subprocess that never returns
+// (hung network, wedged CLI) used to block a thread forever — the cockpit marks
+// the conversation in-flight and only a service restart clears it. We now cap each
+// model call and kill the child on timeout so the run errors out (and the caller
+// persists whatever streamed). Configurable for long tool chains.
+const RUN_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.JARVIS_RUN_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 10 * 60 * 1000; // 10 min per model call
+})();
+// Grace period between SIGTERM and SIGKILL when force-killing a subprocess.
+const CHILD_KILL_GRACE_MS = 5_000;
+
+// Live model subprocesses, tracked so a service shutdown (SIGTERM/SIGINT) can tear
+// them down deterministically instead of orphaning them mid-run.
+const activeChildren = new Set<ChildProcess>();
+
+/** Kill a subprocess: SIGTERM, then SIGKILL after a grace period if still alive. */
+function killChild(child: ChildProcess): void {
+  try {
+    child.kill('SIGTERM');
+  } catch {}
+  const grace = setTimeout(() => {
+    try {
+      if (!child.killed) child.kill('SIGKILL');
+    } catch {}
+  }, CHILD_KILL_GRACE_MS);
+  grace.unref?.();
+}
+
+/**
+ * Fix C (DAR-676): tear down every live model subprocess. Called from the process
+ * SIGTERM/SIGINT handler so a restart doesn't orphan a running `claude`/`codex`
+ * child. Any empty assistant turns left behind are healed on next boot by
+ * reconcileInterruptedRuns() (Fix B).
+ */
+export function shutdownActiveRuns(): number {
+  const n = activeChildren.size;
+  for (const child of activeChildren) killChild(child);
+  activeChildren.clear();
+  return n;
+}
+
+/** Error thrown when a model call exceeds RUN_TIMEOUT_MS and is killed. */
+export class RunTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`model call produced no output for ${Math.round(ms / 1000)}s and was terminated as hung`);
+    this.name = 'RunTimeoutError';
+  }
+}
+
+// --- Runtime descriptor contract (mirrors Paperclip's AdapterRuntimeDescriptor,
+// packages/adapter-utils/src/types.ts) so JARVIS and Paperclip describe provider
+// switching with the same vocabulary. DAR-680 Slice 3. ---
+export type AdapterRuntimeTransport = 'local_cli' | 'gateway' | 'http_api' | 'child_process';
+export type AdapterResumeStrategy =
+  | 'native'
+  | 'workspace_bound'
+  | 'provider_bound'
+  | 'stateless'
+  | 'transcript_replay';
+export type AdapterSessionScope = 'none' | 'provider' | 'workspace' | 'thread';
+
+export interface AdapterRuntimeAuthDescriptor {
+  envKeys: string[];
+  supportsLocalLogin: boolean;
+  detectedFromConfig: boolean;
+}
+
+export interface AdapterRuntimeSessionDescriptor {
+  resumeStrategy: AdapterResumeStrategy;
+  sessionScope: AdapterSessionScope;
+  canResumeAcrossModelChange: boolean;
+  canResumeAcrossProviderChange: boolean;
+  requiresFreshSessionOnAssignment: boolean;
+}
+
+export interface AdapterRuntimeCapabilities {
+  tools: boolean;
+  mcp: boolean;
+  streamingText: boolean;
+  structuredOutput: boolean;
+  webSearch: boolean;
+}
+
+export interface AdapterRuntimeDescriptor {
+  adapterType: string;
+  provider: string;
+  providerLabel: string;
+  transport: AdapterRuntimeTransport;
+  model: string | null;
+  modelLabel: string | null;
+  auth: AdapterRuntimeAuthDescriptor;
+  session: AdapterRuntimeSessionDescriptor;
+  capabilities: AdapterRuntimeCapabilities;
+}
+
+export interface AdapterOptionSchema {
+  key: string;
+  label: string;
+  type: 'enum';
+  values: string[];
+  default?: string;
+}
+
+export interface AdapterConfig {
+  id: string;
+  name: string;
+  bin: string;
+  models: { id: string; label: string }[];
+  // Declarative options schema so the UI renders the right controls per provider.
+  optionsSchema?: AdapterOptionSchema[];
+  // Static runtime metadata (provider/auth/session/capability) for this adapter.
+  // The `model`/`modelLabel` fields are placeholders here and filled in per-request
+  // by getAdapterRuntimeDescriptor(); leave them null in the static config.
+  runtime: Omit<AdapterRuntimeDescriptor, 'adapterType' | 'model' | 'modelLabel'>;
+  buildArgs: (opts: { sessionId?: string | null; model?: string | null; options?: Record<string, unknown> }) => string[];
+  envOverrides?: (env: Record<string, string>) => void;
+  // Optional adapter-specific stdout parser. Defaults to the claude JSONL parser.
+  parseOutput?: (stdout: string) => ClaudeResult;
+  // Optional per-line event mapper to translate adapter-native JSONL into claude-shaped
+  // events for the SSE stream. Return null to drop an event from the stream.
+  mapStreamEvent?: (event: Record<string, unknown>) => Record<string, unknown> | null;
+  // Optional adapter-specific pattern used to detect "unknown/expired session" stderr,
+  // so runConversationTurn can retry without --resume.
+  unknownSessionPattern?: RegExp;
+}
+
+const ADAPTERS: Record<string, AdapterConfig> = {
+  claude: {
+    id: 'claude',
+    name: 'Claude (Anthropic)',
+    bin: process.env.CLAUDE_BIN ?? 'claude',
+    models: [
+      { id: 'claude-opus-4-8', label: 'Opus 4.8' },
+      { id: 'claude-opus-4-7', label: 'Opus 4.7' },
+      { id: 'claude-sonnet-5', label: 'Sonnet 5' },
+      { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
+      { id: 'claude-fable-5', label: 'Fable 5' },
+      { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
+    ],
+    optionsSchema: [
+      { key: 'thinking', label: 'Thinking level', type: 'enum', values: ['low', 'medium', 'high', 'xhigh', 'max'], default: 'high' },
+    ],
+    runtime: {
+      provider: 'anthropic',
+      providerLabel: 'Anthropic',
+      transport: 'local_cli',
+      // The claude adapter deletes ANTHROPIC_API_KEY (envOverrides) and relies on
+      // the local `claude` CLI subscription login, so there is no required env key.
+      auth: { envKeys: [], supportsLocalLogin: true, detectedFromConfig: false },
+      session: {
+        resumeStrategy: 'native',
+        sessionScope: 'provider',
+        canResumeAcrossModelChange: true,
+        canResumeAcrossProviderChange: false,
+        requiresFreshSessionOnAssignment: false,
+      },
+      capabilities: { tools: true, mcp: true, streamingText: true, structuredOutput: false, webSearch: true },
+    },
+    buildArgs({ sessionId, model, options }) {
+      const args = ['--print', '-', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
+      if (model) args.push('--model', model);
+      if (sessionId) args.push('--resume', sessionId);
+      if (options?.thinking && typeof options.thinking === 'string') args.push('--effort', options.thinking);
+      return args;
+    },
+    envOverrides(env) { delete env['ANTHROPIC_API_KEY']; },
+  },
+  codex: {
+    id: 'codex',
+    name: 'Codex (OpenAI)',
+    bin: process.env.CODEX_BIN ?? 'codex',
+    models: [
+      { id: 'gpt-5.5', label: 'GPT-5.5' },
+      { id: 'gpt-5.4', label: 'GPT-5.4' },
+      { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
+    ],
+    runtime: {
+      provider: 'openai',
+      providerLabel: 'OpenAI',
+      transport: 'local_cli',
+      auth: { envKeys: ['OPENAI_API_KEY'], supportsLocalLogin: true, detectedFromConfig: false },
+      session: {
+        resumeStrategy: 'native',
+        sessionScope: 'provider',
+        canResumeAcrossModelChange: true,
+        canResumeAcrossProviderChange: false,
+        requiresFreshSessionOnAssignment: false,
+      },
+      // Codex's --json stream emits one item.completed at end of turn rather than
+      // incremental deltas (see codexMapStreamEvent), so streamingText is false.
+      capabilities: { tools: true, mcp: true, streamingText: false, structuredOutput: false, webSearch: false },
+    },
+    buildArgs({ sessionId, model }) {
+      const args: string[] = ['exec'];
+      if (sessionId) args.push('resume', sessionId);
+      args.push(
+        '--json',
+        '--dangerously-bypass-approvals-and-sandbox',
+        '--skip-git-repo-check',
+      );
+      if (model) args.push('-m', model);
+      // Prompt argument `-` explicitly tells codex to read the prompt from stdin.
+      args.push('-');
+      return args;
+    },
+    parseOutput: parseCodexOutput,
+    mapStreamEvent: codexMapStreamEvent,
+    unknownSessionPattern: /(session|thread)[^\n]*not found|no such (session|thread)|unknown (session|thread)/i,
+  },
+  auggie: {
+    id: 'auggie',
+    name: 'Auggie (Augment)',
+    bin: process.env.AUGGIE_BIN ?? 'auggie',
+    models: [
+      { id: 'default', label: 'Default' },
+    ],
+    runtime: {
+      provider: 'augment',
+      providerLabel: 'Augment',
+      transport: 'local_cli',
+      auth: { envKeys: [], supportsLocalLogin: true, detectedFromConfig: false },
+      session: {
+        resumeStrategy: 'native',
+        sessionScope: 'provider',
+        canResumeAcrossModelChange: true,
+        canResumeAcrossProviderChange: false,
+        requiresFreshSessionOnAssignment: false,
+      },
+      capabilities: { tools: true, mcp: false, streamingText: false, structuredOutput: false, webSearch: false },
+    },
+    buildArgs({ sessionId, model }) {
+      const args = ['--print', '--output-format', 'json'];
+      if (sessionId) args.push('--resume', sessionId);
+      if (model && model !== 'default') args.push('--model', model);
+      return args;
+    },
+  },
+};
+
+export function getAdapters(): Record<string, AdapterConfig> {
+  return ADAPTERS;
+}
+
+function getActiveAdapter(): AdapterConfig {
+  const adapterId = getSetting('adapter') ?? 'claude';
+  return ADAPTERS[adapterId] ?? ADAPTERS.claude;
+}
+
+export function getActiveAdapterInfo(): { adapter: string; model: string | null } {
+  const adapter = getActiveAdapter();
+  const model = getSetting('model');
+  return { adapter: adapter.id, model };
+}
+
+function getActiveOptions(): Record<string, unknown> {
+  const raw = getSetting('adapter_options');
+  if (!raw) return {};
+  try { return JSON.parse(raw) as Record<string, unknown>; } catch { return {}; }
+}
+
+// Resolve the effective adapter+model+options for a specific conversation (DAR-680 AC#4).
+// A per-thread override (conv.thread_adapter/thread_model) wins over the global
+// setting. If the thread pins an adapter but no valid model for it, the adapter's
+// default (null) is used rather than leaking a model from another provider.
+// Options always come from the active global preset for now (per-thread options are a future slice).
+export function resolveConversationRuntime(
+  conv: ConversationRow,
+): { adapter: AdapterConfig; model: string | null; options: Record<string, unknown> } {
+  if (conv.thread_adapter && ADAPTERS[conv.thread_adapter]) {
+    const adapter = ADAPTERS[conv.thread_adapter];
+    const model =
+      conv.thread_model && adapter.models.some((m) => m.id === conv.thread_model)
+        ? conv.thread_model
+        : null;
+    return { adapter, model, options: getActiveOptions() };
+  }
+  return { adapter: getActiveAdapter(), model: getSetting('model'), options: getActiveOptions() };
+}
+
+// Resolve the full runtime descriptor for an adapter, filling in the concrete
+// model/modelLabel for this request. Mirrors Paperclip's
+// getAdapterRuntimeDescriptor(type, { model }).
+export function getAdapterRuntimeDescriptor(
+  adapterId: string,
+  model?: string | null,
+): AdapterRuntimeDescriptor | null {
+  const adapter = ADAPTERS[adapterId];
+  if (!adapter) return null;
+  const resolvedModel = model ?? null;
+  const modelLabel = resolvedModel
+    ? adapter.models.find((m) => m.id === resolvedModel)?.label ?? resolvedModel
+    : null;
+  return {
+    adapterType: adapter.id,
+    model: resolvedModel,
+    modelLabel,
+    ...adapter.runtime,
+  };
+}
+
+// Runtime descriptor for whatever adapter/model is currently selected.
+export function getActiveRuntimeDescriptor(): AdapterRuntimeDescriptor | null {
+  const info = getActiveAdapterInfo();
+  return getAdapterRuntimeDescriptor(info.adapter, info.model);
+}
+
+// Per-conversation in-flight registry — the single concurrency + observability
+// source of truth shared by EVERY ingress path (cockpit /api/v1, Slack, webhook,
+// check-in worker). They all funnel through processMessage(), so tracking runs
+// here (a) prevents two turns racing on one conversation regardless of source and
+// (b) lets the UI report each concurrent thread's status independently instead of
+// a single global scalar that cross-talks between simultaneous runs.
+interface ActiveRun {
+  messageId: string;
+  startedAt: number;
+  abort: AbortController;
+}
+const activeRuns = new Map<number, ActiveRun>();
+
+// Stop button (cockpit POST /threads/:id/stop): abort the in-flight run for a
+// conversation. Kills the model subprocess; the run then persists whatever
+// streamed and stops the thread. Returns false if nothing was running.
+export function abortConversationRun(conversationId: number): boolean {
+  const run = activeRuns.get(conversationId);
+  if (!run) return false;
+  run.abort.abort();
+  return true;
+}
+
+// Thrown by processMessage() when a turn is already running on the conversation.
+export class ConversationBusyError extends Error {
+  constructor(public readonly pendingMessageId: string) {
+    super('Another message is still processing on this thread');
+    this.name = 'ConversationBusyError';
+  }
+}
+
+// Message id of the turn currently running on a conversation, if any.
+export function getInFlightMessageId(conversationId: number): string | null {
+  return activeRuns.get(conversationId)?.messageId ?? null;
+}
+
+// Live in-progress streamed text per conversation, so a SECOND browser that
+// opens a thread mid-run sees what JARVIS has "thought" so far — the streamed
+// text isn't a committed turn yet, so getThread alone can't show it. Non-empty
+// only while a text block is actively streaming; cleared per tool-turn + on end.
+const liveStreams = new Map<number, string>();
+export function getLiveStream(conversationId: number): string | null {
+  const s = liveStreams.get(conversationId);
+  return s && s.length ? s : null;
+}
+
+// Whether a turn is currently running on a specific conversation.
+export function isConversationActive(conversationId: number): boolean {
+  return activeRuns.has(conversationId);
+}
+
+// Oldest still-running conversation — used for the single-slot status-bar label.
+export function getActiveConversation(): { conversationId: number; startedAt: number } | null {
+  let oldest: { conversationId: number; startedAt: number } | null = null;
+  for (const [conversationId, run] of activeRuns) {
+    if (oldest == null || run.startedAt < oldest.startedAt) {
+      oldest = { conversationId, startedAt: run.startedAt };
+    }
+  }
+  return oldest;
+}
+
+export function buildToolsBlock(): string {
+  const defs = ALL_TOOLS.map(
+    (t) =>
+      `### ${t.name}\n${t.description}\nParameters: ${JSON.stringify(t.parameters, null, 2)}`,
+  ).join('\n\n');
+
+  return [
+    '## Tools',
+    'When you need to call a tool, output EXACTLY this format then STOP — do not write anything after the closing tag:',
+    '<tool_call>',
+    '{"name": "tool_name", "arguments": {"param": "value"}}',
+    '</tool_call>',
+    '',
+    'Available tools:',
+    defs,
+  ].join('\n');
+}
+
+function buildInitialPrompt(userMessage: string): string {
+  return [buildSystemPrompt(), buildToolsBlock(), '---', `Human: ${userMessage}`, 'Assistant:'].join('\n\n');
+}
+
+function adapterFromModel(model: string | null | undefined): string | null {
+  if (!model) return null;
+  const normalized = model.toLowerCase();
+  if (normalized.includes('claude')) return 'claude';
+  if (normalized.includes('gpt') || normalized.includes('codex') || normalized.includes('o4')) return 'codex';
+  if (normalized.includes('augment') || normalized.includes('auggie')) return 'auggie';
+  return null;
+}
+
+function resolveSessionAdapter(conv: ConversationRow, turns: TurnRow[]): string | null {
+  if (conv.session_adapter) return conv.session_adapter;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const inferred = adapterFromModel(turns[i]?.model);
+    if (inferred) return inferred;
+  }
+  return null;
+}
+
+function summarizeTurnForReplay(turn: TurnRow): string | null {
+  const content = turn.content?.trim() ?? '';
+  if (turn.role === 'user') return `Human (${turn.created_at} UTC): ${content}`;
+  if (turn.role === 'assistant') return `Assistant (${turn.created_at} UTC): ${content}`;
+  if (turn.role === 'tool_call') {
+    const args = turn.tool_args ? turn.tool_args.slice(0, 1200) : '{}';
+    return `Assistant tool call (${turn.created_at} UTC): ${turn.tool_name ?? 'unknown'} ${args}`;
+  }
+  if (turn.role === 'tool_result') {
+    const result = turn.tool_result ? turn.tool_result.slice(0, 2000) : '';
+    return `Tool result (${turn.created_at} UTC): ${turn.tool_name ?? 'unknown'} ${result}`;
+  }
+  return null;
+}
+
+function buildContinuationPrompt(turns: TurnRow[], userMessage: string): string {
+  const priorTurns = turns.length && turns[turns.length - 1]?.role === 'user'
+    ? turns.slice(0, -1)
+    : turns;
+  const HEAD_KEEP = 6;
+  const TAIL_KEEP = 18;
+  const selectedTurns = priorTurns.length <= HEAD_KEEP + TAIL_KEEP
+    ? priorTurns
+    : [...priorTurns.slice(0, HEAD_KEEP), ...priorTurns.slice(-TAIL_KEEP)];
+  const elidedCount = priorTurns.length - selectedTurns.length;
+  const transcriptLines = selectedTurns
+    .map(summarizeTurnForReplay)
+    .filter((line): line is string => Boolean(line));
+
+  if (elidedCount > 0) {
+    transcriptLines.splice(HEAD_KEEP, 0, `[... ${elidedCount} earlier turns omitted for brevity ...]`);
+  }
+
+  return [
+    buildSystemPrompt(),
+    buildToolsBlock(),
+    '---',
+    'You are continuing an existing JARVIS conversation after the backing adapter session changed or was reset.',
+    'Treat the transcript below as prior context from the same thread and continue naturally from the final human message.',
+    '',
+    '## Current Memory',
+    `<memory_refresh>\n${loadMemoryBlock()}\n</memory_refresh>`,
+    '',
+    '## Prior Transcript',
+    transcriptLines.length ? transcriptLines.join('\n\n') : '(no prior turns)',
+    '',
+    `Human: ${userMessage}`,
+    'Assistant:',
+  ].join('\n\n');
+}
+
+interface ClaudeUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
+export interface ClaudeResult {
+  text: string;
+  sessionId: string | null;
+  usage?: ClaudeUsage;
+  model?: string;
+  rawOutput?: string;
+}
+
+function parseClaudeOutput(stdout: string): ClaudeResult {
+  const texts: string[] = [];
+  let sessionId: string | null = null;
+  let usage: ClaudeUsage | undefined;
+  let model: string | undefined;
+
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+
+    if (typeof event.session_id === 'string' && event.session_id) {
+      sessionId = event.session_id;
+    }
+
+    if (typeof event.model === 'string' && event.model) {
+      model = event.model;
+    }
+
+    if (event.type === 'system' && event.subtype === 'init') {
+      if (typeof event.session_id === 'string' && event.session_id) {
+        sessionId = event.session_id;
+      }
+    }
+
+    if (event.type === 'assistant') {
+      if (typeof (event as Record<string, unknown>).session_id === 'string') {
+        sessionId = (event as Record<string, unknown>).session_id as string;
+      }
+      const content = (event.message as Record<string, unknown> | null)?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          const b = block as Record<string, unknown>;
+          if (b.type === 'text' && typeof b.text === 'string') texts.push(b.text);
+        }
+      }
+    }
+
+    if (event.type === 'result') {
+      if (typeof event.session_id === 'string' && event.session_id) {
+        sessionId = event.session_id;
+      }
+      const u = event.usage as Record<string, unknown> | undefined;
+      if (u) {
+        usage = {
+          inputTokens: (typeof u.input_tokens === 'number' ? u.input_tokens : 0),
+          outputTokens: (typeof u.output_tokens === 'number' ? u.output_tokens : 0),
+          cacheReadTokens: typeof u.cache_read_input_tokens === 'number' ? u.cache_read_input_tokens : undefined,
+          cacheWriteTokens: typeof u.cache_creation_input_tokens === 'number' ? u.cache_creation_input_tokens : undefined,
+        };
+      }
+      // Bug fix (2026-07-10): `event.result` is Claude Code's own summary field —
+      // in practice it's just the FINAL assistant text segment, not the full
+      // session. Preferring it over `texts` silently dropped every earlier text
+      // block from a multi-step tool-calling turn (visible live via streaming,
+      // then gone once persisted). `texts` already accumulates every assistant
+      // text segment across the whole CLI session in order, so it's the
+      // authoritative reconstruction — only fall back to `event.result` if the
+      // stream somehow produced no assistant text events at all.
+      const r = typeof event.result === 'string' ? event.result.trim() : '';
+      const full = texts.join('\n\n').trim();
+      return { text: full || r, sessionId, usage, model, rawOutput: stdout };
+    }
+  }
+
+  return { text: texts.join('\n\n').trim() || stdout.trim(), sessionId, usage, model, rawOutput: stdout };
+}
+
+function parseCodexOutput(stdout: string): ClaudeResult {
+  const texts: string[] = [];
+  let sessionId: string | null = null;
+  let usage: ClaudeUsage | undefined;
+
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+
+    if (event.type === 'thread.started' && typeof event.thread_id === 'string' && event.thread_id) {
+      sessionId = event.thread_id;
+    }
+
+    if (event.type === 'item.completed') {
+      const item = event.item as Record<string, unknown> | undefined;
+      if (item && item.type === 'agent_message' && typeof item.text === 'string') {
+        texts.push(item.text);
+      }
+    }
+
+    if (event.type === 'turn.completed') {
+      const u = event.usage as Record<string, unknown> | undefined;
+      if (u) {
+        usage = {
+          inputTokens: typeof u.input_tokens === 'number' ? u.input_tokens : 0,
+          outputTokens: typeof u.output_tokens === 'number' ? u.output_tokens : 0,
+          cacheReadTokens: typeof u.cached_input_tokens === 'number' ? u.cached_input_tokens : undefined,
+        };
+      }
+    }
+  }
+
+  return { text: texts.join('\n').trim(), sessionId, usage, rawOutput: stdout };
+}
+
+// Codex's `--json` stream emits `item.completed` with `agent_message` at the end of a
+// turn rather than incremental deltas. We surface that as a single claude-shaped
+// `content_block_delta` so the existing SSE bridge in runConversationTurn keeps working.
+function codexMapStreamEvent(event: Record<string, unknown>): Record<string, unknown> | null {
+  if (event.type === 'item.completed') {
+    const item = event.item as Record<string, unknown> | undefined;
+    if (item && item.type === 'agent_message' && typeof item.text === 'string') {
+      return {
+        type: 'content_block_delta',
+        delta: { type: 'text_delta', text: item.text },
+      };
+    }
+  }
+  return null;
+}
+
+export function parseToolCall(
+  text: string,
+): { name: string; arguments: Record<string, unknown>; precedingText: string } | null {
+  const match = text.match(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/);
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[1]) as { name: string; arguments: Record<string, unknown> };
+    if (typeof parsed.name === 'string' && parsed.arguments && typeof parsed.arguments === 'object')
+      return { ...parsed, precedingText: text.slice(0, match.index ?? 0).trim() };
+  } catch {}
+  return null;
+}
+
+const UNKNOWN_SESSION_RE = /no conversation found with session id|unknown session|session .* not found/i;
+
+export async function runClaude(
+  input: string,
+  sessionId?: string | null,
+  onEvent?: (event: Record<string, unknown>) => void,
+  runtime?: { adapter: AdapterConfig; model: string | null; options?: Record<string, unknown> },
+  signal?: AbortSignal,
+): Promise<ClaudeResult> {
+  // A resolved per-thread runtime (DAR-680 AC#4) wins; otherwise fall back to the
+  // global adapter/model settings for callers that don't pass one.
+  const adapter = runtime?.adapter ?? getActiveAdapter();
+  const model = runtime ? runtime.model : getSetting('model');
+  const options = runtime?.options ?? getActiveOptions();
+  const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+  adapter.envOverrides?.(env);
+
+  const args = adapter.buildArgs({ sessionId, model, options });
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(adapter.bin, args, { env });
+    const outChunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+    let lineBuffer = '';
+
+    // Fix C (DAR-676): track this child for shutdown teardown and cap its lifetime.
+    activeChildren.add(child);
+    let timedOut = false;
+    let aborted = false;
+    // Stop button: aborting the run kills the child; the close handler then
+    // surfaces a distinct "stopped" error and the caller persists what streamed.
+    const onAbort = () => { aborted = true; killChild(child); };
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    // IDLE timeout, not a total-runtime cap: the timer is re-armed on every chunk
+    // of output, so a long-but-actively-working run (streaming text, tool calls)
+    // never trips it — only a run that goes SILENT for RUN_TIMEOUT_MS is treated
+    // as hung and killed. This lets multi-minute agentic turns complete while
+    // still catching genuinely stuck subprocesses.
+    let killTimer: ReturnType<typeof setTimeout>;
+    const armIdleTimer = () => {
+      clearTimeout(killTimer);
+      killTimer = setTimeout(() => {
+        timedOut = true;
+        killChild(child);
+      }, RUN_TIMEOUT_MS);
+      killTimer.unref?.();
+    };
+    armIdleTimer();
+    const cleanup = () => {
+      clearTimeout(killTimer);
+      signal?.removeEventListener('abort', onAbort);
+      activeChildren.delete(child);
+    };
+
+    const forwardEvent = (event: Record<string, unknown>) => {
+      if (!onEvent) return;
+      const mapped = adapter.mapStreamEvent ? adapter.mapStreamEvent(event) : event;
+      if (mapped) onEvent(mapped);
+    };
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      outChunks.push(chunk);
+      armIdleTimer(); // progress → not hung; reset the idle clock
+
+      if (onEvent) {
+        lineBuffer += chunk.toString('utf8');
+        const lines = lineBuffer.split('\n');
+        lineBuffer = lines.pop() ?? '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            forwardEvent(JSON.parse(trimmed) as Record<string, unknown>);
+          } catch {}
+        }
+      }
+    });
+
+    child.stderr.on('data', (chunk: Buffer) => { errChunks.push(chunk); armIdleTimer(); });
+    child.on('error', (err) => { cleanup(); reject(err); });
+    child.on('close', (code) => {
+      cleanup();
+
+      // Fix C (DAR-676): killed by the run-timeout watchdog. Surface a distinct
+      // error so the caller can persist whatever streamed and stop the thread.
+      if (timedOut) {
+        reject(new RunTimeoutError(RUN_TIMEOUT_MS));
+        return;
+      }
+
+      // Stopped via the cockpit Stop button.
+      if (aborted) {
+        reject(new Error('Run stopped by user'));
+        return;
+      }
+
+      if (onEvent && lineBuffer.trim()) {
+        try { forwardEvent(JSON.parse(lineBuffer.trim()) as Record<string, unknown>); } catch {}
+      }
+
+      const stdout = Buffer.concat(outChunks).toString('utf8');
+      const stderr = Buffer.concat(errChunks).toString('utf8');
+
+      if ((code ?? 0) !== 0 && !stdout.trim()) {
+        const combined = stderr + '\n' + stdout;
+        const unknownSessionRe = adapter.unknownSessionPattern ?? UNKNOWN_SESSION_RE;
+        if (sessionId && unknownSessionRe.test(combined)) {
+          resolve({ text: '', sessionId: null });
+          return;
+        }
+        const firstErr = stderr.split('\n').find((l) => l.trim()) ?? `exit code ${code}`;
+        reject(new Error(`${adapter.id}: ${firstErr}`));
+        return;
+      }
+      const parse = adapter.parseOutput ?? parseClaudeOutput;
+      resolve(parse(stdout));
+    });
+
+    child.stdin.write(input, 'utf8');
+    child.stdin.end();
+  });
+}
+
+export function clearConversation(externalId: string): void {
+  dbCloseConversation(externalId);
+}
+
+export async function processMessage(
+  input: string,
+  conversationId: string,
+  messageId?: string,
+): Promise<string> {
+  const conv = getOrCreateConversation(conversationId);
+
+  // Per-conversation mutex. The get/set pair is synchronous (no await between the
+  // check and the set), so this is a true gate across every ingress path — a
+  // Slack turn and a cockpit turn can no longer double-run one conversation.
+  const existing = activeRuns.get(conv.id);
+  if (existing) {
+    throw new ConversationBusyError(existing.messageId);
+  }
+  const runMessageId = messageId ?? `turn:${conv.id}:${countTurns(conv.id)}`;
+  const abort = new AbortController();
+  activeRuns.set(conv.id, { messageId: runMessageId, startedAt: Date.now(), abort });
+
+  sseBus.emit('sse', {
+    type: 'status',
+    running: true,
+    conversationId: conv.id,
+    activeConversationId: conv.id,
+  } satisfies StatusEvent);
+
+  try {
+    return await runConversationTurn(conv, input, abort.signal);
+  } finally {
+    activeRuns.delete(conv.id);
+    liveStreams.delete(conv.id);
+    sseBus.emit('sse', {
+      type: 'status',
+      running: false,
+      conversationId: conv.id,
+      activeConversationId: null,
+    } satisfies StatusEvent);
+  }
+}
+
+async function runConversationTurn(conv: ConversationRow, input: string, signal?: AbortSignal): Promise<string> {
+  const userTurnIndex = addTurn(conv.id, 'user', input);
+  const runtime = resolveConversationRuntime(conv);
+  const adapter = runtime.adapter;
+  const turns = getTurns(conv.id);
+  const toolContext: ToolExecutionContext = {
+    conversationId: conv.id,
+    externalId: conv.external_id,
+    sourceMessageId: `turn:${conv.id}:${userTurnIndex}`,
+    sourceTimestamp: new Date().toISOString(),
+    originalText: input,
+  };
+
+  let sessionId = conv.claude_session_id;
+  const storedSessionAdapter = resolveSessionAdapter(conv, turns);
+
+  if (sessionId && storedSessionAdapter && storedSessionAdapter !== adapter.id) {
+    console.log(
+      `[agent] Conversation ${conv.id} switching adapters (${storedSessionAdapter} -> ${adapter.id}); starting a fresh session from transcript`,
+    );
+    sessionId = null;
+  }
+
+  // Tell the model which thread it's running in, so it never has to guess
+  // (this is what the cockpit todo-panel self-drive + thread routing rely on).
+  const threadContextLine = `<jarvis_thread external_id="${conv.external_id}" conversation_id="${conv.id}"/>\n`;
+  let stdinContent = threadContextLine + (sessionId
+    ? `<memory_refresh>\n${loadMemoryBlock()}\n</memory_refresh>\n\n${input}`
+    : (turns.length > 1 ? buildContinuationPrompt(turns, input) : buildInitialPrompt(input)));
+
+  for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
+    let accumulatedText = '';
+    liveStreams.delete(conv.id); // reset the cross-browser buffer each tool-turn
+    const onStreamEvent = (event: Record<string, unknown>) => {
+      if (event.type === 'content_block_delta') {
+        const delta = event.delta as Record<string, unknown> | undefined;
+        if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+          sseBus.emit('sse', { type: 'stream_delta', conversationId: conv.id, delta: delta.text } satisfies StreamDeltaEvent);
+          accumulatedText += delta.text;
+          liveStreams.set(conv.id, accumulatedText);
+          return;
+        }
+      }
+      if (event.type === 'assistant') {
+        const content = (event.message as Record<string, unknown> | null)?.content;
+        if (Array.isArray(content)) {
+          let fullText = '';
+          for (const block of content) {
+            const b = block as Record<string, unknown>;
+            if (b.type === 'text' && typeof b.text === 'string') fullText += b.text;
+          }
+          if (fullText.length > accumulatedText.length) {
+            sseBus.emit('sse', { type: 'stream_delta', conversationId: conv.id, delta: fullText.slice(accumulatedText.length) } satisfies StreamDeltaEvent);
+            accumulatedText = fullText;
+            liveStreams.set(conv.id, accumulatedText);
+          }
+        }
+      }
+    };
+
+    sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
+    const claudeT0 = Date.now();
+    let result: ClaudeResult;
+    try {
+      result = await runClaude(stdinContent, sessionId, onStreamEvent, runtime, signal);
+      sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
+
+      // Session expired or unknown — retry without resume
+      if (sessionId && !result.text && !result.sessionId) {
+        console.log(`[agent] Session ${sessionId} expired, starting fresh`);
+        sessionId = null;
+        stdinContent = buildContinuationPrompt(turns, input);
+        accumulatedText = '';
+        sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
+        result = await runClaude(stdinContent, null, onStreamEvent, runtime, signal);
+        sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
+      }
+    } catch (err) {
+      // Fix C (DAR-676): a timed-out or crashed model call must not vanish. Persist
+      // whatever streamed so far as the assistant reply (marked interrupted when
+      // empty) and stop the stream, then rethrow so the ingress layer records the
+      // error state instead of leaving the thread stuck "thinking".
+      sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
+      const partial = accumulatedText.trim()
+        ? `${accumulatedText}\n\n${INTERRUPTED_SUFFIX}`
+        : INTERRUPTED_MARKER;
+      // Capture the raw error so the cockpit can expose it behind "Details"
+      // instead of hiding it behind the clean interrupted sentence.
+      const errorDetail = (err instanceof Error
+        ? `${err.message}\n\n${err.stack ?? ''}`
+        : String(err)).slice(0, 8000);
+      addTurn(conv.id, 'assistant', partial, undefined, undefined, undefined, {
+        timingMs: Date.now() - claudeT0,
+        claudeInput: stdinContent,
+        errorDetail,
+      });
+      touchConversation(conv.id);
+      throw err;
+    }
+    const claudeMs = Date.now() - claudeT0;
+
+    if (result.sessionId && result.sessionId !== sessionId) {
+      sessionId = result.sessionId;
+      updateSessionState(conv.id, sessionId, adapter.id);
+    }
+
+    const claudeMeta: TurnMetadata = {
+      timingMs: claudeMs,
+      inputTokens: result.usage?.inputTokens,
+      outputTokens: result.usage?.outputTokens,
+      cacheReadTokens: result.usage?.cacheReadTokens,
+      cacheWriteTokens: result.usage?.cacheWriteTokens,
+      model: result.model,
+      claudeInput: stdinContent,
+      claudeOutput: result.rawOutput,
+    };
+
+    // Fix A (DAR-676): a torn-down run leaves result.text empty even though we
+    // already streamed a real reply to the UI. Fall back to the accumulated
+    // streamed text so the reply is persisted instead of a blank turn.
+    const persistedText = (result.text && result.text.trim())
+      ? result.text
+      : accumulatedText;
+
+    const toolCall = parseToolCall(persistedText);
+
+    if (!toolCall) {
+      addTurn(conv.id, 'assistant', persistedText, undefined, undefined, undefined, claudeMeta);
+      touchConversation(conv.id);
+      return persistedText;
+    }
+
+    addTurn(
+      conv.id,
+      'tool_call',
+      toolCall.precedingText || null,
+      toolCall.name,
+      JSON.stringify(toolCall.arguments),
+      undefined,
+      claudeMeta,
+    );
+
+    const tool = TOOL_MAP.get(toolCall.name);
+    const toolT0 = Date.now();
+    let toolResult: unknown;
+    try {
+      toolResult = tool
+        ? await withToolExecutionContext(toolContext, () => tool.execute(toolCall.arguments, toolContext))
+        : { error: `Unknown tool: ${toolCall.name}` };
+    } catch (err) {
+      toolResult = { error: err instanceof Error ? err.message : String(err) };
+    }
+    const toolMs = Date.now() - toolT0;
+
+    const toolResultStr = JSON.stringify(toolResult, null, 2);
+    addTurn(conv.id, 'tool_result', null, toolCall.name, undefined, toolResultStr, { timingMs: toolMs });
+
+    // Feed tool result back — always use --resume now since we have a session
+    stdinContent = `<tool_result name="${toolCall.name}">\n${toolResultStr}\n</tool_result>`;
+  }
+
+  addTurn(conv.id, 'assistant', 'Tool call limit reached. Please try a more specific request.');
+  return 'Tool call limit reached. Please try a more specific request.';
+}

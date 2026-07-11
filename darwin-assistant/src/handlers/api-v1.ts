@@ -2,6 +2,7 @@ import { Router, type Request, type Response, type NextFunction } from 'express'
 import { randomUUID } from 'node:crypto';
 import { statSync, readFileSync } from 'node:fs';
 import { parseTurnSteps } from '../turn-steps.js';
+import { isPlanModeMessage } from '../agent.js';
 import {
   getOrCreateConversation,
   getConversation,
@@ -214,6 +215,9 @@ function serializeTurn(turn: TurnRow, convSource?: string): Record<string, unkno
     // render a full trace after refresh instead of just the flattened content.
     // Null when there's nothing to derive (older turns, non-model turns).
     steps: parseTurnSteps(turn.claude_output),
+    // DAR-716: user turns sent with the plan-mode marker, so the cockpit can
+    // color the bubble without re-deriving it from raw content client-side.
+    plan_mode: turn.role === 'user' ? isPlanModeMessage(turn.content) : false,
   };
 }
 

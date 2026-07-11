@@ -20,6 +20,37 @@ import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent,
 
 const MAX_TOOL_TURNS = 50;
 
+// DAR-716: cockpit plan/build mode toggle. The frontend prepends this marker
+// to the raw outgoing message when the operator has plan mode on; we persist
+// the turn's `content` completely unchanged (marker included) so the cockpit
+// can detect it later purely from turn history (refresh-safe, no schema
+// change) and color the bubble accordingly. Only the copy of the text that
+// actually reaches the model gets rewritten into an explicit instruction.
+export const PLAN_MODE_MARKER = '-- mode: planning --';
+
+export function isPlanModeMessage(rawContent: string | null | undefined): boolean {
+  return !!rawContent && rawContent.trimStart().startsWith(PLAN_MODE_MARKER);
+}
+
+/** Strip the marker and rewrite it into an explicit no-action instruction the
+ *  model actually has to follow. Baked into the human turn itself (not the
+ *  system prompt) so it works whether this is a fresh turn or a --resume'd
+ *  one, since resumed turns never resend the system prompt. */
+function applyPlanMode(rawInput: string): string {
+  const trimmed = rawInput.trimStart();
+  if (!trimmed.startsWith(PLAN_MODE_MARKER)) return rawInput;
+  const message = trimmed.slice(PLAN_MODE_MARKER.length).trimStart();
+  return [
+    '<planning_mode>',
+    'PLANNING MODE is active for this message only. Do not take any action: no file edits, no tool calls,',
+    'no task/build execution, nothing that changes state. Only discuss and plan. If asked to do something,',
+    'describe what you would do instead of doing it.',
+    '</planning_mode>',
+    '',
+    message,
+  ].join('\n');
+}
+
 // Fix C (DAR-676): appended to whatever streamed when a run is torn down mid-reply,
 // so the user sees the partial answer plus a clear "retry" cue. The fully-empty
 // case reuses INTERRUPTED_MARKER (shared with Fix B) instead.
@@ -819,12 +850,21 @@ async function runConversationTurn(conv: ConversationRow, input: string, signal?
     sessionId = null;
   }
 
+  // DAR-716: rewrite the plan-mode marker (if present) into an explicit
+  // instruction for the model. `input` itself stays untouched — it's already
+  // been persisted as-is above, and stdinContent is the only thing that needs
+  // the rewritten copy. `planModeActive` is a hard gate below, not just a
+  // prompt nudge — the ticket asks for a guarantee, not a suggestion the
+  // model can ignore.
+  const planModeActive = isPlanModeMessage(input);
+  const modelInput = applyPlanMode(input);
+
   // Tell the model which thread it's running in, so it never has to guess
   // (this is what the cockpit todo-panel self-drive + thread routing rely on).
   const threadContextLine = `<jarvis_thread external_id="${conv.external_id}" conversation_id="${conv.id}"/>\n`;
   let stdinContent = threadContextLine + (sessionId
-    ? `<memory_refresh>\n${loadMemoryBlock()}\n</memory_refresh>\n\n${input}`
-    : (turns.length > 1 ? buildContinuationPrompt(turns, input) : buildInitialPrompt(input)));
+    ? `<memory_refresh>\n${loadMemoryBlock()}\n</memory_refresh>\n\n${modelInput}`
+    : (turns.length > 1 ? buildContinuationPrompt(turns, modelInput) : buildInitialPrompt(modelInput)));
 
   for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
     let accumulatedText = '';
@@ -867,7 +907,7 @@ async function runConversationTurn(conv: ConversationRow, input: string, signal?
       if (sessionId && !result.text && !result.sessionId) {
         console.log(`[agent] Session ${sessionId} expired, starting fresh`);
         sessionId = null;
-        stdinContent = buildContinuationPrompt(turns, input);
+        stdinContent = buildContinuationPrompt(turns, modelInput);
         accumulatedText = '';
         sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
         result = await runClaude(stdinContent, null, onStreamEvent, runtime, signal);
@@ -941,12 +981,21 @@ async function runConversationTurn(conv: ConversationRow, input: string, signal?
     const tool = TOOL_MAP.get(toolCall.name);
     const toolT0 = Date.now();
     let toolResult: unknown;
-    try {
-      toolResult = tool
-        ? await withToolExecutionContext(toolContext, () => tool.execute(toolCall.arguments, toolContext))
-        : { error: `Unknown tool: ${toolCall.name}` };
-    } catch (err) {
-      toolResult = { error: err instanceof Error ? err.message : String(err) };
+    if (planModeActive) {
+      // Hard gate, not a prompt-level nudge: even if the model ignores the
+      // planning-mode instruction and emits a tool call anyway, it never
+      // actually runs. Fed back so the model can recover and just answer.
+      toolResult = {
+        error: 'Tool execution is disabled — this message is in planning mode. Describe the plan instead of executing it.',
+      };
+    } else {
+      try {
+        toolResult = tool
+          ? await withToolExecutionContext(toolContext, () => tool.execute(toolCall.arguments, toolContext))
+          : { error: `Unknown tool: ${toolCall.name}` };
+      } catch (err) {
+        toolResult = { error: err instanceof Error ? err.message : String(err) };
+      }
     }
     const toolMs = Date.now() - toolT0;
 

@@ -1194,9 +1194,15 @@ export function createApiV1Router(): Router {
   // -- GET /events: GLOBAL stream across all of the caller's threads ----------
   // Powers the sidebar's live view — a Slack message landing on any thread, or
   // JARVIS replying to it, bumps + re-statuses the row in real time without the
-  // thread being open. Deliberately drops per-token stream_* events (those are
-  // for the open thread's timeline only); forwards the list-relevant events.
-
+  // thread being open. Forwards the list-relevant events, plus (DAR-717)
+  // per-token stream_* events annotated with external_id so a client CAN fold
+  // its per-thread live connection into this one instead of opening a second
+  // long-lived SSE connection per open tab — see DAR-717 for why that matters
+  // (plain HTTP/1.1 caps a browser at ~6 connections per origin; today's two
+  // SSE connections per tab means as few as 3 open tabs exhausts it). Nothing
+  // consumes these here yet — the cockpit still opens its own per-thread
+  // stream — this is prep for that consolidation, additive and unused until
+  // the frontend is updated to rely on it.
   router.get('/events', (req: AuthedRequest, res) => {
     const caller = req.apiKey!;
     const seesAll = isAdminScope(caller.scope);
@@ -1204,7 +1210,7 @@ export function createApiV1Router(): Router {
     const FORWARD = new Set([
       'turn', 'conversation_updated', 'conversation_created',
       'conversation_renamed', 'conversation_deleted', 'status', 'thread_todo',
-      'queued_message', 'note',
+      'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
     ]);
 
     res.writeHead(200, {

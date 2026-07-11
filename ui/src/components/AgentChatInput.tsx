@@ -1,6 +1,7 @@
 import { useState, useRef, type KeyboardEvent } from "react";
-import { SendHorizontal, Loader2 } from "lucide-react";
+import { SendHorizontal, Loader2, CornerDownLeft, WrapText } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "../lib/utils";
 
 interface AgentChatInputProps {
@@ -9,9 +10,25 @@ interface AgentChatInputProps {
   onSend: (message: string) => void;
 }
 
+const ENTER_MODE_STORAGE_KEY = "jarvis:chatInput:enterMode";
+
+function loadEnterSubmitsPref(): boolean {
+  if (typeof window === "undefined") return true;
+  return window.localStorage.getItem(ENTER_MODE_STORAGE_KEY) !== "newline";
+}
+
 export function AgentChatInput({ disabled, isLoading, onSend }: AgentChatInputProps) {
   const [value, setValue] = useState("");
+  const [enterSubmits, setEnterSubmits] = useState(loadEnterSubmitsPref);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const toggleEnterMode = () => {
+    setEnterSubmits((prev) => {
+      const next = !prev;
+      window.localStorage.setItem(ENTER_MODE_STORAGE_KEY, next ? "submit" : "newline");
+      return next;
+    });
+  };
 
   const handleSend = () => {
     const trimmed = value.trim();
@@ -24,10 +41,12 @@ export function AgentChatInput({ disabled, isLoading, onSend }: AgentChatInputPr
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
+    if (e.key !== "Enter") return;
+    // Shift+Enter always does the opposite of the current mode's plain-Enter action.
+    const shouldSend = enterSubmits ? !e.shiftKey : e.shiftKey;
+    if (!shouldSend) return;
+    e.preventDefault();
+    handleSend();
   };
 
   const handleInput = () => {
@@ -53,6 +72,23 @@ export function AgentChatInput({ disabled, isLoading, onSend }: AgentChatInputPr
         onInput={handleInput}
         rows={1}
       />
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            size="icon"
+            variant="outline"
+            onClick={toggleEnterMode}
+            className="shrink-0 text-muted-foreground"
+            aria-label={enterSubmits ? "Enter sends message (click to switch to newline)" : "Enter inserts newline (click to switch to send)"}
+          >
+            {enterSubmits ? <CornerDownLeft className="h-4 w-4" /> : <WrapText className="h-4 w-4" />}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>
+          {enterSubmits ? "Enter sends · Shift+Enter for newline" : "Enter for newline · Shift+Enter sends"}
+        </TooltipContent>
+      </Tooltip>
       <Button
         size="icon"
         variant="default"

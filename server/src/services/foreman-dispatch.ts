@@ -71,9 +71,18 @@ export function paperclipAgentDispatcher(db: Db, config: PaperclipDispatcherConf
         status: "in_progress",
         assigneeAgentId: agentId,
         originKind: "manual",
-        // Request an isolated git-worktree workspace so the worker branch is isolated.
-        // Ignored unless the isolated-workspaces flag is on (see file header).
+        // Request an isolated git-worktree workspace pinned to the job's base branch, so the
+        // worker's worktree can't silently inherit whatever HEAD the shared clone happens to
+        // have checked out. Ignored unless the isolated-workspaces flag is on (see file header).
         executionWorkspacePreference: "isolated",
+        executionWorkspaceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: {
+            type: "git_worktree",
+            baseRef: job.baseBranch,
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+          },
+        },
       } as Parameters<typeof issuesSvc.create>[1]);
 
       await heartbeat

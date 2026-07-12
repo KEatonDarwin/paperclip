@@ -7,6 +7,7 @@ import type { Db } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
 import { foremanService } from "../services/foreman.js";
 import { paperclipAgentDispatcher, DEFAULT_WORKER_AGENTS } from "../services/foreman-dispatch.js";
+import { askForemanAboutJob, ForemanAskError } from "../services/foreman-ask.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 
 const taskSchema = z.object({
@@ -27,6 +28,10 @@ const createSchema = z.object({
   workers: z.number().int().min(1).max(3).optional(), // Phase-1 fan-out cap: 2-3 workers
   external_ref: z.string().nullable().optional(),
   tasks: z.array(taskSchema).max(3).optional(),
+});
+
+const askSchema = z.object({
+  question: z.string().min(1).max(2000),
 });
 
 const runSchema = z.object({
@@ -118,6 +123,30 @@ export function jobRoutes(db: Db) {
     }
     assertCompanyAccess(req, tree.job.companyId);
     res.json(jobTree(tree.job, tree.tasks));
+  });
+
+  // Phase 1 chat: single-shot, read-only Q&A grounded in the Job's own tree (DAR-720).
+  // No persisted thread, no ability to steer a running Job — just an accurate answer.
+  router.post("/v1/jobs/:id/ask", validate(askSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const tree = await foreman.getJobTree(id);
+    if (!tree) {
+      res.status(404).json({ error: { code: "job_not_found", message: "job not found" } });
+      return;
+    }
+    assertCompanyAccess(req, tree.job.companyId);
+
+    try {
+      const answer = await askForemanAboutJob(tree.job, tree.tasks, req.body.question as string);
+      res.json({ answer });
+    } catch (err) {
+      if (err instanceof ForemanAskError) {
+        const status = err.code === "missing_api_key" ? 501 : 502;
+        res.status(status).json({ error: { code: err.code, message: err.message } });
+        return;
+      }
+      throw err;
+    }
   });
 
   // List jobs for a company.

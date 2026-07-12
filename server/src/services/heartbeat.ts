@@ -77,6 +77,12 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "opencode_local",
   "pi_local",
 ]);
+// Statuses that count as "actionable work" for the timer-triggered inbox gate.
+// "blocked" is deliberately excluded: a stale blocked issue would otherwise satisfy
+// this gate forever, firing hourly timer heartbeats with zero new information.
+// Event-driven wakes (assignment, comment, reassignment) bypass this gate entirely
+// via queueIssueAssignmentWakeup, so unblocking an issue still wakes the agent immediately.
+export const TIMER_INBOX_GATE_STATUSES: string[] = ["todo", "in_progress"];
 
 export function applyPersistedExecutionWorkspaceConfig(input: {
   config: Record<string, unknown>;
@@ -2805,6 +2811,28 @@ export function heartbeatService(db: Db) {
         }
       }
 
+      // Post the agent's final response back to the issue thread so it's visible
+      // inline (not buried in the run transcript). The server has no runId on
+      // comments, so we guard against double-posting when the agent already
+      // self-posted a comment during this run.
+      if (outcome === "succeeded" && issueId) {
+        const issueResponseText =
+          typeof adapterResult.summary === "string" ? adapterResult.summary.trim() : "";
+        if (issueResponseText) {
+          try {
+            const runStartedAt = finalizedRun?.startedAt ?? run.startedAt ?? null;
+            const alreadyPosted = runStartedAt
+              ? await issuesSvc.hasAgentCommentSince(issueId, agent.id, runStartedAt)
+              : false;
+            if (!alreadyPosted) {
+              await issuesSvc.addComment(issueId, issueResponseText, { agentId: agent.id });
+            }
+          } catch (err) {
+            logger.warn({ err, runId: run.id }, "failed to write issue agent comment");
+          }
+        }
+      }
+
       // Fire shadow runs for split testing (non-blocking)
       if (outcome === "succeeded") {
         const agentRtCfg = parseObject(agent.runtimeConfig);
@@ -3202,7 +3230,7 @@ export function heartbeatService(db: Db) {
           and(
             eq(issues.companyId, agent.companyId),
             eq(issues.assigneeAgentId, agentId),
-            inArray(issues.status, ["todo", "in_progress", "blocked"]),
+            inArray(issues.status, TIMER_INBOX_GATE_STATUSES),
           ),
         )
         .limit(1)

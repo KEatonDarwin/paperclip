@@ -15,13 +15,13 @@ import { NewAgentDialog } from "./NewAgentDialog";
 import { ToastViewport } from "./ToastViewport";
 import { GlobalChatBubble } from "./GlobalChatBubble";
 import { CommandModal } from "./CommandModal";
+import { BugIntakeWidget } from "./BugIntakeWidget";
 import { QuickNotesModal } from "./QuickNotesModal";
 import { HopperModal } from "./HopperModal";
 import { HopperWidget } from "./HopperWidget";
 import { ScheduledTaskModal } from "./ScheduledTaskModal";
 import { ScheduledTasksWidget } from "./ScheduledTasksWidget";
 import { KeyboardShortcutsModal } from "./KeyboardShortcutsModal";
-import { VersionInfoModal } from "./VersionInfoModal";
 import { MobileScheduleBubble } from "./MobileScheduleBubble";
 import { MobileBottomNav } from "./MobileBottomNav";
 import { WorktreeBanner } from "./WorktreeBanner";
@@ -464,13 +464,13 @@ export function Layout() {
       <GlobalChatBubble />
       <MobileScheduleBubble />
       <CommandModal />
+      <BugIntakeWidget />
       <QuickNotesModal />
       <HopperModal />
       <HopperWidget />
       <ScheduledTaskModal />
       <ScheduledTasksWidget />
       <KeyboardShortcutsModal />
-      <VersionInfoModal />
     </div>
   );
 }

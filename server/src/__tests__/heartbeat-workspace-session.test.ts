@@ -11,6 +11,7 @@ import {
   resolveRuntimeSessionParamsForWorkspace,
   stripWorkspaceRuntimeFromExecutionRunConfig,
   shouldResetTaskSessionForWake,
+  TIMER_INBOX_GATE_STATUSES,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
 
@@ -389,5 +390,12 @@ describe("parseSessionCompactionPolicy", () => {
       maxRawInputTokens: 500_000,
       maxSessionAgeHours: 0,
     });
+  });
+});
+
+describe("TIMER_INBOX_GATE_STATUSES", () => {
+  it("treats todo and in_progress as actionable but excludes blocked", () => {
+    expect(TIMER_INBOX_GATE_STATUSES).toEqual(["todo", "in_progress"]);
+    expect(TIMER_INBOX_GATE_STATUSES).not.toContain("blocked");
   });
 });

@@ -166,6 +166,24 @@ export function projectUrl(project: { id: string; urlKey?: string | null; name?:
   return `/projects/${projectRouteRef(project)}`;
 }
 
+/** Strip markdown syntax to produce plain text for clipboard copy. */
+export function stripMarkdown(md: string): string {
+  return md
+    .replace(/```[\s\S]*?```/g, (m) => m.replace(/```[^\n]*\n?/g, "").trim())
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/(\*\*|__)(.*?)\1/gs, "$2")
+    .replace(/(\*|_)(.*?)\1/gs, "$2")
+    .replace(/~~(.*?)~~/gs, "$1")
+    .replace(/^>\s+/gm, "")
+    .replace(/^[-*+]\s+/gm, "")
+    .replace(/^\d+\.\s+/gm, "")
+    .replace(/^[-*_]{3,}\s*$/gm, "")
+    .trim();
+}
+
 /** Build a project workspace URL scoped under its project. */
 export function projectWorkspaceUrl(
   project: { id: string; urlKey?: string | null; name?: string | null },

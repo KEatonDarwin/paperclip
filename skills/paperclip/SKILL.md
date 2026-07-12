@@ -33,11 +33,12 @@ Follow these steps every time you wake up:
 - Your entire response text will be captured as the agent chat message. Write it as prose addressed to the user. Do not narrate what you are doing step-by-step — just do the work and deliver the answer.
 - Do **not** do any inbox check, checkout, or status updates for this wakeup. Just respond to the message and exit.
 
-**Step 0b — Comment-wake short-circuit.** If `PAPERCLIP_WAKE_REASON` equals `issue_commented` AND `PAPERCLIP_TASK_ID` is set, **skip the inbox scan entirely.** You were woken because someone commented on a specific task. Go directly to Step 5 (Checkout) using `PAPERCLIP_TASK_ID`, including `in_review` in `expectedStatuses`. Then proceed from Step 6.
+**Step 0b — Comment-wake short-circuit.** If `PAPERCLIP_WAKE_COMMENT_ID` is set (covers every comment-driven wake reason — `issue_commented`, `issue_comment_mentioned`, `issue_reopened_via_comment`, and any future variant — do not gate this on an exact `PAPERCLIP_WAKE_REASON` string match), **skip the inbox scan and read that comment before doing anything else, including before deciding there is "nothing to do."** This rule overrides the "nothing assigned = exit" guidance later in Step 4 — a comment-triggered wake always earns at least one read of its comment.
 
-- Do **not** call `GET /api/agents/me/inbox-lite` — go straight to the task.
-- Include `"in_review"` in the checkout `expectedStatuses` array, since the task may be awaiting review.
-- After checkout, fetch `PAPERCLIP_WAKE_COMMENT_ID` comment first to read the new context.
+- Do **not** call `GET /api/agents/me/inbox-lite` first — go straight to the comment.
+- Fetch the comment with `GET /api/issues/{PAPERCLIP_TASK_ID}/comments/{PAPERCLIP_WAKE_COMMENT_ID}` (use `PAPERCLIP_TASK_ID` if set; if it's missing, use `PAPERCLIP_LINKED_ISSUE_IDS` or fall back to the wake payload's issue id) and read enough surrounding thread context to understand it.
+- If the task is assigned to you (or you were directed to take it — see the mention-handoff rule in Step 4), checkout via Step 5 using `PAPERCLIP_TASK_ID`, including `"in_review"` in `expectedStatuses` since the task may be awaiting review, then proceed from Step 6.
+- If the task is not assigned to you and the comment does not direct you to take ownership, still reply in the comment thread if a reply is useful (e.g. answering a question, acknowledging a mention), then exit the heartbeat — do not fall through to a silent inbox scan.
 
 **Step 1 — Identity.** If not already in context, `GET /api/agents/me` to get your id, companyId, role, chainOfCommand, and budget.
 
@@ -55,7 +56,7 @@ Follow these steps every time you wake up:
 **Step 4 — Pick work (with mention exception).** Work on `in_progress` first, then `todo`. Skip `blocked` unless you can unblock it.
 **Blocked-task dedup:** Before working on a `blocked` task, fetch its comment thread. If your most recent comment was a blocked-status update AND no new comments from other agents or users have been posted since, skip the task entirely — do not checkout, do not post another comment. Exit the heartbeat (or move to the next task) instead. Only re-engage with a blocked task when new context exists (a new comment, status change, or event-based wake like `PAPERCLIP_WAKE_COMMENT_ID`).
 If `PAPERCLIP_TASK_ID` is set and that task is assigned to you, prioritize it first for this heartbeat.
-If this run was triggered by a comment mention (`PAPERCLIP_WAKE_COMMENT_ID` set; typically `PAPERCLIP_WAKE_REASON=issue_comment_mentioned`), you MUST read that comment thread first, even if the task is not currently assigned to you.
+If `PAPERCLIP_WAKE_COMMENT_ID` was set, you already read that comment thread in Step 0b before reaching here — do not treat this step's "nothing assigned" exit as license to skip that read.
 If that mentioned comment explicitly asks you to take the task, you may self-assign by checking out `PAPERCLIP_TASK_ID` as yourself, then proceed normally.
 If the comment asks for input/review but not ownership, respond in comments if useful, then continue with assigned work.
 If the comment does not direct you to take ownership, do not self-assign.

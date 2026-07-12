@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Loader2, Wrench } from "lucide-react";
+import { Check, Copy, Loader2, Wrench } from "lucide-react";
 import type { Agent } from "@paperclipai/shared";
-import { cn } from "../lib/utils";
+import { cn, stripMarkdown } from "../lib/utils";
 import { MarkdownBody } from "./MarkdownBody";
 import { AgentIcon } from "./AgentIconPicker";
 import { AgentChatInput } from "./AgentChatInput";
@@ -13,6 +13,26 @@ interface AgentChatThreadProps {
   agentId: string;
   chatId: string;
   agent: Agent;
+}
+
+function CopyButton({ text, title, plain }: { text: string; title: string; plain?: boolean }) {
+  const [copied, setCopied] = useState(false);
+  const content = plain ? stripMarkdown(text) : text;
+  return (
+    <button
+      type="button"
+      className="text-muted-foreground hover:text-foreground transition-colors opacity-0 group-hover:opacity-100"
+      title={title}
+      onClick={() => {
+        navigator.clipboard.writeText(content).then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        });
+      }}
+    >
+      {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+    </button>
+  );
 }
 
 // Brief tool-use annotation lines start with "Tool used:"
@@ -46,7 +66,7 @@ function ChatBubble({
     const content = contentLines.join("\n").trim();
 
     return (
-      <div className="flex gap-3 items-start">
+      <div className="group flex gap-3 items-start">
         <div className="shrink-0 mt-0.5">
           <div className="h-7 w-7 rounded-full bg-muted flex items-center justify-center">
             <AgentIcon icon={agentIcon ?? null} className="h-4 w-4 text-muted-foreground" />
@@ -71,13 +91,23 @@ function ChatBubble({
               <MarkdownBody>{content}</MarkdownBody>
             </div>
           )}
+          {content && (
+            <div className="flex items-center gap-1.5 pt-0.5">
+              <CopyButton text={content} title="Copy" plain />
+              <CopyButton text={content} title="Copy as markdown" />
+            </div>
+          )}
         </div>
       </div>
     );
   }
 
   return (
-    <div className="flex justify-end">
+    <div className="group flex justify-end items-end gap-1.5">
+      <div className="flex items-center gap-1.5 pb-1">
+        <CopyButton text={message.body} title="Copy" plain />
+        <CopyButton text={message.body} title="Copy as markdown" />
+      </div>
       <div className="max-w-[75%] rounded-2xl rounded-tr-sm bg-primary text-primary-foreground px-3 py-2 text-sm whitespace-pre-wrap break-words">
         {message.body}
       </div>

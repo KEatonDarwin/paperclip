@@ -55,6 +55,7 @@ import {
 } from "@paperclipai/adapter-openclaw-gateway";
 import { listCodexModels } from "./codex-models.js";
 import { listCursorModels } from "./cursor-models.js";
+import { listClaudeModels, resetClaudeModelsCache } from "./claude-models.js";
 import {
   execute as piExecute,
   listPiSkills,
@@ -106,6 +107,7 @@ const claudeLocalAdapter: ServerAdapterModule = {
   sessionCodec: claudeSessionCodec,
   sessionManagement: getAdapterSessionManagement("claude_local") ?? undefined,
   models: claudeModels,
+  listModels: listClaudeModels,
   supportsLocalAgentJwt: true,
   agentConfigurationDoc: claudeAgentConfigurationDoc,
   getQuotaWindows: claudeGetQuotaWindows,
@@ -261,6 +263,10 @@ export async function listAdapterModels(type: string): Promise<{ id: string; lab
 
 export function listServerAdapters(): ServerAdapterModule[] {
   return Array.from(adaptersByType.values());
+}
+
+export function resetAdapterModelsCache(type: string): void {
+  if (type === "claude_local") resetClaudeModelsCache();
 }
 
 export async function detectAdapterModel(

@@ -10,7 +10,7 @@ import { MarkdownEditor, type MarkdownEditorRef, type MentionOption } from "./Ma
 import { StatusBadge } from "./StatusBadge";
 import { AgentIcon } from "./AgentIconPicker";
 import { QuickChatPanel } from "./QuickChatPanel";
-import { formatDateTime } from "../lib/utils";
+import { formatDateTime, stripMarkdown } from "../lib/utils";
 import { PluginSlotOutlet } from "@/plugins/slots";
 
 interface CommentWithRunMeta extends IssueComment {
@@ -104,15 +104,16 @@ function parseReassignment(target: string): CommentReassignment | null {
   return null;
 }
 
-function CopyMarkdownButton({ text }: { text: string }) {
+function CopyButton({ text, title, plain }: { text: string; title: string; plain?: boolean }) {
   const [copied, setCopied] = useState(false);
+  const content = plain ? stripMarkdown(text) : text;
   return (
     <button
       type="button"
       className="text-muted-foreground hover:text-foreground transition-colors"
-      title="Copy as markdown"
+      title={title}
       onClick={() => {
-        navigator.clipboard.writeText(text).then(() => {
+        navigator.clipboard.writeText(content).then(() => {
           setCopied(true);
           setTimeout(() => setCopied(false), 2000);
         });
@@ -199,7 +200,8 @@ function CommentCard({
               {formatDateTime(comment.createdAt)}
             </a>
           )}
-          <CopyMarkdownButton text={comment.body} />
+          <CopyButton text={comment.body} title="Copy" plain />
+          <CopyButton text={comment.body} title="Copy as markdown" />
           {comment.authorAgentId && onOpenQuickChat && !isPending ? (
             <button
               type="button"

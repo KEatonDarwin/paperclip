@@ -79,6 +79,10 @@ for (const col of [
   // User-set display name for a thread (rename). Null → fall back to a derived
   // title (from external_id / first message) on the client.
   'title TEXT',
+  // True once Kevin has explicitly renamed the thread (via the rename endpoint
+  // with a non-null title). Auto-naming (DAR-726) only ever writes `title` when
+  // this is false, so it never clobbers a manual rename.
+  'title_is_user_set INTEGER NOT NULL DEFAULT 0',
 ]) {
   try { db.exec(`ALTER TABLE conversations ADD COLUMN ${col}`); } catch {}
 }
@@ -100,6 +104,8 @@ export interface ConversationRow {
   thread_model: string | null;
   // User-set display name (rename). Null → client derives a title.
   title: string | null;
+  // 1 once Kevin has explicitly renamed the thread; gates auto-naming (DAR-726).
+  title_is_user_set: number;
 }
 
 /**
@@ -216,8 +222,14 @@ const stmts = {
   getLastAssistantTurnId: db.prepare<[number], { id: number }>(
     `SELECT id FROM turns WHERE conversation_id = ? AND role = 'assistant' ORDER BY turn_index DESC LIMIT 1`,
   ),
-  renameConversation: db.prepare<[string | null, number]>(
-    `UPDATE conversations SET title = ?, updated_at = datetime('now') WHERE id = ?`,
+  renameConversation: db.prepare<[string | null, number, number]>(
+    `UPDATE conversations SET title = ?, title_is_user_set = ?, updated_at = datetime('now') WHERE id = ?`,
+  ),
+  // Auto-name only ever wins the race against a manual rename by construction:
+  // it's guarded to rows that are still untitled and never user-renamed.
+  autoNameConversation: db.prepare<[string, number]>(
+    `UPDATE conversations SET title = ?, updated_at = datetime('now')
+     WHERE id = ? AND title IS NULL AND title_is_user_set = 0`,
   ),
   setConversationStatus: db.prepare<[string, number]>(
     `UPDATE conversations SET status = ?, updated_at = datetime('now') WHERE id = ?`,
@@ -409,14 +421,35 @@ export function getLastAssistantTurnId(conversationId: number): number | null {
   return stmts.getLastAssistantTurnId.get(conversationId)?.id ?? null;
 }
 
-/** Rename a thread (user-set display title). Pass null to clear. */
+/**
+ * Rename a thread (user-set display title). Pass null to clear it back to a
+ * derived/auto-nameable title — this also clears `title_is_user_set`, so
+ * auto-naming (DAR-726) is free to fill it back in on the next opportunity.
+ */
 export function renameConversation(id: number, title: string | null): void {
-  stmts.renameConversation.run(title, id);
+  stmts.renameConversation.run(title, title !== null ? 1 : 0, id);
   sseBus.emit('sse', {
     type: 'conversation_renamed',
     conversationId: id,
     title,
   } satisfies ConversationRenamedEvent);
+}
+
+/**
+ * Auto-generate a thread's title (DAR-726) from its first message. No-op if
+ * Kevin already renamed it or another writer already set a title — the
+ * update is guarded in SQL so a slow LLM call can't clobber a rename that
+ * happened while it was in flight.
+ */
+export function autoNameConversation(id: number, title: string): void {
+  const { changes } = stmts.autoNameConversation.run(title, id);
+  if (changes > 0) {
+    sseBus.emit('sse', {
+      type: 'conversation_renamed',
+      conversationId: id,
+      title,
+    } satisfies ConversationRenamedEvent);
+  }
 }
 
 /** Update a conversation's status (e.g. active/archived) and nudge clients to refresh. */

@@ -28,6 +28,7 @@ import { listMcpServers, refreshMcpServers } from '../mcp-registry.js';
 import { resolveNativeServer, nativeListTools } from '../tools/mcp-native.js';
 import { listNotes, createNote } from '../notes-db.js';
 import { triageNote } from '../notes.js';
+import { autoNameThreadFromFirstMessage } from '../thread-autoname.js';
 import {
   listJarvisDecisions,
   insertJarvisDecision,
@@ -834,6 +835,13 @@ export function createApiV1Router(): Router {
     const nextIndex = countTurns(conv.id);
     const messageId = `turn:${conv.id}:${nextIndex}`;
     errorByMessageId.delete(messageId);
+
+    // DAR-726: the thread's very first message, and nobody's named it yet —
+    // kick off auto-naming in the background. Doesn't block the send response
+    // or the actual turn; the title lands later via a `conversation_renamed` SSE.
+    if (nextIndex === 0 && conv.title === null && !conv.title_is_user_set) {
+      void autoNameThreadFromFirstMessage(conv, text);
+    }
 
     processMessage(text, externalId, messageId)
       .catch((err: unknown) => {

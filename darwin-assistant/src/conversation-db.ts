@@ -83,6 +83,15 @@ for (const col of [
   // with a non-null title). Auto-naming (DAR-726) only ever writes `title` when
   // this is false, so it never clobbers a manual rename.
   'title_is_user_set INTEGER NOT NULL DEFAULT 0',
+  // JARVIS Desk (DAR-727): persisted floor position + optional pile membership,
+  // so icons don't reshuffle on reload. Null desk_x/desk_y → client lays the
+  // thread out on a default grid until it's dragged.
+  'desk_x REAL',
+  'desk_y REAL',
+  // Not a REFERENCES column: desk_piles is created later in this file, and
+  // SQLite ALTER TABLE ADD COLUMN runs before that table exists. Application
+  // code is the only thing that treats it as a foreign key to desk_piles(id).
+  'desk_pile_id INTEGER',
 ]) {
   try { db.exec(`ALTER TABLE conversations ADD COLUMN ${col}`); } catch {}
 }
@@ -106,6 +115,10 @@ export interface ConversationRow {
   title: string | null;
   // 1 once Kevin has explicitly renamed the thread; gates auto-naming (DAR-726).
   title_is_user_set: number;
+  // JARVIS Desk (DAR-727): persisted floor position + pile membership.
+  desk_x: number | null;
+  desk_y: number | null;
+  desk_pile_id: number | null;
 }
 
 /**
@@ -233,6 +246,12 @@ const stmts = {
   ),
   setConversationStatus: db.prepare<[string, number]>(
     `UPDATE conversations SET status = ?, updated_at = datetime('now') WHERE id = ?`,
+  ),
+  setThreadDeskPosition: db.prepare<[number, number, number]>(
+    `UPDATE conversations SET desk_x = ?, desk_y = ? WHERE id = ?`,
+  ),
+  setThreadDeskPile: db.prepare<[number | null, number]>(
+    `UPDATE conversations SET desk_pile_id = ? WHERE id = ?`,
   ),
   deleteTurnsForConversation: db.prepare<[number]>(
     `DELETE FROM turns WHERE conversation_id = ?`,
@@ -465,6 +484,17 @@ export function setConversationStatus(id: number, status: string): void {
   } satisfies ConversationUpdatedEvent);
 }
 
+/** JARVIS Desk (DAR-727): persist a thread icon's floor position. No SSE push
+ * needed — position drags are local-tab-only and don't need cross-tab sync. */
+export function setThreadDeskPosition(id: number, x: number, y: number): void {
+  stmts.setThreadDeskPosition.run(x, y, id);
+}
+
+/** JARVIS Desk (DAR-727): assign/clear a thread's pile membership. */
+export function setThreadDeskPile(id: number, pileId: number | null): void {
+  stmts.setThreadDeskPile.run(pileId, id);
+}
+
 /**
  * Auto-hide sweep: archive `active` threads that have been idle longer than
  * `days` — but never one that still has an open (not-done) todo, so nothing
@@ -575,6 +605,73 @@ export function trackCreatedIssue(issueId: string, identifier: string, title: st
 
 export function getTrackedIssue(issueId: string) {
   return jciStmts.get.get(issueId) ?? null;
+}
+
+// -- JARVIS Desk piles (DAR-727) --
+// A named group of threads, built by lasso-selecting icons on the /desk floor.
+// Membership itself lives on conversations.desk_pile_id, not here.
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS desk_piles (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
+export interface DeskPileRow {
+  id: number;
+  name: string;
+  created_at: string;
+  updated_at: string;
+}
+
+const deskPileStmts = {
+  create: db.prepare<[string]>(
+    `INSERT INTO desk_piles (name) VALUES (?)`,
+  ),
+  listAll: db.prepare<[], DeskPileRow>(
+    `SELECT * FROM desk_piles ORDER BY created_at ASC`,
+  ),
+  getById: db.prepare<[number], DeskPileRow>(
+    `SELECT * FROM desk_piles WHERE id = ?`,
+  ),
+  rename: db.prepare<[string, number]>(
+    `UPDATE desk_piles SET name = ?, updated_at = datetime('now') WHERE id = ?`,
+  ),
+  clearMembers: db.prepare<[number]>(
+    `UPDATE conversations SET desk_pile_id = NULL WHERE desk_pile_id = ?`,
+  ),
+  remove: db.prepare<[number]>(
+    `DELETE FROM desk_piles WHERE id = ?`,
+  ),
+};
+
+export function createDeskPile(name: string): DeskPileRow {
+  const info = deskPileStmts.create.run(name);
+  return deskPileStmts.getById.get(Number(info.lastInsertRowid))!;
+}
+
+export function listDeskPiles(): DeskPileRow[] {
+  return deskPileStmts.listAll.all();
+}
+
+export function getDeskPile(id: number): DeskPileRow | undefined {
+  return deskPileStmts.getById.get(id);
+}
+
+export function renameDeskPile(id: number, name: string): void {
+  deskPileStmts.rename.run(name, id);
+}
+
+/** Deletes a pile and un-groups its member threads (they stay on the desk, just unpiled). */
+export function deleteDeskPile(id: number): void {
+  const txn = db.transaction(() => {
+    deskPileStmts.clearMembers.run(id);
+    deskPileStmts.remove.run(id);
+  });
+  txn();
 }
 
 // -- Settings table --

@@ -20,6 +20,13 @@ import {
   setConversationStatus,
   deleteConversation,
   copyTurns,
+  setThreadDeskPosition,
+  setThreadDeskPile,
+  createDeskPile,
+  listDeskPiles,
+  getDeskPile,
+  renameDeskPile,
+  deleteDeskPile,
   type ConversationRow,
   type TurnRow,
 } from '../conversation-db.js';
@@ -146,6 +153,11 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     // the global default); runtime is the resolved descriptor actually in effect.
     model_override: { adapter: conv.thread_adapter, model: conv.thread_model },
     runtime: getAdapterRuntimeDescriptor(adapter.id, model),
+    // JARVIS Desk (DAR-727): persisted floor position + pile membership. Null
+    // desk_x/desk_y → client lays this thread out on a default grid.
+    desk_x: conv.desk_x ?? null,
+    desk_y: conv.desk_y ?? null,
+    desk_pile_id: conv.desk_pile_id ?? null,
   };
 }
 
@@ -680,9 +692,10 @@ export function createApiV1Router(): Router {
     });
   });
 
-  // -- PATCH /threads/:external_id: rename and/or archive --------------------
-  // Body: { title?: string|null, status?: 'active'|'archived' }. Distinct from
-  // the /model sub-route (Express matches that more specific path first).
+  // -- PATCH /threads/:external_id: rename, archive, and/or desk state --------
+  // Body: { title?: string|null, status?: 'active'|'archived', desk_x?: number,
+  // desk_y?: number, desk_pile_id?: number|null }. Distinct from the /model
+  // sub-route (Express matches that more specific path first).
 
   router.patch('/threads/:external_id', (req: AuthedRequest, res) => {
     const caller = req.apiKey!;
@@ -693,7 +706,13 @@ export function createApiV1Router(): Router {
       return;
     }
     const conv = result;
-    const body = (req.body ?? {}) as { title?: unknown; status?: unknown };
+    const body = (req.body ?? {}) as {
+      title?: unknown;
+      status?: unknown;
+      desk_x?: unknown;
+      desk_y?: unknown;
+      desk_pile_id?: unknown;
+    };
 
     if (body.title !== undefined) {
       if (body.title !== null && typeof body.title !== 'string') {
@@ -710,8 +729,71 @@ export function createApiV1Router(): Router {
       }
       setConversationStatus(conv.id, body.status);
     }
+    if (body.desk_x !== undefined || body.desk_y !== undefined) {
+      if (typeof body.desk_x !== 'number' || typeof body.desk_y !== 'number') {
+        sendError(res, 400, 'invalid_request', 'desk_x and desk_y must both be provided as numbers');
+        return;
+      }
+      setThreadDeskPosition(conv.id, body.desk_x, body.desk_y);
+    }
+    if (body.desk_pile_id !== undefined) {
+      if (body.desk_pile_id !== null && typeof body.desk_pile_id !== 'number') {
+        sendError(res, 400, 'invalid_request', 'desk_pile_id must be a number or null');
+        return;
+      }
+      if (body.desk_pile_id !== null && !getDeskPile(body.desk_pile_id)) {
+        sendError(res, 404, 'pile_not_found', `Pile ${body.desk_pile_id} not found`);
+        return;
+      }
+      setThreadDeskPile(conv.id, body.desk_pile_id);
+    }
     const refreshed = getConversationById(conv.id) ?? conv;
     res.json(threadDescriptor(refreshed, req));
+  });
+
+  // -- JARVIS Desk piles (DAR-727) --------------------------------------------
+  // Named groups of threads, built by lasso-selecting icons on the /desk floor.
+  // Scoped to the authenticated caller's own threads only when assigning
+  // membership (checked via findConversationForCaller above); the pile list
+  // itself has no per-caller ownership concept yet (single-tenant JARVIS).
+
+  router.get('/piles', (_req: AuthedRequest, res) => {
+    res.json({ piles: listDeskPiles() });
+  });
+
+  router.post('/piles', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { name?: unknown };
+    if (typeof body.name !== 'string' || !body.name.trim()) {
+      sendError(res, 400, 'invalid_request', 'name is required');
+      return;
+    }
+    const pile = createDeskPile(body.name.trim().slice(0, 100));
+    res.status(201).json(pile);
+  });
+
+  router.patch('/piles/:id', (req: AuthedRequest, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || !getDeskPile(id)) {
+      sendError(res, 404, 'pile_not_found', `Pile ${req.params.id} not found`);
+      return;
+    }
+    const body = (req.body ?? {}) as { name?: unknown };
+    if (typeof body.name !== 'string' || !body.name.trim()) {
+      sendError(res, 400, 'invalid_request', 'name is required');
+      return;
+    }
+    renameDeskPile(id, body.name.trim().slice(0, 100));
+    res.json(getDeskPile(id));
+  });
+
+  router.delete('/piles/:id', (req: AuthedRequest, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || !getDeskPile(id)) {
+      sendError(res, 404, 'pile_not_found', `Pile ${req.params.id} not found`);
+      return;
+    }
+    deleteDeskPile(id);
+    res.status(204).end();
   });
 
   // -- DELETE /threads/:external_id: delete thread + its turns/todos ----------

@@ -739,4 +739,161 @@ export function deleteSetting(key: string): void {
   settingsStmts.remove.run(key);
 }
 
+// -- Personality stats (DAR-729) --
+// Six 1-10 dials that used to live only as prose in memory.md. Current values
+// are stored as a JSON blob in the generic `settings` table (same pattern as
+// `model_presets`); every change is also appended to a dedicated history
+// table so the control panel can show a real audit trail (old, new, when,
+// who/what changed it) without re-deriving it from settings snapshots.
+
+export const PERSONALITY_STAT_KEYS = [
+  'forwardThinking',
+  'directness',
+  'charisma',
+  'sarcasm',
+  'humor',
+  'formality',
+] as const;
+
+export type PersonalityStatKey = (typeof PERSONALITY_STAT_KEYS)[number];
+
+export type PersonalityStats = Record<PersonalityStatKey, number>;
+
+// Seed values are the numbers recorded in the "JARVIS PERSONALITY STATS"
+// memory.md section as of 2026-07-13, migrated into a real backend here.
+const DEFAULT_PERSONALITY_STATS: PersonalityStats = {
+  forwardThinking: 9,
+  directness: 8,
+  charisma: 6,
+  sarcasm: 5,
+  humor: 5,
+  formality: 4,
+};
+
+const PERSONALITY_STATS_SETTING_KEY = 'personality_stats';
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS personality_stats_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    stat_key    TEXT NOT NULL,
+    old_value   INTEGER,
+    new_value   INTEGER NOT NULL,
+    changed_by  TEXT,
+    changed_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_personality_history_changed_at ON personality_stats_history(changed_at DESC);
+`);
+
+export interface PersonalityStatsHistoryRow {
+  id: number;
+  stat_key: PersonalityStatKey;
+  old_value: number | null;
+  new_value: number;
+  changed_by: string | null;
+  changed_at: string;
+}
+
+const personalityStmts = {
+  insertHistory: db.prepare<[string, number | null, number, string | null]>(
+    `INSERT INTO personality_stats_history (stat_key, old_value, new_value, changed_by) VALUES (?, ?, ?, ?)`,
+  ),
+  listHistory: db.prepare<[number], PersonalityStatsHistoryRow>(
+    `SELECT * FROM personality_stats_history ORDER BY changed_at DESC, id DESC LIMIT ?`,
+  ),
+};
+
+function clampStat(n: number): number {
+  return Math.max(1, Math.min(10, Math.round(n)));
+}
+
+/** Current personality stat values, seeded with the memory.md defaults on first read. */
+export function getPersonalityStats(): PersonalityStats {
+  const raw = getSetting(PERSONALITY_STATS_SETTING_KEY);
+  if (!raw) {
+    setSetting(PERSONALITY_STATS_SETTING_KEY, JSON.stringify(DEFAULT_PERSONALITY_STATS));
+    return { ...DEFAULT_PERSONALITY_STATS };
+  }
+  const parsed = JSON.parse(raw) as Partial<PersonalityStats>;
+  const merged = { ...DEFAULT_PERSONALITY_STATS, ...parsed };
+  return merged;
+}
+
+/**
+ * Apply a partial update to the personality stats, logging one history row
+ * per changed key (unchanged keys are skipped — no-op writes shouldn't pad
+ * the audit trail). `changedBy` is a free-form label (e.g. a Paperclip
+ * agent/user identifier) for the "who/what changed it" column.
+ */
+export function updatePersonalityStats(
+  patch: Partial<Record<PersonalityStatKey, number>>,
+  changedBy: string | null,
+): PersonalityStats {
+  const current = getPersonalityStats();
+  const next = { ...current };
+  const txn = db.transaction(() => {
+    for (const key of PERSONALITY_STAT_KEYS) {
+      const rawValue = patch[key];
+      if (rawValue === undefined || rawValue === null) continue;
+      const value = clampStat(rawValue);
+      if (value === current[key]) continue;
+      personalityStmts.insertHistory.run(key, current[key], value, changedBy);
+      next[key] = value;
+    }
+    setSetting(PERSONALITY_STATS_SETTING_KEY, JSON.stringify(next));
+  });
+  txn();
+  return next;
+}
+
+/** Most recent personality stat changes, newest first. */
+export function getPersonalityStatsHistory(limit = 100): PersonalityStatsHistoryRow[] {
+  return personalityStmts.listHistory.all(limit);
+}
+
+// -- Run history (DAR-729) --
+// A "run" is a conversation/thread. This aggregates the fields the control
+// panel's historical run log needs (duration, tool-call count, outcome) on
+// top of the existing conversations/turns tables — no new tables required.
+
+export interface RunHistoryRow {
+  id: number;
+  external_id: string;
+  title: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  duration_seconds: number;
+  turn_count: number;
+  tool_call_count: number;
+  error_count: number;
+}
+
+const runHistoryStmt = db.prepare<[number, number], RunHistoryRow>(`
+  SELECT
+    c.id,
+    c.external_id,
+    c.title,
+    c.status,
+    c.created_at,
+    c.updated_at,
+    CAST(strftime('%s', c.updated_at) AS INTEGER) - CAST(strftime('%s', c.created_at) AS INTEGER) AS duration_seconds,
+    (SELECT COUNT(*) FROM turns t WHERE t.conversation_id = c.id) AS turn_count,
+    (SELECT COUNT(*) FROM turns t WHERE t.conversation_id = c.id AND t.tool_name IS NOT NULL) AS tool_call_count,
+    (SELECT COUNT(*) FROM turns t WHERE t.conversation_id = c.id AND t.error_detail IS NOT NULL) AS error_count
+  FROM conversations c
+  ORDER BY c.created_at DESC
+  LIMIT ? OFFSET ?
+`);
+
+const runHistoryCountStmt = db.prepare<[], { cnt: number }>(
+  `SELECT COUNT(*) as cnt FROM conversations`,
+);
+
+/** Paginated historical run log (newest first) with derived duration/tool-call/error counts. */
+export function listRunHistory(limit = 50, offset = 0): { rows: RunHistoryRow[]; total: number } {
+  const rows = runHistoryStmt.all(limit, offset);
+  const total = runHistoryCountStmt.get()?.cnt ?? 0;
+  return { rows, total };
+}
+
 export { db as sqliteDb };

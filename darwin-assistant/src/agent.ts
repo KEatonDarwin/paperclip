@@ -426,6 +426,21 @@ export function getActiveConversation(): { conversationId: number; startedAt: nu
   return oldest;
 }
 
+// Number of conversations with a turn currently in flight (DAR-729 control
+// panel "live run count" — concurrent processMessage() calls, not systemd
+// instances; darwin-assistant is a single service).
+export function getActiveRunCount(): number {
+  return activeRuns.size;
+}
+
+// Every currently-running conversation, oldest first — same shape as
+// getActiveConversation() but for all of them, not just the oldest.
+export function getActiveRuns(): { conversationId: number; startedAt: number }[] {
+  return [...activeRuns.entries()]
+    .map(([conversationId, run]) => ({ conversationId, startedAt: run.startedAt }))
+    .sort((a, b) => a.startedAt - b.startedAt);
+}
+
 export function buildToolsBlock(): string {
   const defs = ALL_TOOLS.map(
     (t) =>

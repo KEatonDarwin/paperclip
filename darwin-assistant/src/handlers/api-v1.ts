@@ -73,8 +73,20 @@ import {
   getLiveStream,
   abortConversationRun,
   ConversationBusyError,
+  getActiveRunCount,
+  getActiveRuns,
 } from '../agent.js';
-import { getAllSettings, getSetting, setSetting, deleteSetting } from '../conversation-db.js';
+import {
+  getAllSettings,
+  getSetting,
+  setSetting,
+  deleteSetting,
+  getPersonalityStats,
+  updatePersonalityStats,
+  getPersonalityStatsHistory,
+  listRunHistory,
+  PERSONALITY_STAT_KEYS,
+} from '../conversation-db.js';
 import { query } from '../db.js';
 import { listVaultTree, readVaultFile, searchVault } from '../vault-page.js';
 import { sseBus, type SSEEvent } from '../sse-bus.js';
@@ -1518,6 +1530,77 @@ export function createApiV1Router(): Router {
     }
     const info = getActiveAdapterInfo();
     res.json({ ok: true, active_adapter: info.adapter, active_model: info.model });
+  });
+
+  // == Control panel (DAR-729) =================================================
+  // Live run count + historical run log + personality stats w/ change history,
+  // for the JARVIS Cockpit's new Control Panel tab. Read endpoints are open to
+  // any authed key (same as /settings GET); writes require admin scope.
+
+  router.get('/control-panel/active-runs', (_req: AuthedRequest, res) => {
+    res.json({ count: getActiveRunCount(), runs: getActiveRuns() });
+  });
+
+  router.get('/control-panel/run-history', (req: AuthedRequest, res) => {
+    const limitRaw = parseInt(String(req.query.limit ?? '50'), 10);
+    const offsetRaw = parseInt(String(req.query.offset ?? '0'), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, limitRaw)) : 50;
+    const offset = Number.isFinite(offsetRaw) ? Math.max(0, offsetRaw) : 0;
+    const { rows, total } = listRunHistory(limit, offset);
+    res.json({
+      total,
+      limit,
+      offset,
+      runs: rows.map((r) => ({
+        conversation_id: r.id,
+        external_id: r.external_id,
+        title: r.title,
+        source: deriveSource(r.external_id),
+        status: r.status,
+        started_at: r.created_at,
+        updated_at: r.updated_at,
+        duration_seconds: r.duration_seconds,
+        turn_count: r.turn_count,
+        tool_call_count: r.tool_call_count,
+        outcome: r.error_count > 0 ? 'error' : (r.status === 'active' ? 'active' : 'completed'),
+        running: getInFlightMessageId(r.id) != null,
+      })),
+    });
+  });
+
+  router.get('/control-panel/personality-stats', (_req: AuthedRequest, res) => {
+    res.json({ stats: getPersonalityStats(), keys: PERSONALITY_STAT_KEYS });
+  });
+
+  router.patch('/control-panel/personality-stats', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Changing personality stats requires an admin-scoped key');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const patch: Partial<Record<(typeof PERSONALITY_STAT_KEYS)[number], number>> = {};
+    for (const key of PERSONALITY_STAT_KEYS) {
+      const value = body[key];
+      if (value === undefined) continue;
+      const num = Number(value);
+      if (!Number.isFinite(num)) {
+        sendError(res, 400, 'invalid_request', `${key} must be a number`);
+        return;
+      }
+      patch[key] = num;
+    }
+    if (Object.keys(patch).length === 0) {
+      sendError(res, 400, 'invalid_request', `Provide at least one of: ${PERSONALITY_STAT_KEYS.join(', ')}`);
+      return;
+    }
+    const stats = updatePersonalityStats(patch, req.apiKey!.caller_label ?? null);
+    res.json({ ok: true, stats });
+  });
+
+  router.get('/control-panel/personality-stats/history', (req: AuthedRequest, res) => {
+    const limitRaw = parseInt(String(req.query.limit ?? '100'), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, limitRaw)) : 100;
+    res.json({ history: getPersonalityStatsHistory(limit) });
   });
 
   // == Check-ins (DAR-676 — port of the 3201 /checkins page) ==================

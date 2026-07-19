@@ -1,5 +1,5 @@
 import { runClaude } from './agent.js';
-import { autoNameConversation, type ConversationRow } from './conversation-db.js';
+import { autoNameConversation, forceAutoNameConversation, type ConversationRow } from './conversation-db.js';
 
 // DAR-726 — generate a short, ChatGPT/Claude.ai-style thread title from the
 // first message a thread ever receives. One-off call — sessionId null so it
@@ -29,12 +29,24 @@ function cleanTitle(raw: string): string | null {
   return t.length ? t.slice(0, 200) : null;
 }
 
-/** Fire-and-forget: generate and store a title for `conv` from its first message. */
-export async function autoNameThreadFromFirstMessage(conv: ConversationRow, firstMessage: string): Promise<void> {
+/**
+ * Fire-and-forget: generate and store a title for `conv` from its first
+ * message. By default this is guarded (won't overwrite a rename/prior title —
+ * see autoNameConversation); pass `force: true` for a manually-triggered
+ * re-title (DAR-728) that always overwrites.
+ */
+export async function autoNameThreadFromFirstMessage(
+  conv: ConversationRow,
+  firstMessage: string,
+  opts?: { force?: boolean },
+): Promise<void> {
   try {
     const result = await runClaude(AUTO_NAME_PROMPT(firstMessage), null);
     const title = cleanTitle(result.text);
-    if (title) autoNameConversation(conv.id, title);
+    if (title) {
+      if (opts?.force) forceAutoNameConversation(conv.id, title);
+      else autoNameConversation(conv.id, title);
+    }
   } catch (err) {
     console.error(`[thread-autoname] failed for conversation ${conv.id}:`, err);
   }

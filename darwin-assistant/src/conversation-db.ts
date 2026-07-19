@@ -244,6 +244,11 @@ const stmts = {
     `UPDATE conversations SET title = ?, updated_at = datetime('now')
      WHERE id = ? AND title IS NULL AND title_is_user_set = 0`,
   ),
+  // Manually-triggered re-title (DAR-728): unguarded, but leaves
+  // title_is_user_set untouched so auto-naming semantics are unaffected.
+  forceAutoNameConversation: db.prepare<[string, number]>(
+    `UPDATE conversations SET title = ?, updated_at = datetime('now') WHERE id = ?`,
+  ),
   setConversationStatus: db.prepare<[string, number]>(
     `UPDATE conversations SET status = ?, updated_at = datetime('now') WHERE id = ?`,
   ),
@@ -469,6 +474,21 @@ export function autoNameConversation(id: number, title: string): void {
       title,
     } satisfies ConversationRenamedEvent);
   }
+}
+
+/**
+ * Manually re-trigger a thread's auto title (DAR-728) — e.g. from the "Auto
+ * generate title" context menu action. Always writes, overwriting any
+ * existing title (auto-generated or user-set), but does not flip
+ * title_is_user_set, so this title still counts as auto-generated.
+ */
+export function forceAutoNameConversation(id: number, title: string): void {
+  stmts.forceAutoNameConversation.run(title, id);
+  sseBus.emit('sse', {
+    type: 'conversation_renamed',
+    conversationId: id,
+    title,
+  } satisfies ConversationRenamedEvent);
 }
 
 /** Update a conversation's status (e.g. active/archived) and nudge clients to refresh. */

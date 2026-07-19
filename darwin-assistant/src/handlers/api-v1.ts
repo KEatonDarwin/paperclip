@@ -751,6 +751,30 @@ export function createApiV1Router(): Router {
     res.json(threadDescriptor(refreshed, req));
   });
 
+  // -- POST /threads/:external_id/auto-title: manually (re)trigger the -------
+  // DAR-726 auto-title logic (DAR-728), bypassing the "already titled" guard.
+  // Fire-and-forget, like the send-time trigger — the title lands via the
+  // existing `conversation_renamed` SSE event.
+  router.post('/threads/:external_id/auto-title', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const conv = result;
+
+    const firstMessage = getTurns(conv.id).find((t) => t.role === 'user')?.content;
+    if (!firstMessage) {
+      sendError(res, 400, 'no_messages', 'Thread has no messages yet to title from');
+      return;
+    }
+
+    void autoNameThreadFromFirstMessage(conv, firstMessage, { force: true });
+    res.status(202).json({ status: 'generating' });
+  });
+
   // -- JARVIS Desk piles (DAR-727) --------------------------------------------
   // Named groups of threads, built by lasso-selecting icons on the /desk floor.
   // Scoped to the authenticated caller's own threads only when assigning

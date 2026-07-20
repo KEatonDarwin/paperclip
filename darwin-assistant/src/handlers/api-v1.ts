@@ -20,13 +20,6 @@ import {
   setConversationStatus,
   deleteConversation,
   copyTurns,
-  setThreadDeskPosition,
-  setThreadDeskPile,
-  createDeskPile,
-  listDeskPiles,
-  getDeskPile,
-  renameDeskPile,
-  deleteDeskPile,
   type ConversationRow,
   type TurnRow,
 } from '../conversation-db.js';
@@ -36,6 +29,7 @@ import { resolveNativeServer, nativeListTools } from '../tools/mcp-native.js';
 import { listNotes, createNote } from '../notes-db.js';
 import { triageNote } from '../notes.js';
 import { autoNameThreadFromFirstMessage } from '../thread-autoname.js';
+import { getBrief } from '../jarvis-brief.js';
 import {
   listJarvisDecisions,
   insertJarvisDecision,
@@ -55,6 +49,13 @@ import {
   type ThreadTodoStatus,
   type ThreadTodoOwner,
 } from '../thread-todos.js';
+import {
+  activeReminderForConversation,
+  setThreadReminder,
+  acknowledgeThreadReminder,
+  cancelRemindersForConversation,
+  serializeReminder,
+} from '../thread-reminders.js';
 import {
   listQueuedMessages,
   enqueueMessage,
@@ -85,6 +86,7 @@ import {
   updatePersonalityStats,
   getPersonalityStatsHistory,
   listRunHistory,
+  classifyRunOutcome,
   PERSONALITY_STAT_KEYS,
 } from '../conversation-db.js';
 import { query } from '../db.js';
@@ -130,8 +132,11 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
   const { adapter, model } = resolveConversationRuntime(conv);
   // Open (not-done) todos for the sidebar indicator + "todos for me" filter.
   const openTodos = openTodoCount(conv.id);
+  // Auto-bump reminder: drives the sidebar bell + the "alerting" highlight.
+  const reminder = activeReminderForConversation(conv.id);
   return {
     thread_id: conv.external_id,
+    reminder: reminder ? serializeReminder(reminder) : null,
     // Open todo signal — total, and the subset tagged "for Kevin".
     open_todo_count: openTodos.total,
     open_todo_for_me_count: openTodos.forKevin,
@@ -165,11 +170,6 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     // the global default); runtime is the resolved descriptor actually in effect.
     model_override: { adapter: conv.thread_adapter, model: conv.thread_model },
     runtime: getAdapterRuntimeDescriptor(adapter.id, model),
-    // JARVIS Desk (DAR-727): persisted floor position + pile membership. Null
-    // desk_x/desk_y → client lays this thread out on a default grid.
-    desk_x: conv.desk_x ?? null,
-    desk_y: conv.desk_y ?? null,
-    desk_pile_id: conv.desk_pile_id ?? null,
   };
 }
 
@@ -328,6 +328,19 @@ export function createApiV1Router(): Router {
 
   router.use(bearerAuth as (req: Request, res: Response, next: NextFunction) => void);
   installQueueDrain();
+
+  // -- GET /brief: JARVIS-authored cockpit landing view -----------------------
+  // Not a fixed dashboard — JARVIS decides the content and shape fresh each
+  // time it goes stale (see jarvis-brief.ts). ?refresh=1 forces regeneration.
+
+  router.get('/brief', async (req: AuthedRequest, res) => {
+    try {
+      const brief = await getBrief(req.query.refresh === '1');
+      res.json(brief);
+    } catch (err) {
+      sendError(res, 500, 'brief_failed', (err as Error).message);
+    }
+  });
 
   // -- GET /providers: selectable provider/model catalog ---------------------
   // Populates the per-thread provider/model selector (DAR-680 AC#4).
@@ -704,10 +717,9 @@ export function createApiV1Router(): Router {
     });
   });
 
-  // -- PATCH /threads/:external_id: rename, archive, and/or desk state --------
-  // Body: { title?: string|null, status?: 'active'|'archived', desk_x?: number,
-  // desk_y?: number, desk_pile_id?: number|null }. Distinct from the /model
-  // sub-route (Express matches that more specific path first).
+  // -- PATCH /threads/:external_id: rename, archive ---------------------------
+  // Body: { title?: string|null, status?: 'active'|'archived' }. Distinct from
+  // the /model sub-route (Express matches that more specific path first).
 
   router.patch('/threads/:external_id', (req: AuthedRequest, res) => {
     const caller = req.apiKey!;
@@ -721,9 +733,6 @@ export function createApiV1Router(): Router {
     const body = (req.body ?? {}) as {
       title?: unknown;
       status?: unknown;
-      desk_x?: unknown;
-      desk_y?: unknown;
-      desk_pile_id?: unknown;
     };
 
     if (body.title !== undefined) {
@@ -740,24 +749,6 @@ export function createApiV1Router(): Router {
         return;
       }
       setConversationStatus(conv.id, body.status);
-    }
-    if (body.desk_x !== undefined || body.desk_y !== undefined) {
-      if (typeof body.desk_x !== 'number' || typeof body.desk_y !== 'number') {
-        sendError(res, 400, 'invalid_request', 'desk_x and desk_y must both be provided as numbers');
-        return;
-      }
-      setThreadDeskPosition(conv.id, body.desk_x, body.desk_y);
-    }
-    if (body.desk_pile_id !== undefined) {
-      if (body.desk_pile_id !== null && typeof body.desk_pile_id !== 'number') {
-        sendError(res, 400, 'invalid_request', 'desk_pile_id must be a number or null');
-        return;
-      }
-      if (body.desk_pile_id !== null && !getDeskPile(body.desk_pile_id)) {
-        sendError(res, 404, 'pile_not_found', `Pile ${body.desk_pile_id} not found`);
-        return;
-      }
-      setThreadDeskPile(conv.id, body.desk_pile_id);
     }
     const refreshed = getConversationById(conv.id) ?? conv;
     res.json(threadDescriptor(refreshed, req));
@@ -785,51 +776,6 @@ export function createApiV1Router(): Router {
 
     void autoNameThreadFromFirstMessage(conv, firstMessage, { force: true });
     res.status(202).json({ status: 'generating' });
-  });
-
-  // -- JARVIS Desk piles (DAR-727) --------------------------------------------
-  // Named groups of threads, built by lasso-selecting icons on the /desk floor.
-  // Scoped to the authenticated caller's own threads only when assigning
-  // membership (checked via findConversationForCaller above); the pile list
-  // itself has no per-caller ownership concept yet (single-tenant JARVIS).
-
-  router.get('/piles', (_req: AuthedRequest, res) => {
-    res.json({ piles: listDeskPiles() });
-  });
-
-  router.post('/piles', (req: AuthedRequest, res) => {
-    const body = (req.body ?? {}) as { name?: unknown };
-    if (typeof body.name !== 'string' || !body.name.trim()) {
-      sendError(res, 400, 'invalid_request', 'name is required');
-      return;
-    }
-    const pile = createDeskPile(body.name.trim().slice(0, 100));
-    res.status(201).json(pile);
-  });
-
-  router.patch('/piles/:id', (req: AuthedRequest, res) => {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id) || !getDeskPile(id)) {
-      sendError(res, 404, 'pile_not_found', `Pile ${req.params.id} not found`);
-      return;
-    }
-    const body = (req.body ?? {}) as { name?: unknown };
-    if (typeof body.name !== 'string' || !body.name.trim()) {
-      sendError(res, 400, 'invalid_request', 'name is required');
-      return;
-    }
-    renameDeskPile(id, body.name.trim().slice(0, 100));
-    res.json(getDeskPile(id));
-  });
-
-  router.delete('/piles/:id', (req: AuthedRequest, res) => {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id) || !getDeskPile(id)) {
-      sendError(res, 404, 'pile_not_found', `Pile ${req.params.id} not found`);
-      return;
-    }
-    deleteDeskPile(id);
-    res.status(204).end();
   });
 
   // -- DELETE /threads/:external_id: delete thread + its turns/todos ----------
@@ -1081,6 +1027,99 @@ export function createApiV1Router(): Router {
       thread: threadDescriptor(conv, req),
       entries,
     });
+  });
+
+  // -- Thread reminders (auto-bump) -----------------------------------------
+  //
+  // A thread holds at most one active reminder. Arming replaces whatever was
+  // there, so the UI's "remind me in X" is idempotent rather than stacking
+  // competing alarms. Firing is handled by the reminder worker, not here.
+
+  /** Convert an ISO instant to the UTC 'YYYY-MM-DD HH:MM:SS' SQLite stores. */
+  const toSqliteUtc = (d: Date): string => d.toISOString().slice(0, 19).replace('T', ' ');
+
+  router.put('/threads/:external_id/reminder', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+
+    const body = (req.body ?? {}) as {
+      in_minutes?: unknown;
+      fire_at?: unknown;
+      note?: unknown;
+      repeat_minutes?: unknown;
+    };
+
+    // Accept either a relative offset ("remind me in 30 minutes" — what the
+    // preset buttons send) or an absolute instant (the date/time picker).
+    let fireAt: Date;
+    if (typeof body.in_minutes === 'number' && Number.isFinite(body.in_minutes)) {
+      if (body.in_minutes < 1 || body.in_minutes > 60 * 24 * 365) {
+        sendError(res, 400, 'invalid_request', 'in_minutes must be between 1 and 525600');
+        return;
+      }
+      fireAt = new Date(Date.now() + body.in_minutes * 60_000);
+    } else if (typeof body.fire_at === 'string') {
+      const parsed = new Date(body.fire_at);
+      if (Number.isNaN(parsed.getTime())) {
+        sendError(res, 400, 'invalid_request', 'fire_at must be a valid ISO 8601 timestamp');
+        return;
+      }
+      fireAt = parsed;
+    } else {
+      sendError(res, 400, 'invalid_request', 'one of in_minutes (number) or fire_at (ISO string) is required');
+      return;
+    }
+
+    let repeatMinutes: number | null = null;
+    if (body.repeat_minutes != null) {
+      const n = Number(body.repeat_minutes);
+      if (!Number.isFinite(n) || n < 1 || n > 60 * 24 * 7) {
+        sendError(res, 400, 'invalid_request', 'repeat_minutes must be between 1 and 10080');
+        return;
+      }
+      repeatMinutes = Math.round(n);
+    }
+
+    const note = typeof body.note === 'string' && body.note.trim() ? body.note.trim().slice(0, 500) : null;
+
+    const reminder = setThreadReminder(result.id, toSqliteUtc(fireAt), note, repeatMinutes);
+    res.status(201).json({ reminder: serializeReminder(reminder), thread: threadDescriptor(result, req) });
+  });
+
+  /** Dismiss the current alert. A repeating reminder stays armed. */
+  router.post('/threads/:external_id/reminder/ack', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const active = activeReminderForConversation(result.id);
+    if (!active) {
+      res.json({ reminder: null });
+      return;
+    }
+    const acked = acknowledgeThreadReminder(active.id);
+    res.json({ reminder: acked ? serializeReminder(acked) : null });
+  });
+
+  /** Turn the reminder off entirely. */
+  router.delete('/threads/:external_id/reminder', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    cancelRemindersForConversation(result.id);
+    res.json({ reminder: null });
   });
 
   // -- GET /threads/:external_id/todos: list per-thread todos ---------------
@@ -1336,6 +1375,7 @@ export function createApiV1Router(): Router {
     const FORWARD = new Set([
       'turn', 'conversation_updated', 'conversation_created',
       'conversation_renamed', 'conversation_deleted', 'status', 'thread_todo',
+      'thread_reminder',
       'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
     ]);
 
@@ -1551,20 +1591,58 @@ export function createApiV1Router(): Router {
       total,
       limit,
       offset,
-      runs: rows.map((r) => ({
-        conversation_id: r.id,
-        external_id: r.external_id,
-        title: r.title,
-        source: deriveSource(r.external_id),
-        status: r.status,
-        started_at: r.created_at,
-        updated_at: r.updated_at,
-        duration_seconds: r.duration_seconds,
-        turn_count: r.turn_count,
-        tool_call_count: r.tool_call_count,
-        outcome: r.error_count > 0 ? 'error' : (r.status === 'active' ? 'active' : 'completed'),
-        running: getInFlightMessageId(r.id) != null,
-      })),
+      runs: rows.map((r) => {
+        const running = getInFlightMessageId(r.id) != null;
+        return {
+          conversation_id: r.id,
+          external_id: r.external_id,
+          title: r.title,
+          source: deriveSource(r.external_id),
+          status: r.status,
+          started_at: r.created_at,
+          updated_at: r.updated_at,
+          duration_seconds: r.duration_seconds,
+          turn_count: r.turn_count,
+          tool_call_count: r.tool_call_count,
+          outcome: classifyRunOutcome(running, r.status, r.error_count, r.last_error_detail),
+          running,
+        };
+      }),
+    });
+  });
+
+  // Turn-by-turn detail for a single run (DAR-732) — powers the Control Panel's
+  // click-into-a-run-history-row drill-down. `getTurns` already returns the raw
+  // rows in turn_index order (user/assistant/tool_call/tool_result), so this is
+  // a thin wrapper that adds the conversation summary + outcome around them.
+  router.get('/control-panel/run-history/:id/turns', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id)) {
+      sendError(res, 400, 'invalid_request', 'id must be a number');
+      return;
+    }
+    const conversation = getConversationById(id);
+    if (!conversation) {
+      sendError(res, 404, 'not_found', `No conversation with id ${id}`);
+      return;
+    }
+    const turns = getTurns(id);
+    const errorCount = turns.filter((t) => t.error_detail != null).length;
+    const lastErrorDetail = [...turns].reverse().find((t) => t.error_detail != null)?.error_detail ?? null;
+    const running = getInFlightMessageId(id) != null;
+    res.json({
+      conversation: {
+        conversation_id: conversation.id,
+        external_id: conversation.external_id,
+        title: conversation.title,
+        source: deriveSource(conversation.external_id),
+        status: conversation.status,
+        started_at: conversation.created_at,
+        updated_at: conversation.updated_at,
+        outcome: classifyRunOutcome(running, conversation.status, errorCount, lastErrorDetail),
+        running,
+      },
+      turns,
     });
   });
 

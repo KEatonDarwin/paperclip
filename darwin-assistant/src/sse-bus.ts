@@ -3,6 +3,7 @@ import type { AutonomyLedgerRow } from './autonomy-ledger.js';
 import type { ThreadTodoRow } from './thread-todos.js';
 import type { JarvisDecisionRow } from './jarvis-decisions.js';
 import type { NoteRow } from './notes-db.js';
+import type { QuickCaptureItemRow } from './quick-capture-db.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -122,13 +123,21 @@ export interface NoteEvent {
   note: NoteRow;
 }
 
+export interface QuickCaptureEvent {
+  type: 'quick_capture';
+  action: 'created' | 'updated' | 'deleted' | 'reordered';
+  item?: QuickCaptureItemRow;
+  items?: QuickCaptureItemRow[];
+  id?: number;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
   | AutonomyLedgerEvent | AutonomyLedgerReviewEvent
   | ThreadTodoEvent | JarvisDecisionEvent
   | ConversationRenamedEvent | ConversationDeletedEvent
-  | QueuedMessageEvent | NoteEvent;
+  | QueuedMessageEvent | NoteEvent | QuickCaptureEvent;
 
 class SSEBus extends EventEmitter {}
 

@@ -29,6 +29,15 @@ import { listMcpServers, refreshMcpServers } from '../mcp-registry.js';
 import { resolveNativeServer, nativeListTools } from '../tools/mcp-native.js';
 import { listNotes, createNote } from '../notes-db.js';
 import { triageNote } from '../notes.js';
+import {
+  listActiveQuickCaptureItems,
+  createQuickCaptureItem,
+  reorderQuickCaptureItems,
+  renameQuickCaptureItem,
+  setQuickCaptureItemCompleted,
+  deleteQuickCaptureItem,
+  getQuickCaptureItem,
+} from '../quick-capture-db.js';
 import { autoNameThreadFromFirstMessage } from '../thread-autoname.js';
 import { getBrief } from '../jarvis-brief.js';
 import {
@@ -564,6 +573,64 @@ export function createApiV1Router(): Router {
       console.error('[notes] triage failed unexpectedly', err);
     });
     res.status(201).json({ note });
+  });
+
+  // == Quick-capture todo widget (DAR-737) =====================================
+  // Standalone scratchpad list, not tied to any thread/task/project.
+
+  router.get('/quick-capture', (_req: AuthedRequest, res) => {
+    res.json({ items: listActiveQuickCaptureItems() });
+  });
+
+  router.post('/quick-capture', (req: AuthedRequest, res) => {
+    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    if (!content) {
+      sendError(res, 400, 'content_required', 'content is required');
+      return;
+    }
+    const item = createQuickCaptureItem(content);
+    res.status(201).json({ item });
+  });
+
+  router.patch('/quick-capture/reorder', (req: AuthedRequest, res) => {
+    const ids = req.body?.ids;
+    if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'number')) {
+      sendError(res, 400, 'ids_required', 'ids must be an array of item ids in the desired order');
+      return;
+    }
+    const items = reorderQuickCaptureItems(ids as number[]);
+    res.json({ items });
+  });
+
+  router.patch('/quick-capture/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getQuickCaptureItem(id)) {
+      sendError(res, 404, 'item_not_found', 'quick-capture item not found');
+      return;
+    }
+    let item = getQuickCaptureItem(id);
+    if (typeof req.body?.content === 'string') {
+      const content = req.body.content.trim();
+      if (!content) {
+        sendError(res, 400, 'content_required', 'content cannot be empty');
+        return;
+      }
+      item = renameQuickCaptureItem(id, content);
+    }
+    if (typeof req.body?.completed === 'boolean') {
+      item = setQuickCaptureItemCompleted(id, req.body.completed);
+    }
+    res.json({ item });
+  });
+
+  router.delete('/quick-capture/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getQuickCaptureItem(id)) {
+      sendError(res, 404, 'item_not_found', 'quick-capture item not found');
+      return;
+    }
+    deleteQuickCaptureItem(id);
+    res.status(204).end();
   });
 
   // -- POST /threads: create a new thread ------------------------------------
@@ -1389,6 +1456,7 @@ export function createApiV1Router(): Router {
       'conversation_renamed', 'conversation_deleted', 'status', 'thread_todo',
       'thread_reminder',
       'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
+      'quick_capture',
     ]);
 
     res.writeHead(200, {

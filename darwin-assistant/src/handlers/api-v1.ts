@@ -41,6 +41,7 @@ import {
 import { autoNameThreadFromFirstMessage } from '../thread-autoname.js';
 import { generateThreadSummary } from '../thread-summarize.js';
 import { listThreadSummaries, getLatestThreadSummary } from '../thread-summaries.js';
+import { searchThreadsByQuery } from '../thread-search.js';
 import { getBrief } from '../jarvis-brief.js';
 import {
   listJarvisDecisions,
@@ -682,6 +683,39 @@ export function createApiV1Router(): Router {
     }).slice(0, limit);
 
     res.json({ threads: filtered.map((c) => threadDescriptor(c, req)) });
+  });
+
+  // -- POST /threads/search: AI-mediated natural-language search (DAR-741) ---
+  // Synchronous (unlike auto-title/summarize's fire-and-forget 202s) — the
+  // cockpit's search modal is waiting on this response to render results.
+
+  router.post('/threads/search', async (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const prefix = callerExternalIdPrefix(caller.id);
+    const seesAllThreads = isAdminScope(caller.scope);
+    const query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
+    if (!query) {
+      sendError(res, 400, 'missing_query', 'query is required');
+      return;
+    }
+
+    const candidates = listAllConversations().filter(
+      (c) => seesAllThreads || c.external_id.startsWith(prefix),
+    );
+
+    try {
+      const matches = await searchThreadsByQuery(query, candidates);
+      const byId = new Map(candidates.map((c) => [c.external_id, c]));
+      const results: Record<string, unknown>[] = [];
+      for (const m of matches) {
+        const conv = byId.get(m.thread_id);
+        if (conv) results.push({ ...threadDescriptor(conv, req), search_reason: m.reason });
+      }
+      res.json({ results });
+    } catch (err) {
+      console.error('[thread-search] search failed:', err);
+      sendError(res, 502, 'search_failed', 'Search failed — try again');
+    }
   });
 
   // -- GET /threads/:external_id ---------------------------------------------

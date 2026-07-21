@@ -4,6 +4,7 @@ import type { ThreadTodoRow } from './thread-todos.js';
 import type { JarvisDecisionRow } from './jarvis-decisions.js';
 import type { NoteRow } from './notes-db.js';
 import type { QuickCaptureItemRow } from './quick-capture-db.js';
+import type { ThreadSummaryRow } from './thread-summaries.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -131,13 +132,24 @@ export interface QuickCaptureEvent {
   id?: number;
 }
 
+// DAR-740 — point-in-time thread summary, generated on demand. The bookmark
+// dropped into the timeline is anchored to anchor_turn_index at generation
+// time, so a client can insert it in the right spot without waiting on a
+// refetch.
+export interface ThreadSummaryEvent {
+  type: 'thread_summary';
+  conversationId: number;
+  action: 'created';
+  summary: ThreadSummaryRow;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
   | AutonomyLedgerEvent | AutonomyLedgerReviewEvent
   | ThreadTodoEvent | JarvisDecisionEvent
   | ConversationRenamedEvent | ConversationDeletedEvent
-  | QueuedMessageEvent | NoteEvent | QuickCaptureEvent;
+  | QueuedMessageEvent | NoteEvent | QuickCaptureEvent | ThreadSummaryEvent;
 
 class SSEBus extends EventEmitter {}
 

@@ -39,6 +39,8 @@ import {
   getQuickCaptureItem,
 } from '../quick-capture-db.js';
 import { autoNameThreadFromFirstMessage } from '../thread-autoname.js';
+import { generateThreadSummary } from '../thread-summarize.js';
+import { listThreadSummaries, getLatestThreadSummary } from '../thread-summaries.js';
 import { getBrief } from '../jarvis-brief.js';
 import {
   listJarvisDecisions,
@@ -177,6 +179,8 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     last_message_role: getLastMessageRole(conv.id),
     continued_from_id: conv.continued_from_id,
     continued_to_id: conv.continued_to_id,
+    // DAR-740 — latest point-in-time summary, for the "a summary exists" indicator.
+    latest_summary: getLatestThreadSummary(conv.id),
     dashboard_url: `${proto}://${host}/conversations/${conv.id}`,
     // DAR-680 AC#4 — per-thread provider/model selection.
     // model_override reflects the explicit per-thread choice (null when inheriting
@@ -857,6 +861,39 @@ export function createApiV1Router(): Router {
     res.status(202).json({ status: 'generating' });
   });
 
+  // -- POST /threads/:external_id/summarize: point-in-time summary (DAR-740) --
+  // Generates a "done / in progress / next" summary anchored to the last turn
+  // that exists right now; async like auto-title — the client hears back over
+  // the `thread_summary` SSE event once it lands.
+
+  router.post('/threads/:external_id/summarize', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const conv = result;
+    void generateThreadSummary(conv).catch((err) => {
+      console.error(`[thread-summarize] failed for conversation ${conv.id}:`, err);
+    });
+    res.status(202).json({ status: 'generating' });
+  });
+
+  // -- GET /threads/:external_id/summaries: list persisted summaries ----------
+
+  router.get('/threads/:external_id/summaries', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    res.json({ summaries: listThreadSummaries(result.id) });
+  });
+
   // -- DELETE /threads/:external_id: delete thread + its turns/todos ----------
 
   router.delete('/threads/:external_id', (req: AuthedRequest, res) => {
@@ -1456,7 +1493,7 @@ export function createApiV1Router(): Router {
       'conversation_renamed', 'conversation_deleted', 'status', 'thread_todo',
       'thread_reminder',
       'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
-      'quick_capture',
+      'quick_capture', 'thread_summary',
     ]);
 
     res.writeHead(200, {

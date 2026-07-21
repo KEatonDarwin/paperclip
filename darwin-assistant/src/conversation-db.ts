@@ -83,6 +83,10 @@ for (const col of [
   // with a non-null title). Auto-naming (DAR-726) only ever writes `title` when
   // this is false, so it never clobbers a manual rename.
   'title_is_user_set INTEGER NOT NULL DEFAULT 0',
+  // Pin-to-top (DAR-735). pinned_at (not just a boolean) so multiple pinned
+  // threads order by most-recently-pinned rather than all tying on updated_at.
+  'pinned INTEGER NOT NULL DEFAULT 0',
+  'pinned_at TEXT',
 ]) {
   try { db.exec(`ALTER TABLE conversations ADD COLUMN ${col}`); } catch {}
 }
@@ -106,6 +110,9 @@ export interface ConversationRow {
   title: string | null;
   // 1 once Kevin has explicitly renamed the thread; gates auto-naming (DAR-726).
   title_is_user_set: number;
+  // Pin-to-top (DAR-735). pinned_at drives ordering among multiple pinned threads.
+  pinned: number;
+  pinned_at: string | null;
 }
 
 /**
@@ -201,7 +208,7 @@ const stmts = {
     `SELECT * FROM conversations WHERE status = 'active' ORDER BY updated_at DESC`,
   ),
   listAllConversations: db.prepare<[], ConversationRow>(
-    `SELECT * FROM conversations ORDER BY updated_at DESC LIMIT 100`,
+    `SELECT * FROM conversations ORDER BY pinned DESC, pinned_at DESC, updated_at DESC LIMIT 100`,
   ),
   countTurns: db.prepare<[number], { cnt: number }>(
     `SELECT COUNT(*) as cnt FROM turns WHERE conversation_id = ?`,
@@ -238,6 +245,9 @@ const stmts = {
   ),
   setConversationStatus: db.prepare<[string, number]>(
     `UPDATE conversations SET status = ?, updated_at = datetime('now') WHERE id = ?`,
+  ),
+  setThreadPinned: db.prepare<[number, string | null, number]>(
+    `UPDATE conversations SET pinned = ?, pinned_at = ? WHERE id = ?`,
   ),
   deleteTurnsForConversation: db.prepare<[number]>(
     `DELETE FROM turns WHERE conversation_id = ?`,
@@ -480,6 +490,19 @@ export function setConversationStatus(id: number, status: string): void {
     type: 'conversation_updated',
     conversationId: id,
     status,
+    updatedAt: now,
+    turnCount: countTurns(id),
+  } satisfies ConversationUpdatedEvent);
+}
+
+/** Pin or unpin a thread (DAR-735). pinned_at is set to now on pin, cleared on unpin. */
+export function setThreadPinned(id: number, pinned: boolean): void {
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  stmts.setThreadPinned.run(pinned ? 1 : 0, pinned ? now : null, id);
+  sseBus.emit('sse', {
+    type: 'conversation_updated',
+    conversationId: id,
+    status: getConversationById(id)?.status ?? 'active',
     updatedAt: now,
     turnCount: countTurns(id),
   } satisfies ConversationUpdatedEvent);

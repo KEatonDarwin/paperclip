@@ -18,6 +18,7 @@ import {
   deriveSource,
   renameConversation,
   setConversationStatus,
+  setThreadPinned,
   deleteConversation,
   copyTurns,
   type ConversationRow,
@@ -145,6 +146,9 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     // User-set display name (rename); null → client derives one. Kept distinct
     // from status so an archived thread keeps its title.
     title: conv.title ?? null,
+    // Pin-to-top (DAR-735). pinned_at drives ordering among multiple pinned threads.
+    pinned: !!conv.pinned,
+    pinned_at: conv.pinned_at ?? null,
     // Where this thread's messages come in from (slack / cockpit / watch / …).
     source: deriveSource(conv.external_id),
     // True while a turn is actively processing — the authoritative signal for the
@@ -733,6 +737,7 @@ export function createApiV1Router(): Router {
     const body = (req.body ?? {}) as {
       title?: unknown;
       status?: unknown;
+      pinned?: unknown;
     };
 
     if (body.title !== undefined) {
@@ -749,6 +754,13 @@ export function createApiV1Router(): Router {
         return;
       }
       setConversationStatus(conv.id, body.status);
+    }
+    if (body.pinned !== undefined) {
+      if (typeof body.pinned !== 'boolean') {
+        sendError(res, 400, 'invalid_request', 'pinned must be a boolean');
+        return;
+      }
+      setThreadPinned(conv.id, body.pinned);
     }
     const refreshed = getConversationById(conv.id) ?? conv;
     res.json(threadDescriptor(refreshed, req));

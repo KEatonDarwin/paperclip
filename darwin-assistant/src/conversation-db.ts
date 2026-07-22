@@ -628,9 +628,24 @@ export function autoHideStaleThreads(days: number): number {
   return candidates.length;
 }
 
-/** Permanently delete a conversation and all of its turns + todos. */
+/**
+ * Permanently delete a conversation and all of its turns + todos.
+ *
+ * Also clears any *other* conversations' continued_from_id/continued_to_id
+ * back-references to this one (e.g. the parent of a fork/continuation, DAR-743)
+ * and rows in other tables keyed by conversation_id — all of these are FK
+ * REFERENCES conversations(id), so a stale pointer left behind after this
+ * delete previously caused a `FOREIGN KEY constraint failed` on the *other*
+ * row, not this one, making it easy to miss. Tables are best-effort (`try`)
+ * since not all of them are guaranteed to exist at every call site's load order.
+ */
 export function deleteConversation(id: number): void {
   const txn = db.transaction(() => {
+    db.prepare(`UPDATE conversations SET continued_to_id = NULL WHERE continued_to_id = ?`).run(id);
+    db.prepare(`UPDATE conversations SET continued_from_id = NULL WHERE continued_from_id = ?`).run(id);
+    for (const table of ['thread_summaries', 'thread_reminders', 'thread_message_queue', 'jarvis_decisions', 'autonomy_ledger']) {
+      try { db.prepare(`DELETE FROM ${table} WHERE conversation_id = ?`).run(id); } catch {}
+    }
     db.prepare(`DELETE FROM thread_todos WHERE conversation_id = ?`).run(id);
     stmts.deleteTurnsForConversation.run(id);
     stmts.deleteConversationRow.run(id);

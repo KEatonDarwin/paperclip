@@ -87,6 +87,15 @@ for (const col of [
   // threads order by most-recently-pinned rather than all tying on updated_at.
   'pinned INTEGER NOT NULL DEFAULT 0',
   'pinned_at TEXT',
+  // Thread groups / folders (DAR-742). group_id is nullable folder membership;
+  // the FK target (conversation_groups) is created lazily by
+  // conversation-groups.ts — SQLite doesn't validate FK targets at ALTER TABLE
+  // time, only on writes, so import order doesn't matter here. is_group_chat
+  // marks the one conversations row per group that IS the group's own "cover"
+  // chat (external_id 'cockpit:group:<id>') — distinct from group_id, which on
+  // that row points at the group it covers, same as any other member.
+  'group_id INTEGER REFERENCES conversation_groups(id)',
+  'is_group_chat INTEGER NOT NULL DEFAULT 0',
 ]) {
   try { db.exec(`ALTER TABLE conversations ADD COLUMN ${col}`); } catch {}
 }
@@ -113,6 +122,11 @@ export interface ConversationRow {
   // Pin-to-top (DAR-735). pinned_at drives ordering among multiple pinned threads.
   pinned: number;
   pinned_at: string | null;
+  // Thread groups / folders (DAR-742). group_id is this thread's folder (null =
+  // ungrouped). is_group_chat = 1 marks the one row per group that IS the
+  // group's own cover chat (its group_id still points at the group it covers).
+  group_id: number | null;
+  is_group_chat: number;
 }
 
 /**
@@ -248,6 +262,18 @@ const stmts = {
   ),
   setThreadPinned: db.prepare<[number, string | null, number]>(
     `UPDATE conversations SET pinned = ?, pinned_at = ? WHERE id = ?`,
+  ),
+  setThreadGroup: db.prepare<[number | null, number]>(
+    `UPDATE conversations SET group_id = ?, updated_at = datetime('now') WHERE id = ?`,
+  ),
+  initGroupChat: db.prepare<[number, number]>(
+    `UPDATE conversations SET group_id = ?, is_group_chat = 1, updated_at = datetime('now') WHERE id = ?`,
+  ),
+  listConversationsByGroup: db.prepare<[number], ConversationRow>(
+    `SELECT * FROM conversations WHERE group_id = ? AND is_group_chat = 0 ORDER BY updated_at DESC`,
+  ),
+  ungroupMembers: db.prepare<[number]>(
+    `UPDATE conversations SET group_id = NULL, updated_at = datetime('now') WHERE group_id = ? AND is_group_chat = 0`,
   ),
   deleteTurnsForConversation: db.prepare<[number]>(
     `DELETE FROM turns WHERE conversation_id = ?`,
@@ -506,6 +532,45 @@ export function setThreadPinned(id: number, pinned: boolean): void {
     updatedAt: now,
     turnCount: countTurns(id),
   } satisfies ConversationUpdatedEvent);
+}
+
+/** File (or unfile, with null) a thread into a group (DAR-742). */
+export function setThreadGroup(id: number, groupId: number | null): void {
+  stmts.setThreadGroup.run(groupId, id);
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  sseBus.emit('sse', {
+    type: 'conversation_updated',
+    conversationId: id,
+    status: getConversationById(id)?.status ?? 'active',
+    updatedAt: now,
+    turnCount: countTurns(id),
+  } satisfies ConversationUpdatedEvent);
+}
+
+/** Mark a freshly-created conversation as a group's own cover chat (DAR-742). */
+export function initGroupChatConversation(id: number, groupId: number): void {
+  stmts.initGroupChat.run(groupId, id);
+}
+
+/** Member threads of a group, excluding the group's own cover chat (DAR-742). */
+export function listConversationsByGroup(groupId: number): ConversationRow[] {
+  return stmts.listConversationsByGroup.all(groupId);
+}
+
+/** Ungroup every member of a group (used when the group itself is deleted). */
+export function ungroupMembers(groupId: number): void {
+  const members = stmts.listConversationsByGroup.all(groupId);
+  stmts.ungroupMembers.run(groupId);
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  for (const m of members) {
+    sseBus.emit('sse', {
+      type: 'conversation_updated',
+      conversationId: m.id,
+      status: m.status,
+      updatedAt: now,
+      turnCount: countTurns(m.id),
+    } satisfies ConversationUpdatedEvent);
+  }
 }
 
 /**

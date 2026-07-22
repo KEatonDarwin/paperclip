@@ -131,6 +131,7 @@ import { logDecision } from './decisions.js';
 import { threadTodos } from './thread-todos-tool.js';
 import { intakeDeploy } from './intake-deploy.js';
 import { cockpitDeploy } from './cockpit-deploy.js';
+import { getMemberThread } from './group-chat-tool.js';
 
 function instrumentTool(tool: ToolDef): ToolDef {
   return {
@@ -193,6 +194,7 @@ export const ALL_TOOLS: ToolDef[] = [
   threadTodos,
   intakeDeploy,
   cockpitDeploy,
+  getMemberThread,
 ].map(instrumentTool);
 
 export const TOOL_MAP: Map<string, ToolDef> = new Map(

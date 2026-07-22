@@ -19,11 +19,20 @@ import {
   renameConversation,
   setConversationStatus,
   setThreadPinned,
+  setThreadGroup,
   deleteConversation,
   copyTurns,
   type ConversationRow,
   type TurnRow,
 } from '../conversation-db.js';
+import {
+  listGroups,
+  getGroupById,
+  createGroup,
+  renameGroup,
+  setGroupColor,
+  deleteGroup,
+} from '../conversation-groups.js';
 import { listAutonomyLedger } from '../autonomy-ledger.js';
 import { listMcpServers, refreshMcpServers } from '../mcp-registry.js';
 import { resolveNativeServer, nativeListTools } from '../tools/mcp-native.js';
@@ -161,6 +170,10 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     // Pin-to-top (DAR-735). pinned_at drives ordering among multiple pinned threads.
     pinned: !!conv.pinned,
     pinned_at: conv.pinned_at ?? null,
+    // Thread groups / folders (DAR-742). group_id null = ungrouped. is_group_chat
+    // marks the one thread per group that IS that group's own cover chat.
+    group_id: conv.group_id ?? null,
+    is_group_chat: !!conv.is_group_chat,
     // Where this thread's messages come in from (slack / cockpit / watch / …).
     source: deriveSource(conv.external_id),
     // True while a turn is actively processing — the authoritative signal for the
@@ -843,6 +856,7 @@ export function createApiV1Router(): Router {
       title?: unknown;
       status?: unknown;
       pinned?: unknown;
+      group_id?: unknown;
     };
 
     if (body.title !== undefined) {
@@ -867,8 +881,93 @@ export function createApiV1Router(): Router {
       }
       setThreadPinned(conv.id, body.pinned);
     }
+    if (body.group_id !== undefined) {
+      if (body.group_id !== null && typeof body.group_id !== 'number') {
+        sendError(res, 400, 'invalid_request', 'group_id must be a number or null');
+        return;
+      }
+      if (conv.is_group_chat) {
+        sendError(res, 400, 'invalid_request', 'A group\'s own cover chat cannot be re-filed into a group');
+        return;
+      }
+      if (body.group_id !== null && !getGroupById(body.group_id)) {
+        sendError(res, 404, 'group_not_found', `Group ${body.group_id} not found`);
+        return;
+      }
+      setThreadGroup(conv.id, body.group_id);
+    }
     const refreshed = getConversationById(conv.id) ?? conv;
     res.json(threadDescriptor(refreshed, req));
+  });
+
+  // -- Thread groups / folders (DAR-742) --------------------------------------
+
+  // GET /groups: list all groups with their member threads + cover chat.
+  router.get('/groups', (req: AuthedRequest, res) => {
+    const groups = listGroups();
+    res.json({
+      groups: groups.map((g) => {
+        const groupChatConv = getConversation(`cockpit:group:${g.id}`);
+        const members = listAllConversations().filter((c) => c.group_id === g.id && !c.is_group_chat);
+        return {
+          ...g,
+          group_chat: groupChatConv ? threadDescriptor(groupChatConv, req) : null,
+          members: members.map((c) => threadDescriptor(c, req)),
+        };
+      }),
+    });
+  });
+
+  // POST /groups: create a group + its cover chat. Body: { name, color? }.
+  router.post('/groups', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { name?: unknown; color?: unknown };
+    const name = typeof body.name === 'string' ? body.name.trim().slice(0, 100) : '';
+    if (!name) {
+      sendError(res, 400, 'invalid_request', 'name is required');
+      return;
+    }
+    const color = typeof body.color === 'string' ? body.color : null;
+    const { group, groupChat } = createGroup(name, color);
+    res.status(201).json({ ...group, group_chat: threadDescriptor(groupChat, req), members: [] });
+  });
+
+  // PATCH /groups/:id: rename / recolor. Body: { name?, color? }.
+  router.patch('/groups/:id', (req: AuthedRequest, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || !getGroupById(id)) {
+      sendError(res, 404, 'group_not_found', `Group ${req.params.id} not found`);
+      return;
+    }
+    const body = (req.body ?? {}) as { name?: unknown; color?: unknown };
+    let group = getGroupById(id);
+    if (body.name !== undefined) {
+      const name = typeof body.name === 'string' ? body.name.trim().slice(0, 100) : '';
+      if (!name) {
+        sendError(res, 400, 'invalid_request', 'name must be a non-empty string');
+        return;
+      }
+      group = renameGroup(id, name);
+    }
+    if (body.color !== undefined) {
+      if (body.color !== null && typeof body.color !== 'string') {
+        sendError(res, 400, 'invalid_request', 'color must be a string or null');
+        return;
+      }
+      group = setGroupColor(id, body.color);
+    }
+    res.json(group);
+  });
+
+  // DELETE /groups/:id: ungroups members (never deletes threads), archives the
+  // group's cover chat, drops the group row.
+  router.delete('/groups/:id', (req: AuthedRequest, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || !getGroupById(id)) {
+      sendError(res, 404, 'group_not_found', `Group ${req.params.id} not found`);
+      return;
+    }
+    deleteGroup(id);
+    res.status(204).end();
   });
 
   // -- POST /threads/:external_id/auto-title: manually (re)trigger the -------

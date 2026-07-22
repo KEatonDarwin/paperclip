@@ -17,6 +17,7 @@ import {
   type TurnMetadata,
 } from './conversation-db.js';
 import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent, type StreamEndEvent } from './sse-bus.js';
+import { buildGroupChatContext } from './group-chat-context.js';
 
 const MAX_TOOL_TURNS = 50;
 
@@ -877,7 +878,15 @@ async function runConversationTurn(conv: ConversationRow, input: string, signal?
   // Tell the model which thread it's running in, so it never has to guess
   // (this is what the cockpit todo-panel self-drive + thread routing rely on).
   const threadContextLine = `<jarvis_thread external_id="${conv.external_id}" conversation_id="${conv.id}"/>\n`;
-  let stdinContent = threadContextLine + (sessionId
+
+  // DAR-742 — group chats get their member threads' summaries prepended every
+  // turn (bounded, lazily-refreshed context — see group-chat-context.ts).
+  // Ungrouped/normal threads are untouched (empty string).
+  const groupContextBlock = conv.is_group_chat && conv.group_id
+    ? await buildGroupChatContext(conv.group_id)
+    : '';
+
+  let stdinContent = threadContextLine + groupContextBlock + (sessionId
     ? `<memory_refresh>\n${loadMemoryBlock()}\n</memory_refresh>\n\n${modelInput}`
     : (turns.length > 1 ? buildContinuationPrompt(turns, modelInput) : buildInitialPrompt(modelInput)));
 

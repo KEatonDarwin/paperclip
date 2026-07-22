@@ -143,13 +143,24 @@ export interface ThreadSummaryEvent {
   summary: ThreadSummaryRow;
 }
 
+// DAR-742 — thread groups (folders). Fired on create/rename/delete of a group
+// itself; per-thread group membership changes ride the existing
+// `conversation_updated` event (setThreadGroup emits one, same as pin/unpin).
+export interface ThreadGroupEvent {
+  type: 'thread_group';
+  action: 'created' | 'updated' | 'deleted';
+  groupId: number;
+  group?: { id: number; name: string; color: string | null; sort_order: number };
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
   | AutonomyLedgerEvent | AutonomyLedgerReviewEvent
   | ThreadTodoEvent | JarvisDecisionEvent
   | ConversationRenamedEvent | ConversationDeletedEvent
-  | QueuedMessageEvent | NoteEvent | QuickCaptureEvent | ThreadSummaryEvent;
+  | QueuedMessageEvent | NoteEvent | QuickCaptureEvent | ThreadSummaryEvent
+  | ThreadGroupEvent;
 
 class SSEBus extends EventEmitter {}
 

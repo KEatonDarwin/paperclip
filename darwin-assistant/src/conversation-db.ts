@@ -46,6 +46,21 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_turns_conversation ON turns(conversation_id, turn_index);
   CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);
   CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
+
+  -- Thread groups / folders (DAR-742). Created here (not in
+  -- conversation-groups.ts, which owns the rest of the group CRUD) because
+  -- the listConversationsByGroup/setThreadGroup statements below are
+  -- prepared eagerly at module load and better-sqlite3 validates a SELECT's
+  -- referenced tables at prepare() time, unlike ALTER TABLE ADD COLUMN's FK
+  -- reference above (lenient) — so this table must exist before that happens.
+  CREATE TABLE IF NOT EXISTS conversation_groups (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    color      TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
 
 // Migrate: add debug columns to turns table

@@ -1,9 +1,12 @@
 import {
   sqliteDb,
   getOrCreateConversation,
+  getConversation,
+  getConversationById,
   initGroupChatConversation,
   ungroupMembers,
   setConversationStatus,
+  setThreadGroup,
   type ConversationRow,
 } from './conversation-db.js';
 import { sseBus, type ThreadGroupEvent } from './sse-bus.js';
@@ -25,6 +28,10 @@ export interface ConversationGroupRow {
   updated_at: string;
 }
 
+// Table is actually created in conversation-db.ts (loaded first, and its own
+// listConversationsByGroup/setThreadGroup statements need it to exist at
+// prepare() time) — this is just a harmless idempotent re-assertion so this
+// file stays readable on its own.
 sqliteDb.exec(`
   CREATE TABLE IF NOT EXISTS conversation_groups (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,8 +83,9 @@ export function createGroup(name: string, color?: string | null): { group: Conve
   const group = stmts.getById.get(groupId);
   if (!group) throw new Error('Failed to load conversation group after insert');
 
-  const groupChat = getOrCreateConversation(groupChatExternalId(groupId));
-  initGroupChatConversation(groupChat.id, groupId);
+  const created = getOrCreateConversation(groupChatExternalId(groupId));
+  initGroupChatConversation(created.id, groupId);
+  const groupChat = getConversationById(created.id) ?? created;
 
   sseBus.emit('sse', {
     type: 'thread_group',
@@ -124,8 +132,23 @@ export function setGroupColor(id: number, color: string | null): ConversationGro
  */
 export function deleteGroup(id: number): void {
   ungroupMembers(id);
-  const groupChat = getOrCreateConversation(groupChatExternalId(id));
+  // Look up (not getOrCreate) — the cover chat is guaranteed to already exist
+  // from createGroup(), and getOrCreateConversation() only knows how to
+  // recreate a row for 'active'/'closed' status, not 'archived' (which this
+  // function itself sets), so calling it again on a group deleted twice would
+  // try to INSERT a duplicate external_id and hit the UNIQUE constraint.
+  const groupChat = getConversation(groupChatExternalId(id));
+  if (!groupChat) {
+    stmts.remove.run(id);
+    sseBus.emit('sse', { type: 'thread_group', action: 'deleted', groupId: id } satisfies ThreadGroupEvent);
+    return;
+  }
   setConversationStatus(groupChat.id, 'archived');
+  // The cover chat's own group_id still self-references this group (see
+  // conversation-db.ts's is_group_chat comment) — ungroupMembers() only
+  // clears actual members, so the FK would block deleting the group row
+  // below if we didn't also clear it here.
+  setThreadGroup(groupChat.id, null);
   stmts.remove.run(id);
   sseBus.emit('sse', {
     type: 'thread_group',

@@ -19,6 +19,7 @@ import {
   setConversationStatus,
   deleteConversation,
   copyTurns,
+  listRecentTurnsAcrossThreads,
   type ConversationRow,
   type TurnRow,
 } from '../conversation-db.js';
@@ -607,6 +608,36 @@ export function createApiV1Router(): Router {
     }).slice(0, limit);
 
     res.json({ threads: filtered.map((c) => threadDescriptor(c, req)) });
+  });
+
+  // -- GET /feed: cross-thread live feed (DAR-747) ---------------------------
+  // Human-visible messages across every thread, newest first, for the cockpit's
+  // unified "what did I miss" view. Paginates backward via `before_id` (a turn
+  // id from the previous page's last item) since turn ids are a global,
+  // monotonically increasing insertion cursor.
+
+  router.get('/feed', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const prefix = callerExternalIdPrefix(caller.id);
+    const seesAll = isAdminScope(caller.scope);
+    const limit = Math.max(1, Math.min(200, parseInt(String(req.query.limit ?? '50'), 10) || 50));
+    const beforeId = req.query.before_id != null ? parseInt(String(req.query.before_id), 10) : undefined;
+
+    // Over-fetch to compensate for prefix filtering, then trim to `limit`.
+    const raw = listRecentTurnsAcrossThreads(seesAll ? limit : limit * 4, beforeId);
+    const filtered = seesAll ? raw : raw.filter((t) => t.external_id.startsWith(prefix));
+    const page = filtered.slice(0, limit);
+
+    res.json({
+      messages: page.map((t) => ({
+        ...serializeTurn(t, deriveSource(t.external_id)),
+        message_id: `turn:${t.conversation_id}:${t.turn_index}`,
+        turn_id: t.id,
+        thread_id: t.external_id,
+        thread_title: t.conv_title,
+      })),
+      next_before_id: page.length > 0 ? page[page.length - 1].id : null,
+    });
   });
 
   // -- GET /threads/:external_id ---------------------------------------------

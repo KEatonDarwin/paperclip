@@ -233,6 +233,15 @@ const stmts = {
      SELECT ?, turn_index, role, content, tool_name, tool_args, tool_result, created_at, timing_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, claude_input, claude_output, error_detail
      FROM turns WHERE conversation_id = ? ORDER BY turn_index ASC`,
   ),
+  // Cross-thread live feed (DAR-747): human-visible messages across every
+  // conversation, newest first. `t.id` is a global autoincrement so it doubles
+  // as a stable pagination cursor (equivalent to insertion order).
+  listRecentTurnsAcrossThreads: db.prepare<[number, number], TurnRow & { external_id: string; conv_title: string | null }>(
+    `SELECT t.*, c.external_id as external_id, c.title as conv_title
+     FROM turns t JOIN conversations c ON c.id = t.conversation_id
+     WHERE t.role IN ('user', 'assistant') AND t.id < ?
+     ORDER BY t.id DESC LIMIT ?`,
+  ),
 };
 
 export function getConversation(externalId: string): ConversationRow | undefined {
@@ -391,6 +400,16 @@ export function countTurns(conversationId: number): number {
 /** Count of human-visible messages (user + assistant) in a conversation. */
 export function countMessages(conversationId: number): number {
   return stmts.countMessages.get(conversationId)?.cnt ?? 0;
+}
+
+export interface FeedTurnRow extends TurnRow {
+  external_id: string;
+  conv_title: string | null;
+}
+
+/** Human-visible messages across every thread, newest first, for the cross-thread live feed. */
+export function listRecentTurnsAcrossThreads(limit: number, beforeId?: number): FeedTurnRow[] {
+  return stmts.listRecentTurnsAcrossThreads.all(beforeId ?? Number.MAX_SAFE_INTEGER, limit);
 }
 
 /** Role ('user' | 'assistant') of the most recent visible message, or null. */

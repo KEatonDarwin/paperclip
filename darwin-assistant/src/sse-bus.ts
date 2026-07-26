@@ -3,6 +3,9 @@ import type { AutonomyLedgerRow } from './autonomy-ledger.js';
 import type { ThreadTodoRow } from './thread-todos.js';
 import type { JarvisDecisionRow } from './jarvis-decisions.js';
 import type { NoteRow } from './notes-db.js';
+import type { QuickCaptureItemRow } from './quick-capture-db.js';
+import type { ThreadReminderRow } from './thread-reminders.js';
+import type { ThreadSummaryRow } from './thread-summaries.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -24,6 +27,7 @@ export interface TurnEvent {
     model: string | null;
     claude_input: string | null;
     claude_output: string | null;
+    images: string | null;
   };
 }
 
@@ -122,13 +126,57 @@ export interface NoteEvent {
   note: NoteRow;
 }
 
+export interface QuickCaptureEvent {
+  type: 'quick_capture';
+  action: 'created' | 'updated' | 'deleted' | 'reordered';
+  item?: QuickCaptureItemRow;
+  items?: QuickCaptureItemRow[];
+  id?: number;
+}
+
+export interface ThreadReminderEvent {
+  type: 'thread_reminder';
+  conversationId: number;
+  action: 'created' | 'updated' | 'cancelled' | 'fired';
+  reminder: ThreadReminderRow & { alerting: boolean };
+}
+
+export interface ToolCallEvent {
+  type: 'tool_call';
+  conversationId: number;
+  toolName: string;
+}
+
+// DAR-740 — point-in-time thread summary, generated on demand. The bookmark
+// dropped into the timeline is anchored to anchor_turn_index at generation
+// time, so a client can insert it in the right spot without waiting on a
+// refetch.
+export interface ThreadSummaryEvent {
+  type: 'thread_summary';
+  conversationId: number;
+  action: 'created';
+  summary: ThreadSummaryRow;
+}
+
+// DAR-742 — thread groups (folders). Fired on create/rename/delete of a group
+// itself; per-thread group membership changes ride the existing
+// `conversation_updated` event (setThreadGroup emits one, same as pin/unpin).
+export interface ThreadGroupEvent {
+  type: 'thread_group';
+  action: 'created' | 'updated' | 'deleted';
+  groupId: number;
+  group?: { id: number; name: string; color: string | null; sort_order: number };
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
   | AutonomyLedgerEvent | AutonomyLedgerReviewEvent
   | ThreadTodoEvent | JarvisDecisionEvent
   | ConversationRenamedEvent | ConversationDeletedEvent
-  | QueuedMessageEvent | NoteEvent;
+  | QueuedMessageEvent | NoteEvent | QuickCaptureEvent
+  | ThreadReminderEvent | ToolCallEvent | ThreadSummaryEvent
+  | ThreadGroupEvent;
 
 class SSEBus extends EventEmitter {}
 

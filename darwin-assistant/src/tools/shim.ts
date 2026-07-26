@@ -114,7 +114,8 @@ export const createShimTask: ToolDef = {
 
 export const updateShimTask: ToolDef = {
   name: 'update_shim_task',
-  description: 'Update a SHIM task — change status, priority, title, or mark complete.',
+  description:
+    'Update a SHIM task — change status, priority, title, mode, mark complete, or move it into a different project.',
   parameters: {
     type: 'object',
     properties: {
@@ -123,6 +124,11 @@ export const updateShimTask: ToolDef = {
       status: { type: 'string', enum: ['open', 'in_progress', 'completed', 'blocked'] },
       priority: { type: 'number' },
       mode: { type: 'string', enum: ['darwin', 'personal'], description: 'Change the task mode.' },
+      project_id: {
+        type: 'number',
+        description:
+          'Move the task into this project. If the project has a mode and this task has no explicit mode set in the same call, the mode is inherited automatically.',
+      },
       mark_complete: { type: 'boolean', description: 'Set true to mark done (cascades to subtasks)' },
     },
     required: ['id'],
@@ -166,6 +172,28 @@ export const createShimProject: ToolDef = {
   },
   execute: async (args) =>
     shimCall('create-project-tool', { status: 'active', ...args }),
+};
+
+export const updateShimProject: ToolDef = {
+  name: 'update_shim_project',
+  description:
+    "Update an existing SHIM project — rename it, change status, or set its mode. Setting mode cascades that mode to every task currently in the project.",
+  parameters: {
+    type: 'object',
+    properties: {
+      id: { type: 'number', description: 'Project ID' },
+      name: { type: 'string', description: 'New project name' },
+      description: { type: 'string', description: 'New project description' },
+      status: { type: 'string', enum: ['active', 'archived', 'on_hold'] },
+      mode: {
+        type: 'string',
+        enum: ['darwin', 'personal'],
+        description: "Project mode. Changing this cascades the new mode to all of the project's tasks.",
+      },
+    },
+    required: ['id'],
+  },
+  execute: async (args) => shimCall('update-project-tool', args),
 };
 
 export const listShimFridge: ToolDef = {

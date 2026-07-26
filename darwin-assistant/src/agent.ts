@@ -1,4 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { buildSystemPrompt, loadMemoryBlock } from './prompt.js';
 import { ALL_TOOLS, TOOL_MAP } from './tools/index.js';
 import { withToolExecutionContext, type ToolExecutionContext } from './autonomy-ledger.js';
@@ -16,9 +19,61 @@ import {
   type TurnRow,
   type TurnMetadata,
 } from './conversation-db.js';
-import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent, type StreamEndEvent } from './sse-bus.js';
+import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent, type StreamEndEvent, type ToolCallEvent } from './sse-bus.js';
+import { buildGroupChatContext } from './group-chat-context.js';
+import { buildQuickChatContext } from './quick-chat-profiles.js';
+import { dirname } from 'node:path';
+import type { SavedImage } from './image-store.js';
 
 const MAX_TOOL_TURNS = 50;
+
+// The jarvis systemd service's own WorkingDirectory is the darwin-assistant repo
+// (so `pnpm build`/relative requires resolve normally) — but every `claude`/`codex`
+// CLI child we spawn used to inherit that same cwd by default. Claude Code buckets
+// sessions by cwd on disk (~/.claude/projects/<encoded-cwd>/), so every JARVIS chat
+// session and every real interactive coding session in this repo landed in the same
+// bucket. A stale/unresolvable --resume id then had a real, currently-active coding
+// session to fall back into instead of erroring cleanly — a watch/Slack message could
+// surface mid-transcript inside someone's live `claude` session instead of getting a
+// clean JARVIS reply. Giving JARVIS's spawned CLI its own cwd — outside any repo Kevin
+// or an agent actually codes in — keeps its session bucket permanently isolated.
+const JARVIS_CLI_CWD = process.env.JARVIS_CLI_CWD ?? join(homedir(), '.jarvis-cli-workspace');
+try {
+  mkdirSync(JARVIS_CLI_CWD, { recursive: true });
+} catch (err) {
+  console.error(`[agent] Failed to create JARVIS_CLI_CWD (${JARVIS_CLI_CWD}):`, err);
+}
+
+// DAR-716: cockpit plan/build mode toggle. The frontend prepends this marker
+// to the raw outgoing message when the operator has plan mode on; we persist
+// the turn's `content` completely unchanged (marker included) so the cockpit
+// can detect it later purely from turn history (refresh-safe, no schema
+// change) and color the bubble accordingly. Only the copy of the text that
+// actually reaches the model gets rewritten into an explicit instruction.
+export const PLAN_MODE_MARKER = '-- mode: planning --';
+
+export function isPlanModeMessage(rawContent: string | null | undefined): boolean {
+  return !!rawContent && rawContent.trimStart().startsWith(PLAN_MODE_MARKER);
+}
+
+/** Strip the marker and rewrite it into an explicit no-action instruction the
+ *  model actually has to follow. Baked into the human turn itself (not the
+ *  system prompt) so it works whether this is a fresh turn or a --resume'd
+ *  one, since resumed turns never resend the system prompt. */
+function applyPlanMode(rawInput: string): string {
+  const trimmed = rawInput.trimStart();
+  if (!trimmed.startsWith(PLAN_MODE_MARKER)) return rawInput;
+  const message = trimmed.slice(PLAN_MODE_MARKER.length).trimStart();
+  return [
+    '<planning_mode>',
+    'PLANNING MODE is active for this message only. Do not take any action: no file edits, no tool calls,',
+    'no task/build execution, nothing that changes state. Only discuss and plan. If asked to do something,',
+    'describe what you would do instead of doing it.',
+    '</planning_mode>',
+    '',
+    message,
+  ].join('\n');
+}
 
 // Fix C (DAR-676): appended to whatever streamed when a run is torn down mid-reply,
 // so the user sees the partial answer plus a clear "retry" cue. The fully-empty
@@ -141,7 +196,7 @@ export interface AdapterConfig {
   // The `model`/`modelLabel` fields are placeholders here and filled in per-request
   // by getAdapterRuntimeDescriptor(); leave them null in the static config.
   runtime: Omit<AdapterRuntimeDescriptor, 'adapterType' | 'model' | 'modelLabel'>;
-  buildArgs: (opts: { sessionId?: string | null; model?: string | null; options?: Record<string, unknown> }) => string[];
+  buildArgs: (opts: { sessionId?: string | null; model?: string | null; options?: Record<string, unknown>; imageDirs?: string[]; imagePaths?: string[] }) => string[];
   envOverrides?: (env: Record<string, string>) => void;
   // Optional adapter-specific stdout parser. Defaults to the claude JSONL parser.
   parseOutput?: (stdout: string) => ClaudeResult;
@@ -185,11 +240,15 @@ const ADAPTERS: Record<string, AdapterConfig> = {
       },
       capabilities: { tools: true, mcp: true, streamingText: true, structuredOutput: false, webSearch: true },
     },
-    buildArgs({ sessionId, model, options }) {
+    buildArgs({ sessionId, model, options, imageDirs }) {
       const args = ['--print', '-', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
       if (model) args.push('--model', model);
       if (sessionId) args.push('--resume', sessionId);
       if (options?.thinking && typeof options.thinking === 'string') args.push('--effort', options.thinking);
+      // DAR-744: give the local claude CLI read access to attached-image temp
+      // dirs so it can open the absolute paths referenced in the prompt (see
+      // vision-critique.ts for the same working pattern).
+      for (const dir of imageDirs ?? []) args.push('--add-dir', dir);
       return args;
     },
     envOverrides(env) { delete env['ANTHROPIC_API_KEY']; },
@@ -219,7 +278,7 @@ const ADAPTERS: Record<string, AdapterConfig> = {
       // incremental deltas (see codexMapStreamEvent), so streamingText is false.
       capabilities: { tools: true, mcp: true, streamingText: false, structuredOutput: false, webSearch: false },
     },
-    buildArgs({ sessionId, model }) {
+    buildArgs({ sessionId, model, imagePaths }) {
       const args: string[] = ['exec'];
       if (sessionId) args.push('resume', sessionId);
       args.push(
@@ -228,6 +287,9 @@ const ADAPTERS: Record<string, AdapterConfig> = {
         '--skip-git-repo-check',
       );
       if (model) args.push('-m', model);
+      // DAR-745: codex's own image flag, one per attached file (unlike claude's
+      // --add-dir, codex wants the file paths themselves, not a containing dir).
+      for (const p of imagePaths ?? []) args.push('-i', p);
       // Prompt argument `-` explicitly tells codex to read the prompt from stdin.
       args.push('-');
       return args;
@@ -257,10 +319,12 @@ const ADAPTERS: Record<string, AdapterConfig> = {
       },
       capabilities: { tools: true, mcp: false, streamingText: false, structuredOutput: false, webSearch: false },
     },
-    buildArgs({ sessionId, model }) {
+    buildArgs({ sessionId, model, imagePaths }) {
       const args = ['--print', '--output-format', 'json'];
       if (sessionId) args.push('--resume', sessionId);
       if (model && model !== 'default') args.push('--model', model);
+      // DAR-745: auggie's own image flag, one per attached file.
+      for (const p of imagePaths ?? []) args.push('--image', p);
       return args;
     },
   },
@@ -395,6 +459,21 @@ export function getActiveConversation(): { conversationId: number; startedAt: nu
   return oldest;
 }
 
+// Number of conversations with a turn currently in flight (DAR-729 control
+// panel "live run count" — concurrent processMessage() calls, not systemd
+// instances; darwin-assistant is a single service).
+export function getActiveRunCount(): number {
+  return activeRuns.size;
+}
+
+// Every currently-running conversation, oldest first — same shape as
+// getActiveConversation() but for all of them, not just the oldest.
+export function getActiveRuns(): { conversationId: number; startedAt: number }[] {
+  return [...activeRuns.entries()]
+    .map(([conversationId, run]) => ({ conversationId, startedAt: run.startedAt }))
+    .sort((a, b) => a.startedAt - b.startedAt);
+}
+
 export function buildToolsBlock(): string {
   const defs = ALL_TOOLS.map(
     (t) =>
@@ -435,10 +514,67 @@ function resolveSessionAdapter(conv: ConversationRow, turns: TurnRow[]): string 
   return null;
 }
 
-function summarizeTurnForReplay(turn: TurnRow): string | null {
+// DAR-756: a mid-thread adapter switch rebuilds a fresh session by replaying
+// the transcript through buildContinuationPrompt(). That prompt used to be
+// sized against nothing — full system prompt + tools block + the entire
+// ~44.5k-token memory block + a fixed HEAD(6)+TAIL(18) turn window + verbatim
+// assistant content — so switching a heavy thread to a smaller-window model
+// (e.g. Codex/GPT-5.5) could overflow on the very first turn. Everything below
+// sizes that prompt against a conservative per-adapter/per-model budget instead.
+
+// No tokenizer dependency — ~4 chars/token is a standard conservative
+// approximation for English+code mixed text. Good enough for budgeting
+// (we're trying to avoid overflow, not hit an exact count).
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+// Deliberately conservative: better to trim a bit more transcript than to
+// overflow and hand Kevin a raw provider error. Reserves room for the model's
+// own reply on top of the input budget.
+const OUTPUT_HEADROOM_TOKENS = 16_000;
+const DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000; // unknown model — assume the smallest common window
+
+// Per-model overrides where known; otherwise falls back to the per-adapter
+// estimate, then the global default. Codex/GPT-5.5's *effective* window in
+// practice (with the CLI's own overhead) is meaningfully smaller than Claude's,
+// which is the root cause this ticket is fixing — kept conservative on purpose.
+const MODEL_CONTEXT_WINDOW_TOKENS: Record<string, number> = {
+  'claude-opus-4-8': 200_000,
+  'claude-opus-4-7': 200_000,
+  'claude-sonnet-5': 200_000,
+  'claude-sonnet-4-6': 200_000,
+  'claude-fable-5': 200_000,
+  'claude-haiku-4-5-20251001': 200_000,
+  'gpt-5.5': 128_000,
+  'gpt-5.4': 128_000,
+  'gpt-5.4-mini': 128_000,
+};
+const ADAPTER_CONTEXT_WINDOW_TOKENS: Record<string, number> = {
+  claude: 200_000,
+  codex: 128_000,
+  auggie: DEFAULT_CONTEXT_WINDOW_TOKENS,
+};
+
+function contextWindowTokensFor(adapterId: string, model: string | null): number {
+  if (model && MODEL_CONTEXT_WINDOW_TOKENS[model] !== undefined) return MODEL_CONTEXT_WINDOW_TOKENS[model];
+  return ADAPTER_CONTEXT_WINDOW_TOKENS[adapterId] ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
+}
+
+// Same truncation idea already applied to tool_args (1200 chars)/tool_result
+// (2000 chars) below, extended to assistant `content` — previously the one
+// field that replayed verbatim no matter how large a single agentic turn was.
+const ASSISTANT_REPLAY_TRUNCATE_CHARS = 4000;
+
+function summarizeTurnForReplay(turn: TurnRow, maxAssistantChars = ASSISTANT_REPLAY_TRUNCATE_CHARS): string | null {
   const content = turn.content?.trim() ?? '';
   if (turn.role === 'user') return `Human (${turn.created_at} UTC): ${content}`;
-  if (turn.role === 'assistant') return `Assistant (${turn.created_at} UTC): ${content}`;
+  if (turn.role === 'assistant') {
+    const body = content.length > maxAssistantChars
+      ? `${content.slice(0, maxAssistantChars)}\n[... truncated ${content.length - maxAssistantChars} chars for replay ...]`
+      : content;
+    return `Assistant (${turn.created_at} UTC): ${body}`;
+  }
   if (turn.role === 'tool_call') {
     const args = turn.tool_args ? turn.tool_args.slice(0, 1200) : '{}';
     return `Assistant tool call (${turn.created_at} UTC): ${turn.tool_name ?? 'unknown'} ${args}`;
@@ -450,33 +586,111 @@ function summarizeTurnForReplay(turn: TurnRow): string | null {
   return null;
 }
 
-function buildContinuationPrompt(turns: TurnRow[], userMessage: string): string {
+// Picks how many turns to replay given a char budget for the transcript
+// section. Always keeps a minimum head/tail for continuity even if that
+// minimum runs slightly over budget (turns are already per-turn truncated
+// above, so the overrun is bounded, not unbounded like the old verbatim replay
+// was) — the budget mainly controls how much *extra* history beyond that
+// minimum gets pulled in.
+function selectTurnsForBudget(
+  priorTurns: TurnRow[],
+  transcriptBudgetChars: number,
+): { selectedTurns: TurnRow[]; elidedCount: number; headCount: number; tailCount: number } {
+  if (priorTurns.length === 0) return { selectedTurns: [], elidedCount: 0, headCount: 0, tailCount: 0 };
+
+  const MIN_TAIL_KEEP = 4;
+  const MAX_TAIL_KEEP = 18;
+  const MIN_HEAD_KEEP = 2;
+  const MAX_HEAD_KEEP = 6;
+
+  let used = 0;
+  let tailCount = 0;
+  for (let i = priorTurns.length - 1; i >= 0 && tailCount < MAX_TAIL_KEEP; i--) {
+    const cost = (summarizeTurnForReplay(priorTurns[i])?.length ?? 0) + 2;
+    if (tailCount >= MIN_TAIL_KEEP && used + cost > transcriptBudgetChars) break;
+    used += cost;
+    tailCount++;
+  }
+
+  const remaining = priorTurns.length - tailCount;
+  let headCount = 0;
+  const headLimit = Math.min(remaining, MAX_HEAD_KEEP);
+  for (let i = 0; i < headLimit; i++) {
+    const cost = (summarizeTurnForReplay(priorTurns[i])?.length ?? 0) + 2;
+    if (headCount >= MIN_HEAD_KEEP && used + cost > transcriptBudgetChars) break;
+    used += cost;
+    headCount++;
+  }
+
+  const elidedCount = priorTurns.length - headCount - tailCount;
+  const selectedTurns = elidedCount > 0
+    ? [...priorTurns.slice(0, headCount), ...priorTurns.slice(priorTurns.length - tailCount)]
+    : priorTurns;
+
+  return { selectedTurns, elidedCount, headCount, tailCount };
+}
+
+// `aggressive` is used for the one-shot retry after a real context-overflow
+// error from the destination adapter (see the overflow-retry handling around
+// runClaude() below): shrinks the budget further and drops to a truncated
+// memory block, on top of whatever the normal per-model budget already trimmed.
+function buildContinuationPrompt(
+  turns: TurnRow[],
+  userMessage: string,
+  adapterId: string = 'claude',
+  model: string | null = null,
+  opts?: { aggressive?: boolean },
+): string {
   const priorTurns = turns.length && turns[turns.length - 1]?.role === 'user'
     ? turns.slice(0, -1)
     : turns;
-  const HEAD_KEEP = 6;
-  const TAIL_KEEP = 18;
-  const selectedTurns = priorTurns.length <= HEAD_KEEP + TAIL_KEEP
-    ? priorTurns
-    : [...priorTurns.slice(0, HEAD_KEEP), ...priorTurns.slice(-TAIL_KEEP)];
-  const elidedCount = priorTurns.length - selectedTurns.length;
+
+  const systemPrompt = buildSystemPrompt();
+  const toolsBlock = buildToolsBlock();
+
+  const windowTokens = contextWindowTokensFor(adapterId, model);
+  const aggressive = opts?.aggressive ?? false;
+  const headroomTokens = aggressive ? OUTPUT_HEADROOM_TOKENS * 2 : OUTPUT_HEADROOM_TOKENS;
+
+  // The memory block is the single biggest fixed cost (~44.5k tokens full-size)
+  // and the ticket's biggest single lever for small-window adapters — compact
+  // it whenever the window is meaningfully smaller than Claude's, not just on
+  // the aggressive retry path.
+  const memoryMaxChars = aggressive
+    ? 4_000
+    : windowTokens <= 128_000
+      ? 12_000
+      : undefined;
+  const memoryBlock = loadMemoryBlock(memoryMaxChars);
+
+  const staticTokens =
+    estimateTokens(systemPrompt) +
+    estimateTokens(toolsBlock) +
+    estimateTokens(memoryBlock) +
+    estimateTokens(userMessage) +
+    500; // scaffolding text (headers, labels, etc.)
+
+  const transcriptBudgetTokens = Math.max(0, windowTokens - headroomTokens - staticTokens);
+  const transcriptBudgetChars = transcriptBudgetTokens * 4;
+
+  const { selectedTurns, elidedCount, headCount } = selectTurnsForBudget(priorTurns, transcriptBudgetChars);
   const transcriptLines = selectedTurns
-    .map(summarizeTurnForReplay)
+    .map((t) => summarizeTurnForReplay(t))
     .filter((line): line is string => Boolean(line));
 
   if (elidedCount > 0) {
-    transcriptLines.splice(HEAD_KEEP, 0, `[... ${elidedCount} earlier turns omitted for brevity ...]`);
+    transcriptLines.splice(headCount, 0, `[... ${elidedCount} earlier turns omitted for brevity ...]`);
   }
 
   return [
-    buildSystemPrompt(),
-    buildToolsBlock(),
+    systemPrompt,
+    toolsBlock,
     '---',
     'You are continuing an existing JARVIS conversation after the backing adapter session changed or was reset.',
     'Treat the transcript below as prior context from the same thread and continue naturally from the final human message.',
     '',
     '## Current Memory',
-    `<memory_refresh>\n${loadMemoryBlock()}\n</memory_refresh>`,
+    `<memory_refresh>\n${memoryBlock}\n</memory_refresh>`,
     '',
     '## Prior Transcript',
     transcriptLines.length ? transcriptLines.join('\n\n') : '(no prior turns)',
@@ -553,25 +767,16 @@ function parseClaudeOutput(stdout: string): ClaudeResult {
           cacheWriteTokens: typeof u.cache_creation_input_tokens === 'number' ? u.cache_creation_input_tokens : undefined,
         };
       }
-      // Bug fix (2026-07-10): `event.result` is Claude Code's own summary field —
-      // in practice it's just the FINAL assistant text segment, not the full
-      // session. Preferring it over `texts` silently dropped every earlier text
-      // block from a multi-step tool-calling turn (visible live via streaming,
-      // then gone once persisted). `texts` already accumulates every assistant
-      // text segment across the whole CLI session in order, so it's the
-      // authoritative reconstruction — only fall back to `event.result` if the
-      // stream somehow produced no assistant text events at all.
       const r = typeof event.result === 'string' ? event.result.trim() : '';
-      const full = texts.join('\n\n').trim();
-      return { text: full || r, sessionId, usage, model, rawOutput: stdout };
+      return { text: r || texts.join('').trim(), sessionId, usage, model, rawOutput: stdout };
     }
   }
 
-  return { text: texts.join('\n\n').trim() || stdout.trim(), sessionId, usage, model, rawOutput: stdout };
+  return { text: texts.join('').trim() || stdout.trim(), sessionId, usage, model, rawOutput: stdout };
 }
 
 function parseCodexOutput(stdout: string): ClaudeResult {
-  const texts: string[] = [];
+  const messages: string[] = [];
   let sessionId: string | null = null;
   let usage: ClaudeUsage | undefined;
 
@@ -588,7 +793,7 @@ function parseCodexOutput(stdout: string): ClaudeResult {
     if (event.type === 'item.completed') {
       const item = event.item as Record<string, unknown> | undefined;
       if (item && item.type === 'agent_message' && typeof item.text === 'string') {
-        texts.push(item.text);
+        messages.push(item.text);
       }
     }
 
@@ -604,12 +809,14 @@ function parseCodexOutput(stdout: string): ClaudeResult {
     }
   }
 
-  return { text: texts.join('\n').trim(), sessionId, usage, rawOutput: stdout };
+  const finalText = messages[messages.length - 1]?.trim();
+  return { text: finalText || stdout.trim(), sessionId, usage, rawOutput: stdout };
 }
 
-// Codex's `--json` stream emits `item.completed` with `agent_message` at the end of a
-// turn rather than incremental deltas. We surface that as a single claude-shaped
-// `content_block_delta` so the existing SSE bridge in runConversationTurn keeps working.
+// Codex's `--json` stream emits one `agent_message` per progress/final update.
+// We cannot know which one is final until the process exits, so persistence is
+// fixed in parseCodexOutput() and parseTurnSteps(). Live SSE still surfaces
+// these as plain progress deltas while a run is active.
 function codexMapStreamEvent(event: Record<string, unknown>): Record<string, unknown> | null {
   if (event.type === 'item.completed') {
     const item = event.item as Record<string, unknown> | undefined;
@@ -638,12 +845,21 @@ export function parseToolCall(
 
 const UNKNOWN_SESSION_RE = /no conversation found with session id|unknown session|session .* not found/i;
 
+// DAR-756: matches the raw provider errors seen when a continuation prompt (or
+// a resumed native session) overflows the destination model's context window —
+// e.g. Codex's "ran out of room in the model's context window" on a mid-thread
+// adapter switch. Kept adapter-agnostic since Claude/Auggie can in principle
+// hit the same class of error with their own wording.
+const CONTEXT_OVERFLOW_RE = /ran out of room|context window|context.length.exceeded|maximum context length|prompt is too long|too many tokens/i;
+
 export async function runClaude(
   input: string,
   sessionId?: string | null,
   onEvent?: (event: Record<string, unknown>) => void,
   runtime?: { adapter: AdapterConfig; model: string | null; options?: Record<string, unknown> },
   signal?: AbortSignal,
+  imageDirs?: string[],
+  imagePaths?: string[],
 ): Promise<ClaudeResult> {
   // A resolved per-thread runtime (DAR-680 AC#4) wins; otherwise fall back to the
   // global adapter/model settings for callers that don't pass one.
@@ -653,10 +869,10 @@ export async function runClaude(
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
   adapter.envOverrides?.(env);
 
-  const args = adapter.buildArgs({ sessionId, model, options });
+  const args = adapter.buildArgs({ sessionId, model, options, imageDirs, imagePaths });
 
   return new Promise((resolve, reject) => {
-    const child = spawn(adapter.bin, args, { env });
+    const child = spawn(adapter.bin, args, { env, cwd: JARVIS_CLI_CWD });
     const outChunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
     let lineBuffer = '';
@@ -770,6 +986,7 @@ export async function processMessage(
   input: string,
   conversationId: string,
   messageId?: string,
+  images?: SavedImage[],
 ): Promise<string> {
   const conv = getOrCreateConversation(conversationId);
 
@@ -792,7 +1009,7 @@ export async function processMessage(
   } satisfies StatusEvent);
 
   try {
-    return await runConversationTurn(conv, input, abort.signal);
+    return await runConversationTurn(conv, input, abort.signal, images);
   } finally {
     activeRuns.delete(conv.id);
     liveStreams.delete(conv.id);
@@ -805,8 +1022,23 @@ export async function processMessage(
   }
 }
 
-async function runConversationTurn(conv: ConversationRow, input: string, signal?: AbortSignal): Promise<string> {
-  const userTurnIndex = addTurn(conv.id, 'user', input);
+async function runConversationTurn(
+  conv: ConversationRow,
+  input: string,
+  signal?: AbortSignal,
+  images?: SavedImage[],
+): Promise<string> {
+  const userTurnIndex = addTurn(
+    conv.id,
+    'user',
+    input,
+    undefined,
+    undefined,
+    undefined,
+    images && images.length
+      ? { images: JSON.stringify(images.map(({ filename, mime, conversationId }) => ({ filename, mime, conversationId }))) }
+      : undefined,
+  );
   const runtime = resolveConversationRuntime(conv);
   const adapter = runtime.adapter;
   const turns = getTurns(conv.id);
@@ -828,12 +1060,50 @@ async function runConversationTurn(conv: ConversationRow, input: string, signal?
     sessionId = null;
   }
 
+  // DAR-716: rewrite the plan-mode marker (if present) into an explicit
+  // instruction for the model. `input` itself stays untouched — it's already
+  // been persisted as-is above, and stdinContent is the only thing that needs
+  // the rewritten copy. `planModeActive` is a hard gate below, not just a
+  // prompt nudge — the ticket asks for a guarantee, not a suggestion the
+  // model can ignore.
+  const planModeActive = isPlanModeMessage(input);
+  const modelInput = applyPlanMode(input);
+
   // Tell the model which thread it's running in, so it never has to guess
   // (this is what the cockpit todo-panel self-drive + thread routing rely on).
   const threadContextLine = `<jarvis_thread external_id="${conv.external_id}" conversation_id="${conv.id}"/>\n`;
-  let stdinContent = threadContextLine + (sessionId
-    ? `<memory_refresh>\n${loadMemoryBlock()}\n</memory_refresh>\n\n${input}`
-    : (turns.length > 1 ? buildContinuationPrompt(turns, input) : buildInitialPrompt(input)));
+
+  // DAR-742 — group chats get their member threads' summaries prepended every
+  // turn (bounded, lazily-refreshed context — see group-chat-context.ts).
+  // Ungrouped/normal threads are untouched (empty string).
+  const groupContextBlock = conv.is_group_chat && conv.group_id
+    ? await buildGroupChatContext(conv.group_id)
+    : '';
+  const quickChatContextBlock = buildQuickChatContext(conv.external_id);
+
+  // DAR-744: hand the model an absolute file path per attached image, mirroring
+  // the working vision-critique.ts pattern (local claude CLI reads an image when
+  // its absolute path is in the prompt + the containing dir is on --add-dir).
+  // DAR-745: also keep the flat path list so non-claude adapters (codex -i,
+  // auggie --image) can attach the files directly — they don't use --add-dir.
+  const imageDirs = images && images.length
+    ? Array.from(new Set(images.map((img) => dirname(img.absPath))))
+    : undefined;
+  const imagePaths = images && images.length ? images.map((img) => img.absPath) : undefined;
+  const imageBlock = images && images.length
+    ? `<attached_images>\nThe user attached ${images.length} image(s) to this message. Open and look at each one now before responding — absolute paths:\n${images.map((img) => `- ${img.absPath}`).join('\n')}\n</attached_images>\n\n`
+    : '';
+
+  const perTurnContextPrefix = threadContextLine + groupContextBlock + quickChatContextBlock + imageBlock;
+
+  let stdinContent = perTurnContextPrefix + (sessionId
+    ? `<memory_refresh>\n${loadMemoryBlock()}\n</memory_refresh>\n\n${modelInput}`
+    : (turns.length > 1 ? buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model) : buildInitialPrompt(modelInput)));
+
+  // DAR-756: only one aggressive-compaction retry per turn — if the destination
+  // model still overflows after that, stop retrying and degrade to a friendly
+  // message instead of looping.
+  let contextOverflowRetried = false;
 
   for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
     let accumulatedText = '';
@@ -869,40 +1139,74 @@ async function runConversationTurn(conv: ConversationRow, input: string, signal?
     const claudeT0 = Date.now();
     let result: ClaudeResult;
     try {
-      result = await runClaude(stdinContent, sessionId, onStreamEvent, runtime, signal);
+      result = await runClaude(stdinContent, sessionId, onStreamEvent, runtime, signal, imageDirs, imagePaths);
       sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
 
       // Session expired or unknown — retry without resume
       if (sessionId && !result.text && !result.sessionId) {
         console.log(`[agent] Session ${sessionId} expired, starting fresh`);
         sessionId = null;
-        stdinContent = buildContinuationPrompt(turns, input);
+        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model);
         accumulatedText = '';
         sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
-        result = await runClaude(stdinContent, null, onStreamEvent, runtime, signal);
+        result = await runClaude(stdinContent, null, onStreamEvent, runtime, signal, imageDirs, imagePaths);
         sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
       }
     } catch (err) {
-      // Fix C (DAR-676): a timed-out or crashed model call must not vanish. Persist
-      // whatever streamed so far as the assistant reply (marked interrupted when
-      // empty) and stop the stream, then rethrow so the ingress layer records the
-      // error state instead of leaving the thread stuck "thinking".
       sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
-      const partial = accumulatedText.trim()
-        ? `${accumulatedText}\n\n${INTERRUPTED_SUFFIX}`
-        : INTERRUPTED_MARKER;
-      // Capture the raw error so the cockpit can expose it behind "Details"
-      // instead of hiding it behind the clean interrupted sentence.
-      const errorDetail = (err instanceof Error
-        ? `${err.message}\n\n${err.stack ?? ''}`
-        : String(err)).slice(0, 8000);
-      addTurn(conv.id, 'assistant', partial, undefined, undefined, undefined, {
-        timingMs: Date.now() - claudeT0,
-        claudeInput: stdinContent,
-        errorDetail,
-      });
-      touchConversation(conv.id);
-      throw err;
+      const message = err instanceof Error ? err.message : String(err);
+
+      // DAR-756: a real context-window overflow from the destination adapter
+      // (typically a mid-thread switch to a smaller-window model like
+      // Codex/GPT-5.5). Retry once with an aggressively compacted continuation
+      // prompt (smaller transcript window, truncated memory block) instead of
+      // immediately surfacing the raw provider error to Kevin.
+      if (CONTEXT_OVERFLOW_RE.test(message) && !contextOverflowRetried && turns.length > 0) {
+        contextOverflowRetried = true;
+        console.log(`[agent] Conversation ${conv.id} overflowed ${adapter.id}'s context window; retrying with an aggressively compacted continuation prompt`);
+        sessionId = null;
+        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { aggressive: true });
+        accumulatedText = '';
+        try {
+          sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
+          result = await runClaude(stdinContent, null, onStreamEvent, runtime, signal, imageDirs, imagePaths);
+          sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
+        } catch (retryErr) {
+          sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
+          const modelLabel = runtime.model
+            ? (adapter.models.find((m) => m.id === runtime.model)?.label ?? runtime.model)
+            : adapter.name;
+          const friendly = `This thread is too large for ${modelLabel}'s context window, even after compacting the conversation history. Start a fresh thread, or switch back to a larger-window model (e.g. Claude Opus) to keep working in this one.`;
+          const retryMessage = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          addTurn(conv.id, 'assistant', friendly, undefined, undefined, undefined, {
+            timingMs: Date.now() - claudeT0,
+            claudeInput: stdinContent,
+            errorDetail: `${message}\n\n(retry after compaction also failed: ${retryMessage})`,
+          });
+          touchConversation(conv.id);
+          return friendly;
+        }
+      } else {
+        // Fix C (DAR-676): a timed-out or crashed model call must not vanish. Persist
+        // whatever streamed so far as the assistant reply (marked interrupted when
+        // empty) and stop the stream, then rethrow so the ingress layer records the
+        // error state instead of leaving the thread stuck "thinking".
+        const partial = accumulatedText.trim()
+          ? `${accumulatedText}\n\n${INTERRUPTED_SUFFIX}`
+          : INTERRUPTED_MARKER;
+        // Capture the raw error so the cockpit can expose it behind "Details"
+        // instead of hiding it behind the clean interrupted sentence.
+        const errorDetail = (err instanceof Error
+          ? `${err.message}\n\n${err.stack ?? ''}`
+          : String(err)).slice(0, 8000);
+        addTurn(conv.id, 'assistant', partial, undefined, undefined, undefined, {
+          timingMs: Date.now() - claudeT0,
+          claudeInput: stdinContent,
+          errorDetail,
+        });
+        touchConversation(conv.id);
+        throw err;
+      }
     }
     const claudeMs = Date.now() - claudeT0;
 
@@ -946,16 +1250,26 @@ async function runConversationTurn(conv: ConversationRow, input: string, signal?
       undefined,
       claudeMeta,
     );
+    sseBus.emit('sse', { type: 'tool_call', conversationId: conv.id, toolName: toolCall.name } satisfies ToolCallEvent);
 
     const tool = TOOL_MAP.get(toolCall.name);
     const toolT0 = Date.now();
     let toolResult: unknown;
-    try {
-      toolResult = tool
-        ? await withToolExecutionContext(toolContext, () => tool.execute(toolCall.arguments, toolContext))
-        : { error: `Unknown tool: ${toolCall.name}` };
-    } catch (err) {
-      toolResult = { error: err instanceof Error ? err.message : String(err) };
+    if (planModeActive) {
+      // Hard gate, not a prompt-level nudge: even if the model ignores the
+      // planning-mode instruction and emits a tool call anyway, it never
+      // actually runs. Fed back so the model can recover and just answer.
+      toolResult = {
+        error: 'Tool execution is disabled — this message is in planning mode. Describe the plan instead of executing it.',
+      };
+    } else {
+      try {
+        toolResult = tool
+          ? await withToolExecutionContext(toolContext, () => tool.execute(toolCall.arguments, toolContext))
+          : { error: `Unknown tool: ${toolCall.name}` };
+      } catch (err) {
+        toolResult = { error: err instanceof Error ? err.message : String(err) };
+      }
     }
     const toolMs = Date.now() - toolT0;
 

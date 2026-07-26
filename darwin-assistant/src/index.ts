@@ -3,6 +3,7 @@ import express from 'express';
 import { createSlackApp, sendDailyBriefing } from './handlers/slack.js';
 import { createWebhookRouter } from './handlers/webhook.js';
 import { startCheckinWorker } from './checkin-worker.js';
+import { startThreadReminderWorker } from './thread-reminders.js';
 import { enqueueCalendarCheckins } from './briefing.js';
 import { startUiServer } from './ui-server.js';
 import { reconcileInterruptedRuns, autoHideStaleThreads } from './conversation-db.js';
@@ -102,6 +103,11 @@ async function main() {
   // Auto-hide stale threads (runs regardless of Slack).
   runAutoHideSweep();
   setInterval(runAutoHideSweep, AUTO_HIDE_INTERVAL_MS);
+
+  // Thread auto-bump reminders. Deliberately outside the Slack branch below:
+  // bumping a cockpit thread is local + SQLite-only and must not depend on
+  // Slack creds the way the Postgres-backed check-in worker does.
+  startThreadReminderWorker();
 
   if (slackApp) {
     await slackApp.start();

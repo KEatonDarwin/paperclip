@@ -2,7 +2,12 @@ import { readFileSync } from 'node:fs';
 
 const MEMORY_FILE = '/home/kevin/obsidian/paperclip-wiki/agent-memory/jarvis/memory.md';
 
-export function loadMemoryBlock(): string {
+// DAR-756: `maxChars` lets small-context-window adapters (mid-thread switch to
+// a model with a smaller window than the source) request a head-truncated copy
+// of the memory block instead of the full ~44.5k-token file every message —
+// that block was the single biggest fixed cost in a replayed continuation
+// prompt. Full block (no arg) is unchanged for the common case.
+export function loadMemoryBlock(maxChars?: number): string {
   let body: string;
   try {
     body = readFileSync(MEMORY_FILE, 'utf-8').trim();
@@ -10,6 +15,9 @@ export function loadMemoryBlock(): string {
     body = '_(memory file unavailable)_';
   }
   if (!body) body = '_(memory file is empty)_';
+  if (maxChars && body.length > maxChars) {
+    body = `${body.slice(0, maxChars)}\n\n_(memory truncated to ${maxChars} chars to fit the destination model's context window — full memory available via \`read_memory\`)_`;
+  }
   return [
     '## Your Persistent Memory (auto-loaded every message)',
     `_Source: ${MEMORY_FILE}. This is injected fresh on EVERY message you receive — not just the first. The content below is always current. Treat the rules and facts here as authoritative. Use \`write_memory\` to update it — changes take effect on the very next message._`,

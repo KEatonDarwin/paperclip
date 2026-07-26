@@ -32,6 +32,36 @@ interface ClaudeStreamLine {
 
 const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/;
 
+function extractCodexAgentMessages(rawOutput: string): string[] {
+  const messages: string[] = [];
+  for (const line of rawOutput.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (event.type !== 'item.completed') continue;
+    const item = event.item as Record<string, unknown> | undefined;
+    if (item?.type === 'agent_message' && typeof item.text === 'string') {
+      messages.push(item.text);
+    }
+  }
+  return messages;
+}
+
+export function displayContentFromRawOutput(
+  content: string | null | undefined,
+  rawOutput: string | null | undefined,
+): string | null | undefined {
+  if (!rawOutput) return content;
+  const codexMessages = extractCodexAgentMessages(rawOutput);
+  const finalMessage = codexMessages[codexMessages.length - 1]?.trim();
+  return finalMessage || content;
+}
+
 function splitEmbeddedToolCall(text: string): TurnStep[] {
   const match = text.match(TOOL_CALL_RE);
   if (!match) return text ? [{ kind: 'text', text }] : [];
@@ -61,6 +91,16 @@ function splitEmbeddedToolCall(text: string): TurnStep[] {
  */
 export function parseTurnSteps(rawOutput: string | null | undefined): TurnStep[] | null {
   if (!rawOutput) return null;
+
+  const codexMessages = extractCodexAgentMessages(rawOutput);
+  if (codexMessages.length) {
+    const progressText = codexMessages
+      .slice(0, -1)
+      .map((text) => text.trim())
+      .filter(Boolean)
+      .join('\n\n');
+    return progressText ? [{ kind: 'thinking', text: progressText }] : null;
+  }
 
   const merged: TurnStep[] = [];
   const pushText = (kind: 'thinking' | 'text', text: string) => {

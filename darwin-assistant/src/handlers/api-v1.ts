@@ -1,7 +1,8 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { randomUUID } from 'node:crypto';
 import { statSync, readFileSync } from 'node:fs';
-import { parseTurnSteps } from '../turn-steps.js';
+import { displayContentFromRawOutput, parseTurnSteps } from '../turn-steps.js';
+import { isPlanModeMessage } from '../agent.js';
 import {
   getOrCreateConversation,
   getConversation,
@@ -17,16 +18,53 @@ import {
   deriveSource,
   renameConversation,
   setConversationStatus,
+  setThreadPinned,
+  setThreadGroup,
   deleteConversation,
   copyTurns,
   type ConversationRow,
   type TurnRow,
 } from '../conversation-db.js';
+import {
+  listGroups,
+  getGroupById,
+  createGroup,
+  renameGroup,
+  setGroupColor,
+  deleteGroup,
+} from '../conversation-groups.js';
 import { listAutonomyLedger } from '../autonomy-ledger.js';
 import { listMcpServers, refreshMcpServers } from '../mcp-registry.js';
 import { resolveNativeServer, nativeListTools } from '../tools/mcp-native.js';
 import { listNotes, createNote } from '../notes-db.js';
 import { triageNote } from '../notes.js';
+import {
+  listActiveQuickCaptureItems,
+  createQuickCaptureItem,
+  reorderQuickCaptureItems,
+  renameQuickCaptureItem,
+  setQuickCaptureItemCompleted,
+  deleteQuickCaptureItem,
+  getQuickCaptureItem,
+} from '../quick-capture-db.js';
+import {
+  archiveExpiredQuickChatSessions,
+  archiveQuickChatProfile,
+  closeQuickChatSession,
+  getQuickChatProfile,
+  getQuickChatSessionForConversation,
+  listQuickChatProfiles,
+  listQuickChatSessions,
+  openQuickChatSession,
+  saveQuickChatProfile,
+  serializeQuickChatProfile,
+  serializeQuickChatSession,
+} from '../quick-chat-profiles.js';
+import { autoNameThreadFromFirstMessage } from '../thread-autoname.js';
+import { generateThreadSummary } from '../thread-summarize.js';
+import { listThreadSummaries, getLatestThreadSummary } from '../thread-summaries.js';
+import { searchThreadsByQuery } from '../thread-search.js';
+import { getBrief } from '../jarvis-brief.js';
 import {
   listJarvisDecisions,
   insertJarvisDecision,
@@ -47,13 +85,27 @@ import {
   type ThreadTodoOwner,
 } from '../thread-todos.js';
 import {
+  activeReminderForConversation,
+  setThreadReminder,
+  acknowledgeThreadReminder,
+  cancelRemindersForConversation,
+  serializeReminder,
+} from '../thread-reminders.js';
+import {
   listQueuedMessages,
   enqueueMessage,
   deleteQueuedMessage,
   shiftQueuedMessage,
 } from '../thread-message-queue.js';
+import {
+  saveMessageImages,
+  resolveImagePath,
+  parseStoredImages,
+  ImageValidationError,
+  type IncomingImage,
+  type SavedImage,
+} from '../image-store.js';
 import { createShimTask } from '../tools/shim.js';
-import { submitIntake, listIntakeOutcomes } from '../tools/paperclip.js';
 import {
   processMessage,
   getAdapters,
@@ -65,8 +117,21 @@ import {
   getLiveStream,
   abortConversationRun,
   ConversationBusyError,
+  getActiveRunCount,
+  getActiveRuns,
 } from '../agent.js';
-import { getAllSettings, getSetting, setSetting, deleteSetting } from '../conversation-db.js';
+import {
+  getAllSettings,
+  getSetting,
+  setSetting,
+  deleteSetting,
+  getPersonalityStats,
+  updatePersonalityStats,
+  getPersonalityStatsHistory,
+  listRunHistory,
+  classifyRunOutcome,
+  PERSONALITY_STAT_KEYS,
+} from '../conversation-db.js';
 import { query } from '../db.js';
 import { listVaultTree, readVaultFile, searchVault } from '../vault-page.js';
 import { sseBus, type SSEEvent } from '../sse-bus.js';
@@ -110,8 +175,12 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
   const { adapter, model } = resolveConversationRuntime(conv);
   // Open (not-done) todos for the sidebar indicator + "todos for me" filter.
   const openTodos = openTodoCount(conv.id);
+  // Auto-bump reminder: drives the sidebar bell + the "alerting" highlight.
+  const reminder = activeReminderForConversation(conv.id);
+  const quickChatSession = getQuickChatSessionForConversation(conv.id);
   return {
     thread_id: conv.external_id,
+    reminder: reminder ? serializeReminder(reminder) : null,
     // Open todo signal — total, and the subset tagged "for Kevin".
     open_todo_count: openTodos.total,
     open_todo_for_me_count: openTodos.forKevin,
@@ -120,8 +189,16 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     // User-set display name (rename); null → client derives one. Kept distinct
     // from status so an archived thread keeps its title.
     title: conv.title ?? null,
+    // Pin-to-top (DAR-735). pinned_at drives ordering among multiple pinned threads.
+    pinned: !!conv.pinned,
+    pinned_at: conv.pinned_at ?? null,
+    // Thread groups / folders (DAR-742). group_id null = ungrouped. is_group_chat
+    // marks the one thread per group that IS that group's own cover chat.
+    group_id: conv.group_id ?? null,
+    is_group_chat: !!conv.is_group_chat,
     // Where this thread's messages come in from (slack / cockpit / watch / …).
     source: deriveSource(conv.external_id),
+    quick_chat: quickChatSession ? serializeQuickChatSession(quickChatSession) : null,
     // True while a turn is actively processing — the authoritative signal for the
     // cockpit's status pill (fixes the "Idle while still thinking" desync).
     running: getInFlightMessageId(conv.id) != null,
@@ -139,6 +216,8 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     last_message_role: getLastMessageRole(conv.id),
     continued_from_id: conv.continued_from_id,
     continued_to_id: conv.continued_to_id,
+    // DAR-740 — latest point-in-time summary, for the "a summary exists" indicator.
+    latest_summary: getLatestThreadSummary(conv.id),
     dashboard_url: `${proto}://${host}/conversations/${conv.id}`,
     // DAR-680 AC#4 — per-thread provider/model selection.
     // model_override reflects the explicit per-thread choice (null when inheriting
@@ -175,10 +254,163 @@ function providerCatalog(): Array<Record<string, unknown>> {
   });
 }
 
+type ProviderUsageWindow = {
+  used_percentage: number | null;
+  resets_at: number | null;
+  label?: string;
+  value_label?: string | null;
+  detail?: string | null;
+};
+
+type ClaudeProviderUsage = {
+  five_hour: ProviderUsageWindow | null;
+  seven_day: ProviderUsageWindow | null;
+  model: string | null;
+  updated_at: number;
+};
+
+type CodexProviderUsage = {
+  windows: ProviderUsageWindow[];
+  plan: string | null;
+  email: string | null;
+  source: string | null;
+  updated_at: number;
+  error?: string | null;
+};
+
+function readClaudeLiveUsage(): ClaudeProviderUsage | null {
+  const LIVE_PATH = '/tmp/claude-usage-live.json';
+  const LIVE_STALE_MS = 3 * 60 * 1000;
+  try {
+    const st = statSync(LIVE_PATH);
+    const ageMs = Date.now() - st.mtimeMs;
+    if (ageMs <= LIVE_STALE_MS) {
+      const raw = JSON.parse(readFileSync(LIVE_PATH, 'utf8')) as {
+        five_hour?: { utilization?: number; resets_at?: string };
+        seven_day?: { utilization?: number; resets_at?: string };
+      };
+      const toWindow = (w?: { utilization?: number; resets_at?: string }) =>
+        w?.utilization != null && w?.resets_at
+          ? { used_percentage: w.utilization, resets_at: Math.floor(new Date(w.resets_at).getTime() / 1000) }
+          : null;
+      const five_hour = toWindow(raw.five_hour);
+      const seven_day = toWindow(raw.seven_day);
+      if (five_hour || seven_day) {
+        return {
+          five_hour,
+          seven_day,
+          model: null,
+          updated_at: Math.floor(st.mtimeMs / 1000),
+        };
+      }
+    }
+  } catch {
+    // fall through to statusline source
+  }
+
+  const STATUSLINE_PATH = '/tmp/claude-status.json';
+  const STATUSLINE_STALE_MS = 5 * 60 * 1000;
+  try {
+    const st = statSync(STATUSLINE_PATH);
+    const ageMs = Date.now() - st.mtimeMs;
+    if (ageMs > STATUSLINE_STALE_MS) return null;
+    const raw = JSON.parse(readFileSync(STATUSLINE_PATH, 'utf8')) as {
+      rate_limits?: {
+        five_hour?: { used_percentage?: number; resets_at?: number };
+        seven_day?: { used_percentage?: number; resets_at?: number };
+      };
+      model?: { display_name?: string };
+    };
+    const rl = raw.rate_limits;
+    if (!rl?.five_hour && !rl?.seven_day) return null;
+    const toStatuslineWindow = (w?: { used_percentage?: number; resets_at?: number }): ProviderUsageWindow | null =>
+      w
+        ? {
+            used_percentage: typeof w.used_percentage === 'number' ? w.used_percentage : null,
+            resets_at: typeof w.resets_at === 'number' ? w.resets_at : null,
+          }
+        : null;
+    return {
+      five_hour: toStatuslineWindow(rl.five_hour),
+      seven_day: toStatuslineWindow(rl.seven_day),
+      model: raw.model?.display_name ?? null,
+      updated_at: Math.floor(st.mtimeMs / 1000),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readCodexUsage(): CodexProviderUsage | null {
+  const LIVE_PATH = '/tmp/codex-usage-live.json';
+  try {
+    const st = statSync(LIVE_PATH);
+    const raw = JSON.parse(readFileSync(LIVE_PATH, 'utf8')) as {
+      windows?: Array<Partial<ProviderUsageWindow>>;
+      plan?: string | null;
+      email?: string | null;
+      source?: string | null;
+      updated_at?: number;
+      error?: string | null;
+    };
+    const windows = Array.isArray(raw.windows)
+      ? raw.windows
+          .map((w): ProviderUsageWindow | null => {
+            const usedPercentage = typeof w.used_percentage === 'number' ? w.used_percentage : null;
+            const resetsAt = typeof w.resets_at === 'number' ? w.resets_at : null;
+            const label = typeof w.label === 'string' && w.label.trim() ? w.label.trim() : undefined;
+            if (usedPercentage == null && resetsAt == null && !w.value_label) return null;
+            return {
+              used_percentage: usedPercentage,
+              resets_at: resetsAt,
+              ...(label ? { label } : {}),
+              value_label: typeof w.value_label === 'string' ? w.value_label : null,
+              detail: typeof w.detail === 'string' ? w.detail : null,
+            };
+          })
+          .filter((w): w is ProviderUsageWindow => w != null)
+      : [];
+    if (!windows.length && !raw.error) return null;
+    return {
+      windows,
+      plan: typeof raw.plan === 'string' ? raw.plan : null,
+      email: typeof raw.email === 'string' ? raw.email : null,
+      source: typeof raw.source === 'string' ? raw.source : null,
+      updated_at: typeof raw.updated_at === 'number' ? raw.updated_at : Math.floor(st.mtimeMs / 1000),
+      error: typeof raw.error === 'string' ? raw.error : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 const WATCH_PREFIX = 'From Kevin’s Watch:';
 const WATCH_PREFIX_ASCII = "From Kevin's Watch:";
 
-function serializeTurn(turn: TurnRow, convSource?: string): Record<string, unknown> {
+// DAR-744: rebuild SavedImage[] (with absolute disk paths) from the JSON
+// persisted on a queue row, so a drained queued message can hand images to
+// processMessage exactly like the immediate-dispatch path does.
+function reconstructSavedImages(json: string | null): SavedImage[] {
+  const stored = parseStoredImages(json);
+  const out: SavedImage[] = [];
+  for (const rec of stored) {
+    const absPath = resolveImagePath(rec.conversationId, rec.filename);
+    if (absPath) out.push({ ...rec, absPath });
+  }
+  return out;
+}
+
+function serializeTurnImages(turn: TurnRow, externalId?: string): { url: string; mime: string }[] | undefined {
+  if (!turn.images || !externalId) return undefined;
+  const stored = parseStoredImages(turn.images);
+  if (!stored.length) return undefined;
+  return stored.map((img) => ({
+    url: `/threads/${encodeURIComponent(externalId)}/images/${turn.turn_index}/${encodeURIComponent(img.filename)}`,
+    mime: img.mime,
+  }));
+}
+
+function serializeTurn(turn: TurnRow, convSource?: string, externalId?: string): Record<string, unknown> {
   // Per-message source: user turns inherit the thread's ingress source (with a
   // watch override when the dictation prefix is present); everything JARVIS
   // emits is tagged 'jarvis'.
@@ -191,10 +423,13 @@ function serializeTurn(turn: TurnRow, convSource?: string): Record<string, unkno
       source = 'jarvis';
     }
   }
+  const displayContent = (turn.role === 'assistant'
+    ? displayContentFromRawOutput(turn.content, turn.claude_output)
+    : turn.content) ?? null;
   return {
     turn_index: turn.turn_index,
     role: turn.role,
-    content: turn.content,
+    content: displayContent,
     tool_name: turn.tool_name,
     tool_args: turn.tool_args,
     tool_result: turn.tool_result,
@@ -215,6 +450,11 @@ function serializeTurn(turn: TurnRow, convSource?: string): Record<string, unkno
     // render a full trace after refresh instead of just the flattened content.
     // Null when there's nothing to derive (older turns, non-model turns).
     steps: parseTurnSteps(turn.claude_output),
+    // DAR-716: user turns sent with the plan-mode marker, so the cockpit can
+    // color the bubble without re-deriving it from raw content client-side.
+    plan_mode: turn.role === 'user' ? isPlanModeMessage(turn.content) : false,
+    // DAR-744: paste/attach-chip images on this (user) turn — undefined when none.
+    images: serializeTurnImages(turn, externalId),
   };
 }
 
@@ -281,11 +521,12 @@ function installQueueDrain(): void {
       const nextIndex = countTurns(convId);
       const messageId = `turn:${convId}:${nextIndex}`;
       errorByMessageId.delete(messageId);
-      processMessage(next.content, conv.external_id, messageId).catch((err: unknown) => {
+      const drainedImages = reconstructSavedImages(next.images);
+      processMessage(next.content, conv.external_id, messageId, drainedImages.length ? drainedImages : undefined).catch((err: unknown) => {
         // Lost the per-conversation mutex to another ingress mid-drain — re-queue
         // so the message isn't dropped; the winning turn's completion drains it.
         if (err instanceof ConversationBusyError) {
-          enqueueMessage(convId, next.content);
+          enqueueMessage(convId, next.content, next.images);
           return;
         }
         const message = err instanceof Error ? err.message : String(err);
@@ -301,6 +542,19 @@ export function createApiV1Router(): Router {
   router.use(bearerAuth as (req: Request, res: Response, next: NextFunction) => void);
   installQueueDrain();
 
+  // -- GET /brief: JARVIS-authored cockpit landing view -----------------------
+  // Not a fixed dashboard — JARVIS decides the content and shape fresh each
+  // time it goes stale (see jarvis-brief.ts). ?refresh=1 forces regeneration.
+
+  router.get('/brief', async (req: AuthedRequest, res) => {
+    try {
+      const brief = await getBrief(req.query.refresh === '1');
+      res.json(brief);
+    } catch (err) {
+      sendError(res, 500, 'brief_failed', (err as Error).message);
+    }
+  });
+
   // -- GET /providers: selectable provider/model catalog ---------------------
   // Populates the per-thread provider/model selector (DAR-680 AC#4).
 
@@ -308,79 +562,17 @@ export function createApiV1Router(): Router {
     res.json({ providers: providerCatalog() });
   });
 
-  // -- GET /provider-usage: Claude quota meter (DAR-696) ---------------------
-  // Primary source: /tmp/claude-usage-live.json, refreshed every 60s by a
-  // systemd timer (claude-usage-poll.timer) hitting the authenticated
-  // claude.ai usage endpoint directly — live regardless of whether a Claude
-  // Code session is active. Falls back to the passive statusline dump
-  // (~/.claude/statusline-dump.sh, only updates while Claude Code is in use)
-  // if the live file is missing or stale.
+  // -- GET /provider-usage: provider quota meters (DAR-696 + Codex) ----------
+  // Claude comes from /tmp/claude-usage-live.json, refreshed every 60s by
+  // claude-usage-poll.timer, with the older statusline dump as a fallback.
+  // Codex comes from /tmp/codex-usage-live.json, refreshed by a sibling timer
+  // using the local Codex CLI app-server rate-limit RPC first and WHAM second.
 
   router.get('/provider-usage', (_req: AuthedRequest, res) => {
-    const LIVE_PATH = '/tmp/claude-usage-live.json';
-    const LIVE_STALE_MS = 3 * 60 * 1000;
-    try {
-      const st = statSync(LIVE_PATH);
-      const ageMs = Date.now() - st.mtimeMs;
-      if (ageMs <= LIVE_STALE_MS) {
-        const raw = JSON.parse(readFileSync(LIVE_PATH, 'utf8')) as {
-          five_hour?: { utilization?: number; resets_at?: string };
-          seven_day?: { utilization?: number; resets_at?: string };
-        };
-        const toWindow = (w?: { utilization?: number; resets_at?: string }) =>
-          w?.utilization != null && w?.resets_at
-            ? { used_percentage: w.utilization, resets_at: Math.floor(new Date(w.resets_at).getTime() / 1000) }
-            : null;
-        const five_hour = toWindow(raw.five_hour);
-        const seven_day = toWindow(raw.seven_day);
-        if (five_hour || seven_day) {
-          res.json({
-            claude: {
-              five_hour,
-              seven_day,
-              model: null,
-              updated_at: Math.floor(st.mtimeMs / 1000),
-            },
-          });
-          return;
-        }
-      }
-    } catch {
-      // fall through to statusline source
-    }
-
-    const STATUSLINE_PATH = '/tmp/claude-status.json';
-    const STATUSLINE_STALE_MS = 5 * 60 * 1000;
-    try {
-      const st = statSync(STATUSLINE_PATH);
-      const ageMs = Date.now() - st.mtimeMs;
-      if (ageMs > STATUSLINE_STALE_MS) {
-        res.json({ claude: null });
-        return;
-      }
-      const raw = JSON.parse(readFileSync(STATUSLINE_PATH, 'utf8')) as {
-        rate_limits?: {
-          five_hour?: { used_percentage?: number; resets_at?: number };
-          seven_day?: { used_percentage?: number; resets_at?: number };
-        };
-        model?: { display_name?: string };
-      };
-      const rl = raw.rate_limits;
-      if (!rl?.five_hour && !rl?.seven_day) {
-        res.json({ claude: null });
-        return;
-      }
-      res.json({
-        claude: {
-          five_hour: rl.five_hour ?? null,
-          seven_day: rl.seven_day ?? null,
-          model: raw.model?.display_name ?? null,
-          updated_at: Math.floor(st.mtimeMs / 1000),
-        },
-      });
-    } catch {
-      res.json({ claude: null });
-    }
+    res.json({
+      claude: readClaudeLiveUsage(),
+      openai_codex: readCodexUsage(),
+    });
   });
 
   // -- GET /mcp/servers: live MCP Connection Manager list --------------------
@@ -521,53 +713,169 @@ export function createApiV1Router(): Router {
     res.status(201).json({ note });
   });
 
-  // == Bug/Task Intake (DAR-711) ================================================
-  // Ctrl+Shift+B in the cockpit -> POST here -> forwarded server-to-server to
-  // Paperclip's Universal Intake API (DAR-688), which opens a Foreman Job
-  // (DAR-687). This is a thin bridge, not a second intake system: the
-  // company/Foreman-project scoping happens once here so the browser widget
-  // never needs a Paperclip session or company id. Not thread-scoped — every
-  // caller sees the same outcome list, mirroring Paperclip's own widget.
+  // == Quick-capture todo widget (DAR-737) =====================================
+  // Standalone scratchpad list, not tied to any thread/task/project.
 
-  router.post('/intake', (req: AuthedRequest, res) => {
-    const body = (req.body ?? {}) as { repo?: unknown; text?: unknown; job_type?: unknown; ref?: unknown; context?: unknown };
-    const text = typeof body.text === 'string' ? body.text.trim() : '';
-    if (!text) {
-      sendError(res, 400, 'invalid_request', 'text is required and must be a non-empty string');
-      return;
-    }
-    const repo = typeof body.repo === 'string' && body.repo.trim() ? body.repo.trim() : 'darwin-assistant';
-    const jobType = body.job_type === 'build' ? 'build' : 'bug_fix';
-    submitIntake({
-      repo,
-      text,
-      jobType,
-      ref: typeof body.ref === 'string' ? body.ref : null,
-      context: typeof body.context === 'string' ? body.context : null,
-    })
-      .then((result) => res.status(202).json(result))
-      .catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        sendError(res, 502, 'intake_submit_failed', message);
-      });
+  router.get('/quick-capture', (_req: AuthedRequest, res) => {
+    res.json({ items: listActiveQuickCaptureItems() });
   });
 
-  router.get('/intake', (req: AuthedRequest, res) => {
-    const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit ?? '15'), 10) || 15));
-    listIntakeOutcomes(limit)
-      .then((outcomes) => res.json({ outcomes }))
-      .catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        sendError(res, 502, 'intake_list_failed', message);
+  router.post('/quick-capture', (req: AuthedRequest, res) => {
+    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    if (!content) {
+      sendError(res, 400, 'content_required', 'content is required');
+      return;
+    }
+    const item = createQuickCaptureItem(content);
+    res.status(201).json({ item });
+  });
+
+  router.patch('/quick-capture/reorder', (req: AuthedRequest, res) => {
+    const ids = req.body?.ids;
+    if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'number')) {
+      sendError(res, 400, 'ids_required', 'ids must be an array of item ids in the desired order');
+      return;
+    }
+    const items = reorderQuickCaptureItems(ids as number[]);
+    res.json({ items });
+  });
+
+  router.patch('/quick-capture/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getQuickCaptureItem(id)) {
+      sendError(res, 404, 'item_not_found', 'quick-capture item not found');
+      return;
+    }
+    let item = getQuickCaptureItem(id);
+    if (typeof req.body?.content === 'string') {
+      const content = req.body.content.trim();
+      if (!content) {
+        sendError(res, 400, 'content_required', 'content cannot be empty');
+        return;
+      }
+      item = renameQuickCaptureItem(id, content);
+    }
+    if (typeof req.body?.completed === 'boolean') {
+      item = setQuickCaptureItemCompleted(id, req.body.completed);
+    }
+    res.json({ item });
+  });
+
+  router.delete('/quick-capture/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getQuickCaptureItem(id)) {
+      sendError(res, 404, 'item_not_found', 'quick-capture item not found');
+      return;
+    }
+    deleteQuickCaptureItem(id);
+    res.status(204).end();
+  });
+
+  // == Quick Chat Profiles ====================================================
+  // Saved, pre-oriented disposable chat profiles. Opening one creates a fresh
+  // conversation with `quick:<profile>:<uuid>` external_id and profile context
+  // injected on every model turn. Sessions auto-archive after their TTL.
+
+  router.get('/quick-chat/profiles', (_req: AuthedRequest, res) => {
+    archiveExpiredQuickChatSessions();
+    res.json({ profiles: listQuickChatProfiles().map(serializeQuickChatProfile) });
+  });
+
+  router.post('/quick-chat/profiles', (req: AuthedRequest, res) => {
+    try {
+      const profile = saveQuickChatProfile(req.body ?? {});
+      res.status(201).json({ profile: serializeQuickChatProfile(profile) });
+    } catch (err) {
+      sendError(res, 400, 'invalid_request', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.patch('/quick-chat/profiles/:id', (req: AuthedRequest, res) => {
+    const id = paramString(req.params.id);
+    const existing = getQuickChatProfile(id);
+    if (!existing || existing.archived_at) {
+      sendError(res, 404, 'profile_not_found', `Quick chat profile ${id} not found`);
+      return;
+    }
+    try {
+      const profile = saveQuickChatProfile({
+        id,
+        name: req.body?.name ?? existing.name,
+        description: req.body?.description ?? existing.description,
+        instructions: req.body?.instructions ?? existing.instructions,
+        tool_scope: req.body?.tool_scope ?? existing.tool_scope,
+        ttl_hours: req.body?.ttl_hours ?? existing.ttl_hours,
+        sort_order: req.body?.sort_order ?? existing.sort_order,
       });
+      res.json({ profile: serializeQuickChatProfile(profile) });
+    } catch (err) {
+      sendError(res, 400, 'invalid_request', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.delete('/quick-chat/profiles/:id', (req: AuthedRequest, res) => {
+    const id = paramString(req.params.id);
+    if (!archiveQuickChatProfile(id)) {
+      sendError(res, 404, 'profile_not_found', `Quick chat profile ${id} not found`);
+      return;
+    }
+    res.status(204).end();
+  });
+
+  router.post('/quick-chat/profiles/:id/open', (req: AuthedRequest, res) => {
+    const id = paramString(req.params.id);
+    try {
+      const session = openQuickChatSession(id);
+      const conv = getConversationById(session.conversation_id);
+      if (!conv) {
+        sendError(res, 500, 'thread_missing', 'Quick chat session was created but the thread could not be loaded');
+        return;
+      }
+      res.status(201).json({
+        session: serializeQuickChatSession(session),
+        thread: threadDescriptor(conv, req),
+      });
+    } catch (err) {
+      sendError(res, 404, 'profile_not_found', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.get('/quick-chat/sessions', (req: AuthedRequest, res) => {
+    archiveExpiredQuickChatSessions();
+    const limit = Math.max(1, Math.min(200, parseInt(String(req.query.limit ?? '50'), 10) || 50));
+    res.json({ sessions: listQuickChatSessions(limit).map(serializeQuickChatSession) });
+  });
+
+  router.post('/quick-chat/sessions/:external_id/close', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    if (!callerOwnsExternalId(caller.id, externalId)) {
+      sendError(res, 403, 'thread_not_owned_by_caller', 'This quick chat session is not owned by the authenticated caller');
+      return;
+    }
+    const closed = closeQuickChatSession(externalId);
+    if (!closed) {
+      sendError(res, 404, 'session_not_found', `Quick chat session ${externalId} not found`);
+      return;
+    }
+    res.json({ session: serializeQuickChatSession(closed) });
   });
 
   // -- POST /threads: create a new thread ------------------------------------
 
   router.post('/threads', (req: AuthedRequest, res) => {
     const caller = req.apiKey!;
-    const body = (req.body ?? {}) as { external_id?: unknown; label?: unknown };
+    const body = (req.body ?? {}) as { external_id?: unknown; label?: unknown; group_id?: unknown };
     const providedId = typeof body.external_id === 'string' ? body.external_id.trim() : '';
+
+    let groupId: number | null = null;
+    if (body.group_id !== undefined && body.group_id !== null) {
+      if (typeof body.group_id !== 'number' || !getGroupById(body.group_id)) {
+        sendError(res, 404, 'group_not_found', `Group ${body.group_id} not found`);
+        return;
+      }
+      groupId = body.group_id;
+    }
 
     let externalId: string;
     if (providedId) {
@@ -587,12 +895,16 @@ export function createApiV1Router(): Router {
     }
 
     const conv = getOrCreateConversation(externalId);
-    res.status(201).json(threadDescriptor(conv, req));
+    if (groupId !== null) {
+      setThreadGroup(conv.id, groupId);
+    }
+    res.status(201).json(threadDescriptor(groupId !== null ? getConversation(externalId)! : conv, req));
   });
 
   // -- GET /threads: list caller's threads -----------------------------------
 
   router.get('/threads', (req: AuthedRequest, res) => {
+    archiveExpiredQuickChatSessions();
     const caller = req.apiKey!;
     const prefix = callerExternalIdPrefix(caller.id);
     const seesAllThreads = isAdminScope(caller.scope);
@@ -607,6 +919,39 @@ export function createApiV1Router(): Router {
     }).slice(0, limit);
 
     res.json({ threads: filtered.map((c) => threadDescriptor(c, req)) });
+  });
+
+  // -- POST /threads/search: AI-mediated natural-language search (DAR-741) ---
+  // Synchronous (unlike auto-title/summarize's fire-and-forget 202s) — the
+  // cockpit's search modal is waiting on this response to render results.
+
+  router.post('/threads/search', async (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const prefix = callerExternalIdPrefix(caller.id);
+    const seesAllThreads = isAdminScope(caller.scope);
+    const query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
+    if (!query) {
+      sendError(res, 400, 'missing_query', 'query is required');
+      return;
+    }
+
+    const candidates = listAllConversations().filter(
+      (c) => seesAllThreads || c.external_id.startsWith(prefix),
+    );
+
+    try {
+      const matches = await searchThreadsByQuery(query, candidates);
+      const byId = new Map(candidates.map((c) => [c.external_id, c]));
+      const results: Record<string, unknown>[] = [];
+      for (const m of matches) {
+        const conv = byId.get(m.thread_id);
+        if (conv) results.push({ ...threadDescriptor(conv, req), search_reason: m.reason });
+      }
+      res.json({ results });
+    } catch (err) {
+      console.error('[thread-search] search failed:', err);
+      sendError(res, 502, 'search_failed', 'Search failed — try again');
+    }
   });
 
   // -- GET /threads/:external_id ---------------------------------------------
@@ -624,7 +969,7 @@ export function createApiV1Router(): Router {
     const convSource = deriveSource(conv.external_id);
     res.json({
       ...threadDescriptor(conv, req),
-      turns: turns.map((t) => serializeTurn(t, convSource)),
+      turns: turns.map((t) => serializeTurn(t, convSource, conv.external_id)),
     });
   });
 
@@ -717,7 +1062,7 @@ export function createApiV1Router(): Router {
     });
   });
 
-  // -- PATCH /threads/:external_id: rename and/or archive --------------------
+  // -- PATCH /threads/:external_id: rename, archive ---------------------------
   // Body: { title?: string|null, status?: 'active'|'archived' }. Distinct from
   // the /model sub-route (Express matches that more specific path first).
 
@@ -730,7 +1075,12 @@ export function createApiV1Router(): Router {
       return;
     }
     const conv = result;
-    const body = (req.body ?? {}) as { title?: unknown; status?: unknown };
+    const body = (req.body ?? {}) as {
+      title?: unknown;
+      status?: unknown;
+      pinned?: unknown;
+      group_id?: unknown;
+    };
 
     if (body.title !== undefined) {
       if (body.title !== null && typeof body.title !== 'string') {
@@ -747,8 +1097,157 @@ export function createApiV1Router(): Router {
       }
       setConversationStatus(conv.id, body.status);
     }
+    if (body.pinned !== undefined) {
+      if (typeof body.pinned !== 'boolean') {
+        sendError(res, 400, 'invalid_request', 'pinned must be a boolean');
+        return;
+      }
+      setThreadPinned(conv.id, body.pinned);
+    }
+    if (body.group_id !== undefined) {
+      if (body.group_id !== null && typeof body.group_id !== 'number') {
+        sendError(res, 400, 'invalid_request', 'group_id must be a number or null');
+        return;
+      }
+      if (conv.is_group_chat) {
+        sendError(res, 400, 'invalid_request', 'A group\'s own cover chat cannot be re-filed into a group');
+        return;
+      }
+      if (body.group_id !== null && !getGroupById(body.group_id)) {
+        sendError(res, 404, 'group_not_found', `Group ${body.group_id} not found`);
+        return;
+      }
+      setThreadGroup(conv.id, body.group_id);
+    }
     const refreshed = getConversationById(conv.id) ?? conv;
     res.json(threadDescriptor(refreshed, req));
+  });
+
+  // -- Thread groups / folders (DAR-742) --------------------------------------
+
+  // GET /groups: list all groups with their member threads + cover chat.
+  router.get('/groups', (req: AuthedRequest, res) => {
+    const groups = listGroups();
+    res.json({
+      groups: groups.map((g) => {
+        const groupChatConv = getConversation(`cockpit:group:${g.id}`);
+        const members = listAllConversations().filter((c) => c.group_id === g.id && !c.is_group_chat);
+        return {
+          ...g,
+          group_chat: groupChatConv ? threadDescriptor(groupChatConv, req) : null,
+          members: members.map((c) => threadDescriptor(c, req)),
+        };
+      }),
+    });
+  });
+
+  // POST /groups: create a group + its cover chat. Body: { name, color? }.
+  router.post('/groups', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { name?: unknown; color?: unknown };
+    const name = typeof body.name === 'string' ? body.name.trim().slice(0, 100) : '';
+    if (!name) {
+      sendError(res, 400, 'invalid_request', 'name is required');
+      return;
+    }
+    const color = typeof body.color === 'string' ? body.color : null;
+    const { group, groupChat } = createGroup(name, color);
+    res.status(201).json({ ...group, group_chat: threadDescriptor(groupChat, req), members: [] });
+  });
+
+  // PATCH /groups/:id: rename / recolor. Body: { name?, color? }.
+  router.patch('/groups/:id', (req: AuthedRequest, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || !getGroupById(id)) {
+      sendError(res, 404, 'group_not_found', `Group ${req.params.id} not found`);
+      return;
+    }
+    const body = (req.body ?? {}) as { name?: unknown; color?: unknown };
+    let group = getGroupById(id);
+    if (body.name !== undefined) {
+      const name = typeof body.name === 'string' ? body.name.trim().slice(0, 100) : '';
+      if (!name) {
+        sendError(res, 400, 'invalid_request', 'name must be a non-empty string');
+        return;
+      }
+      group = renameGroup(id, name);
+    }
+    if (body.color !== undefined) {
+      if (body.color !== null && typeof body.color !== 'string') {
+        sendError(res, 400, 'invalid_request', 'color must be a string or null');
+        return;
+      }
+      group = setGroupColor(id, body.color);
+    }
+    res.json(group);
+  });
+
+  // DELETE /groups/:id: ungroups members (never deletes threads), archives the
+  // group's cover chat, drops the group row.
+  router.delete('/groups/:id', (req: AuthedRequest, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || !getGroupById(id)) {
+      sendError(res, 404, 'group_not_found', `Group ${req.params.id} not found`);
+      return;
+    }
+    deleteGroup(id);
+    res.status(204).end();
+  });
+
+  // -- POST /threads/:external_id/auto-title: manually (re)trigger the -------
+  // DAR-726 auto-title logic (DAR-728), bypassing the "already titled" guard.
+  // Fire-and-forget, like the send-time trigger — the title lands via the
+  // existing `conversation_renamed` SSE event.
+  router.post('/threads/:external_id/auto-title', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const conv = result;
+
+    const firstMessage = getTurns(conv.id).find((t) => t.role === 'user')?.content;
+    if (!firstMessage) {
+      sendError(res, 400, 'no_messages', 'Thread has no messages yet to title from');
+      return;
+    }
+
+    void autoNameThreadFromFirstMessage(conv, firstMessage, { force: true });
+    res.status(202).json({ status: 'generating' });
+  });
+
+  // -- POST /threads/:external_id/summarize: point-in-time summary (DAR-740) --
+  // Generates a "done / in progress / next" summary anchored to the last turn
+  // that exists right now; async like auto-title — the client hears back over
+  // the `thread_summary` SSE event once it lands.
+
+  router.post('/threads/:external_id/summarize', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const conv = result;
+    void generateThreadSummary(conv).catch((err) => {
+      console.error(`[thread-summarize] failed for conversation ${conv.id}:`, err);
+    });
+    res.status(202).json({ status: 'generating' });
+  });
+
+  // -- GET /threads/:external_id/summaries: list persisted summaries ----------
+
+  router.get('/threads/:external_id/summaries', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    res.json({ summaries: listThreadSummaries(result.id) });
   });
 
   // -- DELETE /threads/:external_id: delete thread + its turns/todos ----------
@@ -835,7 +1334,7 @@ export function createApiV1Router(): Router {
   router.post('/threads/:external_id/messages', (req: AuthedRequest, res) => {
     const caller = req.apiKey!;
     const externalId = paramString(req.params.external_id);
-    const body = (req.body ?? {}) as { text?: unknown };
+    const body = (req.body ?? {}) as { text?: unknown; images?: unknown };
     const text = typeof body.text === 'string' ? body.text : '';
 
     if (!text.trim()) {
@@ -854,13 +1353,31 @@ export function createApiV1Router(): Router {
     }
     const conv = result;
 
+    // DAR-744: decode + persist any attached images up front (before deciding
+    // queued vs immediate below) so both dispatch paths see the same saved
+    // records. Bytes land on disk under image-store's UPLOADS_DIR either way —
+    // a queued message's images just wait alongside the queue row until drained.
+    let savedImages: SavedImage[] = [];
+    if (Array.isArray(body.images) && body.images.length) {
+      try {
+        savedImages = saveMessageImages(conv.id, countTurns(conv.id), body.images as IncomingImage[]);
+      } catch (err) {
+        const message = err instanceof ImageValidationError ? err.message : 'failed to save attached image(s)';
+        sendError(res, 400, 'invalid_image', message);
+        return;
+      }
+    }
+    const imagesJson = savedImages.length
+      ? JSON.stringify(savedImages.map(({ filename, mime, conversationId }) => ({ filename, mime, conversationId })))
+      : undefined;
+
     // If a turn is already running, park this message on the server-owned queue
     // instead of bouncing. It's drained oldest-first when the current turn ends
     // (see the status listener below). The queue is exposed over API + SSE, so it
     // survives a refresh and stays in sync across every browser on this thread.
     const pending = getInFlightMessageId(conv.id);
     if (pending) {
-      const queued = enqueueMessage(conv.id, text);
+      const queued = enqueueMessage(conv.id, text, imagesJson);
       res.status(202).json({
         status: 'queued',
         queued_id: queued.id,
@@ -873,7 +1390,14 @@ export function createApiV1Router(): Router {
     const messageId = `turn:${conv.id}:${nextIndex}`;
     errorByMessageId.delete(messageId);
 
-    processMessage(text, externalId, messageId)
+    // DAR-726: the thread's very first message, and nobody's named it yet —
+    // kick off auto-naming in the background. Doesn't block the send response
+    // or the actual turn; the title lands later via a `conversation_renamed` SSE.
+    if (nextIndex === 0 && conv.title === null && !conv.title_is_user_set) {
+      void autoNameThreadFromFirstMessage(conv, text);
+    }
+
+    processMessage(text, externalId, messageId, savedImages.length ? savedImages : undefined)
       .catch((err: unknown) => {
         // A busy error here means another ingress won the mutex between the
         // pre-flight check and processMessage's synchronous registration.
@@ -891,6 +1415,41 @@ export function createApiV1Router(): Router {
       poll_url: `${base}/messages/${messageId}`,
       events_url: `${base}/events`,
     });
+  });
+
+  // -- GET /threads/:external_id/images/:turn_index/:filename: serve an -----
+  // -- attached image (DAR-744) ----------------------------------------------
+  // The turn_index + filename must both match a real record on a turn the
+  // caller is authorized to view — resolveImagePath only ever reads bytes for
+  // the conversationId recorded on that turn's own images JSON, not whatever
+  // the URL happens to contain, so this can't be used to read another thread's
+  // uploads even though the physical path (image-store's UPLOADS_DIR) is keyed
+  // by numeric conversation id rather than external_id.
+  router.get('/threads/:external_id/images/:turn_index/:filename', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const conv = result;
+    const turnIndex = Number(paramString(req.params.turn_index));
+    const filename = paramString(req.params.filename);
+
+    const turn = getTurns(conv.id).find((t) => t.turn_index === turnIndex);
+    const stored = turn ? parseStoredImages(turn.images) : [];
+    const rec = stored.find((s) => s.filename === filename);
+    if (!rec) {
+      sendError(res, 404, 'image_not_found', 'No such attached image on this turn');
+      return;
+    }
+    const absPath = resolveImagePath(rec.conversationId, rec.filename);
+    if (!absPath) {
+      sendError(res, 404, 'image_not_found', 'Attached image is no longer on disk');
+      return;
+    }
+    res.type(rec.mime).sendFile(absPath);
   });
 
   // -- DELETE /threads/:external_id/queue/:queue_id: cancel a queued message -
@@ -961,9 +1520,9 @@ export function createApiV1Router(): Router {
       message_id: messageId,
       status: 'done',
       text: assistantTurn.content,
-      turn: serializeTurn(assistantTurn),
-      user_turn: serializeTurn(userTurn),
-      tool_calls: toolCalls.map((t) => serializeTurn(t)),
+      turn: serializeTurn(assistantTurn, undefined, conv.external_id),
+      user_turn: serializeTurn(userTurn, undefined, conv.external_id),
+      tool_calls: toolCalls.map((t) => serializeTurn(t, undefined, conv.external_id)),
     });
   });
 
@@ -993,6 +1552,99 @@ export function createApiV1Router(): Router {
       thread: threadDescriptor(conv, req),
       entries,
     });
+  });
+
+  // -- Thread reminders (auto-bump) -----------------------------------------
+  //
+  // A thread holds at most one active reminder. Arming replaces whatever was
+  // there, so the UI's "remind me in X" is idempotent rather than stacking
+  // competing alarms. Firing is handled by the reminder worker, not here.
+
+  /** Convert an ISO instant to the UTC 'YYYY-MM-DD HH:MM:SS' SQLite stores. */
+  const toSqliteUtc = (d: Date): string => d.toISOString().slice(0, 19).replace('T', ' ');
+
+  router.put('/threads/:external_id/reminder', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+
+    const body = (req.body ?? {}) as {
+      in_minutes?: unknown;
+      fire_at?: unknown;
+      note?: unknown;
+      repeat_minutes?: unknown;
+    };
+
+    // Accept either a relative offset ("remind me in 30 minutes" — what the
+    // preset buttons send) or an absolute instant (the date/time picker).
+    let fireAt: Date;
+    if (typeof body.in_minutes === 'number' && Number.isFinite(body.in_minutes)) {
+      if (body.in_minutes < 1 || body.in_minutes > 60 * 24 * 365) {
+        sendError(res, 400, 'invalid_request', 'in_minutes must be between 1 and 525600');
+        return;
+      }
+      fireAt = new Date(Date.now() + body.in_minutes * 60_000);
+    } else if (typeof body.fire_at === 'string') {
+      const parsed = new Date(body.fire_at);
+      if (Number.isNaN(parsed.getTime())) {
+        sendError(res, 400, 'invalid_request', 'fire_at must be a valid ISO 8601 timestamp');
+        return;
+      }
+      fireAt = parsed;
+    } else {
+      sendError(res, 400, 'invalid_request', 'one of in_minutes (number) or fire_at (ISO string) is required');
+      return;
+    }
+
+    let repeatMinutes: number | null = null;
+    if (body.repeat_minutes != null) {
+      const n = Number(body.repeat_minutes);
+      if (!Number.isFinite(n) || n < 1 || n > 60 * 24 * 7) {
+        sendError(res, 400, 'invalid_request', 'repeat_minutes must be between 1 and 10080');
+        return;
+      }
+      repeatMinutes = Math.round(n);
+    }
+
+    const note = typeof body.note === 'string' && body.note.trim() ? body.note.trim().slice(0, 500) : null;
+
+    const reminder = setThreadReminder(result.id, toSqliteUtc(fireAt), note, repeatMinutes);
+    res.status(201).json({ reminder: serializeReminder(reminder), thread: threadDescriptor(result, req) });
+  });
+
+  /** Dismiss the current alert. A repeating reminder stays armed. */
+  router.post('/threads/:external_id/reminder/ack', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const active = activeReminderForConversation(result.id);
+    if (!active) {
+      res.json({ reminder: null });
+      return;
+    }
+    const acked = acknowledgeThreadReminder(active.id);
+    res.json({ reminder: acked ? serializeReminder(acked) : null });
+  });
+
+  /** Turn the reminder off entirely. */
+  router.delete('/threads/:external_id/reminder', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    cancelRemindersForConversation(result.id);
+    res.json({ reminder: null });
   });
 
   // -- GET /threads/:external_id/todos: list per-thread todos ---------------
@@ -1232,9 +1884,15 @@ export function createApiV1Router(): Router {
   // -- GET /events: GLOBAL stream across all of the caller's threads ----------
   // Powers the sidebar's live view — a Slack message landing on any thread, or
   // JARVIS replying to it, bumps + re-statuses the row in real time without the
-  // thread being open. Deliberately drops per-token stream_* events (those are
-  // for the open thread's timeline only); forwards the list-relevant events.
-
+  // thread being open. Forwards the list-relevant events, plus (DAR-717)
+  // per-token stream_* events annotated with external_id so a client CAN fold
+  // its per-thread live connection into this one instead of opening a second
+  // long-lived SSE connection per open tab — see DAR-717 for why that matters
+  // (plain HTTP/1.1 caps a browser at ~6 connections per origin; today's two
+  // SSE connections per tab means as few as 3 open tabs exhausts it). Nothing
+  // consumes these here yet — the cockpit still opens its own per-thread
+  // stream — this is prep for that consolidation, additive and unused until
+  // the frontend is updated to rely on it.
   router.get('/events', (req: AuthedRequest, res) => {
     const caller = req.apiKey!;
     const seesAll = isAdminScope(caller.scope);
@@ -1242,7 +1900,9 @@ export function createApiV1Router(): Router {
     const FORWARD = new Set([
       'turn', 'conversation_updated', 'conversation_created',
       'conversation_renamed', 'conversation_deleted', 'status', 'thread_todo',
-      'queued_message', 'note',
+      'thread_reminder',
+      'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
+      'quick_capture', 'thread_summary',
     ]);
 
     res.writeHead(200, {
@@ -1436,6 +2096,115 @@ export function createApiV1Router(): Router {
     }
     const info = getActiveAdapterInfo();
     res.json({ ok: true, active_adapter: info.adapter, active_model: info.model });
+  });
+
+  // == Control panel (DAR-729) =================================================
+  // Live run count + historical run log + personality stats w/ change history,
+  // for the JARVIS Cockpit's new Control Panel tab. Read endpoints are open to
+  // any authed key (same as /settings GET); writes require admin scope.
+
+  router.get('/control-panel/active-runs', (_req: AuthedRequest, res) => {
+    res.json({ count: getActiveRunCount(), runs: getActiveRuns() });
+  });
+
+  router.get('/control-panel/run-history', (req: AuthedRequest, res) => {
+    const limitRaw = parseInt(String(req.query.limit ?? '50'), 10);
+    const offsetRaw = parseInt(String(req.query.offset ?? '0'), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, limitRaw)) : 50;
+    const offset = Number.isFinite(offsetRaw) ? Math.max(0, offsetRaw) : 0;
+    const { rows, total } = listRunHistory(limit, offset);
+    res.json({
+      total,
+      limit,
+      offset,
+      runs: rows.map((r) => {
+        const running = getInFlightMessageId(r.id) != null;
+        return {
+          conversation_id: r.id,
+          external_id: r.external_id,
+          title: r.title,
+          source: deriveSource(r.external_id),
+          status: r.status,
+          started_at: r.created_at,
+          updated_at: r.updated_at,
+          duration_seconds: r.duration_seconds,
+          turn_count: r.turn_count,
+          tool_call_count: r.tool_call_count,
+          outcome: classifyRunOutcome(running, r.status, r.error_count, r.last_error_detail),
+          running,
+        };
+      }),
+    });
+  });
+
+  // Turn-by-turn detail for a single run (DAR-732) — powers the Control Panel's
+  // click-into-a-run-history-row drill-down. `getTurns` already returns the raw
+  // rows in turn_index order (user/assistant/tool_call/tool_result), so this is
+  // a thin wrapper that adds the conversation summary + outcome around them.
+  router.get('/control-panel/run-history/:id/turns', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id)) {
+      sendError(res, 400, 'invalid_request', 'id must be a number');
+      return;
+    }
+    const conversation = getConversationById(id);
+    if (!conversation) {
+      sendError(res, 404, 'not_found', `No conversation with id ${id}`);
+      return;
+    }
+    const turns = getTurns(id);
+    const errorCount = turns.filter((t) => t.error_detail != null).length;
+    const lastErrorDetail = [...turns].reverse().find((t) => t.error_detail != null)?.error_detail ?? null;
+    const running = getInFlightMessageId(id) != null;
+    res.json({
+      conversation: {
+        conversation_id: conversation.id,
+        external_id: conversation.external_id,
+        title: conversation.title,
+        source: deriveSource(conversation.external_id),
+        status: conversation.status,
+        started_at: conversation.created_at,
+        updated_at: conversation.updated_at,
+        outcome: classifyRunOutcome(running, conversation.status, errorCount, lastErrorDetail),
+        running,
+      },
+      turns,
+    });
+  });
+
+  router.get('/control-panel/personality-stats', (_req: AuthedRequest, res) => {
+    res.json({ stats: getPersonalityStats(), keys: PERSONALITY_STAT_KEYS });
+  });
+
+  router.patch('/control-panel/personality-stats', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Changing personality stats requires an admin-scoped key');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const patch: Partial<Record<(typeof PERSONALITY_STAT_KEYS)[number], number>> = {};
+    for (const key of PERSONALITY_STAT_KEYS) {
+      const value = body[key];
+      if (value === undefined) continue;
+      const num = Number(value);
+      if (!Number.isFinite(num)) {
+        sendError(res, 400, 'invalid_request', `${key} must be a number`);
+        return;
+      }
+      patch[key] = num;
+    }
+    if (Object.keys(patch).length === 0) {
+      sendError(res, 400, 'invalid_request', `Provide at least one of: ${PERSONALITY_STAT_KEYS.join(', ')}`);
+      return;
+    }
+    const stats = updatePersonalityStats(patch, req.apiKey!.caller_label ?? null);
+    res.json({ ok: true, stats });
+  });
+
+  router.get('/control-panel/personality-stats/history', (req: AuthedRequest, res) => {
+    const limitRaw = parseInt(String(req.query.limit ?? '100'), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, limitRaw)) : 100;
+    res.json({ history: getPersonalityStatsHistory(limit) });
   });
 
   // == Check-ins (DAR-676 — port of the 3201 /checkins page) ==================

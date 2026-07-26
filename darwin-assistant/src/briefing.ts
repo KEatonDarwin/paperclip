@@ -106,7 +106,7 @@ function isMutedCalendarEvent(eventId: string, mutedIds: Set<string>): boolean {
 
 // ─── Paperclip helpers ────────────────────────────────────────────────────────
 
-async function getPaperclipSnapshot(): Promise<string> {
+export async function getPaperclipSnapshot(): Promise<string> {
   try {
     const rows = await query<Record<string, string>>(
       `SELECT
@@ -134,7 +134,7 @@ async function getPaperclipSnapshot(): Promise<string> {
 
 // ─── SHIM helpers ─────────────────────────────────────────────────────────────
 
-async function getShimSnapshot(): Promise<{ tasks: string; sessions: string }> {
+export async function getShimSnapshot(): Promise<{ tasks: string; sessions: string }> {
   const shimUrl = process.env.SHIM_MCP_URL ?? 'https://somehow.thedarwinhub.com/mcp';
   const token = process.env.SHIM_MCP_TOKEN;
   const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: 'application/json' };
@@ -180,7 +180,7 @@ async function getShimSnapshot(): Promise<{ tasks: string; sessions: string }> {
 
 // ─── Top priorities ───────────────────────────────────────────────────────────
 
-async function getTopPriorities(): Promise<string> {
+export async function getTopPriorities(): Promise<string> {
   const shimUrl = process.env.SHIM_MCP_URL ?? 'https://somehow.thedarwinhub.com/mcp';
   const token = process.env.SHIM_MCP_TOKEN;
   const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: 'application/json' };

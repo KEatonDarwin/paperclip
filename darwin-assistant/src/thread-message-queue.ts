@@ -12,6 +12,7 @@ export interface QueuedMessageRow {
   conversation_id: number;
   content: string;
   created_at: string;
+  images: string | null;
 }
 
 sqliteDb.exec(`
@@ -26,9 +27,14 @@ sqliteDb.exec(`
     ON thread_message_queue(conversation_id, id);
 `);
 
-const insertStmt = sqliteDb.prepare<[number, string]>(`
-  INSERT INTO thread_message_queue (conversation_id, content)
-  VALUES (?, ?)
+// DAR-744: images attached to a message that got parked on the queue (a turn
+// was already running) — same JSON shape as turns.images, decoded back into
+// SavedImage[] on drain (see reconstructSavedImages in handlers/api-v1.ts).
+try { sqliteDb.exec(`ALTER TABLE thread_message_queue ADD COLUMN images TEXT`); } catch {}
+
+const insertStmt = sqliteDb.prepare<[number, string, string | null]>(`
+  INSERT INTO thread_message_queue (conversation_id, content, images)
+  VALUES (?, ?, ?)
 `);
 
 const getByIdStmt = sqliteDb.prepare<[number], QueuedMessageRow>(
@@ -60,8 +66,8 @@ export function listQueuedMessages(conversationId: number): QueuedMessageRow[] {
   return listByConversationStmt.all(conversationId);
 }
 
-export function enqueueMessage(conversationId: number, content: string): QueuedMessageRow {
-  const info = insertStmt.run(conversationId, content);
+export function enqueueMessage(conversationId: number, content: string, images?: string | null): QueuedMessageRow {
+  const info = insertStmt.run(conversationId, content, images ?? null);
   const created = getByIdStmt.get(Number(info.lastInsertRowid));
   if (!created) throw new Error('Failed to load queued message after insert');
   emit(conversationId, 'created', created);

@@ -13,10 +13,15 @@ import { secretService } from "./secrets.js";
 export const BUILT_IN_MODELS: Record<LlmProvider, Array<{ modelKey: string; displayName: string; contextWindow: number | null }>> = {
   anthropic: [
     { modelKey: "claude-opus-5", displayName: "Claude Opus 5", contextWindow: 1_000_000 },
+    { modelKey: "claude-opus-4-8", displayName: "Claude Opus 4.8", contextWindow: 200_000 },
+    { modelKey: "claude-opus-4-7", displayName: "Claude Opus 4.7", contextWindow: 200_000 },
     { modelKey: "claude-opus-4-6", displayName: "Claude Opus 4.6", contextWindow: 200_000 },
+    { modelKey: "claude-sonnet-5", displayName: "Claude Sonnet 5", contextWindow: 200_000 },
     { modelKey: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6", contextWindow: 200_000 },
+    { modelKey: "claude-fable-5", displayName: "Claude Fable 5", contextWindow: 200_000 },
     { modelKey: "claude-haiku-4-6", displayName: "Claude Haiku 4.6", contextWindow: 200_000 },
     { modelKey: "claude-sonnet-4-5-20250929", displayName: "Claude Sonnet 4.5", contextWindow: 200_000 },
+    { modelKey: "claude-sonnet-4-5-20250514", displayName: "Claude Sonnet 4.5 (May)", contextWindow: 200_000 },
     { modelKey: "claude-haiku-4-5-20251001", displayName: "Claude Haiku 4.5", contextWindow: 200_000 },
   ],
   openai: [

@@ -496,7 +496,7 @@ function buildInitialPrompt(userMessage: string): string {
   return [buildSystemPrompt(), buildToolsBlock(), '---', `Human: ${userMessage}`, 'Assistant:'].join('\n\n');
 }
 
-function adapterFromModel(model: string | null | undefined): string | null {
+export function adapterFromModel(model: string | null | undefined): string | null {
   if (!model) return null;
   const normalized = model.toLowerCase();
   if (normalized.includes('claude')) return 'claude';
@@ -505,10 +505,29 @@ function adapterFromModel(model: string | null | undefined): string | null {
   return null;
 }
 
-function resolveSessionAdapter(conv: ConversationRow, turns: TurnRow[]): string | null {
+// DAR-759: `session_adapter` is the ONLY authoritative signal for which provider
+// owns this conversation's session. Model-name inference is a fragile legacy
+// fallback ONLY — Augment is a harness whose model shelf contains ids literally
+// named `gpt-5.5`, `claude-opus-...`, etc., so adapterFromModel() would mis-infer
+// an auggie turn as codex/claude and fire a false provider-switch replay. To
+// prevent that, when the CURRENT runtime adapter is auggie we resolve the session
+// adapter to auggie directly rather than trusting an ambiguous shelf model name.
+// This is what makes switching models WITHIN augment a no-op for the session.
+export function resolveSessionAdapter(
+  conv: ConversationRow,
+  turns: TurnRow[],
+  currentAdapterId?: string,
+): string | null {
   if (conv.session_adapter) return conv.session_adapter;
+  // No stored adapter (legacy row). If we're currently running through auggie,
+  // this session is auggie's — never let a shelf model name impersonate another
+  // provider and trigger a false replay.
+  if (currentAdapterId === 'auggie') return 'auggie';
   for (let i = turns.length - 1; i >= 0; i--) {
     const inferred = adapterFromModel(turns[i]?.model);
+    // Guard the reverse collision too: a legacy turn's model name that happens to
+    // match auggie's shelf must not resolve this session to a different provider
+    // while we're mid-auggie. (currentAdapterId==='auggie' already returned above.)
     if (inferred) return inferred;
   }
   return null;
@@ -1051,8 +1070,17 @@ async function runConversationTurn(
   };
 
   let sessionId = conv.claude_session_id;
-  const storedSessionAdapter = resolveSessionAdapter(conv, turns);
+  const storedSessionAdapter = resolveSessionAdapter(conv, turns, adapter.id);
 
+  // DAR-759: the resume-vs-replay decision is keyed on the ADAPTER (provider:
+  // claude/codex/auggie), never the model. Augment's entire model shelf lives
+  // under the single `auggie` adapter, so switching model WITHIN augment
+  // (e.g. Opus 4.8 -> GPT-5.5, both via auggie) keeps adapter.id==='auggie' and
+  // is a deliberate NO-OP here — the session id is preserved and NO transcript
+  // replay is built. Augment's own harness handles model switching inside one
+  // session. Only a real PROVIDER change (storedSessionAdapter !== adapter.id)
+  // nulls the session and rebuilds context via transcript replay. Do not
+  // reintroduce the model into this key.
   if (sessionId && storedSessionAdapter && storedSessionAdapter !== adapter.id) {
     console.log(
       `[agent] Conversation ${conv.id} switching adapters (${storedSessionAdapter} -> ${adapter.id}); starting a fresh session from transcript`,

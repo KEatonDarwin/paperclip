@@ -117,6 +117,7 @@ export type {
   CompanySecret,
   SecretProviderDescriptor,
 } from "./secrets.js";
+export type { ProviderModel, ProviderStatus } from "./provider-models.js";
 export type {
   Routine,
   RoutineTrigger,

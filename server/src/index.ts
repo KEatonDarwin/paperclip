@@ -28,7 +28,7 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
-import { heartbeatService, reconcilePersistedRuntimeServicesOnStartup, routineService } from "./services/index.js";
+import { heartbeatService, modelCatalogService, reconcilePersistedRuntimeServicesOnStartup, routineService } from "./services/index.js";
 import { hopperSlackPoller } from "./services/hopper-slack-poller.js";
 import { hopperCalendarPlacer } from "./services/hopper-calendar-placer.js";
 import { hopperDailyBriefing } from "./services/hopper-daily-briefing.js";
@@ -640,6 +640,22 @@ export async function startServer(): Promise<StartedServer> {
       }, 60_000);
       logger.info("hopper daily briefing registered (fires at configured time, default 05:30)");
     }
+  }
+
+  {
+    const modelCatalog = modelCatalogService(db as any);
+    const MODEL_CATALOG_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000; // twice a day
+    const runModelCatalogRefresh = async () => {
+      const companyRows = await (db as any).select({ id: companies.id }).from(companies);
+      const result = await modelCatalog.refreshAllCompanies(companyRows.map((row: { id: string }) => row.id));
+      logger.info({ ...result }, "model catalog refresh tick complete");
+    };
+    setInterval(() => {
+      void runModelCatalogRefresh().catch((err) => {
+        logger.error({ err }, "model catalog refresh tick failed");
+      });
+    }, MODEL_CATALOG_REFRESH_INTERVAL_MS);
+    logger.info("model catalog refresh registered (12h interval)");
   }
 
   if (config.databaseBackupEnabled) {

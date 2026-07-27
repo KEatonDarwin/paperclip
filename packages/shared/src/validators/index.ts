@@ -204,6 +204,13 @@ export {
 } from "./secret.js";
 
 export {
+  createProviderModelSchema,
+  updateProviderModelSchema,
+  type CreateProviderModel,
+  type UpdateProviderModel,
+} from "./provider-model.js";
+
+export {
   createRoutineSchema,
   updateRoutineSchema,
   createRoutineTriggerSchema,

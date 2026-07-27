@@ -220,6 +220,12 @@ export type SecretProvider = (typeof SECRET_PROVIDERS)[number];
 export const STORAGE_PROVIDERS = ["local_disk", "s3"] as const;
 export type StorageProvider = (typeof STORAGE_PROVIDERS)[number];
 
+export const LLM_PROVIDERS = ["anthropic", "openai", "google", "other"] as const;
+export type LlmProvider = (typeof LLM_PROVIDERS)[number];
+
+export const PROVIDER_MODEL_SOURCES = ["discovered", "manual"] as const;
+export type ProviderModelSource = (typeof PROVIDER_MODEL_SOURCES)[number];
+
 export const BILLING_TYPES = [
   "metered_api",
   "subscription_included",

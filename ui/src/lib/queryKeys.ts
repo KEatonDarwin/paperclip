@@ -105,6 +105,10 @@ export const queryKeys = {
     list: (companyId: string) => ["secrets", companyId] as const,
     providers: (companyId: string) => ["secret-providers", companyId] as const,
   },
+  modelCatalog: {
+    list: (companyId: string) => ["model-catalog", companyId] as const,
+    providers: (companyId: string) => ["model-catalog-providers", companyId] as const,
+  },
   dashboard: (companyId: string) => ["dashboard", companyId] as const,
   sidebarBadges: (companyId: string) => ["sidebar-badges", companyId] as const,
   activity: (companyId: string) => ["activity", companyId] as const,

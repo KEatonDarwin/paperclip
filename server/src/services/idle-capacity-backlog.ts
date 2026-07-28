@@ -16,6 +16,7 @@ import { and, eq, like } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { jobs } from "@paperclipai/db";
 import { issueService } from "./issues.js";
+import { projectService } from "./projects.js";
 
 export const AUTONOMY_APPROVED_LABEL = "autonomy-approved";
 export const IDLE_CAPACITY_EXTERNAL_REF_PREFIX = "idle-capacity:";
@@ -35,6 +36,13 @@ export interface AutonomyApprovedBacklogItem {
   status: string;
   priority: string;
   createdAt: Date;
+  /**
+   * The issue's project's primary workspace repo (cwd, falling back to repoUrl), resolved so
+   * Phase 2 dispatch (idle-capacity-dispatch.ts) knows which repo to hand Foreman. null when
+   * the issue has no project, or the project has no workspace with a repo configured — such
+   * items are surfaced (not silently dropped) so the caller can decide whether to skip them.
+   */
+  repoPath: string | null;
 }
 
 /**
@@ -47,6 +55,7 @@ export async function listAutonomyApprovedBacklog(
   companyId: string,
 ): Promise<AutonomyApprovedBacklogItem[]> {
   const svc = issueService(db);
+  const projects = projectService(db);
   const allLabels = await svc.listLabels(companyId);
   const label = allLabels.find((l) => l.name === AUTONOMY_APPROVED_LABEL);
   if (!label) return [];
@@ -56,25 +65,34 @@ export async function listAutonomyApprovedBacklog(
 
   // One IN-ish query per candidate is fine at backlog scale (dozens, not thousands) — a
   // pre-approved queue is meant to be small and hand-curated, not a bulk work generator.
-  const openByIssue = await Promise.all(
-    candidates.map(async (issue) => {
-      if (!issue.identifier) return false;
-      const rows = await db
-        .select({ status: jobs.status })
-        .from(jobs)
-        .where(
-          and(
-            eq(jobs.companyId, companyId),
-            like(jobs.externalRef, `${encodeIdleCapacityExternalRef(issue.identifier)}%`),
-          ),
-        );
-      return rows.some((r) => OPEN_JOB_STATUSES.has(r.status));
-    }),
-  );
+  const [openByIssue, repoPathByIssue] = await Promise.all([
+    Promise.all(
+      candidates.map(async (issue) => {
+        if (!issue.identifier) return false;
+        const rows = await db
+          .select({ status: jobs.status })
+          .from(jobs)
+          .where(
+            and(
+              eq(jobs.companyId, companyId),
+              like(jobs.externalRef, `${encodeIdleCapacityExternalRef(issue.identifier)}%`),
+            ),
+          );
+        return rows.some((r) => OPEN_JOB_STATUSES.has(r.status));
+      }),
+    ),
+    Promise.all(
+      candidates.map(async (issue) => {
+        if (!issue.projectId) return null;
+        const workspaces = await projects.listWorkspaces(issue.projectId);
+        const primary = workspaces[0]; // listWorkspaces orders isPrimary DESC, createdAt ASC
+        return primary?.cwd ?? primary?.repoUrl ?? null;
+      }),
+    ),
+  ]);
 
   return candidates
-    .filter((_, i) => !openByIssue[i])
-    .map((issue) => ({
+    .map((issue, i) => ({
       issueId: issue.id,
       identifier: issue.identifier,
       title: issue.title,
@@ -82,6 +100,10 @@ export async function listAutonomyApprovedBacklog(
       status: issue.status,
       priority: issue.priority,
       createdAt: issue.createdAt,
+      repoPath: repoPathByIssue[i] ?? null,
+      isOpen: openByIssue[i],
     }))
+    .filter((item) => !item.isOpen)
+    .map(({ isOpen: _isOpen, ...item }) => item)
     .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 }

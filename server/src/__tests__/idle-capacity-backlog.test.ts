@@ -12,6 +12,7 @@ import {
   jobs,
   labels,
   projects,
+  projectWorkspaces,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -49,6 +50,7 @@ describeEmbeddedPostgres("listAutonomyApprovedBacklog", () => {
     await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(labels);
     await db.delete(companies);
@@ -203,5 +205,52 @@ describeEmbeddedPostgres("listAutonomyApprovedBacklog", () => {
 
     const result = await listAutonomyApprovedBacklog(db, companyId);
     expect(result.map((r) => r.identifier).sort()).toEqual(["DAR-9102", "DAR-9103"]);
+  });
+
+  it("resolves repoPath from the issue's project's primary workspace, and reports null when unresolvable", async () => {
+    const companyId = await setupCompany();
+    const [approvedLabel] = await db
+      .insert(labels)
+      .values({ companyId, name: AUTONOMY_APPROVED_LABEL, color: "#8B5CF6" })
+      .returning();
+
+    const [project] = await db.insert(projects).values({ companyId, name: "darwin-assistant" }).returning();
+    await db.insert(projectWorkspaces).values([
+      { companyId, projectId: project.id, name: "secondary", cwd: "/tmp/not-primary", isPrimary: false },
+      { companyId, projectId: project.id, name: "primary", cwd: "/tmp/darwin-assistant", isPrimary: true },
+    ]);
+
+    const withRepo = randomUUID();
+    const withoutProject = randomUUID();
+
+    await db.insert(issues).values([
+      {
+        id: withRepo,
+        companyId,
+        identifier: "DAR-9201",
+        title: "Has a project with a primary workspace",
+        status: "backlog",
+        priority: "medium",
+        projectId: project.id,
+      },
+      {
+        id: withoutProject,
+        companyId,
+        identifier: "DAR-9202",
+        title: "No project at all",
+        status: "backlog",
+        priority: "medium",
+      },
+    ]);
+
+    await db.insert(issueLabels).values([
+      { issueId: withRepo, labelId: approvedLabel.id, companyId },
+      { issueId: withoutProject, labelId: approvedLabel.id, companyId },
+    ]);
+
+    const result = await listAutonomyApprovedBacklog(db, companyId);
+    const byIdentifier = Object.fromEntries(result.map((r) => [r.identifier, r.repoPath]));
+    expect(byIdentifier["DAR-9201"]).toBe("/tmp/darwin-assistant");
+    expect(byIdentifier["DAR-9202"]).toBeNull();
   });
 });

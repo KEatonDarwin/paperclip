@@ -19,6 +19,7 @@ import {
   renameConversation,
   setConversationStatus,
   setThreadPinned,
+  setThreadDisplay,
   setThreadGroup,
   deleteConversation,
   copyTurns,
@@ -38,6 +39,16 @@ import { listMcpServers, refreshMcpServers } from '../mcp-registry.js';
 import { resolveNativeServer, nativeListTools } from '../tools/mcp-native.js';
 import { listNotes, createNote } from '../notes-db.js';
 import { triageNote } from '../notes.js';
+import {
+  listNotifications,
+  unreadNotificationCount,
+  createNotification,
+  markNotificationRead,
+  markAllNotificationsRead,
+  deleteNotification,
+  getNotification,
+  type NotificationSeverity,
+} from '../notifications.js';
 import {
   listActiveQuickCaptureItems,
   createQuickCaptureItem,
@@ -62,6 +73,7 @@ import {
 } from '../quick-chat-profiles.js';
 import { autoNameThreadFromFirstMessage } from '../thread-autoname.js';
 import { generateThreadSummary } from '../thread-summarize.js';
+import { condenseThread, buildSmartForkMessage } from '../thread-condense.js';
 import { listThreadSummaries, getLatestThreadSummary } from '../thread-summaries.js';
 import { searchThreadsByQuery } from '../thread-search.js';
 import { getBrief } from '../jarvis-brief.js';
@@ -119,6 +131,7 @@ import {
   ConversationBusyError,
   getActiveRunCount,
   getActiveRuns,
+  type AdapterConfig,
 } from '../agent.js';
 import {
   getAllSettings,
@@ -196,6 +209,10 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     // marks the one thread per group that IS that group's own cover chat.
     group_id: conv.group_id ?? null,
     is_group_chat: !!conv.is_group_chat,
+    // Standalone-window display metadata: big bold headline + border color so
+    // popped-out windows opened side-by-side are easy to tell apart.
+    headline: conv.headline ?? null,
+    border_color: conv.border_color ?? null,
     // Where this thread's messages come in from (slack / cockpit / watch / …).
     source: deriveSource(conv.external_id),
     quick_chat: quickChatSession ? serializeQuickChatSession(quickChatSession) : null,
@@ -343,6 +360,52 @@ function readClaudeLiveUsage(): ClaudeProviderUsage | null {
 
 function readCodexUsage(): CodexProviderUsage | null {
   const LIVE_PATH = '/tmp/codex-usage-live.json';
+  try {
+    const st = statSync(LIVE_PATH);
+    const raw = JSON.parse(readFileSync(LIVE_PATH, 'utf8')) as {
+      windows?: Array<Partial<ProviderUsageWindow>>;
+      plan?: string | null;
+      email?: string | null;
+      source?: string | null;
+      updated_at?: number;
+      error?: string | null;
+    };
+    const windows = Array.isArray(raw.windows)
+      ? raw.windows
+          .map((w): ProviderUsageWindow | null => {
+            const usedPercentage = typeof w.used_percentage === 'number' ? w.used_percentage : null;
+            const resetsAt = typeof w.resets_at === 'number' ? w.resets_at : null;
+            const label = typeof w.label === 'string' && w.label.trim() ? w.label.trim() : undefined;
+            if (usedPercentage == null && resetsAt == null && !w.value_label) return null;
+            return {
+              used_percentage: usedPercentage,
+              resets_at: resetsAt,
+              ...(label ? { label } : {}),
+              value_label: typeof w.value_label === 'string' ? w.value_label : null,
+              detail: typeof w.detail === 'string' ? w.detail : null,
+            };
+          })
+          .filter((w): w is ProviderUsageWindow => w != null)
+      : [];
+    if (!windows.length && !raw.error) return null;
+    return {
+      windows,
+      plan: typeof raw.plan === 'string' ? raw.plan : null,
+      email: typeof raw.email === 'string' ? raw.email : null,
+      source: typeof raw.source === 'string' ? raw.source : null,
+      updated_at: typeof raw.updated_at === 'number' ? raw.updated_at : Math.floor(st.mtimeMs / 1000),
+      error: typeof raw.error === 'string' ? raw.error : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Augment (auggie) shares the generic windows[] snapshot shape with Codex, so
+// the reader is the same — only the live file differs. Written every 60s by
+// augment-usage-poll.timer from `auggie account status --json`.
+function readAugmentUsage(): CodexProviderUsage | null {
+  const LIVE_PATH = '/tmp/auggie-usage-live.json';
   try {
     const st = statSync(LIVE_PATH);
     const raw = JSON.parse(readFileSync(LIVE_PATH, 'utf8')) as {
@@ -567,11 +630,14 @@ export function createApiV1Router(): Router {
   // claude-usage-poll.timer, with the older statusline dump as a fallback.
   // Codex comes from /tmp/codex-usage-live.json, refreshed by a sibling timer
   // using the local Codex CLI app-server rate-limit RPC first and WHAM second.
+  // Augment comes from /tmp/auggie-usage-live.json (credit burn-down, no time
+  // window), refreshed by augment-usage-poll.timer via `auggie account status`.
 
   router.get('/provider-usage', (_req: AuthedRequest, res) => {
     res.json({
       claude: readClaudeLiveUsage(),
       openai_codex: readCodexUsage(),
+      augment: readAugmentUsage(),
     });
   });
 
@@ -768,6 +834,61 @@ export function createApiV1Router(): Router {
       return;
     }
     deleteQuickCaptureItem(id);
+    res.status(204).end();
+  });
+
+  // == Notifications (DAR-761) =================================================
+  // Cockpit-wide notification layer: bell/center + toasts. Not thread-scoped —
+  // every caller sees the same list, same as notes/quick-capture above. JARVIS
+  // pushes here via the `notifications` tool; this REST surface mirrors it for
+  // direct/external callers and drives read-state from the cockpit UI.
+
+  const VALID_SEVERITIES: NotificationSeverity[] = ['info', 'success', 'warning', 'error'];
+
+  router.get('/notifications', (req: AuthedRequest, res) => {
+    const limit = Math.max(1, Math.min(500, parseInt(String(req.query.limit ?? '100'), 10) || 100));
+    res.json({ notifications: listNotifications(limit), unread: unreadNotificationCount() });
+  });
+
+  router.post('/notifications', (req: AuthedRequest, res) => {
+    const severity = (typeof req.body?.severity === 'string' ? req.body.severity : 'info') as NotificationSeverity;
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+    if (!VALID_SEVERITIES.includes(severity)) {
+      sendError(res, 400, 'invalid_severity', `severity must be one of ${VALID_SEVERITIES.join(', ')}`);
+      return;
+    }
+    if (!title) {
+      sendError(res, 400, 'title_required', 'title is required');
+      return;
+    }
+    const body = typeof req.body?.body === 'string' ? req.body.body : null;
+    const source = typeof req.body?.source === 'string' ? req.body.source : null;
+    const link = typeof req.body?.link === 'string' ? req.body.link : null;
+    const notification = createNotification({ severity, title, body, source, link });
+    res.status(201).json({ notification });
+  });
+
+  router.patch('/notifications/:id/read', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getNotification(id)) {
+      sendError(res, 404, 'notification_not_found', 'notification not found');
+      return;
+    }
+    res.json({ notification: markNotificationRead(id) });
+  });
+
+  router.post('/notifications/mark-all-read', (_req: AuthedRequest, res) => {
+    const updated = markAllNotificationsRead();
+    res.json({ notifications: updated });
+  });
+
+  router.delete('/notifications/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getNotification(id)) {
+      sendError(res, 404, 'notification_not_found', 'notification not found');
+      return;
+    }
+    deleteNotification(id);
     res.status(204).end();
   });
 
@@ -1080,6 +1201,8 @@ export function createApiV1Router(): Router {
       status?: unknown;
       pinned?: unknown;
       group_id?: unknown;
+      headline?: unknown;
+      border_color?: unknown;
     };
 
     if (body.title !== undefined) {
@@ -1103,6 +1226,24 @@ export function createApiV1Router(): Router {
         return;
       }
       setThreadPinned(conv.id, body.pinned);
+    }
+    // Standalone-window display metadata (headline + border color). Each is
+    // optional and written independently; null/'' clears it.
+    if (body.headline !== undefined) {
+      if (body.headline !== null && typeof body.headline !== 'string') {
+        sendError(res, 400, 'invalid_request', 'headline must be a string or null');
+        return;
+      }
+      const h = typeof body.headline === 'string' ? body.headline.trim().slice(0, 200) : null;
+      setThreadDisplay(conv.id, { headline: h });
+    }
+    if (body.border_color !== undefined) {
+      if (body.border_color !== null && typeof body.border_color !== 'string') {
+        sendError(res, 400, 'invalid_request', 'border_color must be a string or null');
+        return;
+      }
+      const c = typeof body.border_color === 'string' ? body.border_color.trim().slice(0, 40) : null;
+      setThreadDisplay(conv.id, { borderColor: c });
     }
     if (body.group_id !== undefined) {
       if (body.group_id !== null && typeof body.group_id !== 'number') {
@@ -1294,6 +1435,102 @@ export function createApiV1Router(): Router {
     res.status(201).json({
       ...threadDescriptor(refreshed, req),
       forked_from: parent.external_id,
+    });
+  });
+
+  // -- POST /threads/:external_id/smart-fork ---------------------------------
+  // Smart Fork: condense the ENTIRE thread (any size) into one markdown context
+  // block and open a fresh thread per selected model with that block as its
+  // first and only message. Unlike /fork this copies NO turns and carries NO
+  // session — the point is to shed the transcript's weight and start clean on a
+  // different model. Body: { targets: [{ adapter, model? }, …] }.
+  //
+  // The forks are created and returned synchronously so the cockpit can open
+  // their windows right away; condensation (one or more local-CLI calls, slow
+  // on a big thread) runs in the background and the seed message lands over the
+  // normal turn SSE once it's ready.
+
+  router.post('/threads/:external_id/smart-fork', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const parent = result;
+
+    if (countTurns(parent.id) === 0) {
+      sendError(res, 400, 'no_messages', 'Thread has no messages to condense');
+      return;
+    }
+
+    const body = (req.body ?? {}) as { targets?: unknown };
+    const rawTargets = Array.isArray(body.targets) ? body.targets : [];
+    if (!rawTargets.length) {
+      sendError(res, 400, 'invalid_request', 'targets must be a non-empty array of { adapter, model? }');
+      return;
+    }
+
+    const adapters = getAdapters();
+    const targets: Array<{ adapter: AdapterConfig; model: string | null }> = [];
+    for (const raw of rawTargets) {
+      const t = (raw ?? {}) as { adapter?: unknown; model?: unknown };
+      if (typeof t.adapter !== 'string' || !adapters[t.adapter]) {
+        sendError(res, 400, 'invalid_request', `each target.adapter must be one of ${Object.keys(adapters).join(', ')}`);
+        return;
+      }
+      const adapter = adapters[t.adapter];
+      let model: string | null = null;
+      if (t.model !== undefined && t.model !== null) {
+        if (typeof t.model !== 'string' || !adapter.models.some((m) => m.id === t.model)) {
+          sendError(res, 400, 'invalid_request', `target.model must be one of ${adapter.models.map((m) => m.id).join(', ')} for adapter ${adapter.id}`);
+          return;
+        }
+        model = t.model;
+      }
+      targets.push({ adapter, model });
+    }
+
+    const baseTitle = parent.title ?? 'Thread';
+    const created: Array<{ conv: ConversationRow; label: string }> = [];
+    for (const target of targets) {
+      const forkExternalId = `${callerExternalIdPrefix(caller.id)}${randomUUID()}`;
+      const fork = getOrCreateConversation(forkExternalId);
+      setThreadModelOverride(fork.id, target.adapter.id, target.model);
+      const label = target.model
+        ? (target.adapter.models.find((m) => m.id === target.model)?.label ?? target.model)
+        : target.adapter.name;
+      renameConversation(fork.id, `[Smart Fork - ${label}] ${baseTitle}`.slice(0, 200));
+      linkContinuedThreads(parent.id, fork.id);
+      created.push({ conv: getConversationById(fork.id) ?? fork, label });
+    }
+
+    // Condense once, then seed every fork with the same carried-over context.
+    void condenseThread(parent)
+      .then((condensed) =>
+        Promise.all(
+          created.map(({ conv, label }) => {
+            const text = buildSmartForkMessage(parent, condensed, label);
+            const messageId = `turn:${conv.id}:${countTurns(conv.id)}`;
+            return processMessage(text, conv.external_id, messageId).catch((err: unknown) => {
+              const code = err instanceof ConversationBusyError ? 'message_in_flight' : 'jarvis_error';
+              errorByMessageId.set(messageId, {
+                code,
+                message: err instanceof Error ? err.message : String(err),
+              });
+            });
+          }),
+        ),
+      )
+      .catch((err: unknown) => {
+        console.error(`[smart-fork] condensation failed for conversation ${parent.id}:`, err);
+      });
+
+    res.status(201).json({
+      status: 'condensing',
+      forked_from: parent.external_id,
+      threads: created.map(({ conv }) => threadDescriptor(conv, req)),
     });
   });
 
@@ -1902,7 +2139,7 @@ export function createApiV1Router(): Router {
       'conversation_renamed', 'conversation_deleted', 'status', 'thread_todo',
       'thread_reminder',
       'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
-      'quick_capture', 'thread_summary',
+      'quick_capture', 'thread_summary', 'notification',
     ]);
 
     res.writeHead(200, {

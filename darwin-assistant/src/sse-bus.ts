@@ -6,6 +6,7 @@ import type { NoteRow } from './notes-db.js';
 import type { QuickCaptureItemRow } from './quick-capture-db.js';
 import type { ThreadReminderRow } from './thread-reminders.js';
 import type { ThreadSummaryRow } from './thread-summaries.js';
+import type { NotificationRow } from './notifications.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -168,6 +169,14 @@ export interface ThreadGroupEvent {
   group?: { id: number; name: string; color: string | null; sort_order: number };
 }
 
+// DAR-761 — cockpit notification layer (bell/center + toasts). Global, not
+// conversation-scoped — same treatment as NoteEvent/QuickCaptureEvent below.
+export interface NotificationEvent {
+  type: 'notification';
+  action: 'created' | 'updated' | 'deleted';
+  notification: NotificationRow;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
@@ -176,7 +185,7 @@ export type SSEEvent =
   | ConversationRenamedEvent | ConversationDeletedEvent
   | QueuedMessageEvent | NoteEvent | QuickCaptureEvent
   | ThreadReminderEvent | ToolCallEvent | ThreadSummaryEvent
-  | ThreadGroupEvent;
+  | ThreadGroupEvent | NotificationEvent;
 
 class SSEBus extends EventEmitter {}
 

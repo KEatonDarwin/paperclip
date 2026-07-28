@@ -1183,9 +1183,10 @@ export function createApiV1Router(): Router {
     });
   });
 
-  // -- PATCH /threads/:external_id: rename, archive ---------------------------
-  // Body: { title?: string|null, status?: 'active'|'archived' }. Distinct from
-  // the /model sub-route (Express matches that more specific path first).
+  // -- PATCH /threads/:external_id: rename, archive, complete -----------------
+  // Body: { title?: string|null, status?: 'active'|'archived'|'completed' }.
+  // Distinct from the /model sub-route (Express matches that more specific
+  // path first).
 
   router.patch('/threads/:external_id', (req: AuthedRequest, res) => {
     const caller = req.apiKey!;
@@ -1214,8 +1215,8 @@ export function createApiV1Router(): Router {
       renameConversation(conv.id, t && t.length ? t : null);
     }
     if (body.status !== undefined) {
-      if (body.status !== 'active' && body.status !== 'archived') {
-        sendError(res, 400, 'invalid_request', "status must be 'active' or 'archived'");
+      if (body.status !== 'active' && body.status !== 'archived' && body.status !== 'completed') {
+        sendError(res, 400, 'invalid_request', "status must be 'active', 'archived', or 'completed'");
         return;
       }
       setConversationStatus(conv.id, body.status);

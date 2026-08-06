@@ -30,6 +30,7 @@ import {
   listGroups,
   getGroupById,
   createGroup,
+  ensureGroupChat,
   renameGroup,
   setGroupColor,
   deleteGroup,
@@ -48,6 +49,8 @@ import {
   deleteNotification,
   getNotification,
   type NotificationSeverity,
+  type NotificationAction,
+  type NotificationMeta,
 } from '../notifications.js';
 import {
   listActiveQuickCaptureItems,
@@ -71,6 +74,13 @@ import {
   serializeQuickChatProfile,
   serializeQuickChatSession,
 } from '../quick-chat-profiles.js';
+import {
+  createEphemeralChatSession,
+  deleteEphemeralChatSession,
+  getEphemeralChatSession,
+  sendEphemeralChatMessage,
+  sweepStaleEphemeralConversations,
+} from '../ephemeral-chat.js';
 import { autoNameThreadFromFirstMessage } from '../thread-autoname.js';
 import { generateThreadSummary } from '../thread-summarize.js';
 import { condenseThread, buildSmartForkMessage } from '../thread-condense.js';
@@ -96,6 +106,26 @@ import {
   type ThreadTodoStatus,
   type ThreadTodoOwner,
 } from '../thread-todos.js';
+import {
+  listThreadLinks,
+  setPreviewLink,
+  addThreadLink,
+  deleteThreadLink,
+  clearThreadLinks,
+  getThreadLink,
+} from '../thread-links.js';
+import {
+  createDispatch,
+  getDispatch,
+  listOutboundDispatches,
+  listInboundDispatches,
+  acknowledgeDispatch,
+  deleteDispatch,
+  listDispatchWorkers,
+  type WaitMode,
+  type WakeMode,
+} from '../dispatches.js';
+import { installDispatchGate } from '../dispatch-gate.js';
 import {
   activeReminderForConversation,
   setThreadReminder,
@@ -131,6 +161,7 @@ import {
   ConversationBusyError,
   getActiveRunCount,
   getActiveRuns,
+  refreshAuggieModels,
   type AdapterConfig,
 } from '../agent.js';
 import {
@@ -141,6 +172,10 @@ import {
   getPersonalityStats,
   updatePersonalityStats,
   getPersonalityStatsHistory,
+  getAutonomyLevel,
+  updateAutonomyLevel,
+  getAutonomyLevelHistory,
+  AUTONOMY_HARD_LIMITER_SUMMARY,
   listRunHistory,
   classifyRunOutcome,
   PERSONALITY_STAT_KEYS,
@@ -158,12 +193,28 @@ import {
 
 const MAX_TEXT_LENGTH = 50_000;
 const UI_PORT = parseInt(process.env.JARVIS_UI_PORT ?? '3201', 10);
+const PROTECTED_THREAD_IDS = new Set(['checkin:notifications']);
 
 interface AuthedRequest extends Request {
   apiKey?: ApiKeyRow;
 }
 
 const errorByMessageId = new Map<string, { code: string; message: string }>();
+const CHECKIN_SNOOZE_PRESETS_MINUTES = [15, 60, 240] as const;
+const MOMENTUM_LAB_SETTINGS_KEY = 'momentum_lab_settings';
+
+interface CheckinRow {
+  id: string;
+  fire_at: string;
+  reason: string;
+  source_type: string;
+  source_id: string | null;
+  status: string;
+}
+
+function isProtectedSystemThread(externalId: string): boolean {
+  return PROTECTED_THREAD_IDS.has(externalId);
+}
 
 function paramString(value: string | string[] | undefined): string {
   if (typeof value === 'string') return value;
@@ -179,6 +230,54 @@ function headerString(value: string | string[] | undefined): string | undefined 
 
 function sendError(res: Response, status: number, code: string, message: string, extra?: Record<string, unknown>): void {
   res.status(status).json({ error: { code, message, ...(extra ?? {}) } });
+}
+
+function parseJsonSetting<T>(key: string): T | null {
+  const raw = getSetting(key);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+function notificationMetaFromBody(value: unknown): NotificationMeta | null {
+  if (!value || typeof value !== 'object') return null;
+  const meta = value as Record<string, unknown>;
+  return {
+    kind: meta.kind === 'checkin' ? 'checkin' : undefined,
+    checkinId: typeof meta.checkinId === 'string' ? meta.checkinId : undefined,
+    sourceType: typeof meta.sourceType === 'string' ? meta.sourceType : null,
+    sourceId: typeof meta.sourceId === 'string' ? meta.sourceId : null,
+  };
+}
+
+function notificationActionsFromBody(value: unknown): NotificationAction[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return [];
+    const action = entry as Record<string, unknown>;
+    const kind = action.kind;
+    const label = typeof action.label === 'string' ? action.label.trim() : '';
+    if (
+      (kind !== 'open_link' && kind !== 'checkin_snooze' && kind !== 'checkin_dismiss' && kind !== 'issue_reopen')
+      || !label
+    ) return [];
+    return [{
+      kind,
+      label,
+      href: typeof action.href === 'string' ? action.href : undefined,
+      minutes: Number.isFinite(action.minutes) ? Number(action.minutes) : undefined,
+      issueId: typeof action.issueId === 'string' ? action.issueId : undefined,
+      issueIdentifier: typeof action.issueIdentifier === 'string' ? action.issueIdentifier : undefined,
+      reopenStatus: typeof action.reopenStatus === 'string' ? action.reopenStatus : undefined,
+      style:
+        action.style === 'default' || action.style === 'secondary' || action.style === 'destructive'
+          ? action.style
+          : undefined,
+    } satisfies NotificationAction];
+  });
 }
 
 function threadDescriptor(conv: ConversationRow, req: Request): Record<string, unknown> {
@@ -197,6 +296,14 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     // Open todo signal — total, and the subset tagged "for Kevin".
     open_todo_count: openTodos.total,
     open_todo_for_me_count: openTodos.forKevin,
+    // Per-thread "relevant links" bar (preview/build URL + reference links).
+    // Sent inline so the pane paints the bar on first load; the thread_link SSE
+    // keeps it live thereafter.
+    links: listThreadLinks(conv.id),
+    dispatches: {
+      outbound: listOutboundDispatches(conv.id),
+      inbound: listInboundDispatches(conv.id),
+    },
     conversation_id: conv.id,
     status: conv.status,
     // User-set display name (rename); null → client derives one. Kept distinct
@@ -246,7 +353,17 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
 
 // Catalog of selectable providers/models for the per-thread selector, with a
 // credentials check so the UI can show which providers are usable vs. disabled.
-function providerCatalog(): Array<Record<string, unknown>> {
+async function providerCatalog(): Promise<Array<Record<string, unknown>>> {
+  // Augment's real model shelf lives in the auggie CLI, not the static adapter
+  // (which only carries {default}). Refresh the auggie adapter's own models
+  // array from `auggie model list` so BOTH the selector AND the per-thread
+  // model validation (resolveConversationRuntime / set-model) see the full
+  // shelf. Best-effort: leaves the static list in place on any failure.
+  try {
+    await refreshAuggieModels();
+  } catch {
+    // leave static models in place
+  }
   const adapters = getAdapters();
   return Object.values(adapters).map((a) => {
     const requiredEnv = a.runtime.auth.envKeys;
@@ -604,6 +721,7 @@ export function createApiV1Router(): Router {
 
   router.use(bearerAuth as (req: Request, res: Response, next: NextFunction) => void);
   installQueueDrain();
+  installDispatchGate();
 
   // -- GET /brief: JARVIS-authored cockpit landing view -----------------------
   // Not a fixed dashboard — JARVIS decides the content and shape fresh each
@@ -621,8 +739,57 @@ export function createApiV1Router(): Router {
   // -- GET /providers: selectable provider/model catalog ---------------------
   // Populates the per-thread provider/model selector (DAR-680 AC#4).
 
-  router.get('/providers', (_req: AuthedRequest, res) => {
-    res.json({ providers: providerCatalog() });
+  router.get('/providers', async (_req: AuthedRequest, res) => {
+    res.json({ providers: await providerCatalog() });
+  });
+
+  // -- Ephemeral chat: in-memory floating quick chat, no thread persistence ---
+
+  router.post('/ephemeral-chat/sessions', (req: AuthedRequest, res) => {
+    try {
+      const body = (req.body ?? {}) as { adapter?: unknown; model?: unknown };
+      const session = createEphemeralChatSession({
+        adapter: typeof body.adapter === 'string' ? body.adapter : undefined,
+        model: typeof body.model === 'string' ? body.model : body.model === null ? null : undefined,
+      });
+      res.status(201).json({ session });
+    } catch (err) {
+      sendError(res, 400, 'invalid_request', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.get('/ephemeral-chat/sessions/:id', (req: AuthedRequest, res) => {
+    const session = getEphemeralChatSession(paramString(req.params.id));
+    if (!session) {
+      sendError(res, 404, 'session_not_found', 'Ephemeral chat session not found');
+      return;
+    }
+    res.json({ session });
+  });
+
+  router.post('/ephemeral-chat/sessions/:id/messages', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { text?: unknown };
+    if (typeof body.text !== 'string' || !body.text.trim()) {
+      sendError(res, 400, 'invalid_request', 'text is required and must be a non-empty string');
+      return;
+    }
+    try {
+      const session = sendEphemeralChatMessage(paramString(req.params.id), body.text);
+      res.status(202).json({ session });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const code = message === 'session not found' ? 'session_not_found' : 'invalid_request';
+      const status = message === 'session not found' ? 404 : 409;
+      sendError(res, status, code, message);
+    }
+  });
+
+  router.delete('/ephemeral-chat/sessions/:id', (req: AuthedRequest, res) => {
+    if (!deleteEphemeralChatSession(paramString(req.params.id))) {
+      sendError(res, 404, 'session_not_found', 'Ephemeral chat session not found');
+      return;
+    }
+    res.status(204).end();
   });
 
   // -- GET /provider-usage: provider quota meters (DAR-696 + Codex) ----------
@@ -864,7 +1031,9 @@ export function createApiV1Router(): Router {
     const body = typeof req.body?.body === 'string' ? req.body.body : null;
     const source = typeof req.body?.source === 'string' ? req.body.source : null;
     const link = typeof req.body?.link === 'string' ? req.body.link : null;
-    const notification = createNotification({ severity, title, body, source, link });
+    const actions = notificationActionsFromBody(req.body?.actions);
+    const meta = notificationMetaFromBody(req.body?.meta);
+    const notification = createNotification({ severity, title, body, source, link, actions, meta });
     res.status(201).json({ notification });
   });
 
@@ -890,6 +1059,111 @@ export function createApiV1Router(): Router {
     }
     deleteNotification(id);
     res.status(204).end();
+  });
+
+  router.post('/notifications/:id/checkin-snooze', async (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const notification = getNotification(id);
+    if (!notification) {
+      sendError(res, 404, 'notification_not_found', 'notification not found');
+      return;
+    }
+    if (notification.meta?.kind !== 'checkin' || !notification.meta.checkinId) {
+      sendError(res, 409, 'notification_not_checkin', 'notification is not a check-in alert');
+      return;
+    }
+
+    const minutes = Number(req.body?.minutes);
+    if (!CHECKIN_SNOOZE_PRESETS_MINUTES.includes(minutes as (typeof CHECKIN_SNOOZE_PRESETS_MINUTES)[number])) {
+      sendError(
+        res,
+        400,
+        'invalid_snooze_minutes',
+        `minutes must be one of ${CHECKIN_SNOOZE_PRESETS_MINUTES.join(', ')}`,
+      );
+      return;
+    }
+
+    const rows = await query<CheckinRow>(
+      `SELECT id, fire_at, reason, source_type, source_id, status
+       FROM jarvis_checkins
+       WHERE id = $1
+       LIMIT 1`,
+      [notification.meta.checkinId],
+    );
+    const original = rows[0];
+    if (!original) {
+      sendError(res, 404, 'checkin_not_found', 'source check-in not found');
+      return;
+    }
+
+    const inserted = await query<CheckinRow>(
+      `INSERT INTO jarvis_checkins (fire_at, reason, source_type, source_id)
+       VALUES (now() + ($1::text || ' minutes')::interval, $2, $3, $4)
+       RETURNING id, fire_at, reason, source_type, source_id, status`,
+      [minutes, original.reason, original.source_type, original.source_id],
+    );
+
+    deleteNotification(id);
+    res.json({ ok: true, checkin: inserted[0] ?? null });
+  });
+
+  router.post('/notifications/:id/checkin-dismiss', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const notification = getNotification(id);
+    if (!notification) {
+      sendError(res, 404, 'notification_not_found', 'notification not found');
+      return;
+    }
+    if (notification.meta?.kind !== 'checkin') {
+      sendError(res, 409, 'notification_not_checkin', 'notification is not a check-in alert');
+      return;
+    }
+    deleteNotification(id);
+    res.status(204).end();
+  });
+
+  router.post('/notifications/:id/issue-reopen', async (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const notification = getNotification(id);
+    if (!notification) {
+      sendError(res, 404, 'notification_not_found', 'notification not found');
+      return;
+    }
+    const actionIndex = typeof req.body?.actionIndex === 'number' ? req.body.actionIndex : -1;
+    const action = notification.actions[actionIndex];
+    if (!action || action.kind !== 'issue_reopen' || !action.issueId) {
+      sendError(res, 409, 'invalid_reopen_action', 'notification action is not a valid issue_reopen');
+      return;
+    }
+    const paperclipUrl = (process.env.PAPERCLIP_API_URL ?? 'http://localhost:3100').replace(/\/$/, '');
+    const paperclipKey = process.env.PAPERCLIP_BOARD_API_KEY ?? '';
+    if (!paperclipKey) {
+      sendError(res, 500, 'paperclip_key_missing', 'PAPERCLIP_BOARD_API_KEY is not configured');
+      return;
+    }
+    try {
+      const patchRes = await fetch(`${paperclipUrl}/api/issues/${action.issueId}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${paperclipKey}`,
+        },
+        body: JSON.stringify({
+          status: action.reopenStatus ?? 'in_review',
+          comment: `Reopened via silence-to-complete digest (was auto-closed).`,
+        }),
+      });
+      if (!patchRes.ok) {
+        const text = await patchRes.text().catch(() => '');
+        sendError(res, 502, 'paperclip_reopen_failed', `Paperclip returned ${patchRes.status}: ${text}`);
+        return;
+      }
+      markNotificationRead(id);
+      res.json({ ok: true, issueId: action.issueId, reopenedTo: action.reopenStatus ?? 'in_review' });
+    } catch (err) {
+      sendError(res, 502, 'paperclip_unreachable', err instanceof Error ? err.message : String(err));
+    }
   });
 
   // == Quick Chat Profiles ====================================================
@@ -1026,6 +1300,7 @@ export function createApiV1Router(): Router {
 
   router.get('/threads', (req: AuthedRequest, res) => {
     archiveExpiredQuickChatSessions();
+    sweepStaleEphemeralConversations();
     const caller = req.apiKey!;
     const prefix = callerExternalIdPrefix(caller.id);
     const seesAllThreads = isAdminScope(caller.scope);
@@ -1034,6 +1309,10 @@ export function createApiV1Router(): Router {
 
     const all = listAllConversations();
     const filtered = all.filter((c) => {
+      // Ephemeral chats are full JARVIS on a throwaway conversation — never a
+      // saved thread, so they never appear in the sidebar list.
+      if (c.external_id.startsWith('ephemeral:')) return false;
+      if (c.external_id.startsWith('checkin:')) return false;
       if (!seesAllThreads && !c.external_id.startsWith(prefix)) return false;
       if (statusFilter && c.status !== statusFilter) return false;
       return true;
@@ -1056,9 +1335,11 @@ export function createApiV1Router(): Router {
       return;
     }
 
-    const candidates = listAllConversations().filter(
-      (c) => seesAllThreads || c.external_id.startsWith(prefix),
-    );
+    const candidates = listAllConversations().filter((c) => {
+      if (c.external_id.startsWith('ephemeral:')) return false;
+      if (c.external_id.startsWith('checkin:')) return false;
+      return seesAllThreads || c.external_id.startsWith(prefix);
+    });
 
     try {
       const matches = await searchThreadsByQuery(query, candidates);
@@ -1205,6 +1486,16 @@ export function createApiV1Router(): Router {
       headline?: unknown;
       border_color?: unknown;
     };
+    const protectedThread = isProtectedSystemThread(conv.external_id);
+
+    if (protectedThread && (
+      body.title !== undefined
+      || body.status !== undefined
+      || body.group_id !== undefined
+    )) {
+      sendError(res, 403, 'protected_thread', 'This system thread cannot be renamed, archived, completed, or moved');
+      return;
+    }
 
     if (body.title !== undefined) {
       if (body.title !== null && typeof body.title !== 'string') {
@@ -1292,8 +1583,23 @@ export function createApiV1Router(): Router {
       return;
     }
     const color = typeof body.color === 'string' ? body.color : null;
-    const { group, groupChat } = createGroup(name, color);
-    res.status(201).json({ ...group, group_chat: threadDescriptor(groupChat, req), members: [] });
+    // No cover chat is created up front anymore — a group starts with none, and
+    // the group-wide chat is spun up on demand via POST /groups/:id/chat.
+    const { group } = createGroup(name, color);
+    res.status(201).json({ ...group, group_chat: null, members: [] });
+  });
+
+  // POST /groups/:id/chat: create-or-return the group's cover chat (the
+  // group-wide message thread) on demand. Idempotent. Returns the thread
+  // descriptor so the caller can open it immediately.
+  router.post('/groups/:id/chat', (req: AuthedRequest, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || !getGroupById(id)) {
+      sendError(res, 404, 'group_not_found', `Group ${req.params.id} not found`);
+      return;
+    }
+    const groupChat = ensureGroupChat(id);
+    res.status(201).json(threadDescriptor(groupChat, req));
   });
 
   // PATCH /groups/:id: rename / recolor. Body: { name?, color? }.
@@ -1400,6 +1706,10 @@ export function createApiV1Router(): Router {
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
       sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    if (isProtectedSystemThread(result.external_id)) {
+      sendError(res, 403, 'protected_thread', 'This system thread cannot be deleted');
       return;
     }
     deleteConversation(result.id);
@@ -1981,6 +2291,196 @@ export function createApiV1Router(): Router {
     res.json({ status: 'deleted', todo_id: todoId });
   });
 
+  // -- GET /threads/:external_id/links: list per-thread relevant links -------
+
+  router.get('/threads/:external_id/links', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    res.json({ thread: threadDescriptor(result, req), links: listThreadLinks(result.id) });
+  });
+
+  // -- POST /threads/:external_id/links: set the preview or add a link -------
+  // kind:'preview' (default) upserts the single hero link; kind:'link' appends.
+
+  router.post('/threads/:external_id/links', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const body = (req.body ?? {}) as { url?: unknown; label?: unknown; kind?: unknown };
+    const url = typeof body.url === 'string' ? body.url.trim() : '';
+    if (!url) {
+      sendError(res, 400, 'invalid_request', 'url is required and must be a non-empty string');
+      return;
+    }
+    if (url.length > 2048) {
+      sendError(res, 413, 'url_too_long', 'url exceeds max length of 2048 chars');
+      return;
+    }
+    const label =
+      typeof body.label === 'string' && body.label.trim() ? body.label.trim().slice(0, 200) : null;
+    const kind = body.kind === 'link' ? 'link' : 'preview';
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const link =
+      kind === 'link' ? addThreadLink(result.id, url, label) : setPreviewLink(result.id, url, label);
+    res.status(201).json({ link });
+  });
+
+  // -- DELETE /threads/:external_id/links/:linkId: remove one link -----------
+
+  router.delete('/threads/:external_id/links/:linkId', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const linkId = Number(paramString(req.params.linkId));
+    const existing = getThreadLink(linkId);
+    if (!existing || existing.conversation_id !== result.id) {
+      sendError(res, 404, 'link_not_found', 'Link not found on this thread');
+      return;
+    }
+    deleteThreadLink(linkId);
+    res.json({ status: 'deleted', link_id: linkId });
+  });
+
+  // -- DELETE /threads/:external_id/links: clear all links -------------------
+
+  router.delete('/threads/:external_id/links', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const removed = clearThreadLinks(result.id);
+    res.json({ status: 'cleared', removed });
+  });
+
+  // == Dispatches (DAR-782) ====================================================
+
+  // -- POST /threads/:ext/dispatches: create a dispatch ----------------------
+  router.post('/threads/:external_id/dispatches', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const body = (req.body ?? {}) as {
+      wait_mode?: unknown; wake_mode?: unknown; label?: unknown;
+      workers?: unknown;
+    };
+    const waitMode = (['all', 'any', 'specific'] as WaitMode[]).includes(body.wait_mode as WaitMode)
+      ? (body.wait_mode as WaitMode) : 'all';
+    const wakeMode = (['active', 'passive'] as WakeMode[]).includes(body.wake_mode as WakeMode)
+      ? (body.wake_mode as WakeMode) : 'active';
+    const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim().slice(0, 200) : null;
+    if (!Array.isArray(body.workers) || body.workers.length === 0) {
+      sendError(res, 400, 'invalid_request', 'workers must be a non-empty array of {external_id, role_label?, is_gate?}');
+      return;
+    }
+    const workerInputs: Array<{ conversationId: number; roleLabel?: string | null; isGate?: boolean }> = [];
+    for (const w of body.workers as Array<{ external_id?: unknown; role_label?: unknown; is_gate?: unknown }>) {
+      const wExtId = typeof w.external_id === 'string' ? w.external_id : '';
+      if (!wExtId) {
+        sendError(res, 400, 'invalid_request', 'each worker must have a non-empty external_id');
+        return;
+      }
+      const wConv = getConversation(wExtId);
+      if (!wConv) {
+        sendError(res, 404, 'worker_thread_not_found', `Worker thread ${wExtId} not found`);
+        return;
+      }
+      workerInputs.push({
+        conversationId: wConv.id,
+        roleLabel: typeof w.role_label === 'string' ? w.role_label.trim().slice(0, 200) : null,
+        isGate: !!w.is_gate,
+      });
+    }
+    const created = createDispatch({
+      orchestratorConversationId: result.id,
+      waitMode,
+      wakeMode,
+      label,
+      workers: workerInputs,
+    });
+    res.status(201).json(created);
+  });
+
+  // -- GET /threads/:ext/dispatches: list outbound + inbound -----------------
+  router.get('/threads/:external_id/dispatches', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    res.json({
+      outbound: listOutboundDispatches(result.id),
+      inbound: listInboundDispatches(result.id),
+    });
+  });
+
+  // -- PATCH /threads/:ext/dispatches/:id: acknowledge -----------------------
+  router.patch('/threads/:external_id/dispatches/:dispatchId', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const dispatchId = Number(paramString(req.params.dispatchId));
+    const dispatch = getDispatch(dispatchId);
+    if (!dispatch || dispatch.orchestrator_conversation_id !== result.id) {
+      sendError(res, 404, 'dispatch_not_found', 'Dispatch not found on this thread');
+      return;
+    }
+    const body = (req.body ?? {}) as { status?: unknown };
+    if (body.status !== 'acknowledged') {
+      sendError(res, 400, 'invalid_request', 'Only status:"acknowledged" is supported');
+      return;
+    }
+    const acked = acknowledgeDispatch(dispatchId);
+    if (!acked) {
+      sendError(res, 409, 'dispatch_not_complete', 'Dispatch is not in "complete" status');
+      return;
+    }
+    res.json({ dispatch: acked, workers: listDispatchWorkers(dispatchId) });
+  });
+
+  // -- DELETE /threads/:ext/dispatches/:id: remove ---------------------------
+  router.delete('/threads/:external_id/dispatches/:dispatchId', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const dispatchId = Number(paramString(req.params.dispatchId));
+    const dispatch = getDispatch(dispatchId);
+    if (!dispatch || dispatch.orchestrator_conversation_id !== result.id) {
+      sendError(res, 404, 'dispatch_not_found', 'Dispatch not found on this thread');
+      return;
+    }
+    deleteDispatch(dispatchId);
+    res.json({ status: 'deleted', dispatch_id: dispatchId });
+  });
+
   // -- POST /threads/:external_id/todos/:todoId/promote-to-shim -------------
 
   router.post('/threads/:external_id/todos/:todoId/promote-to-shim', (req: AuthedRequest, res) => {
@@ -2138,9 +2638,10 @@ export function createApiV1Router(): Router {
     const FORWARD = new Set([
       'turn', 'conversation_updated', 'conversation_created',
       'conversation_renamed', 'conversation_deleted', 'status', 'thread_todo',
-      'thread_reminder',
+      'thread_link', 'thread_reminder',
       'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
       'quick_capture', 'thread_summary', 'notification',
+      'dispatch', 'dispatch_cue',
     ]);
 
     res.writeHead(200, {
@@ -2302,7 +2803,7 @@ export function createApiV1Router(): Router {
   // descriptor (DAR-680), and the full adapter catalog. POST sets the GLOBAL
   // default adapter/model (applies to new turns). Mutation is admin-scoped.
 
-  router.get('/settings', (_req: AuthedRequest, res) => {
+  router.get('/settings', async (_req: AuthedRequest, res) => {
     const info = getActiveAdapterInfo();
     res.json({
       settings: getAllSettings(),
@@ -2311,7 +2812,7 @@ export function createApiV1Router(): Router {
       active_runtime: getActiveRuntimeDescriptor(),
       active_preset_id: getSetting('active_preset'),
       adapter_options: (() => { try { return JSON.parse(getSetting('adapter_options') ?? '{}'); } catch { return {}; } })(),
-      adapters: providerCatalog(),
+      adapters: await providerCatalog(),
     });
   });
 
@@ -2334,6 +2835,26 @@ export function createApiV1Router(): Router {
     }
     const info = getActiveAdapterInfo();
     res.json({ ok: true, active_adapter: info.adapter, active_model: info.model });
+  });
+
+  router.get('/settings/dashboard', (_req: AuthedRequest, res) => {
+    res.json({
+      settings: parseJsonSetting<Record<string, unknown>>(MOMENTUM_LAB_SETTINGS_KEY),
+    });
+  });
+
+  router.post('/settings/dashboard', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Changing dashboard settings requires an admin-scoped key');
+      return;
+    }
+    const settings = (req.body as { settings?: unknown } | null | undefined)?.settings;
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+      sendError(res, 400, 'invalid_dashboard_settings', 'Dashboard settings must be a JSON object');
+      return;
+    }
+    setSetting(MOMENTUM_LAB_SETTINGS_KEY, JSON.stringify(settings));
+    res.json({ ok: true, settings });
   });
 
   // == Control panel (DAR-729) =================================================
@@ -2443,6 +2964,34 @@ export function createApiV1Router(): Router {
     const limitRaw = parseInt(String(req.query.limit ?? '100'), 10);
     const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, limitRaw)) : 100;
     res.json({ history: getPersonalityStatsHistory(limit) });
+  });
+
+  // Autonomy dial (kevin/jarvis-autonomy-dial.md) — same shape as personality
+  // stats above: a 0-10 value + change history. `hard_limiter` is fixed,
+  // read-only context for the UI — it never changes with the dial.
+  router.get('/control-panel/autonomy-level', (_req: AuthedRequest, res) => {
+    res.json({ level: getAutonomyLevel(), hard_limiter: AUTONOMY_HARD_LIMITER_SUMMARY });
+  });
+
+  router.patch('/control-panel/autonomy-level', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Changing the autonomy level requires an admin-scoped key');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const num = Number(body.level);
+    if (!Number.isFinite(num)) {
+      sendError(res, 400, 'invalid_request', 'level must be a number 0-10');
+      return;
+    }
+    const level = updateAutonomyLevel(num, req.apiKey!.caller_label ?? null);
+    res.json({ ok: true, level });
+  });
+
+  router.get('/control-panel/autonomy-level/history', (req: AuthedRequest, res) => {
+    const limitRaw = parseInt(String(req.query.limit ?? '100'), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, limitRaw)) : 100;
+    res.json({ history: getAutonomyLevelHistory(limit) });
   });
 
   // == Check-ins (DAR-676 — port of the 3201 /checkins page) ==================

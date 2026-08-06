@@ -1,12 +1,14 @@
 import { EventEmitter } from 'node:events';
 import type { AutonomyLedgerRow } from './autonomy-ledger.js';
 import type { ThreadTodoRow } from './thread-todos.js';
+import type { ThreadLinkRow } from './thread-links.js';
 import type { JarvisDecisionRow } from './jarvis-decisions.js';
 import type { NoteRow } from './notes-db.js';
 import type { QuickCaptureItemRow } from './quick-capture-db.js';
 import type { ThreadReminderRow } from './thread-reminders.js';
 import type { ThreadSummaryRow } from './thread-summaries.js';
 import type { NotificationRow } from './notifications.js';
+import type { DispatchRow, DispatchWorkerRow } from './dispatches.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -90,6 +92,16 @@ export interface ThreadTodoEvent {
   conversationId: number;
   action: 'created' | 'updated' | 'deleted';
   todo: ThreadTodoRow;
+}
+
+// Per-thread "relevant links" bar under the title (preview/build URL + refs).
+// Same shape as ThreadTodoEvent — one row, create/update/delete, keyed by
+// conversationId (the /events writer annotates external_id on the way out).
+export interface ThreadLinkEvent {
+  type: 'thread_link';
+  conversationId: number;
+  action: 'created' | 'updated' | 'deleted';
+  link: ThreadLinkRow;
 }
 
 export interface ConversationRenamedEvent {
@@ -177,15 +189,37 @@ export interface NotificationEvent {
   notification: NotificationRow;
 }
 
+// DAR-782 — dispatch signaling. Fired on dispatch lifecycle (create/complete/ack/delete)
+// and worker status updates. Keyed to the orchestrator's conversationId.
+export interface DispatchEvent {
+  type: 'dispatch';
+  conversationId: number;
+  action: 'created' | 'updated' | 'completed' | 'acknowledged' | 'deleted';
+  dispatch: DispatchRow;
+  workers: DispatchWorkerRow[];
+}
+
+// DAR-782 — dispatch cue. Fired when a dispatch gate is satisfied and the
+// orchestrator should be notified. Renders as a cue chip, NOT a chat message.
+export interface DispatchCueEvent {
+  type: 'dispatch_cue';
+  conversationId: number;
+  dispatchId: number;
+  label: string | null;
+  workersFinished: number;
+  workersTotal: number;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
   | AutonomyLedgerEvent | AutonomyLedgerReviewEvent
-  | ThreadTodoEvent | JarvisDecisionEvent
+  | ThreadTodoEvent | ThreadLinkEvent | JarvisDecisionEvent
   | ConversationRenamedEvent | ConversationDeletedEvent
   | QueuedMessageEvent | NoteEvent | QuickCaptureEvent
   | ThreadReminderEvent | ToolCallEvent | ThreadSummaryEvent
-  | ThreadGroupEvent | NotificationEvent;
+  | ThreadGroupEvent | NotificationEvent
+  | DispatchEvent | DispatchCueEvent;
 
 class SSEBus extends EventEmitter {}
 

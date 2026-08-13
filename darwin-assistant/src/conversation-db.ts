@@ -116,6 +116,13 @@ for (const col of [
   // that row points at the group it covers, same as any other member.
   'group_id INTEGER REFERENCES conversation_groups(id)',
   'is_group_chat INTEGER NOT NULL DEFAULT 0',
+  // Standalone-window display metadata used by cockpit popouts.
+  'headline TEXT',
+  'border_color TEXT',
+  // Per-thread password lock (DAR-785). Stores "salt:hash" (scrypt) when set;
+  // null = unlocked. The cockpit gates thread content behind a password prompt
+  // whenever this is non-null.
+  'password_hash TEXT',
 ]) {
   try { db.exec(`ALTER TABLE conversations ADD COLUMN ${col}`); } catch {}
 }
@@ -147,6 +154,11 @@ export interface ConversationRow {
   // group's own cover chat (its group_id still points at the group it covers).
   group_id: number | null;
   is_group_chat: number;
+  // Standalone-window display metadata (headline + accent color).
+  headline: string | null;
+  border_color: string | null;
+  // Per-thread password lock (DAR-785). "salt:hash" when locked, null when open.
+  password_hash: string | null;
 }
 
 /**
@@ -155,7 +167,7 @@ export interface ConversationRow {
  * `watch:...`, etc. Used to badge messages by where they came from.
  */
 export type ConversationSource =
-  | 'slack' | 'cockpit' | 'watch' | 'api' | 'checkin' | 'webhook' | 'quick' | 'other';
+  | 'slack' | 'cockpit' | 'watch' | 'api' | 'checkin' | 'webhook' | 'quick' | 'ephemeral' | 'other';
 
 export function deriveSource(externalId: string): ConversationSource {
   const prefix = externalId.split(':', 1)[0]?.toLowerCase() ?? '';
@@ -167,6 +179,7 @@ export function deriveSource(externalId: string): ConversationSource {
     case 'checkin': return 'checkin';
     case 'webhook': return 'webhook';
     case 'quick': return 'quick';
+    case 'ephemeral': return 'ephemeral';
     default: return 'other';
   }
 }
@@ -288,8 +301,18 @@ const stmts = {
   setThreadPinned: db.prepare<[number, string | null, number]>(
     `UPDATE conversations SET pinned = ?, pinned_at = ? WHERE id = ?`,
   ),
+  setThreadDisplay: db.prepare<[string | null, string | null, number]>(
+    `UPDATE conversations
+     SET headline = COALESCE(?, headline),
+         border_color = COALESCE(?, border_color),
+         updated_at = datetime('now')
+     WHERE id = ?`,
+  ),
   setThreadGroup: db.prepare<[number | null, number]>(
     `UPDATE conversations SET group_id = ?, updated_at = datetime('now') WHERE id = ?`,
+  ),
+  setThreadPasswordHash: db.prepare<[string | null, number]>(
+    `UPDATE conversations SET password_hash = ? WHERE id = ?`,
   ),
   initGroupChat: db.prepare<[number, number]>(
     `UPDATE conversations SET group_id = ?, is_group_chat = 1, updated_at = datetime('now') WHERE id = ?`,
@@ -560,6 +583,26 @@ export function setThreadPinned(id: number, pinned: boolean): void {
   } satisfies ConversationUpdatedEvent);
 }
 
+/** Update standalone-window display metadata without disturbing unspecified fields. */
+export function setThreadDisplay(
+  id: number,
+  display: { headline?: string | null; borderColor?: string | null },
+): void {
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  stmts.setThreadDisplay.run(
+    display.headline === undefined ? null : display.headline,
+    display.borderColor === undefined ? null : display.borderColor,
+    id,
+  );
+  sseBus.emit('sse', {
+    type: 'conversation_updated',
+    conversationId: id,
+    status: getConversationById(id)?.status ?? 'active',
+    updatedAt: now,
+    turnCount: countTurns(id),
+  } satisfies ConversationUpdatedEvent);
+}
+
 /** File (or unfile, with null) a thread into a group (DAR-742). */
 export function setThreadGroup(id: number, groupId: number | null): void {
   stmts.setThreadGroup.run(groupId, id);
@@ -571,6 +614,49 @@ export function setThreadGroup(id: number, groupId: number | null): void {
     updatedAt: now,
     turnCount: countTurns(id),
   } satisfies ConversationUpdatedEvent);
+}
+
+// -- Per-thread password lock (DAR-785) ----------------------------------------
+
+import { scryptSync, randomBytes, timingSafeEqual } from 'crypto';
+
+export function setThreadPassword(id: number, password: string): void {
+  const salt = randomBytes(16).toString('hex');
+  const hash = scryptSync(password, salt, 64).toString('hex');
+  stmts.setThreadPasswordHash.run(`${salt}:${hash}`, id);
+  sseBus.emit('sse', {
+    type: 'conversation_updated',
+    conversationId: id,
+    status: getConversationById(id)?.status ?? 'active',
+    updatedAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
+    turnCount: countTurns(id),
+  } satisfies ConversationUpdatedEvent);
+}
+
+export function clearThreadPassword(id: number): void {
+  stmts.setThreadPasswordHash.run(null, id);
+  sseBus.emit('sse', {
+    type: 'conversation_updated',
+    conversationId: id,
+    status: getConversationById(id)?.status ?? 'active',
+    updatedAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
+    turnCount: countTurns(id),
+  } satisfies ConversationUpdatedEvent);
+}
+
+export function verifyThreadPassword(id: number, password: string): boolean {
+  const conv = getConversationById(id);
+  if (!conv?.password_hash) return true;
+  const [salt, storedHash] = conv.password_hash.split(':');
+  if (!salt || !storedHash) return false;
+  const derived = scryptSync(password, salt, 64);
+  const expected = Buffer.from(storedHash, 'hex');
+  return derived.length === expected.length && timingSafeEqual(derived, expected);
+}
+
+export function isThreadLocked(id: number): boolean {
+  const conv = getConversationById(id);
+  return !!conv?.password_hash;
 }
 
 /** Mark a freshly-created conversation as a group's own cover chat (DAR-742). */
@@ -614,6 +700,7 @@ export function autoHideStaleThreads(days: number): number {
       `SELECT id FROM conversations
         WHERE status = 'active'
           AND updated_at < datetime('now', ?)
+          AND group_id IS NULL
           AND id NOT IN (SELECT conversation_id FROM thread_todos WHERE status != 'done')`,
     )
     .all(cutoff);
@@ -880,6 +967,83 @@ export function updatePersonalityStats(
 /** Most recent personality stat changes, newest first. */
 export function getPersonalityStatsHistory(limit = 100): PersonalityStatsHistoryRow[] {
   return personalityStmts.listHistory.all(limit);
+}
+
+// -- Autonomy dial (kevin/jarvis-autonomy-dial.md) --
+// Same shelf/mechanism as the personality stats above: one 0-10 value in the
+// settings KV table + a history log. Governs how autonomously JARVIS decides
+// and executes work decisions vs. deferring to Kevin. The hard limiter (see
+// AUTONOMY_HARD_LIMITER_SUMMARY below) is a fixed ceiling the dial can never
+// raise past, regardless of value.
+
+const AUTONOMY_LEVEL_SETTING_KEY = 'autonomy_level';
+const DEFAULT_AUTONOMY_LEVEL = 5;
+
+export const AUTONOMY_HARD_LIMITER_SUMMARY =
+  'Regardless of dial position, ALWAYS escalate to Kevin instead of acting: ' +
+  'editing/running against live production servers/files/databases (e.g. live Hub 2.0 kuojrvfdjjqhqyvkuiam); ' +
+  'destructive/irreversible ops (drop/delete data, force-push, delete branches); ' +
+  'merging to main on a repo Kevin cares about; ' +
+  'external-facing/third-party actions (Slack/email to Mike or outsiders, public PRs/posts under Kevin\'s identity); ' +
+  'non-trivial money (new subscriptions/contracts).';
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS autonomy_level_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    old_value   INTEGER,
+    new_value   INTEGER NOT NULL,
+    changed_by  TEXT,
+    changed_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_autonomy_level_history_changed_at ON autonomy_level_history(changed_at DESC);
+`);
+
+export interface AutonomyLevelHistoryRow {
+  id: number;
+  old_value: number | null;
+  new_value: number;
+  changed_by: string | null;
+  changed_at: string;
+}
+
+const autonomyStmts = {
+  insertHistory: db.prepare<[number | null, number, string | null]>(
+    `INSERT INTO autonomy_level_history (old_value, new_value, changed_by) VALUES (?, ?, ?)`,
+  ),
+  listHistory: db.prepare<[number], AutonomyLevelHistoryRow>(
+    `SELECT * FROM autonomy_level_history ORDER BY changed_at DESC, id DESC LIMIT ?`,
+  ),
+};
+
+function clampAutonomyLevel(n: number): number {
+  return Math.max(0, Math.min(10, Math.round(n)));
+}
+
+/** Current autonomy dial value (0-10), seeded to the mid-default on first read. */
+export function getAutonomyLevel(): number {
+  const raw = getSetting(AUTONOMY_LEVEL_SETTING_KEY);
+  if (raw == null) {
+    setSetting(AUTONOMY_LEVEL_SETTING_KEY, String(DEFAULT_AUTONOMY_LEVEL));
+    return DEFAULT_AUTONOMY_LEVEL;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? clampAutonomyLevel(parsed) : DEFAULT_AUTONOMY_LEVEL;
+}
+
+/** Set the autonomy dial, logging a history row when the value actually changes. */
+export function updateAutonomyLevel(level: number, changedBy: string | null): number {
+  const current = getAutonomyLevel();
+  const next = clampAutonomyLevel(level);
+  if (next !== current) {
+    autonomyStmts.insertHistory.run(current, next, changedBy);
+    setSetting(AUTONOMY_LEVEL_SETTING_KEY, String(next));
+  }
+  return next;
+}
+
+/** Most recent autonomy dial changes, newest first. */
+export function getAutonomyLevelHistory(limit = 100): AutonomyLevelHistoryRow[] {
+  return autonomyStmts.listHistory.all(limit);
 }
 
 // -- Run history (DAR-729) --

@@ -21,6 +21,10 @@ import {
   setThreadPinned,
   setThreadDisplay,
   setThreadGroup,
+  setThreadPassword,
+  clearThreadPassword,
+  verifyThreadPassword,
+  isThreadLocked,
   deleteConversation,
   copyTurns,
   type ConversationRow,
@@ -348,6 +352,7 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     // the global default); runtime is the resolved descriptor actually in effect.
     model_override: { adapter: conv.thread_adapter, model: conv.thread_model },
     runtime: getAdapterRuntimeDescriptor(adapter.id, model),
+    locked: !!conv.password_hash,
   };
 }
 
@@ -1554,6 +1559,51 @@ export function createApiV1Router(): Router {
     }
     const refreshed = getConversationById(conv.id) ?? conv;
     res.json(threadDescriptor(refreshed, req));
+  });
+
+  // -- Thread password lock (DAR-785) -------------------------------------------
+
+  // PUT /threads/:external_id/lock — set or change a password on the thread.
+  router.put('/threads/:external_id/lock', (req: AuthedRequest, res) => {
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(req.apiKey!, externalId);
+    if ('error' in result) { sendError(res, result.error.status, result.error.code, result.error.message); return; }
+    const { password } = (req.body ?? {}) as { password?: unknown };
+    if (typeof password !== 'string' || password.length < 1) {
+      sendError(res, 400, 'invalid_request', 'password must be a non-empty string');
+      return;
+    }
+    setThreadPassword(result.id, password);
+    const refreshed = getConversationById(result.id) ?? result;
+    res.json(threadDescriptor(refreshed, req));
+  });
+
+  // DELETE /threads/:external_id/lock — remove the password from the thread.
+  router.delete('/threads/:external_id/lock', (req: AuthedRequest, res) => {
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(req.apiKey!, externalId);
+    if ('error' in result) { sendError(res, result.error.status, result.error.code, result.error.message); return; }
+    clearThreadPassword(result.id);
+    const refreshed = getConversationById(result.id) ?? result;
+    res.json(threadDescriptor(refreshed, req));
+  });
+
+  // POST /threads/:external_id/unlock — verify a password to access the thread.
+  router.post('/threads/:external_id/unlock', (req: AuthedRequest, res) => {
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(req.apiKey!, externalId);
+    if ('error' in result) { sendError(res, result.error.status, result.error.code, result.error.message); return; }
+    const { password } = (req.body ?? {}) as { password?: unknown };
+    if (typeof password !== 'string') {
+      sendError(res, 400, 'invalid_request', 'password must be a string');
+      return;
+    }
+    const ok = verifyThreadPassword(result.id, password);
+    if (!ok) {
+      sendError(res, 403, 'wrong_password', 'Incorrect password');
+      return;
+    }
+    res.json({ ok: true });
   });
 
   // -- Thread groups / folders (DAR-742) --------------------------------------

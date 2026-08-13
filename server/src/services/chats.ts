@@ -1,7 +1,25 @@
+import { scrypt, randomBytes, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
 import type { Db } from "@paperclipai/db";
 import { agentChats, agentChatMessages, issues, issueComments } from "@paperclipai/db";
 import { and, asc, desc, eq, lte, or, count } from "drizzle-orm";
 import { publishLiveEvent } from "./live-events.js";
+
+const scryptAsync = promisify(scrypt);
+
+async function hashPassword(password: string): Promise<string> {
+  const salt = randomBytes(16).toString("hex");
+  const derived = (await scryptAsync(password, salt, 64)) as Buffer;
+  return `${salt}:${derived.toString("hex")}`;
+}
+
+async function verifyPassword(password: string, stored: string): Promise<boolean> {
+  const [salt, hash] = stored.split(":");
+  if (!salt || !hash) return false;
+  const derived = (await scryptAsync(password, salt, 64)) as Buffer;
+  const expected = Buffer.from(hash, "hex");
+  return timingSafeEqual(derived, expected);
+}
 
 const CHAT_CONTEXT_WINDOW = 50;
 
@@ -256,6 +274,45 @@ export function chatService(db: Db) {
     return chat;
   }
 
+  async function setPassword(chatId: string, companyId: string, password: string) {
+    const hash = await hashPassword(password);
+    const [updated] = await db
+      .update(agentChats)
+      .set({ passwordHash: hash, updatedAt: new Date() })
+      .where(and(eq(agentChats.id, chatId), eq(agentChats.companyId, companyId)))
+      .returning();
+    if (updated) {
+      publishLiveEvent({
+        companyId,
+        type: "agent.chat.updated",
+        payload: { chatId, agentId: updated.agentId, locked: true },
+      });
+    }
+    return updated ?? null;
+  }
+
+  async function removePassword(chatId: string, companyId: string) {
+    const [updated] = await db
+      .update(agentChats)
+      .set({ passwordHash: null, updatedAt: new Date() })
+      .where(and(eq(agentChats.id, chatId), eq(agentChats.companyId, companyId)))
+      .returning();
+    if (updated) {
+      publishLiveEvent({
+        companyId,
+        type: "agent.chat.updated",
+        payload: { chatId, agentId: updated.agentId, locked: false },
+      });
+    }
+    return updated ?? null;
+  }
+
+  async function checkPassword(chatId: string, companyId: string, password: string): Promise<boolean> {
+    const chat = await getChat(chatId, companyId);
+    if (!chat?.passwordHash) return true;
+    return verifyPassword(password, chat.passwordHash);
+  }
+
   return {
     createChat,
     listChats,
@@ -267,5 +324,8 @@ export function chatService(db: Db) {
     addAgentMessage,
     buildIssueContext,
     getOrCreateQuickChat,
+    setPassword,
+    removePassword,
+    checkPassword,
   };
 }

@@ -1,10 +1,11 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { MessageCircle, X, Minus, ChevronDown } from "lucide-react";
 import type { Agent } from "@paperclipai/shared";
 import { cn } from "../lib/utils";
 import { AgentIcon } from "./AgentIconPicker";
 import { AgentChatThread } from "./AgentChatThread";
+import { PasswordGate } from "./ChatPasswordDialog";
 import { chatsApi } from "../api/chats";
 import { agentsApi } from "../api/agents";
 import { queryKeys } from "../lib/queryKeys";
@@ -20,6 +21,7 @@ export function GlobalChatBubble() {
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
   const [agentPickerOpen, setAgentPickerOpen] = useState(false);
   const agentPickerRef = useRef<HTMLDivElement>(null);
+  const [unlockedChats, setUnlockedChats] = useState<Set<string>>(new Set());
 
   const { data: agents = [] } = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId ?? ""),
@@ -36,6 +38,10 @@ export function GlobalChatBubble() {
     enabled: Boolean(selectedAgentId),
     staleTime: 10000,
   });
+
+  const handleChatUnlocked = useCallback((chatId: string) => {
+    setUnlockedChats((prev) => new Set(prev).add(chatId));
+  }, []);
 
   // Auto-select most recent active chat when agent changes
   useEffect(() => {
@@ -223,11 +229,25 @@ export function GlobalChatBubble() {
       {/* Chat body */}
       <div className="flex-1 min-h-0 overflow-hidden rounded-b-xl">
         {selectedAgent && selectedChatId ? (
-          <AgentChatThread
-            agentId={selectedAgent.id}
-            chatId={selectedChatId}
-            agent={selectedAgent}
-          />
+          (() => {
+            const chat = chats.find((c) => c.id === selectedChatId);
+            if (chat?.locked && !unlockedChats.has(selectedChatId)) {
+              return (
+                <PasswordGate
+                  agentId={selectedAgent.id}
+                  chatId={selectedChatId}
+                  onUnlocked={() => handleChatUnlocked(selectedChatId)}
+                />
+              );
+            }
+            return (
+              <AgentChatThread
+                agentId={selectedAgent.id}
+                chatId={selectedChatId}
+                agent={selectedAgent}
+              />
+            );
+          })()
         ) : selectedAgent ? (
           <div className="flex flex-col items-center justify-center h-full gap-3 text-sm text-muted-foreground">
             <p>No active chat.</p>

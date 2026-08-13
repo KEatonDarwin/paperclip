@@ -2432,7 +2432,7 @@ export function agentRoutes(db: Db) {
     assertCompanyAccess(req, agent.companyId);
 
     const list = await chats.listChats(agent.companyId, agent.id);
-    res.json(list);
+    res.json(list.map(({ passwordHash, ...rest }) => ({ ...rest, locked: !!passwordHash })));
   });
 
   router.get("/agents/:id/chats/:chatId", async (req, res) => {
@@ -2450,8 +2450,9 @@ export function agentRoutes(db: Db) {
       res.status(404).json({ error: "Chat not found" });
       return;
     }
+    const { passwordHash: _ph, ...chatSafe } = chat;
     const messages = await chats.getMessages(chatId, agent.companyId);
-    res.json({ ...chat, messages });
+    res.json({ ...chatSafe, locked: !!_ph, messages });
   });
 
   router.patch("/agents/:id/chats/:chatId", async (req, res) => {
@@ -2474,7 +2475,8 @@ export function agentRoutes(db: Db) {
       res.status(404).json({ error: "Chat not found" });
       return;
     }
-    res.json(updated);
+    const { passwordHash: _ph2, ...updatedSafe } = updated;
+    res.json({ ...updatedSafe, locked: !!_ph2 });
   });
 
   router.get("/agents/:id/chats/:chatId/messages", async (req, res) => {
@@ -2545,6 +2547,64 @@ export function agentRoutes(db: Db) {
     });
 
     res.json({ message: msg, runId: run?.id ?? null });
+  });
+
+  // Chat password lock
+  router.post("/agents/:id/chats/:chatId/lock", async (req, res) => {
+    const id = req.params.id as string;
+    const chatId = req.params.chatId as string;
+    const agent = await svc.getById(id);
+    if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
+    assertCompanyAccess(req, agent.companyId);
+    assertBoard(req);
+
+    const password = typeof req.body.password === "string" ? req.body.password : "";
+    if (!password || password.length < 1) {
+      res.status(422).json({ error: "Password is required" });
+      return;
+    }
+
+    const updated = await chats.setPassword(chatId, agent.companyId, password);
+    if (!updated) { res.status(404).json({ error: "Chat not found" }); return; }
+    res.json({ locked: true });
+  });
+
+  router.post("/agents/:id/chats/:chatId/unlock", async (req, res) => {
+    const id = req.params.id as string;
+    const chatId = req.params.chatId as string;
+    const agent = await svc.getById(id);
+    if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
+    assertCompanyAccess(req, agent.companyId);
+    assertBoard(req);
+
+    const password = typeof req.body.password === "string" ? req.body.password : "";
+    if (!password) {
+      res.status(422).json({ error: "Current password is required" });
+      return;
+    }
+
+    const valid = await chats.checkPassword(chatId, agent.companyId, password);
+    if (!valid) {
+      res.status(403).json({ error: "Incorrect password" });
+      return;
+    }
+
+    const updated = await chats.removePassword(chatId, agent.companyId);
+    if (!updated) { res.status(404).json({ error: "Chat not found" }); return; }
+    res.json({ locked: false });
+  });
+
+  router.post("/agents/:id/chats/:chatId/verify-password", async (req, res) => {
+    const id = req.params.id as string;
+    const chatId = req.params.chatId as string;
+    const agent = await svc.getById(id);
+    if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
+    assertCompanyAccess(req, agent.companyId);
+    assertBoard(req);
+
+    const password = typeof req.body.password === "string" ? req.body.password : "";
+    const valid = await chats.checkPassword(chatId, agent.companyId, password);
+    res.json({ valid });
   });
 
   // Agent Groups CRUD — /companies/:companyId/agent-groups

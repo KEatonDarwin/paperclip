@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Archive, Edit2, Check, X } from "lucide-react";
+import { Plus, Archive, Edit2, Check, X, Lock, LockOpen } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "../lib/utils";
@@ -13,6 +13,7 @@ interface AgentChatSessionSidebarProps {
   selectedChatId: string | null;
   onSelect: (chatId: string) => void;
   onNew: () => void;
+  onToggleLock?: (chat: AgentChat) => void;
 }
 
 function relativeDate(isoStr: string) {
@@ -35,6 +36,7 @@ export function AgentChatSessionSidebar({
   selectedChatId,
   onSelect,
   onNew,
+  onToggleLock,
 }: AgentChatSessionSidebarProps) {
   const queryClient = useQueryClient();
   const [hoveredId, setHoveredId] = useState<string | null>(null);
@@ -112,7 +114,8 @@ export function AgentChatSessionSidebar({
               </div>
             ) : (
               <>
-                <span className="text-sm truncate pr-12">
+                <span className="text-sm truncate pr-12 flex items-center gap-1">
+                  {chat.locked && <Lock className="h-3 w-3 shrink-0 text-muted-foreground" />}
                   {chat.title ?? "Untitled"}
                 </span>
                 <span className="text-xs text-muted-foreground">{relativeDate(chat.updatedAt)}</span>
@@ -128,6 +131,15 @@ export function AgentChatSessionSidebar({
                     >
                       <Edit2 className="h-3 w-3" />
                     </button>
+                    {onToggleLock && (
+                      <button
+                        title={chat.locked ? "Unlock" : "Lock"}
+                        className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-accent"
+                        onClick={() => onToggleLock(chat)}
+                      >
+                        {chat.locked ? <LockOpen className="h-3 w-3" /> : <Lock className="h-3 w-3" />}
+                      </button>
+                    )}
                     <button
                       title="Archive"
                       className="p-1 rounded text-muted-foreground hover:text-destructive hover:bg-accent"

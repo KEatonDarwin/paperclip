@@ -16,6 +16,7 @@ export const agentChats = pgTable(
     status: text("status").notNull().default("active"),
     issueId: uuid("issue_id").references(() => issues.id, { onDelete: "cascade" }),
     anchorCommentId: uuid("anchor_comment_id").references(() => issueComments.id, { onDelete: "cascade" }),
+    passwordHash: text("password_hash"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

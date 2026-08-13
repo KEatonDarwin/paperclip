@@ -9,6 +9,7 @@ export interface AgentChat {
   status: "active" | "archived";
   issueId: string | null;
   anchorCommentId: string | null;
+  locked: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -53,6 +54,15 @@ export const chatsApi = {
 
   sendMessage: (agentId: string, chatId: string, body: string) =>
     api.post<SendMessageResult>(`${chatBasePath(agentId)}/${encodeURIComponent(chatId)}/messages`, { body }),
+
+  lock: (agentId: string, chatId: string, password: string) =>
+    api.post<{ locked: boolean }>(`${chatBasePath(agentId)}/${encodeURIComponent(chatId)}/lock`, { password }),
+
+  unlock: (agentId: string, chatId: string, password: string) =>
+    api.post<{ locked: boolean }>(`${chatBasePath(agentId)}/${encodeURIComponent(chatId)}/unlock`, { password }),
+
+  verifyPassword: (agentId: string, chatId: string, password: string) =>
+    api.post<{ valid: boolean }>(`${chatBasePath(agentId)}/${encodeURIComponent(chatId)}/verify-password`, { password }),
 };
 
 export interface QuickChatResponse {

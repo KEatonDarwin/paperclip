@@ -104,15 +104,38 @@ function parseReassignment(target: string): CommentReassignment | null {
   return null;
 }
 
-function CopyMarkdownButton({ text }: { text: string }) {
+function stripMarkdown(md: string): string {
+  return md
+    .replace(/```[\s\S]*?```/g, (m) => m.replace(/^```[\w]*\n?/gm, "").replace(/\n?```$/gm, ""))
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/\*{3}([^*]+)\*{3}/g, "$1")
+    .replace(/\*{2}([^*]+)\*{2}/g, "$1")
+    .replace(/_{2}([^_]+)_{2}/g, "$1")
+    .replace(/\*([^*\n]+)\*/g, "$1")
+    .replace(/_([^_\n]+)_/g, "$1")
+    .replace(/~~([^~]+)~~/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^>\s*/gm, "")
+    .replace(/^[-*+]\s+/gm, "")
+    .replace(/^\d+\.\s+/gm, "")
+    .replace(/^[-*_]{3,}$/gm, "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function CopyButton({ text, title, plain }: { text: string; title: string; plain?: boolean }) {
   const [copied, setCopied] = useState(false);
+  const content = plain ? stripMarkdown(text) : text;
   return (
     <button
       type="button"
       className="text-muted-foreground hover:text-foreground transition-colors"
-      title="Copy as markdown"
+      title={title}
       onClick={() => {
-        navigator.clipboard.writeText(text).then(() => {
+        navigator.clipboard.writeText(content).then(() => {
           setCopied(true);
           setTimeout(() => setCopied(false), 2000);
         });
@@ -199,7 +222,8 @@ function CommentCard({
               {formatDateTime(comment.createdAt)}
             </a>
           )}
-          <CopyMarkdownButton text={comment.body} />
+          <CopyButton text={comment.body} title="Copy as plain text" plain />
+          <CopyButton text={comment.body} title="Copy as markdown" />
           {comment.authorAgentId && onOpenQuickChat && !isPending ? (
             <button
               type="button"

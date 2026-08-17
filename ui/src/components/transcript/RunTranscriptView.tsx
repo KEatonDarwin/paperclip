@@ -1,12 +1,13 @@
 import { useMemo, useState } from "react";
 import type { TranscriptEntry } from "../../adapters";
 import { MarkdownBody } from "../MarkdownBody";
-import { cn, formatTokens } from "../../lib/utils";
+import { cn, formatTokens, stripMarkdown } from "../../lib/utils";
 import {
   Check,
   ChevronDown,
   ChevronRight,
   CircleAlert,
+  Copy,
   TerminalSquare,
   User,
   Wrench,
@@ -579,6 +580,26 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
   return groupToolBlocks(groupCommandBlocks(blocks));
 }
 
+function CopyButton({ text, title, plain }: { text: string; title: string; plain?: boolean }) {
+  const [copied, setCopied] = useState(false);
+  const content = plain ? stripMarkdown(text) : text;
+  return (
+    <button
+      type="button"
+      className="text-muted-foreground hover:text-foreground transition-colors opacity-0 group-hover:opacity-100"
+      title={title}
+      onClick={() => {
+        navigator.clipboard.writeText(content).then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        });
+      }}
+    >
+      {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+    </button>
+  );
+}
+
 function TranscriptMessageBlock({
   block,
   density,
@@ -590,7 +611,7 @@ function TranscriptMessageBlock({
   const compact = density === "compact";
 
   return (
-    <div>
+    <div className="group">
       {!isAssistant && (
         <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
           <User className={compact ? "h-3.5 w-3.5" : "h-4 w-4"} />
@@ -612,6 +633,12 @@ function TranscriptMessageBlock({
             <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-current" />
           </span>
           Streaming
+        </div>
+      )}
+      {!block.streaming && block.text && (
+        <div className="flex items-center gap-1.5 pt-0.5">
+          <CopyButton text={block.text} title="Copy" plain />
+          <CopyButton text={block.text} title="Copy as markdown" />
         </div>
       )}
     </div>

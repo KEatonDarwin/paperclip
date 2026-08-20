@@ -187,6 +187,7 @@ import {
 import { query } from '../db.js';
 import { listVaultTree, readVaultFile, searchVault } from '../vault-page.js';
 import { sseBus, type SSEEvent } from '../sse-bus.js';
+import { listPluginAdapters, getPluginAdapter } from '../plugins/index.js';
 import {
   authenticateBearer,
   callerExternalIdPrefix,
@@ -926,6 +927,48 @@ export function createApiV1Router(): Router {
       seesAll || (d.conversation_external_id != null && d.conversation_external_id.startsWith(prefix)),
     );
     res.json({ decisions: visible.map(serializeDecision) });
+  });
+
+  // == Plugins ==================================================================
+  // Local always-on watchers (systemd-driven or ad-hoc) surfaced in the Cockpit
+  // "Plugins" pane. Each plugin exposes status + on/off + a small set of typed
+  // actions (e.g. "update cookies"). Adding a new plugin = adding a new adapter
+  // in src/plugins/ and registering it — zero UI changes.
+
+  router.get('/plugins', async (_req: AuthedRequest, res) => {
+    try {
+      const statuses = await Promise.all(listPluginAdapters().map((a) => a.status()));
+      res.json({ plugins: statuses });
+    } catch (err) {
+      sendError(res, 500, 'plugin_list_failed', (err as Error).message);
+    }
+  });
+
+  router.get('/plugins/:id', async (req: AuthedRequest, res) => {
+    const id = paramString(req.params.id);
+    const adapter = getPluginAdapter(id);
+    if (!adapter) { sendError(res, 404, 'plugin_not_found', `No plugin: ${id}`); return; }
+    try { res.json(await adapter.status()); }
+    catch (err) { sendError(res, 500, 'plugin_status_failed', (err as Error).message); }
+  });
+
+  router.post('/plugins/:id/toggle', async (req: AuthedRequest, res) => {
+    const id = paramString(req.params.id);
+    const adapter = getPluginAdapter(id);
+    if (!adapter) { sendError(res, 404, 'plugin_not_found', `No plugin: ${id}`); return; }
+    const enabled = Boolean(req.body?.enabled);
+    try { res.json(await adapter.toggle(enabled)); }
+    catch (err) { sendError(res, 500, 'plugin_toggle_failed', (err as Error).message); }
+  });
+
+  router.post('/plugins/:id/actions/:name', async (req: AuthedRequest, res) => {
+    const id = paramString(req.params.id);
+    const name = paramString(req.params.name);
+    const adapter = getPluginAdapter(id);
+    if (!adapter) { sendError(res, 404, 'plugin_not_found', `No plugin: ${id}`); return; }
+    const payload = (req.body && typeof req.body === 'object') ? req.body as Record<string, unknown> : {};
+    try { res.json(await adapter.action(name, payload)); }
+    catch (err) { sendError(res, 500, 'plugin_action_failed', (err as Error).message); }
   });
 
   // == Quick-capture notes (DAR-701) ============================================

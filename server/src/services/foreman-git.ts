@@ -35,13 +35,20 @@ export function branchExists(repo: string, branch: string): boolean {
 }
 
 // Create (or reset) the integration branch off the job's base ref.
+// SELF-HEALING (force checkouts): a prior run killed/interrupted mid-gate can strand this
+// worktree on some other branch with dirty tracked files, and a plain `checkout` then fails
+// ("local changes would be overwritten") — dead-ending EVERY future job with
+// "could not create integration branch". At integration start no uncommitted real work should
+// exist here: task work is committed on task branches and the integration branch is rebuilt
+// fresh off baseBranch by re-merging them. So `-f` only ever discards stranded residue, never
+// real work (same reasoning the delta gate already documents for its own forced restore).
 export function createIntegrationBranch(repo: string, baseBranch: string, integrationBranch: string): GitResult {
   if (branchExists(repo, integrationBranch)) {
-    const co = git(repo, ["checkout", integrationBranch]);
+    const co = git(repo, ["checkout", "-f", integrationBranch]);
     if (!co.ok) return co;
     return git(repo, ["reset", "--hard", baseBranch]);
   }
-  return git(repo, ["checkout", "-B", integrationBranch, baseBranch]);
+  return git(repo, ["checkout", "-f", "-B", integrationBranch, baseBranch]);
 }
 
 export interface MergeOutcome {
@@ -132,6 +139,77 @@ export function runVerify(repo: string, command: string | null | undefined, time
     const combined = `${e.stdout ? e.stdout.toString() : ""}\n${e.stderr ? e.stderr.toString() : String(err)}`;
     return { pass: false, skipped: false, exitCode: e.status ?? null, output: tail(combined) };
   }
+}
+
+// Normalize compiler-error lines into position-independent signatures, so the SAME underlying
+// error matches across two different checkouts. Line/column numbers shift when unrelated code
+// changes above an error, so they are stripped; the file path + error code + message remain.
+function extractErrorSignatures(output: string): Set<string> {
+  const sigs = new Set<string>();
+  for (const raw of output.split("\n")) {
+    const line = raw.trim();
+    if (!/error TS\d+/.test(line)) continue; // TypeScript diagnostics — the gate's dominant signal
+    const sig = line
+      .replace(/\(\d+,\d+\)/g, "") // "file.ts(140,47):" -> "file.ts:"
+      .replace(/:\d+:\d+/g, "") // "file.ts:140:47" -> "file.ts"
+      .replace(/\s+/g, " ")
+      .trim();
+    sigs.add(sig);
+  }
+  return sigs;
+}
+
+// Delta verify gate (DAR-687): answer "did THIS change break anything?" instead of "is the
+// entire monorepo pristine?". Runs the real gate on the integrated result first; if it passes,
+// behaves exactly like runVerify (no extra work, no extra latency). Only when it FAILS does it
+// re-run the same gate on baseBranch and subtract: failures that already fail identically on the
+// base are pre-existing and tolerated; failures the change introduced fail the gate. This is what
+// lets a whole-repo `pnpm typecheck && pnpm build` gate coexist with chronically-broken example
+// packages without dead-ending every front-door job. Strict superset of runVerify — a clean job
+// is unaffected. Leaves the repo checked out on integrationBranch (as runVerify would).
+export function runVerifyDelta(
+  repo: string,
+  command: string | null | undefined,
+  baseBranch: string,
+  integrationBranch: string,
+  timeoutMs = 15 * 60_000,
+): VerifyResult {
+  const head = runVerify(repo, command, timeoutMs);
+  if (head.skipped || head.pass) return head;
+
+  const headSigs = extractErrorSignatures(head.output);
+  // Can't attribute the failure to recognizable errors → cannot prove it's pre-existing. Fail
+  // closed with the raw output (an unrecognized build/test failure is a real gate failure).
+  if (headSigs.size === 0) return head;
+
+  // Run the SAME gate on the base branch to learn its pre-existing failures, then ALWAYS restore
+  // the integration checkout (mergeToBase + note attachment downstream expect it). Force both
+  // directions and restore in a finally: the integration branch is fully committed, so `-f` only
+  // discards build residue (dist/tsbuildinfo) from the baseline pass, never real work — and it
+  // guarantees the worktree can't be stranded on baseBranch if the base gate leaves it dirty.
+  let baseResult: VerifyResult | null = null;
+  const onBase = git(repo, ["checkout", "-f", baseBranch]);
+  try {
+    if (onBase.ok) baseResult = runVerify(repo, command, timeoutMs);
+  } finally {
+    git(repo, ["checkout", "-f", integrationBranch]);
+  }
+
+  // Base is clean (or unreadable) → the failures are genuinely this change's. Fail.
+  if (!onBase.ok || !baseResult || baseResult.pass) return head;
+
+  const baseSigs = extractErrorSignatures(baseResult.output);
+  const newSigs = [...headSigs].filter((s) => !baseSigs.has(s));
+  if (newSigs.length === 0) {
+    const note =
+      `verify: delta-pass — all ${headSigs.size} failure(s) pre-exist on ${baseBranch}; ` +
+      `0 introduced by this change.\n\nPre-existing (tolerated):\n${[...headSigs].slice(0, 40).join("\n")}`;
+    return { pass: true, skipped: false, exitCode: 0, output: tail(note) };
+  }
+  const note =
+    `verify: delta-fail — ${newSigs.length} NEW error(s) introduced by this change ` +
+    `(${baseSigs.size} pre-existing on ${baseBranch} ignored):\n\n${newSigs.join("\n")}`;
+  return { pass: false, skipped: false, exitCode: head.exitCode, output: tail(note) };
 }
 
 export interface MergeToBaseResult {

@@ -86,6 +86,7 @@ import {
   sweepStaleEphemeralConversations,
 } from '../ephemeral-chat.js';
 import { autoNameThreadFromFirstMessage } from '../thread-autoname.js';
+import { autoGroupThreadFromFirstMessage } from '../thread-autogroup.js';
 import { generateThreadSummary } from '../thread-summarize.js';
 import { condenseThread, buildSmartForkMessage } from '../thread-condense.js';
 import { listThreadSummaries, getLatestThreadSummary } from '../thread-summaries.js';
@@ -1993,6 +1994,7 @@ export function createApiV1Router(): Router {
     // or the actual turn; the title lands later via a `conversation_renamed` SSE.
     if (nextIndex === 0 && conv.title === null && !conv.title_is_user_set) {
       void autoNameThreadFromFirstMessage(conv, text);
+      void autoGroupThreadFromFirstMessage(conv, text);
     }
 
     processMessage(text, externalId, messageId, savedImages.length ? savedImages : undefined)

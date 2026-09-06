@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { query, DARWIN_COMPANY_ID } from './db.js';
 import { getMutedSourceIds } from './mute-check.js';
+import { sqliteDb } from './conversation-db.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -207,41 +208,204 @@ export async function getTopPriorities(): Promise<string> {
   }
 }
 
-// ─── Main briefing builder ─────────────────────────────────────────────────────
+// ─── Morning "Build Standup" ────────────────────────────────────────────────
+//
+// Kevin retired the old fixed brief (calendar + Paperclip issue-counts + top-3
+// SHIM tasks) on 2026-08-01. His actual work now flows through many parallel
+// cockpit build threads (harness + Hub 2.0 accounting), not a SHIM task list or
+// calendar — so that template was blind to ~everything he does and surfaced
+// noise (156 "in review"). The morning message is now a "Build Standup" that
+// mirrors how he works: (1) where we left off — synthesized from the most
+// recent thread summaries; (2) needs your call — the short filtered set of
+// things genuinely waiting on him; (3) I'd start with — JARVIS picks the single
+// highest-leverage next move, like a human collaborator. Composed by the local
+// `claude` CLI (NO ANTHROPIC_API_KEY — see the NO API KEYS rule), mirroring the
+// jarvis-brief.ts / vision-critique.ts pattern, with a deterministic fallback
+// so the morning message can never hard-fail. Weekend-aware; silent on Sundays.
+
+const CLAUDE_BIN = process.env.UX_REVIEWER_CLAUDE_BIN || 'claude';
+const STANDUP_TIMEOUT_MS = 90 * 1000;
+
+interface StandupSignal {
+  dateStr: string;
+  weekday: string;
+  isWeekend: boolean;
+  isSunday: boolean;
+  calendar: string;
+  paperclip: string;
+  threads: string;
+  kevinTodos: string;
+}
+
+/** Recently-active build threads + their latest summary — the "where we left
+ *  off" signal. Excludes ephemeral/check-in plumbing threads. */
+function recentThreadActivity(): string {
+  try {
+    const rows = sqliteDb
+      .prepare<[], { title: string | null; external_id: string; summary: string | null }>(
+        `SELECT c.title, c.external_id,
+          (SELECT s.content FROM thread_summaries s
+             WHERE s.conversation_id = c.id
+             ORDER BY s.created_at DESC LIMIT 1) AS summary
+         FROM conversations c
+         WHERE c.updated_at > datetime('now','-48 hours')
+           AND c.external_id NOT LIKE 'ephemeral:%'
+           AND c.external_id NOT LIKE 'checkin:%'
+           AND c.title IS NOT NULL AND c.title != ''
+         ORDER BY c.updated_at DESC
+         LIMIT 10`,
+      )
+      .all();
+    if (!rows.length) return '(no active build threads in the last 48h)';
+    return rows
+      .map((r) => {
+        const summ = (r.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 260);
+        return `- "${r.title}"${summ ? ` — ${summ}` : ''}`;
+      })
+      .join('\n');
+  } catch (err) {
+    return `(could not read thread activity: ${(err as Error).message})`;
+  }
+}
+
+/** Open todos assigned to Kevin across every cockpit thread — the real
+ *  "needs your call" backlog (not the in_review pile). */
+function openKevinTodos(): string {
+  try {
+    const rows = sqliteDb
+      .prepare<[], { content: string; status: string; title: string | null; external_id: string }>(
+        `SELECT t.content, t.status, c.title, c.external_id
+         FROM thread_todos t
+         JOIN conversations c ON c.id = t.conversation_id
+         WHERE t.owner = 'kevin' AND t.status != 'done'
+         ORDER BY t.updated_at DESC LIMIT 12`,
+      )
+      .all();
+    if (!rows.length) return '(none)';
+    return rows
+      .map((r) => `- [${r.status}] "${r.content}" (thread: ${r.title ?? r.external_id})`)
+      .join('\n');
+  } catch (err) {
+    return `(could not read Kevin todos: ${(err as Error).message})`;
+  }
+}
+
+function buildStandupPrompt(s: StandupSignal): string {
+  return [
+    "You are JARVIS, Kevin's chief of staff. Write his MORNING message (a Slack DM) for",
+    `${s.dateStr}. Kevin RETIRED the old brief (calendar + Paperclip issue-counts + a top-3`,
+    'SHIM task list) — it was blind to how he actually works now: many parallel cockpit BUILD',
+    'THREADS (his JARVIS harness + Hub 2.0 accounting). This replaces it with a "Build Standup".',
+    '',
+    'Write exactly three short sections, in this order, using Slack formatting only',
+    '(*single-asterisk bold*, `code`; NO ## headers, NO **double** bold, no tables):',
+    '',
+    '1. *Where we left off* — 2-4 tight lines re-entering yesterday\'s active build fronts,',
+    '   SYNTHESIZED from the thread activity below. Group by theme (e.g. harness vs accounting);',
+    '   do NOT list every thread or paste summaries verbatim. Give him a running start, not a log.',
+    '2. *Needs your call* — ONLY things genuinely waiting on Kevin: a merge decision, a blocked',
+    '   item, a real question, or a Kevin-owned todo. Filter hard. If nothing truly needs him,',
+    '   say "Nothing waiting on you." The Paperclip "in review" pile is his own async review',
+    '   queue — mention it as at most a one-liner, never as a to-do dump.',
+    '3. *I\'d start with:* — pick the SINGLE highest-leverage next move and offer to run it.',
+    '   ONE thing. Actually choose, like a human collaborator sizing up the day — do not hedge',
+    '   or give options. End by offering to jump in.',
+    '',
+    'Voice: warm, direct, broad strokes (no root-cause detail), concise — he reads this on a',
+    'phone. Open with a one-line greeting that includes the date. Keep the whole thing tight.',
+    s.isSunday
+      ? 'IT IS SUNDAY — his rest day. Do NOT push work. Keep it to a warm one-liner; skip the three sections entirely (at most note what is parked for Monday if something is genuinely time-sensitive).'
+      : s.isWeekend
+        ? 'It is the WEEKEND — lead lighter and do not pressure. Still give the standup if there is live build momentum, but keep the tone easy and optional.'
+        : 'It is a weekday — this is his work-focused standup.',
+    '',
+    `=== CALENDAR TODAY ===\n${s.calendar}`,
+    '',
+    `=== RECENT BUILD-THREAD ACTIVITY (most recent first, with latest summaries) ===\n${s.threads}`,
+    '',
+    `=== OPEN TODOS ASSIGNED TO KEVIN ===\n${s.kevinTodos}`,
+    '',
+    `=== PAPERCLIP SNAPSHOT (counts only — do not just recite these) ===\n${s.paperclip}`,
+    '',
+    'Output ONLY the finished Slack message text — no preamble, no code fences, no explanation.',
+  ].join('\n');
+}
+
+function runStandup(prompt: string): Promise<string> {
+  const env = { ...process.env };
+  delete env.ANTHROPIC_API_KEY;
+  return new Promise((resolve, reject) => {
+    execFile(
+      CLAUDE_BIN,
+      ['-p', prompt, '--output-format', 'json'],
+      { timeout: STANDUP_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, env },
+      (err, stdout, stderr) => {
+        if (err && !stdout) {
+          reject(new Error(`claude standup failed: ${err.message}${stderr ? ` | ${stderr.slice(0, 200)}` : ''}`));
+          return;
+        }
+        try {
+          const envelope = JSON.parse(stdout.trim()) as { result?: string };
+          resolve(typeof envelope.result === 'string' ? envelope.result : stdout);
+        } catch {
+          resolve(stdout);
+        }
+      },
+    );
+  });
+}
+
+/** Deterministic Build-Standup render — the safety net if the claude call
+ *  fails. Deliberately NOT the old calendar/issue-count/top-3 layout. */
+function fallbackStandup(s: StandupSignal): string {
+  if (s.isSunday) {
+    return `☀️ *Morning, Kevin — ${s.dateStr}.*\n\nSunday — resting the build. Nothing work-side from me today. 💛`;
+  }
+  const lines: string[] = [`☀️ *Morning, Kevin — ${s.dateStr}.*`, '', '*Where we left off*', s.threads, '', '*Needs your call*'];
+  const needs: string[] = [];
+  if (/blocked/i.test(s.paperclip)) needs.push('• Blocked items sitting in Paperclip — worth a look.');
+  if (s.kevinTodos !== '(none)') needs.push(s.kevinTodos);
+  lines.push(needs.length ? needs.join('\n') : '• Nothing waiting on you.');
+  lines.push('', "*I'd start with:* pick up the top thread above — reply and I'll jump in.");
+  return lines.join('\n');
+}
 
 export async function buildMorningBriefing(): Promise<string> {
+  const now = new Date();
   const dateStr = new Intl.DateTimeFormat('en-US', {
     weekday: 'long',
     month: 'long',
     day: 'numeric',
     timeZone: TZ,
-  }).format(new Date());
+  }).format(now);
+  const weekday = new Intl.DateTimeFormat('en-US', { weekday: 'long', timeZone: TZ }).format(now);
+  const isSunday = weekday === 'Sunday';
+  const isWeekend = isSunday || weekday === 'Saturday';
 
-  const [calendar, paperclip, shim, priorities] = await Promise.all([
+  const [calendar, paperclip] = await Promise.all([
     getTodayCalendarEvents(),
     getPaperclipSnapshot(),
-    getShimSnapshot(),
-    getTopPriorities(),
   ]);
 
-  return [
-    `☀️ *Good morning, Kevin. ${dateStr}.*`,
-    '',
-    `*📅 Calendar today:*`,
+  const signal: StandupSignal = {
+    dateStr,
+    weekday,
+    isWeekend,
+    isSunday,
     calendar,
-    '',
-    `*🤖 Paperclip:* ${paperclip}`,
-    '',
-    `*📌 SHIM:* ${shim.tasks}`,
-    shim.sessions ? `*🍅 Focus:* ${shim.sessions}` : '',
-    '',
-    `*Your top 3 right now:*`,
-    priorities,
-    '',
-    `What do you want to tackle first?`,
-  ]
-    .filter((line) => line !== null)
-    .join('\n');
+    paperclip,
+    threads: recentThreadActivity(),
+    kevinTodos: openKevinTodos(),
+  };
+
+  try {
+    const text = (await runStandup(buildStandupPrompt(signal))).trim();
+    if (!text) throw new Error('empty standup');
+    return text;
+  } catch (err) {
+    console.error('[briefing] standup generation failed, using fallback:', err);
+    return fallbackStandup(signal);
+  }
 }
 
 // ─── Check-in producer: enqueue reminders for today's calendar events ─────────

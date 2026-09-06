@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
  * This module talks the MCP Streamable-HTTP transport directly, with no model
  * in the loop. It is used ONLY for servers JARVIS can reach on its own:
  *
- *   - **smarty-pants** (`mcp.thedarwinhub.com`) — Darwin's own server, no auth.
+ *   - **smarty-pants** (`mcp.thedarwinhub.com/mcp/kevin-connected`) — Darwin's own server, no auth.
  *
  * The five claude.ai connectors (Lovable / Supabase / Slack / Context7 / M365)
  * are deliberately NOT handled here: their OAuth is brokered by Kevin's
@@ -27,7 +27,7 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.JARVIS_MCP_NATIVE_TIMEOUT_MS || 60
 /** Servers reachable by the native client, keyed by the same friendly names
  * the bridge accepts. Anything not in here falls back to the CLI bridge. */
 export const NATIVE_SERVERS: Record<string, { url: string; headers?: Record<string, string> }> = {
-  'smarty-pants': { url: process.env.JARVIS_SMARTY_PANTS_URL || 'https://mcp.thedarwinhub.com/mcp/boost' },
+  'smarty-pants': { url: process.env.JARVIS_SMARTY_PANTS_URL || 'https://mcp.thedarwinhub.com/mcp/kevin-connected' },
 };
 
 export function resolveNativeServer(server: string): { url: string; headers?: Record<string, string> } | undefined {

@@ -57,6 +57,43 @@ import {
   type NotificationMeta,
 } from '../notifications.js';
 import {
+  listHopperItems,
+  getHopperItem,
+  createHopperItem,
+  markHopperPromoted,
+  markHopperDismissed,
+  deleteHopperItem,
+  composeHopperSeed,
+  type HopperStatus,
+} from '../hopper.js';
+import {
+  createHopperTree,
+  agreeHopperTree,
+  getHopperTree,
+  listHopperTrees,
+  listTreeNodes,
+  getHopperNode,
+  finishHopperNode,
+  answerHopperNode,
+  dispatchTick,
+  type NewNodeInput,
+} from '../hopper-engine.js';
+import { governorStatus } from '../hopper-governor.js';
+import {
+  listSmartTodoNodes,
+  getSmartTodoNode,
+  createSmartTodoNode,
+  updateSmartTodoNode,
+  moveSmartTodoNode,
+  deleteSmartTodoNode,
+  insertSmartTodoTree,
+  setSmartTodoGroup,
+  setSmartTodoThread,
+  type SmartTodoStatus,
+} from '../smart-todos.js';
+import { decomposeNote } from '../smart-todos-decompose.js';
+import { listSpawnTasks } from '../spawn-tasks.js';
+import {
   listActiveQuickCaptureItems,
   createQuickCaptureItem,
   reorderQuickCaptureItems,
@@ -153,6 +190,7 @@ import {
   type SavedImage,
 } from '../image-store.js';
 import { createShimTask } from '../tools/shim.js';
+import { submitIntake, listIntakeOutcomes } from '../tools/paperclip.js';
 import {
   processMessage,
   getAdapters,
@@ -167,6 +205,7 @@ import {
   getActiveRunCount,
   getActiveRuns,
   refreshAuggieModels,
+  refreshDevinModels,
   type AdapterConfig,
 } from '../agent.js';
 import {
@@ -367,6 +406,13 @@ async function providerCatalog(): Promise<Array<Record<string, unknown>>> {
   // shelf. Best-effort: leaves the static list in place on any failure.
   try {
     await refreshAuggieModels();
+  } catch {
+    // leave static models in place
+  }
+  // Devin's real family shelf lives in the `devin` CLI too — refresh it so the
+  // selector + per-thread model validation see all ~40 families, not the seed.
+  try {
+    await refreshDevinModels();
   } catch {
     // leave static models in place
   }
@@ -1067,6 +1113,414 @@ export function createApiV1Router(): Router {
     res.status(204).end();
   });
 
+  // == Task Hopper (candidate tasks awaiting Kevin's yes/dismiss) ==============
+  // Global list. A candidate lands here when something MIGHT be a task but the
+  // ask is ambiguous; Kevin reviews it in the standalone hopper window and
+  // promotes it (Yes / Yes-but) into a live cockpit thread, or dismisses it.
+
+  router.get('/hopper', (req: AuthedRequest, res) => {
+    const raw = typeof req.query.status === 'string' ? req.query.status : 'pending';
+    const status: HopperStatus | 'all' =
+      raw === 'promoted' || raw === 'dismissed' || raw === 'all' ? raw : 'pending';
+    res.json({ items: listHopperItems(status) });
+  });
+
+  // == Sub-agent tree (JARVIS worker protocol) ================================
+  // Read-only view over the spawn_tasks ledger — the cockpit tree widget renders
+  // orchestrator→worker fan-out + live status from this.
+  router.get('/spawn-tasks', (_req: AuthedRequest, res) => {
+    res.json({ tasks: listSpawnTasks() });
+  });
+
+  router.post('/hopper', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const title = typeof body.title === 'string' ? body.title.trim() : '';
+    if (!title) {
+      sendError(res, 400, 'invalid_request', 'title is required and must be a non-empty string');
+      return;
+    }
+    const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+    const item = createHopperItem({
+      title: title.slice(0, 300),
+      summary: str(body.summary),
+      source: str(body.source),
+      source_ref: str(body.source_ref),
+      raw_message: str(body.raw_message),
+      suggested_adapter: str(body.suggested_adapter),
+      suggested_model: str(body.suggested_model),
+    });
+    res.status(201).json({ item });
+  });
+
+  // Promote a candidate → a fresh cockpit thread. Optionally attach extra
+  // context ("Yes, but…") and override the model. Returns the new thread + the
+  // composed seed text; the client posts that seed (with any images) to
+  // /threads/:ext/messages to actually start JARVIS working — reusing the
+  // existing image-capable ingest+dispatch path rather than duplicating it.
+  router.post('/hopper/:id/promote', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const id = parseInt(String(req.params.id), 10);
+    const item = getHopperItem(id);
+    if (!item) {
+      sendError(res, 404, 'hopper_item_not_found', 'hopper item not found');
+      return;
+    }
+    if (item.status !== 'pending') {
+      sendError(res, 409, 'hopper_item_resolved', `hopper item already ${item.status}`);
+      return;
+    }
+    const body = (req.body ?? {}) as { extra_context?: unknown; adapter?: unknown; model?: unknown };
+    const extraContext = typeof body.extra_context === 'string' ? body.extra_context : null;
+
+    const externalId = `${callerExternalIdPrefix(caller.id)}hopper-${randomUUID()}`;
+    const conv = getOrCreateConversation(externalId);
+    renameConversation(conv.id, item.title.slice(0, 120));
+
+    // Optional model override for this thread ("Yes, but… use <model>").
+    const adapters = getAdapters();
+    if (typeof body.adapter === 'string' && adapters[body.adapter]) {
+      const adapter = adapters[body.adapter];
+      const model =
+        typeof body.model === 'string' && adapter.models.some((m) => m.id === body.model)
+          ? body.model
+          : null;
+      setThreadModelOverride(conv.id, adapter.id, model);
+    }
+
+    const seedText = composeHopperSeed(item, extraContext);
+    markHopperPromoted(id, externalId);
+    const refreshed = getConversationById(conv.id) ?? conv;
+    res.status(201).json({
+      thread: threadDescriptor(refreshed, req),
+      external_id: externalId,
+      seed_text: seedText,
+    });
+  });
+
+  router.post('/hopper/:id/dismiss', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const item = getHopperItem(id);
+    if (!item) {
+      sendError(res, 404, 'hopper_item_not_found', 'hopper item not found');
+      return;
+    }
+    res.json({ item: markHopperDismissed(id) });
+  });
+
+  router.delete('/hopper/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getHopperItem(id)) {
+      sendError(res, 404, 'hopper_item_not_found', 'hopper item not found');
+      return;
+    }
+    deleteHopperItem(id);
+    res.status(204).end();
+  });
+
+  // == Hopper Engine ==========================================================
+  // The autonomous work-tree executor (two-table design: hopper_trees/nodes =
+  // durable state, spawn_tasks = attempts). Breakdown chats write draft trees;
+  // Kevin's agree flips them live; the in-process dispatcher spawns ephemeral
+  // worker threads; workers report back through /hopper-nodes/:id/finish.
+
+  router.get('/hopper-trees', (_req: AuthedRequest, res) => {
+    res.json({ trees: listHopperTrees() });
+  });
+
+  router.post('/hopper-trees', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { topic?: unknown; origin_thread?: unknown; nodes?: unknown };
+    const topic = typeof body.topic === 'string' ? body.topic.trim() : '';
+    const nodes = Array.isArray(body.nodes) ? (body.nodes as NewNodeInput[]) : [];
+    if (!topic || !nodes.length || nodes.some((n) => typeof n?.title !== 'string' || !n.title.trim())) {
+      sendError(res, 400, 'invalid_request', 'topic and a non-empty nodes array (each with a title) are required');
+      return;
+    }
+    const origin = typeof body.origin_thread === 'string' && body.origin_thread.trim() ? body.origin_thread.trim() : null;
+    const created = createHopperTree(topic, origin, nodes);
+    res.status(201).json(created);
+  });
+
+  router.get('/hopper-trees/:treeId', (req: AuthedRequest, res) => {
+    const tree = getHopperTree(paramString(req.params.treeId));
+    if (!tree) {
+      sendError(res, 404, 'hopper_tree_not_found', 'hopper tree not found');
+      return;
+    }
+    res.json({ tree, nodes: listTreeNodes(tree.id) });
+  });
+
+  // Kevin's "yep that looks good" — the ONE human gate. Nothing below `agreed`
+  // ever dispatches; this flip is what starts autonomous execution.
+  router.post('/hopper-trees/:treeId/agree', (req: AuthedRequest, res) => {
+    const tree = agreeHopperTree(paramString(req.params.treeId));
+    if (!tree) {
+      sendError(res, 404, 'hopper_tree_not_found', 'hopper tree not found');
+      return;
+    }
+    res.json({ tree, nodes: listTreeNodes(tree.id) });
+  });
+
+  // Worker finish contract — the one place execution writes tree state.
+  router.post('/hopper-nodes/:id/finish', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const node = getHopperNode(id);
+    if (!node) {
+      sendError(res, 404, 'hopper_node_not_found', 'hopper node not found');
+      return;
+    }
+    if (node.status !== 'running') {
+      sendError(res, 409, 'hopper_node_not_running', `node is ${node.status}, not running (lease may have expired)`);
+      return;
+    }
+    const body = (req.body ?? {}) as {
+      outcome?: unknown; result?: unknown; question?: unknown;
+      children?: Array<{ title: string; spec?: string; depends_on_prev?: boolean }>;
+    };
+    const outcome = body.outcome;
+    if (outcome !== 'done' && outcome !== 'split' && outcome !== 'blocked_question' && outcome !== 'blocked') {
+      sendError(res, 400, 'invalid_request', "outcome must be one of done|split|blocked_question|blocked");
+      return;
+    }
+    if (outcome === 'split' && (!Array.isArray(body.children) || !body.children.length)) {
+      sendError(res, 400, 'invalid_request', 'split requires a non-empty children array');
+      return;
+    }
+    const updated = finishHopperNode(id, outcome, {
+      result: typeof body.result === 'string' ? body.result : undefined,
+      question: typeof body.question === 'string' ? body.question : undefined,
+      children: body.children,
+    });
+    res.json({ node: updated });
+  });
+
+  // Kevin answers a worker's blocking question → node re-queues with it injected.
+  router.post('/hopper-nodes/:id/answer', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const node = getHopperNode(id);
+    if (!node) {
+      sendError(res, 404, 'hopper_node_not_found', 'hopper node not found');
+      return;
+    }
+    const body = (req.body ?? {}) as { answer?: unknown };
+    if (typeof body.answer !== 'string' || !body.answer.trim()) {
+      sendError(res, 400, 'invalid_request', 'answer is required');
+      return;
+    }
+    if (node.status !== 'blocked_question') {
+      sendError(res, 409, 'hopper_node_not_questioning', `node is ${node.status}, not blocked_question`);
+      return;
+    }
+    res.json({ node: answerHopperNode(id, body.answer.trim()) });
+  });
+
+  // Manual kick (mostly for testing) — the engine is otherwise event-driven.
+  router.post('/hopper-engine/tick', (_req: AuthedRequest, res) => {
+    void dispatchTick('manual');
+    res.json({ ok: true });
+  });
+
+  // Governor status — is overnight dispatch currently open, and why/why not.
+  router.get('/hopper-engine/governor', (_req: AuthedRequest, res) => {
+    res.json(governorStatus());
+  });
+
+  // == Smart Todo Tree ========================================================
+  // Kevin's standalone, always-open "smart todo list": a file-tree of jotted
+  // ideas → main idea + unlimited nested subitems. Global (not thread-scoped).
+  // Any node can spawn/re-open a chat that ties back to it and lands in the
+  // node's group. See src/smart-todos.ts.
+
+  router.get('/smart-todos', (_req: AuthedRequest, res) => {
+    res.json({ nodes: listSmartTodoNodes() });
+  });
+
+  // Jot a note → decompose into a main idea + nested subitems → new branch.
+  router.post('/smart-todos/jot', async (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { note?: unknown; group_id?: unknown };
+    const note = typeof body.note === 'string' ? body.note.trim() : '';
+    if (!note) {
+      sendError(res, 400, 'invalid_request', 'note is required and must be a non-empty string');
+      return;
+    }
+    const groupId =
+      typeof body.group_id === 'number' && getGroupById(body.group_id) ? body.group_id : null;
+    const tree = await decomposeNote(note);
+    const root = insertSmartTodoTree(note, tree, { group_id: groupId });
+    res.status(201).json({ root, nodes: listSmartTodoNodes() });
+  });
+
+  // Add a single node (manual add / new empty root branch).
+  router.post('/smart-todos', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const title = typeof body.title === 'string' ? body.title.trim() : '';
+    if (!title) {
+      sendError(res, 400, 'invalid_request', 'title is required');
+      return;
+    }
+    let parentId: number | null = null;
+    if (body.parent_id !== undefined && body.parent_id !== null) {
+      if (typeof body.parent_id !== 'number' || !getSmartTodoNode(body.parent_id)) {
+        sendError(res, 404, 'smart_todo_not_found', `parent node ${String(body.parent_id)} not found`);
+        return;
+      }
+      parentId = body.parent_id;
+    }
+    const node = createSmartTodoNode({
+      title,
+      parent_id: parentId,
+      notes: typeof body.notes === 'string' ? body.notes : null,
+      group_id: typeof body.group_id === 'number' ? body.group_id : undefined,
+    });
+    res.status(201).json({ node });
+  });
+
+  // Patch a node's own fields (title / notes / status / collapsed / prompt).
+  router.patch('/smart-todos/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getSmartTodoNode(id)) {
+      sendError(res, 404, 'smart_todo_not_found', 'node not found');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const patch: {
+      title?: string;
+      notes?: string | null;
+      status?: SmartTodoStatus;
+      collapsed?: boolean;
+      original_prompt?: string | null;
+    } = {};
+    if (typeof body.title === 'string') patch.title = body.title;
+    if (body.notes !== undefined) patch.notes = body.notes === null ? null : String(body.notes);
+    if (body.status === 'open' || body.status === 'doing' || body.status === 'done') patch.status = body.status;
+    if (typeof body.collapsed === 'boolean') patch.collapsed = body.collapsed;
+    if (body.original_prompt !== undefined)
+      patch.original_prompt = body.original_prompt === null ? null : String(body.original_prompt);
+    const node = updateSmartTodoNode(id, patch);
+    res.json({ node });
+  });
+
+  // Move/reorder a node (and its subtree). parent_id null → make it a root.
+  router.post('/smart-todos/:id/move', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getSmartTodoNode(id)) {
+      sendError(res, 404, 'smart_todo_not_found', 'node not found');
+      return;
+    }
+    const body = (req.body ?? {}) as { parent_id?: unknown; sort_order?: unknown };
+    let parentId: number | null = null;
+    if (body.parent_id !== undefined && body.parent_id !== null) {
+      if (typeof body.parent_id !== 'number' || !getSmartTodoNode(body.parent_id)) {
+        sendError(res, 404, 'smart_todo_not_found', `target parent ${String(body.parent_id)} not found`);
+        return;
+      }
+      parentId = body.parent_id;
+    }
+    const sortOrder = typeof body.sort_order === 'number' ? body.sort_order : 0;
+    try {
+      const node = moveSmartTodoNode(id, parentId, sortOrder);
+      res.json({ node, nodes: listSmartTodoNodes() });
+    } catch (err) {
+      sendError(res, 400, 'invalid_move', (err as Error).message);
+    }
+  });
+
+  // Set (or clear) the cockpit group a whole branch maps to.
+  router.post('/smart-todos/:id/group', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getSmartTodoNode(id)) {
+      sendError(res, 404, 'smart_todo_not_found', 'node not found');
+      return;
+    }
+    const body = (req.body ?? {}) as { group_id?: unknown };
+    let groupId: number | null = null;
+    if (body.group_id !== undefined && body.group_id !== null) {
+      if (typeof body.group_id !== 'number' || !getGroupById(body.group_id)) {
+        sendError(res, 404, 'group_not_found', `Group ${String(body.group_id)} not found`);
+        return;
+      }
+      groupId = body.group_id;
+    }
+    const node = setSmartTodoGroup(id, groupId);
+    res.json({ node, nodes: listSmartTodoNodes() });
+  });
+
+  router.delete('/smart-todos/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getSmartTodoNode(id)) {
+      sendError(res, 404, 'smart_todo_not_found', 'node not found');
+      return;
+    }
+    deleteSmartTodoNode(id);
+    res.status(204).end();
+  });
+
+  // Open (or re-open) the chat tied to a node. If the node already has a live
+  // linked thread, returns it (reused:true) so "Open chat" from the tree focuses
+  // the SAME thread. Otherwise ensures the branch has a cockpit group (creating
+  // one named after the root branch if needed), creates a thread in that group,
+  // links it both ways, and returns a seed_text the client posts to
+  // /threads/:ext/messages to orient JARVIS on the item.
+  router.post('/smart-todos/:id/open-chat', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const id = parseInt(String(req.params.id), 10);
+    const node = getSmartTodoNode(id);
+    if (!node) {
+      sendError(res, 404, 'smart_todo_not_found', 'node not found');
+      return;
+    }
+
+    // Reuse an existing linked thread if it's still around.
+    if (node.linked_thread_ext) {
+      const existing = getConversation(node.linked_thread_ext);
+      if (existing) {
+        res.status(200).json({
+          thread: threadDescriptor(existing, req),
+          external_id: existing.external_id,
+          group_id: existing.group_id ?? null,
+          reused: true,
+          seed_text: null,
+        });
+        return;
+      }
+    }
+
+    // Ensure the branch has a group (a group per root branch).
+    const rootNode = getSmartTodoNode(node.root_id) ?? node;
+    let groupId = rootNode.group_id;
+    if (groupId === null || !getGroupById(groupId)) {
+      const { group } = createGroup(rootNode.title.slice(0, 100), null);
+      groupId = group.id;
+      setSmartTodoGroup(rootNode.id, groupId);
+    }
+
+    const externalId = `${callerExternalIdPrefix(caller.id)}tree-${randomUUID()}`;
+    const conv = getOrCreateConversation(externalId);
+    renameConversation(conv.id, node.title.slice(0, 120));
+    setThreadGroup(conv.id, groupId);
+    setSmartTodoThread(node.id, externalId);
+
+    const seedLines: string[] = [];
+    seedLines.push(`**Smart-todo item:** ${node.title}`);
+    if (node.notes && node.notes.trim()) seedLines.push('', node.notes.trim());
+    if (rootNode.id !== node.id) seedLines.push('', `_Part of: ${rootNode.title}_`);
+    if (rootNode.original_prompt && rootNode.original_prompt.trim()) {
+      seedLines.push('', 'Original note this came from:', '> ' + rootNode.original_prompt.trim().replace(/\n/g, '\n> '));
+    }
+    seedLines.push(
+      '',
+      "_(Opened from Kevin's Smart Todo Tree. This chat is tied to that item — progress you make here can be reflected back with the `smart_todos` tool's `sync` op. Orient on where this stands and what the next move is; ask Kevin what he wants if it's ambiguous.)_",
+    );
+
+    const refreshed = getConversationById(conv.id) ?? conv;
+    res.status(201).json({
+      thread: threadDescriptor(refreshed, req),
+      external_id: externalId,
+      group_id: groupId,
+      reused: false,
+      seed_text: seedLines.join('\n'),
+    });
+  });
+
   router.post('/notifications/:id/checkin-snooze', async (req: AuthedRequest, res) => {
     const id = parseInt(String(req.params.id), 10);
     const notification = getNotification(id);
@@ -1169,6 +1623,39 @@ export function createApiV1Router(): Router {
       res.json({ ok: true, issueId: action.issueId, reopenedTo: action.reopenStatus ?? 'in_review' });
     } catch (err) {
       sendError(res, 502, 'paperclip_unreachable', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  // == Foreman bug/task intake bridge (DAR-688 / DAR-711) =====================
+  // The Ctrl+Shift+B cockpit widget (BugIntakeWidget.tsx) POSTs here via the
+  // /cockpit-api proxy. We forward server-to-server into Paperclip's intake API
+  // (board key + Foreman worker project + run:true resolved in tools/paperclip.ts),
+  // so the widget never needs a Paperclip browser session. GET lists recent outcomes.
+  router.get('/intake', async (req: AuthedRequest, res) => {
+    try {
+      const raw = parseInt(String(req.query.limit ?? '15'), 10);
+      const limit = Math.min(50, Math.max(1, Number.isFinite(raw) ? raw : 15));
+      const outcomes = await listIntakeOutcomes(limit);
+      res.json({ outcomes });
+    } catch (err) {
+      sendError(res, 502, 'intake_list_failed', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.post('/intake', async (req: AuthedRequest, res) => {
+    const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+    if (!text) {
+      sendError(res, 400, 'text_required', 'text is required');
+      return;
+    }
+    const repo =
+      typeof req.body?.repo === 'string' && req.body.repo.trim() ? req.body.repo.trim() : 'darwin-assistant';
+    const jobType = req.body?.job_type === 'build' ? 'build' : 'bug_fix';
+    try {
+      const result = await submitIntake({ repo, text, jobType });
+      res.status(202).json(result);
+    } catch (err) {
+      sendError(res, 502, 'intake_submit_failed', err instanceof Error ? err.message : String(err));
     }
   });
 
@@ -2693,7 +3180,7 @@ export function createApiV1Router(): Router {
       'thread_link', 'thread_reminder',
       'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
       'quick_capture', 'thread_summary', 'notification',
-      'dispatch', 'dispatch_cue',
+      'dispatch', 'dispatch_cue', 'hopper_item', 'hopper_node', 'smart_todo',
     ]);
 
     res.writeHead(200, {

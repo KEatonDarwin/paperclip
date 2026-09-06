@@ -1,8 +1,10 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { mkdirSync, writeFileSync, unlinkSync, readFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSystemPrompt, loadMemoryBlock } from './prompt.js';
+import { getAuggieModels } from './auggie-catalog.js';
+import { getDevinModels } from './devin-catalog.js';
 import { ALL_TOOLS, TOOL_MAP } from './tools/index.js';
 import { withToolExecutionContext, type ToolExecutionContext } from './autonomy-ledger.js';
 import {
@@ -14,6 +16,8 @@ import {
   getTurns,
   countTurns,
   getSetting,
+  getAutonomyLevel,
+  AUTONOMY_HARD_LIMITER_SUMMARY,
   INTERRUPTED_MARKER,
   type ConversationRow,
   type TurnRow,
@@ -197,6 +201,18 @@ export interface AdapterConfig {
   // by getAdapterRuntimeDescriptor(); leave them null in the static config.
   runtime: Omit<AdapterRuntimeDescriptor, 'adapterType' | 'model' | 'modelLabel'>;
   buildArgs: (opts: { sessionId?: string | null; model?: string | null; options?: Record<string, unknown>; imageDirs?: string[]; imagePaths?: string[] }) => string[];
+  // Some CLIs (e.g. Devin) don't read the prompt from stdin — they take it via a
+  // file flag. When set, runClaude writes the composed prompt to a temp file and
+  // appends `<promptFileArg> <path>` to the args instead of piping stdin. The
+  // temp file is unlinked on close. Adapters that leave this undefined get the
+  // default stdin behavior (claude/codex/auggie).
+  promptFileArg?: string;
+  // Devin's --print mode returns plain text with no session id in stdout, but it
+  // DOES have resumable native sessions — the id is written to the --export file.
+  // When set, runClaude adds `--export <tmp>`, reads `session_id` back out after
+  // the run, and returns it so the harness can `-r <id>` on the next turn (native
+  // resume instead of transcript replay). Claude/Codex (id in stdout) leave unset.
+  captureSessionFromExport?: boolean;
   envOverrides?: (env: Record<string, string>) => void;
   // Optional adapter-specific stdout parser. Defaults to the claude JSONL parser.
   parseOutput?: (stdout: string) => ClaudeResult;
@@ -214,6 +230,7 @@ const ADAPTERS: Record<string, AdapterConfig> = {
     name: 'Claude (Anthropic)',
     bin: process.env.CLAUDE_BIN ?? 'claude',
     models: [
+      { id: 'claude-opus-5', label: 'Opus 5.0' },
       { id: 'claude-opus-4-8', label: 'Opus 4.8' },
       { id: 'claude-opus-4-7', label: 'Opus 4.7' },
       { id: 'claude-sonnet-5', label: 'Sonnet 5' },
@@ -328,11 +345,88 @@ const ADAPTERS: Record<string, AdapterConfig> = {
       return args;
     },
   },
+  devin: {
+    id: 'devin',
+    name: 'Devin (Windsurf)',
+    // Absolute path avoids the non-interactive-PATH gotcha under systemd.
+    bin: process.env.DEVIN_BIN ?? '/home/kevin/.local/bin/devin',
+    // Curated shortlist; refreshDevinModels() swaps in the live family shelf
+    // (~40 families) from `devin models list`. Family ids are valid --model values.
+    models: [
+      { id: 'adaptive', label: 'Adaptive (auto)' },
+      { id: 'claude-opus-5', label: 'Claude Opus 5' },
+      { id: 'claude-sonnet-5', label: 'Claude Sonnet 5' },
+      { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol' },
+      { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
+      { id: 'swe', label: 'SWE-1.7 Lightning (free)' },
+    ],
+    runtime: {
+      provider: 'devin',
+      providerLabel: 'Devin',
+      transport: 'local_cli',
+      // Devin authenticates via the local CLI's Windsurf/Devin subscription login
+      // (credentials.toml) — NO API key. Same no-key posture as claude/auggie.
+      auth: { envKeys: [], supportsLocalLogin: true, detectedFromConfig: false },
+      session: {
+        // Devin has real resumable native sessions (verified): the id is written
+        // to the --export file, captured via captureSessionFromExport, and passed
+        // back as `--resume <id>` next turn — no transcript replay needed.
+        resumeStrategy: 'native',
+        sessionScope: 'provider',
+        canResumeAcrossModelChange: true,
+        canResumeAcrossProviderChange: false,
+        requiresFreshSessionOnAssignment: false,
+      },
+      // It's itself a multi-model coding agent (tools + MCP); we don't parse a
+      // token stream from --print, so streamingText is false (mirrors auggie).
+      capabilities: { tools: true, mcp: true, streamingText: false, structuredOutput: false, webSearch: false },
+    },
+    buildArgs({ sessionId, model }) {
+      // --print + exit; --respect-workspace-trust false so print mode never blocks
+      // on the trust prompt in JARVIS_CLI_CWD. The prompt itself is delivered via
+      // promptFileArg (--prompt-file) since Devin ignores stdin in print mode.
+      const args = ['--print', '--respect-workspace-trust', 'false'];
+      if (sessionId) args.push('--resume', sessionId); // native resume by captured id
+      if (model && model !== 'default') args.push('--model', model);
+      return args;
+    },
+    promptFileArg: '--prompt-file',
+    captureSessionFromExport: true,
+    // A stored session that Devin no longer knows → clean fresh-session retry.
+    unknownSessionPattern: /No session found matching/i,
+    // Devin --print emits the final answer as plain text; the session id comes
+    // from the export file (captureSessionFromExport), not stdout.
+    parseOutput: (stdout: string): ClaudeResult => ({ text: stdout.trim(), sessionId: null }),
+    envOverrides(env) { delete env['ANTHROPIC_API_KEY']; delete env['OPENAI_API_KEY']; },
+  },
 };
 
 export function getAdapters(): Record<string, AdapterConfig> {
   return ADAPTERS;
 }
+
+// Refresh the auggie adapter's model shelf from `auggie model list` (Augment's
+// real models live in the CLI, not our static config). Mutating ADAPTERS.auggie
+// .models means the selector, per-thread model validation, resolveConversationRuntime,
+// and model-label lookups all see the full shelf. Best-effort; keeps the static
+// {default} list on failure. Cached (5-min TTL) inside auggie-catalog.
+export async function refreshAuggieModels(): Promise<Array<{ id: string; label: string }>> {
+  const models = await getAuggieModels();
+  if (models.length > 0) ADAPTERS.auggie.models = models;
+  return ADAPTERS.auggie.models;
+}
+// Warm the shelf at startup so validation works before the first /providers hit.
+void refreshAuggieModels().catch(() => { /* best-effort */ });
+
+// Same pattern for Devin: its real model shelf (40 families) lives in the CLI,
+// not our static config. `devin models list` -> family ids -> ADAPTERS.devin.models
+// so the selector + per-thread model validation see the full shelf.
+export async function refreshDevinModels(): Promise<Array<{ id: string; label: string }>> {
+  const models = await getDevinModels();
+  if (models.length > 0) ADAPTERS.devin.models = models;
+  return ADAPTERS.devin.models;
+}
+void refreshDevinModels().catch(() => { /* best-effort */ });
 
 function getActiveAdapter(): AdapterConfig {
   const adapterId = getSetting('adapter') ?? 'claude';
@@ -492,7 +586,7 @@ export function buildToolsBlock(): string {
   ].join('\n');
 }
 
-function buildInitialPrompt(userMessage: string): string {
+export function buildInitialPrompt(userMessage: string): string {
   return [buildSystemPrompt(), buildToolsBlock(), '---', `Human: ${userMessage}`, 'Assistant:'].join('\n\n');
 }
 
@@ -555,9 +649,12 @@ const OUTPUT_HEADROOM_TOKENS = 16_000;
 const DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000; // unknown model — assume the smallest common window
 
 // Per-model overrides where known; otherwise falls back to the per-adapter
-// estimate, then the global default. Codex/GPT-5.5's *effective* window in
-// practice (with the CLI's own overhead) is meaningfully smaller than Claude's,
-// which is the root cause this ticket is fixing — kept conservative on purpose.
+// estimate, then the global default. GPT-5.5's *effective input* window is
+// 258,400 tokens, not 128k: Codex reserves 400K total = 272K input + 128K
+// output, and auto-compaction fires at 90% = ~258K (confirmed by an OpenAI
+// maintainer, openai/codex#19185). This value belongs ONLY in JARVIS's own map
+// here — never in ~/.codex/config.toml, which would break Codex's own
+// auto-compaction. gpt-5.4/mini left at 128k until separately confirmed.
 const MODEL_CONTEXT_WINDOW_TOKENS: Record<string, number> = {
   'claude-opus-4-8': 200_000,
   'claude-opus-4-7': 200_000,
@@ -565,7 +662,7 @@ const MODEL_CONTEXT_WINDOW_TOKENS: Record<string, number> = {
   'claude-sonnet-4-6': 200_000,
   'claude-fable-5': 200_000,
   'claude-haiku-4-5-20251001': 200_000,
-  'gpt-5.5': 128_000,
+  'gpt-5.5': 258_400,
   'gpt-5.4': 128_000,
   'gpt-5.4-mini': 128_000,
 };
@@ -653,7 +750,7 @@ function selectTurnsForBudget(
 // error from the destination adapter (see the overflow-retry handling around
 // runClaude() below): shrinks the budget further and drops to a truncated
 // memory block, on top of whatever the normal per-model budget already trimmed.
-function buildContinuationPrompt(
+export function buildContinuationPrompt(
   turns: TurnRow[],
   userMessage: string,
   adapterId: string = 'claude',
@@ -890,6 +987,27 @@ export async function runClaude(
 
   const args = adapter.buildArgs({ sessionId, model, options, imageDirs, imagePaths });
 
+  // Prompt delivery: most adapters read the composed prompt from stdin. Adapters
+  // that set promptFileArg (Devin) instead get it via a temp file passed on argv.
+  let promptFilePath: string | null = null;
+  if (adapter.promptFileArg) {
+    promptFilePath = join(tmpdir(), `jarvis-${adapter.id}-prompt-${process.pid}-${Date.now()}-${Math.round(Math.random() * 1e9)}.txt`);
+    try {
+      writeFileSync(promptFilePath, input, 'utf8');
+      args.push(adapter.promptFileArg, promptFilePath);
+    } catch {
+      promptFilePath = null; // fall back to stdin if the temp write fails
+    }
+  }
+
+  // Native-session capture (Devin): ask the CLI to export the conversation so we
+  // can read its session_id back out and resume with `-r <id>` next turn.
+  let exportFilePath: string | null = null;
+  if (adapter.captureSessionFromExport) {
+    exportFilePath = join(tmpdir(), `jarvis-${adapter.id}-export-${process.pid}-${Date.now()}-${Math.round(Math.random() * 1e9)}.json`);
+    args.push('--export', exportFilePath);
+  }
+
   return new Promise((resolve, reject) => {
     const child = spawn(adapter.bin, args, { env, cwd: JARVIS_CLI_CWD });
     const outChunks: Buffer[] = [];
@@ -926,6 +1044,8 @@ export async function runClaude(
       clearTimeout(killTimer);
       signal?.removeEventListener('abort', onAbort);
       activeChildren.delete(child);
+      if (promptFilePath) { try { unlinkSync(promptFilePath); } catch { /* noop */ } }
+      if (exportFilePath) { try { unlinkSync(exportFilePath); } catch { /* noop */ } }
     };
 
     const forwardEvent = (event: Record<string, unknown>) => {
@@ -955,6 +1075,15 @@ export async function runClaude(
     child.stderr.on('data', (chunk: Buffer) => { errChunks.push(chunk); armIdleTimer(); });
     child.on('error', (err) => { cleanup(); reject(err); });
     child.on('close', (code) => {
+      // Read the native session id out of Devin's export file BEFORE cleanup
+      // unlinks it (the id isn't in stdout for --print adapters).
+      let exportSessionId: string | null = null;
+      if (exportFilePath) {
+        try {
+          const exp = JSON.parse(readFileSync(exportFilePath, 'utf8')) as { session_id?: string };
+          if (exp.session_id) exportSessionId = exp.session_id;
+        } catch { /* keep null */ }
+      }
       cleanup();
 
       // Fix C (DAR-676): killed by the run-timeout watchdog. Surface a distinct
@@ -989,10 +1118,16 @@ export async function runClaude(
         return;
       }
       const parse = adapter.parseOutput ?? parseClaudeOutput;
-      resolve(parse(stdout));
+      const parsed = parse(stdout);
+      // Native session resume: prefer the id captured from the export file over
+      // whatever the stdout parser produced (Devin's stdout has none).
+      if (exportSessionId) parsed.sessionId = exportSessionId;
+      resolve(parsed);
     });
 
-    child.stdin.write(input, 'utf8');
+    // promptFileArg adapters (Devin) already have the prompt on argv via a temp
+    // file — don't also pipe it to stdin (Devin ignores stdin in --print mode).
+    if (!promptFilePath) child.stdin.write(input, 'utf8');
     child.stdin.end();
   });
 }
@@ -1101,6 +1236,24 @@ async function runConversationTurn(
   // (this is what the cockpit todo-panel self-drive + thread routing rely on).
   const threadContextLine = `<jarvis_thread external_id="${conv.external_id}" conversation_id="${conv.id}"/>\n`;
 
+  // kevin/jarvis-autonomy-dial.md — 0-10 dial controlling how autonomously
+  // JARVIS decides & executes work decisions this turn vs. deferring to
+  // Kevin. Read fresh every turn (Control Panel writes take effect on the
+  // very next message, same as the personality stats' write-then-read
+  // pattern). hard_limiter is fixed and never modulated by the dial value.
+  const autonomyLevel = getAutonomyLevel();
+  const autonomyGuidance =
+    autonomyLevel <= 3
+      ? 'Low: highly questioning on work decisions — surface the fork, lay out options, prefer Kevin\'s input over your own judgment. Ask before acting on most non-trivial choices.'
+      : autonomyLevel <= 7
+        ? 'Mid (default): do a silent threat analysis; act on low/no-risk decisions you have a clear recommendation on (and note what you did so Kevin can override), surface the genuinely consequential or ambiguous ones.'
+        : 'High: execute every decision you run into, no matter what — no asking, just do it and report — up to the hard limiter below.';
+  const autonomyDialLine =
+    `<jarvis_autonomy_dial level="${autonomyLevel}">\n` +
+    `${autonomyGuidance}\n` +
+    `Hard limiter (fixed, NOT modulated by this dial — ALWAYS escalate to Kevin instead of acting on these regardless of level): ${AUTONOMY_HARD_LIMITER_SUMMARY}\n` +
+    `</jarvis_autonomy_dial>\n`;
+
   // DAR-742 — group chats get their member threads' summaries prepended every
   // turn (bounded, lazily-refreshed context — see group-chat-context.ts).
   // Ungrouped/normal threads are untouched (empty string).
@@ -1122,10 +1275,19 @@ async function runConversationTurn(
     ? `<attached_images>\nThe user attached ${images.length} image(s) to this message. Open and look at each one now before responding — absolute paths:\n${images.map((img) => `- ${img.absPath}`).join('\n')}\n</attached_images>\n\n`
     : '';
 
-  const perTurnContextPrefix = threadContextLine + groupContextBlock + quickChatContextBlock + imageBlock;
+  const perTurnContextPrefix = threadContextLine + autonomyDialLine + groupContextBlock + quickChatContextBlock + imageBlock;
 
+  // The resume path re-injects memory on EVERY turn that has a live sessionId
+  // (the common case), so an uncapped loadMemoryBlock() here was the dominant
+  // per-turn token cost. Mirror the continuation path's window-aware cap: small
+  // windows (≤128k) get the proven 12k trim so they don't overflow; large
+  // windows stay uncapped (the structural shrink comes from the Core/archive
+  // memory split), and the truncation footer already points the model at
+  // read_memory for anything trimmed.
+  const resumeMemoryMaxChars =
+    contextWindowTokensFor(adapter.id, runtime.model) <= 128_000 ? 12_000 : undefined;
   let stdinContent = perTurnContextPrefix + (sessionId
-    ? `<memory_refresh>\n${loadMemoryBlock()}\n</memory_refresh>\n\n${modelInput}`
+    ? `<memory_refresh>\n${loadMemoryBlock(resumeMemoryMaxChars)}\n</memory_refresh>\n\n${modelInput}`
     : (turns.length > 1 ? buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model) : buildInitialPrompt(modelInput)));
 
   // DAR-756: only one aggressive-compaction retry per turn — if the destination

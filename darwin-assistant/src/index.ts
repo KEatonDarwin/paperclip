@@ -8,7 +8,8 @@ import { enqueueCalendarCheckins } from './briefing.js';
 import { startUiServer } from './ui-server.js';
 import { reconcileInterruptedRuns, autoHideStaleThreads } from './conversation-db.js';
 import { getSetting } from './conversation-db.js';
-import { shutdownActiveRuns } from './agent.js';
+import { shutdownActiveRuns, processMessage } from './agent.js';
+import { startHopperEngine } from './hopper-engine.js';
 
 const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT ?? '3200', 10);
 const SLACK_ENABLED = !!(process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN);
@@ -108,6 +109,10 @@ async function main() {
   // bumping a cockpit thread is local + SQLite-only and must not depend on
   // Slack creds the way the Postgres-backed check-in worker does.
   startThreadReminderWorker();
+
+  // Hopper Engine — the autonomous work-tree dispatcher. Event-driven (ticks
+  // fire on node state writes); the 60s interval inside is only the safety net.
+  startHopperEngine(processMessage);
 
   if (slackApp) {
     await slackApp.start();

@@ -76,16 +76,17 @@ function groupChatExternalId(groupId: number): string {
   return `cockpit:group:${groupId}`;
 }
 
-/** Create a group and its cover chat (auto-created, same conversations row family as any thread). */
-export function createGroup(name: string, color?: string | null): { group: ConversationGroupRow; groupChat: ConversationRow } {
+/**
+ * Create a group. The group's own "cover" chat (the group-wide message thread)
+ * is NO LONGER created here — per Kevin's 2026-07-30 call, an empty group should
+ * not spawn a standalone group chat by default. The cover chat is now created
+ * lazily, on demand, via ensureGroupChat() (right-click → "New group chat").
+ */
+export function createGroup(name: string, color?: string | null): { group: ConversationGroupRow } {
   const info = stmts.insert.run(name, color ?? null);
   const groupId = Number(info.lastInsertRowid);
   const group = stmts.getById.get(groupId);
   if (!group) throw new Error('Failed to load conversation group after insert');
-
-  const created = getOrCreateConversation(groupChatExternalId(groupId));
-  initGroupChatConversation(created.id, groupId);
-  const groupChat = getConversationById(created.id) ?? created;
 
   sseBus.emit('sse', {
     type: 'thread_group',
@@ -94,7 +95,32 @@ export function createGroup(name: string, color?: string | null): { group: Conve
     group: { id: group.id, name: group.name, color: group.color, sort_order: group.sort_order },
   } satisfies ThreadGroupEvent);
 
-  return { group, groupChat };
+  return { group };
+}
+
+/**
+ * Create-or-return a group's cover chat on demand (the group-wide message
+ * thread). Idempotent: the external_id `cockpit:group:<id>` is deterministic,
+ * so calling this repeatedly just returns the same conversation. Emits a
+ * `thread_group` update so every open cockpit window resyncs its group list and
+ * the new cover chat appears live. Throws if the group doesn't exist.
+ */
+export function ensureGroupChat(groupId: number): ConversationRow {
+  const group = stmts.getById.get(groupId);
+  if (!group) throw new Error(`Conversation group ${groupId} not found`);
+
+  const created = getOrCreateConversation(groupChatExternalId(groupId));
+  initGroupChatConversation(created.id, groupId);
+  const groupChat = getConversationById(created.id) ?? created;
+
+  sseBus.emit('sse', {
+    type: 'thread_group',
+    action: 'updated',
+    groupId,
+    group: { id: group.id, name: group.name, color: group.color, sort_order: group.sort_order },
+  } satisfies ThreadGroupEvent);
+
+  return groupChat;
 }
 
 export function renameGroup(id: number, name: string): ConversationGroupRow | undefined {

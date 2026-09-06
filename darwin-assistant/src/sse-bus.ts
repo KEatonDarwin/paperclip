@@ -9,6 +9,9 @@ import type { ThreadReminderRow } from './thread-reminders.js';
 import type { ThreadSummaryRow } from './thread-summaries.js';
 import type { NotificationRow } from './notifications.js';
 import type { DispatchRow, DispatchWorkerRow } from './dispatches.js';
+import type { HopperItemRow } from './hopper.js';
+import type { HopperNodeRow } from './hopper-engine.js';
+import type { SmartTodoNodeRow } from './smart-todos.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -210,6 +213,32 @@ export interface DispatchCueEvent {
   workersTotal: number;
 }
 
+// TASK HOPPER — a candidate task awaiting Kevin's yes/dismiss. Global, not
+// conversation-scoped (same treatment as NotificationEvent).
+export interface HopperItemEvent {
+  type: 'hopper_item';
+  action: 'created' | 'updated' | 'deleted';
+  item: HopperItemRow;
+}
+
+// SMART TODO TREE — Kevin's standalone always-open backlog tree. Global, not
+// conversation-scoped (same treatment as HopperItemEvent). A tree edit can
+// touch many nodes, so 'bulk' signals "refetch the whole tree"; single-node
+// create/update/delete carry the affected node.
+export interface SmartTodoEvent {
+  type: 'smart_todo';
+  action: 'created' | 'updated' | 'deleted' | 'bulk';
+  node?: SmartTodoNodeRow;
+}
+
+// HOPPER ENGINE — work-tree node state changes (dispatch/finish/split/etc.).
+// Global like HopperItemEvent; a future tree-view pane renders live off these.
+export interface HopperNodeEvent {
+  type: 'hopper_node';
+  action: 'created' | 'updated' | 'deleted';
+  node: HopperNodeRow;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
@@ -219,7 +248,7 @@ export type SSEEvent =
   | QueuedMessageEvent | NoteEvent | QuickCaptureEvent
   | ThreadReminderEvent | ToolCallEvent | ThreadSummaryEvent
   | ThreadGroupEvent | NotificationEvent
-  | DispatchEvent | DispatchCueEvent;
+  | DispatchEvent | DispatchCueEvent | HopperItemEvent | HopperNodeEvent | SmartTodoEvent;
 
 class SSEBus extends EventEmitter {}
 

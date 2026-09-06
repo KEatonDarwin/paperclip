@@ -129,6 +129,9 @@ import {
 import { mcpCall, lovableSendMessage, supabaseExecuteSql } from './mcp.js';
 import { logDecision } from './decisions.js';
 import { threadTodos } from './thread-todos-tool.js';
+import { threadLinks } from './thread-links-tool.js';
+import { hopper } from './hopper-tool.js';
+import { smartTodos } from './smart-todos-tool.js';
 import { notifications } from './notifications-tool.js';
 import { intakeDeploy } from './intake-deploy.js';
 import { cockpitDeploy } from './cockpit-deploy.js';
@@ -193,6 +196,9 @@ export const ALL_TOOLS: ToolDef[] = [
   supabaseExecuteSql,
   logDecision,
   threadTodos,
+  threadLinks,
+  hopper,
+  smartTodos,
   notifications,
   intakeDeploy,
   cockpitDeploy,

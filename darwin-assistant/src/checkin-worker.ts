@@ -2,10 +2,13 @@ import type { App } from '@slack/bolt';
 import { query } from './db.js';
 import { processMessage } from './agent.js';
 import { isMuted } from './mute-check.js';
-import { getConversation, getOrCreateConversation, addTurn, updateSessionState } from './conversation-db.js';
+import { createNotification, type NotificationAction } from './notifications.js';
+import { getConversation, getOrCreateConversation, addTurn, updateSessionState, renameConversation } from './conversation-db.js';
 
 const POLL_INTERVAL_MS = 60_000;
-const CHECKIN_CONV_PREFIX = 'checkin:';
+const CHECKIN_CONV_PREFIX = 'ephemeral:checkin:';
+const CHECKIN_NOTIFICATIONS_THREAD_ID = 'checkin:notifications';
+const CHECKIN_NOTIFICATIONS_THREAD_TITLE = 'Notifications';
 
 // Server-guaranteed Project Shepherd. The check-in re-queue used to be model-owned
 // (each firing had to INSERT the next row), so the loop died permanently the first
@@ -48,6 +51,79 @@ interface CheckinRow {
   reason: string;
   source_type: string;
   source_id: string | null;
+}
+
+function linkForCheckin(checkin: CheckinRow): string | null {
+  if ((checkin.source_type === 'paperclip' || checkin.source_type === 'paperclip_review') && checkin.source_id) {
+    const identifier = checkin.source_id.trim();
+    const prefix = identifier.split('-', 1)[0];
+    if (prefix && /^[A-Z0-9]+$/.test(prefix)) return `/${prefix}/issues/${identifier}`;
+  }
+  return null;
+}
+
+function titleForCheckin(checkin: CheckinRow): string {
+  if ((checkin.source_type === 'paperclip' || checkin.source_type === 'paperclip_review') && checkin.source_id) {
+    return checkin.source_type === 'paperclip_review'
+      ? `Review ready: ${checkin.source_id}`
+      : `Follow up: ${checkin.source_id}`;
+  }
+  switch (checkin.source_type) {
+    case 'calendar':
+      return 'Calendar check-in';
+    case 'shim_task':
+      return 'SHIM task reminder';
+    case 'scheduled_task':
+      return 'Scheduled reminder';
+    default:
+      return 'Check-in reminder';
+  }
+}
+
+function sourceLabelForCheckin(checkin: CheckinRow): string {
+  switch (checkin.source_type) {
+    case 'paperclip':
+      return 'Paperclip';
+    case 'paperclip_review':
+      return 'Paperclip review';
+    case 'calendar':
+      return 'Calendar';
+    case 'shim_task':
+      return 'SHIM';
+    case 'scheduled_task':
+      return 'Scheduled task';
+    default:
+      return 'Reminder';
+  }
+}
+
+function actionsForCheckin(checkin: CheckinRow, link: string | null): NotificationAction[] {
+  const actions: NotificationAction[] = [
+    {
+      kind: 'open_link',
+      label: 'View message',
+      href: `/thread/${encodeURIComponent(CHECKIN_NOTIFICATIONS_THREAD_ID)}`,
+    },
+  ];
+  if (link) actions.push({ kind: 'open_link', label: 'Open source', href: link, style: 'secondary' });
+  for (const minutes of [15, 60, 240]) {
+    actions.push({
+      kind: 'checkin_snooze',
+      label: minutes >= 60 ? `Snooze ${minutes / 60}h` : `Snooze ${minutes}m`,
+      minutes,
+      style: 'secondary',
+    });
+  }
+  actions.push({ kind: 'checkin_dismiss', label: 'Dismiss', style: 'destructive' });
+  return actions;
+}
+
+function ensureCheckinNotificationsConversationId(): number {
+  const conv = getOrCreateConversation(CHECKIN_NOTIFICATIONS_THREAD_ID);
+  if (conv.title !== CHECKIN_NOTIFICATIONS_THREAD_TITLE || conv.title_is_user_set !== 1) {
+    renameConversation(conv.id, CHECKIN_NOTIFICATIONS_THREAD_TITLE);
+  }
+  return conv.id;
 }
 
 async function processDueCheckins(slackApp: App): Promise<void> {
@@ -99,6 +175,23 @@ async function processDueCheckins(slackApp: App): Promise<void> {
       }
 
       const postResult = await slackApp.client.chat.postMessage({ channel: userId, text: response });
+      const notificationsConversationId = ensureCheckinNotificationsConversationId();
+      addTurn(notificationsConversationId, 'assistant', response);
+      const link = linkForCheckin(checkin);
+      createNotification({
+        severity: 'info',
+        title: titleForCheckin(checkin),
+        body: response,
+        source: sourceLabelForCheckin(checkin),
+        link: `/thread/${encodeURIComponent(CHECKIN_NOTIFICATIONS_THREAD_ID)}`,
+        actions: actionsForCheckin(checkin, link),
+        meta: {
+          kind: 'checkin',
+          checkinId: checkin.id,
+          sourceType: checkin.source_type,
+          sourceId: checkin.source_id,
+        },
+      });
       console.log(`[checkin-worker] Fired ${checkin.id}: ${checkin.reason.slice(0, 60)}`);
 
       // Link the posted message to a Slack-keyed conversation so that when Kevin

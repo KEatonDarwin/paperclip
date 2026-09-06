@@ -71,7 +71,7 @@ function classifyAuth(name: string, url: string): McpAuthType {
 /**
  * Parse a line of `claude mcp list`. Expected forms:
  *   "claude.ai Lovable: https://mcp.lovable.dev - ✔ Connected"
- *   "smarty-pants: https://mcp.thedarwinhub.com/mcp/boost (HTTP) - ✔ Connected"
+ *   "smarty-pants: https://mcp.thedarwinhub.com/mcp/kevin-connected (HTTP) - ✔ Connected"
  *   "claude.ai Gmail: https://.../mcp/v1 - ! Needs authentication"
  * Returns null for non-server lines (headers, blank lines).
  */

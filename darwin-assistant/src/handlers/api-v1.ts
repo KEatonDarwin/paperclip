@@ -76,6 +76,7 @@ import {
   finishHopperNode,
   answerHopperNode,
   dispatchTick,
+  getHopperHistory,
   type NewNodeInput,
 } from '../hopper-engine.js';
 import { governorStatus } from '../hopper-governor.js';
@@ -1322,6 +1323,12 @@ export function createApiV1Router(): Router {
   // Governor status — is overnight dispatch currently open, and why/why not.
   router.get('/hopper-engine/governor', (_req: AuthedRequest, res) => {
     res.json(governorStatus());
+  });
+
+  // Decision memory — real settled-node outcomes by model, for the planner to
+  // read before routing a new tree's nodes.
+  router.get('/hopper-engine/history', (_req: AuthedRequest, res) => {
+    res.json(getHopperHistory());
   });
 
   // == Smart Todo Tree ========================================================

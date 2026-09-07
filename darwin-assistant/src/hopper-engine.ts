@@ -134,6 +134,39 @@ const getNodeStmt = sqliteDb.prepare<[number], HopperNodeRow>(`SELECT * FROM hop
 const treeNodesStmt = sqliteDb.prepare<[string], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE tree_id = ? ORDER BY id`);
 const childrenStmt = sqliteDb.prepare<[number], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE parent_id = ? ORDER BY id`);
 const runningCountStmt = sqliteDb.prepare<[], { n: number }>(`SELECT COUNT(*) AS n FROM hopper_nodes WHERE status = 'running'`);
+const historyByModelStmt = sqliteDb.prepare<[], {
+  model: string;
+  done: number;
+  blocked: number;
+  split: number;
+  avg_attempts: number;
+}>(`
+  SELECT
+    COALESCE(model, 'default') AS model,
+    SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
+    SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked,
+    SUM(CASE WHEN status = 'split' THEN 1 ELSE 0 END) AS split,
+    AVG(attempts) AS avg_attempts
+  FROM hopper_nodes
+  WHERE status IN ('done', 'blocked', 'split')
+  GROUP BY COALESCE(model, 'default')
+  ORDER BY (done + blocked + split) DESC
+`);
+const historyRecentStmt = sqliteDb.prepare<[], {
+  id: number;
+  tree_id: string;
+  title: string;
+  model: string | null;
+  attempts: number;
+  status: HopperNodeStatus;
+  updated_at: string;
+}>(`
+  SELECT id, tree_id, title, model, attempts, status, updated_at
+  FROM hopper_nodes
+  WHERE status IN ('done', 'blocked', 'split')
+  ORDER BY updated_at DESC
+  LIMIT 30
+`);
 
 // A node is DISPATCHABLE only if it's a pending LEAF (no children) in an active
 // tree — parents are containers that auto-complete off their children.
@@ -184,6 +217,47 @@ export function getHopperNode(id: number): HopperNodeRow | null {
 }
 export function listTreeNodes(treeId: string): HopperNodeRow[] {
   return treeNodesStmt.all(treeId);
+}
+
+export interface HopperHistoryByModel {
+  model: string;
+  done: number;
+  blocked: number;
+  split: number;
+  avg_attempts: number;
+}
+
+export interface HopperHistoryRecentNode {
+  id: number;
+  tree_id: string;
+  title: string;
+  model: string;
+  attempts: number;
+  status: HopperNodeStatus;
+  updated_at: string;
+}
+
+export interface HopperHistory {
+  by_model: HopperHistoryByModel[];
+  recent: HopperHistoryRecentNode[];
+}
+
+/**
+ * DECISION MEMORY — the planner reads this before decomposing a new tree to
+ * route models based on real outcomes, not guesswork. Only settled nodes
+ * (done/blocked/split) count; running/pending/draft/blocked_question are
+ * still in flight and would skew the averages.
+ */
+export function getHopperHistory(): HopperHistory {
+  const by_model = historyByModelStmt.all().map((r) => ({
+    ...r,
+    avg_attempts: Math.round(r.avg_attempts * 100) / 100,
+  }));
+  const recent = historyRecentStmt.all().map((r) => ({
+    ...r,
+    model: r.model ?? 'default',
+  }));
+  return { by_model, recent };
 }
 
 export interface NewNodeInput {

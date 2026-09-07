@@ -4,6 +4,14 @@ import { query, DARWIN_COMPANY_ID } from './db.js';
 import { getMutedSourceIds } from './mute-check.js';
 import { sqliteDb } from './conversation-db.js';
 import { createHopperItem } from './hopper.js';
+// Side-effect: guarantees the hopper_trees/hopper_nodes (and, transitively,
+// spawn_tasks) DDL has run before the debrief queries them. Without this the
+// debrief only worked by module-graph accident — index.ts happens to import the
+// engine first — and any other entrypoint would silently render "nothing ran
+// overnight" off a `no such table` error. A broken check reporting green is the
+// exact failure this debrief exists to prevent. Module load is DDL only; the
+// dispatch loop starts from startHopperEngine(), which this does not call.
+import './hopper-engine.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -241,6 +249,35 @@ const STANDUP_TIMEOUT_MS = 180 * 1000;
 /** How far back "overnight" reaches. 16h covers an 8am fire back through the
  *  prior afternoon — the whole window Kevin was away from the keyboard. */
 const OVERNIGHT_HOURS = 16;
+/** Per-signal ceiling for the external lookups (gog calendar, Paperclip PG). */
+const SIGNAL_TIMEOUT_MS = 30 * 1000;
+
+/**
+ * A HANG is worse than a throw here. The 8am fire is `await sendDailyBriefing()`
+ * followed by the call that re-arms tomorrow's timer (index.ts) — its try/catch
+ * contains throws, but a promise that never settles skips the catch AND the
+ * re-arm, so the morning message would die permanently and silently (the exact
+ * failure class that killed the Project Shepherd for 17 days). Both external
+ * signal lookups (`gog` subprocess, Postgres pool) are unbounded, so every one
+ * of them gets a ceiling and degrades to a placeholder line instead of stalling.
+ */
+function settleWithin<T>(p: Promise<T>, ms: number, onTimeout: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    const timer = setTimeout(() => resolve(onTimeout), ms);
+    timer.unref?.();
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(timer);
+        console.error('[briefing] signal lookup failed:', err);
+        resolve(onTimeout);
+      },
+    );
+  });
+}
 
 interface FollowOn {
   title: string;
@@ -373,7 +410,8 @@ function overnightHopperActivity(): { text: string; empty: boolean; rows: Overni
            LEFT JOIN spawn_tasks s ON s.thread_ext = n.worker_thread_ext
           WHERE n.updated_at > datetime('now', ?)
             AND n.status IN ('done','split','running','blocked','blocked_question')
-          ORDER BY n.tree_id, n.id`,
+          ORDER BY n.tree_id, n.id
+          LIMIT 120`,
       )
       .all(`-${OVERNIGHT_HOURS} hours`);
 
@@ -609,16 +647,29 @@ function runDebrief(prompt: string): Promise<string> {
       ['-p', prompt, '--output-format', 'json'],
       { timeout: STANDUP_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, env },
       (err, stdout, stderr) => {
+        const fail = (why: string) =>
+          reject(new Error(`claude debrief failed: ${why}${stderr ? ` | ${stderr.slice(0, 200)}` : ''}`));
         if (err && !stdout) {
-          reject(new Error(`claude debrief failed: ${err.message}${stderr ? ` | ${stderr.slice(0, 200)}` : ''}`));
+          fail(err.message);
           return;
         }
+        let envelope: { result?: string } | null = null;
         try {
-          const envelope = JSON.parse(stdout.trim()) as { result?: string };
-          resolve(typeof envelope.result === 'string' ? envelope.result : stdout);
+          envelope = JSON.parse(stdout.trim()) as { result?: string };
         } catch {
-          resolve(stdout);
+          envelope = null;
         }
+        const result = envelope && typeof envelope.result === 'string' ? envelope.result : null;
+        // A FAILED run (non-zero exit, timeout kill) that still printed to stdout
+        // is NOT a debrief — it's a usage-limit banner or a truncated stream. Only
+        // a well-formed envelope survives an error; anything else must reject so
+        // the deterministic fallback renders instead of shipping CLI noise to Kevin.
+        if (err) {
+          if (result) resolve(result);
+          else fail(`${err.message} (stdout was not a debrief envelope)`);
+          return;
+        }
+        resolve(result ?? stdout);
       },
     );
     // The whole prompt rides in argv; close stdin so the CLI doesn't burn its
@@ -680,8 +731,8 @@ export async function buildMorningBriefing(opts?: { fileCandidates?: boolean }):
   const isWeekend = isSunday || weekday === 'Saturday';
 
   const [calendar, paperclip] = await Promise.all([
-    getTodayCalendarEvents(),
-    getPaperclipSnapshot(),
+    settleWithin(getTodayCalendarEvents(), SIGNAL_TIMEOUT_MS, '(calendar lookup timed out)'),
+    settleWithin(getPaperclipSnapshot(), SIGNAL_TIMEOUT_MS, '(Paperclip lookup timed out)'),
   ]);
 
   const overnight = overnightHopperActivity();

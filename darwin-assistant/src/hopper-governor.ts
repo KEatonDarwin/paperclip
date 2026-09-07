@@ -136,20 +136,26 @@ function evaluate(): GovernorVerdict {
   }
 
   if (weekly != null && weekly >= WEEKLY_CEILING) {
+    // Kevin 2026-09-07: never hard-stop for overages when work matters — soft
+    // mode keeps dispatching past the weekly ceiling but rings the bell once so
+    // he knows we're into protected (possibly paid extra-usage) territory.
+    const soft = process.env.HOPPER_GOV_WEEKLY_MODE === 'soft';
     notifyOnce(
       'weekly',
       'info',
-      '⛽ Hopper governor: weekly budget reached',
-      `Weekly window at ${weekly}% ≥ ceiling ${WEEKLY_CEILING}%. Overnight dispatch is parked to protect the workweek — raise HOPPER_GOV_WEEKLY_CEILING to keep going.`,
+      `⛽ Hopper governor: weekly budget reached${soft ? ' (soft — continuing)' : ''}`,
+      `Weekly window at ${weekly}% ≥ ceiling ${WEEKLY_CEILING}%. ${soft ? 'HOPPER_GOV_WEEKLY_MODE=soft, so dispatch continues — this may burn extra-usage credits.' : 'Overnight dispatch is parked to protect the workweek — raise HOPPER_GOV_WEEKLY_CEILING or set HOPPER_GOV_WEEKLY_MODE=soft to keep going.'}`,
     );
-    return {
-      allow: false,
-      reason: 'weekly_ceiling',
-      detail: `weekly ${weekly}% ≥ ${WEEKLY_CEILING}%`,
-      five_hour: fiveHour,
-      weekly,
-      config: CONFIG,
-    };
+    if (!soft) {
+      return {
+        allow: false,
+        reason: 'weekly_ceiling',
+        detail: `weekly ${weekly}% ≥ ${WEEKLY_CEILING}%`,
+        five_hour: fiveHour,
+        weekly,
+        config: CONFIG,
+      };
+    }
   }
 
   if (fiveHour != null && fiveHour >= FIVE_HOUR_CEILING) {

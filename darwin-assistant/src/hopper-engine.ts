@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import './spawn-tasks.js'; // side-effect: guarantees the spawn_tasks DDL ran before we prepare against it
-import { sqliteDb, getOrCreateConversation, renameConversation, setThreadModelOverride } from './conversation-db.js';
+import { sqliteDb, getOrCreateConversation, renameConversation, setThreadModelOverride, getSetting } from './conversation-db.js';
 import { sseBus, type HopperNodeEvent } from './sse-bus.js';
 import { createNotification } from './notifications.js';
 import { governorCheck } from './hopper-governor.js';
@@ -56,6 +56,8 @@ export interface HopperNodeRow {
   result: string | null;
   worker_thread_ext: string | null;
   lease_expires_at: string | null;
+  adapter: string | null;
+  model: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -63,10 +65,23 @@ export interface HopperNodeRow {
 const MAX_SLOTS = Math.max(1, parseInt(process.env.HOPPER_ENGINE_SLOTS ?? '2', 10) || 2);
 const LEASE_MINUTES = Math.max(5, parseInt(process.env.HOPPER_ENGINE_LEASE_MIN ?? '30', 10) || 30);
 const MAX_ATTEMPTS = 2;
-// Pin worker threads to a specific adapter/model so an expensive global model
-// (Fable) doesn't silently become the overnight fleet's engine. Unset = inherit.
+// Default worker loadout when a node has no planner-assigned model. Settings-KV
+// key wins over env so it's changeable live (no restart); unset both = inherit
+// the global model — which is exactly the "workers on Fable" trap, so keep one.
 const WORKER_ADAPTER = process.env.HOPPER_WORKER_ADAPTER ?? 'claude';
-const WORKER_MODEL = process.env.HOPPER_WORKER_MODEL || null;
+function defaultWorkerModel(): string | null {
+  return getSetting('hopper_worker_model')?.trim() || process.env.HOPPER_WORKER_MODEL || null;
+}
+
+// Retry escalation ladder: a node that burned an attempt retries one tier UP.
+// This is the misroute safety net that makes routing down aggressively cheap.
+const MODEL_LADDER = ['claude-haiku-4-5-20251001', 'claude-sonnet-5', 'claude-opus-5', 'claude-fable-5'];
+function escalateModel(model: string | null): string | null {
+  const current = model ?? defaultWorkerModel();
+  if (!current) return null;
+  const i = MODEL_LADDER.indexOf(current);
+  return i >= 0 && i < MODEL_LADDER.length - 1 ? MODEL_LADDER[i + 1] : current;
+}
 
 sqliteDb.exec(`
   CREATE TABLE IF NOT EXISTS hopper_trees (
@@ -101,6 +116,17 @@ sqliteDb.exec(`
   CREATE INDEX IF NOT EXISTS idx_hopper_nodes_tree ON hopper_nodes(tree_id, id);
   CREATE INDEX IF NOT EXISTS idx_hopper_nodes_status ON hopper_nodes(status, priority DESC, id);
 `);
+
+// ROUTER (phase 1, 2026-09-07): per-node model/adapter chosen by the PLANNER at
+// decomposition time — the tree-breakdown conversation IS the router brain, so
+// there's no separate scoring service. Additive columns; null = default loadout.
+for (const col of ['adapter TEXT', 'model TEXT']) {
+  try {
+    sqliteDb.exec(`ALTER TABLE hopper_nodes ADD COLUMN ${col}`);
+  } catch {
+    /* column already exists */
+  }
+}
 
 const getTreeStmt = sqliteDb.prepare<[string], HopperTreeRow>(`SELECT * FROM hopper_trees WHERE id = ?`);
 const listTreesStmt = sqliteDb.prepare<[], HopperTreeRow>(`SELECT * FROM hopper_trees ORDER BY created_at DESC LIMIT 100`);
@@ -166,6 +192,8 @@ export interface NewNodeInput {
   parent_index?: number | null;      // index into the same input array
   depends_on_indexes?: number[];     // indexes into the same input array
   priority?: number;
+  adapter?: string | null;           // router: planner-assigned worker loadout
+  model?: string | null;             // null → hopper_worker_model setting/env default
 }
 
 /** Create a tree + its draft nodes in one shot (the breakdown chat calls this). */
@@ -179,12 +207,14 @@ export function createHopperTree(topic: string, originThreadExt: string | null, 
     .run(treeId, topic.slice(0, 300), originThreadExt);
   const ids: number[] = [];
   const insert = sqliteDb.prepare(
-    `INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, priority) VALUES (?, ?, ?, ?, ?)`,
+    `INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, priority, adapter, model) VALUES (?, ?, ?, ?, ?, ?, ?)`,
   );
   for (const n of nodes) {
     const parentId =
       n.parent_index != null && n.parent_index >= 0 && n.parent_index < ids.length ? ids[n.parent_index] : null;
-    const info = insert.run(treeId, parentId, n.title.slice(0, 300), n.spec ?? null, n.priority ?? 0);
+    const info = insert.run(
+      treeId, parentId, n.title.slice(0, 300), n.spec ?? null, n.priority ?? 0, n.adapter ?? null, n.model ?? null,
+    );
     ids.push(Number(info.lastInsertRowid));
   }
   // Second pass: map depends_on indexes → real ids (forward refs allowed).
@@ -292,7 +322,9 @@ async function spawnWorker(node: HopperNodeRow, tree: HopperTreeRow): Promise<vo
   const ext = node.worker_thread_ext!;
   const conv = getOrCreateConversation(ext);
   renameConversation(conv.id, `⚙️ ${node.title.slice(0, 100)}`);
-  if (WORKER_MODEL) setThreadModelOverride(conv.id, WORKER_ADAPTER, WORKER_MODEL);
+  // Router: node's planner-assigned loadout wins; else the default worker model.
+  const model = node.model ?? defaultWorkerModel();
+  if (model) setThreadModelOverride(conv.id, node.adapter ?? WORKER_ADAPTER, model);
   const prompt = composeWorkerPrompt(node, tree);
   spawnTaskInsert.run(ext, conv.id, tree.origin_thread_ext, `hopper #${node.id}: ${node.title.slice(0, 80)}`, prompt.slice(0, 2000));
   try {
@@ -356,12 +388,13 @@ export function finishHopperNode(
     if (updated) settleAncestors(updated);
   } else if (outcome === 'split' && payload.children?.length) {
     const insert = sqliteDb.prepare(
-      `INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, status, depends_on) VALUES (?, ?, ?, ?, 'pending', ?)`,
+      `INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, status, depends_on, adapter, model)
+       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
     );
     let prevId: number | null = null;
     for (const c of payload.children.slice(0, 12)) {
       const deps = c.depends_on_prev && prevId != null ? JSON.stringify([prevId]) : null;
-      const info = insert.run(node.tree_id, node.id, c.title.slice(0, 300), c.spec ?? null, deps);
+      const info = insert.run(node.tree_id, node.id, c.title.slice(0, 300), c.spec ?? null, deps, node.adapter, node.model);
       prevId = Number(info.lastInsertRowid);
       const created = getNodeStmt.get(prevId);
       if (created) emitNode('created', created);
@@ -415,7 +448,10 @@ export async function dispatchTick(reason: string): Promise<void> {
           source: 'hopper-engine',
         });
       } else {
-        setNode(node.id, { status: 'pending', worker_thread_ext: null, lease_expires_at: null });
+        // Retry rides one tier up the ladder — a misrouted cheap node self-corrects.
+        const bumped = escalateModel(node.model);
+        if (bumped !== node.model) console.log(`[hopper-engine] node ${node.id} retry escalates ${node.model ?? 'default'} → ${bumped}`);
+        setNode(node.id, { status: 'pending', worker_thread_ext: null, lease_expires_at: null, model: bumped });
       }
     }
 

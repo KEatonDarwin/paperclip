@@ -117,6 +117,19 @@ const kevinActiveStmt = sqliteDb.prepare<[string], { active: number }>(`
   ) AS active
 `);
 
+/**
+ * Kevin-at-the-keyboard probe, exported so the engine can apply the daytime
+ * concurrency cap (non-Claude lanes stay open while he works, but narrowed).
+ */
+export function kevinActive(): boolean {
+  if (IDLE_MINUTES <= 0) return false;
+  return !!kevinActiveStmt.get(`-${IDLE_MINUTES} minutes`)?.active;
+}
+
+export function idleMinutes(): number {
+  return IDLE_MINUTES;
+}
+
 interface UsageWindow {
   utilization?: number | null;
 }
@@ -295,7 +308,7 @@ function evaluate(provider: GovernorProvider = 'claude'): GovernorVerdict {
     };
   }
 
-  if (IDLE_MINUTES > 0 && kevinActiveStmt.get(`-${IDLE_MINUTES} minutes`)?.active) {
+  if (kevinActive()) {
     return {
       allow: false,
       reason: 'kevin_active',

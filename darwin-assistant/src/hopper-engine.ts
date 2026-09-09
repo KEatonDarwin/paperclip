@@ -3,7 +3,7 @@ import './spawn-tasks.js'; // side-effect: guarantees the spawn_tasks DDL ran be
 import { sqliteDb, getOrCreateConversation, renameConversation, setThreadModelOverride, getSetting } from './conversation-db.js';
 import { sseBus, type HopperNodeEvent } from './sse-bus.js';
 import { createNotification } from './notifications.js';
-import { governorCheck, governorStatus, providerFor, type GovernorProvider } from './hopper-governor.js';
+import { governorCheck, governorStatus, kevinActive, providerFor, type GovernorProvider } from './hopper-governor.js';
 
 // HOPPER ENGINE — the autonomous work-tree executor (designed 2026-09-06 with
 // Kevin; worker-model details hashed out in cockpit:worker-engine-design-2026-09-06).
@@ -65,6 +65,13 @@ export interface HopperNodeRow {
 const MAX_SLOTS = Math.max(1, parseInt(process.env.HOPPER_ENGINE_SLOTS ?? '2', 10) || 2);
 const LEASE_MINUTES = Math.max(5, parseInt(process.env.HOPPER_ENGINE_LEASE_MIN ?? '30', 10) || 30);
 const MAX_ATTEMPTS = 2;
+// Daytime cap: while Kevin is at the keyboard the non-Claude lanes stay open
+// (their plans are separate), but narrowed — a machine full of workers makes
+// his own session crawl. 0 = no non-Claude dispatch while he's active.
+const DAYTIME_MAX_WORKERS = (() => {
+  const n = parseInt(process.env.HOPPER_DAYTIME_MAX_WORKERS ?? '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : 2;
+})();
 // Default worker loadout when a node has no planner-assigned model. Settings-KV
 // key wins over env so it's changeable live (no restart); unset both = inherit
 // the global model — which is exactly the "workers on Fable" trap, so keep one.
@@ -182,6 +189,9 @@ const getNodeStmt = sqliteDb.prepare<[number], HopperNodeRow>(`SELECT * FROM hop
 const treeNodesStmt = sqliteDb.prepare<[string], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE tree_id = ? ORDER BY id`);
 const childrenStmt = sqliteDb.prepare<[number], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE parent_id = ? ORDER BY id`);
 const runningCountStmt = sqliteDb.prepare<[], { n: number }>(`SELECT COUNT(*) AS n FROM hopper_nodes WHERE status = 'running'`);
+const runningAdaptersStmt = sqliteDb.prepare<[], { adapter: string | null }>(
+  `SELECT adapter FROM hopper_nodes WHERE status = 'running'`,
+);
 const historyByModelStmt = sqliteDb.prepare<[], {
   model: string;
   done: number;
@@ -460,7 +470,9 @@ export function startHopperEngine(processMessage: (input: string, conversationId
   processMessageRef = processMessage;
   setInterval(() => void dispatchTick('interval'), 60_000).unref?.();
   queueMicrotask(() => void dispatchTick('startup'));
-  console.log(`[hopper-engine] started · slots=${MAX_SLOTS} lease=${LEASE_MINUTES}m maxAttempts=${MAX_ATTEMPTS}`);
+  console.log(
+    `[hopper-engine] started · slots=${MAX_SLOTS} lease=${LEASE_MINUTES}m maxAttempts=${MAX_ATTEMPTS} daytimeMax=${DAYTIME_MAX_WORKERS}`,
+  );
 }
 
 const spawnTaskInsert = sqliteDb.prepare(`
@@ -642,6 +654,13 @@ export async function dispatchTick(reason: string): Promise<void> {
     //    Lease recovery above always runs; running workers are never interrupted.
     let free = MAX_SLOTS - (runningCountStmt.get()?.n ?? 0);
     if (free <= 0) return;
+    // While Kevin is active the non-Claude lanes stay open but capped, so the
+    // box he's working on isn't hosting a full worker pool behind his back.
+    const daytime = kevinActive();
+    let daytimeRunning = daytime
+      ? runningAdaptersStmt.all().filter((r) => providerFor(r.adapter ?? WORKER_ADAPTER) !== 'claude').length
+      : 0;
+    let cappedLogged = false;
     const verdicts = new Map<string, boolean>(); // one governor eval per provider per tick
     for (const node of readyLeavesStmt.all()) {
       if (free <= 0) break;
@@ -653,6 +672,16 @@ export async function dispatchTick(reason: string): Promise<void> {
         verdicts.set(adapter, allowed);
       }
       if (!allowed) continue;
+      const nonClaude = providerFor(adapter) !== 'claude';
+      if (daytime && nonClaude && daytimeRunning >= DAYTIME_MAX_WORKERS) {
+        if (!cappedLogged) {
+          console.log(
+            `[hopper-engine] daytime cap: ${daytimeRunning}/${DAYTIME_MAX_WORKERS} non-claude workers running while Kevin is active — holding the rest`,
+          );
+          cappedLogged = true;
+        }
+        continue;
+      }
       const ext = `cockpit:hopper-node-${node.id}-${randomUUID().slice(0, 8)}`;
       const claimed = claimStmt.run(ext, `+${LEASE_MINUTES} minutes`, node.id);
       if (claimed.changes !== 1) continue; // raced — someone else claimed it
@@ -660,6 +689,7 @@ export async function dispatchTick(reason: string): Promise<void> {
       emitNode('updated', fresh);
       const tree = getHopperTree(node.tree_id)!;
       free -= 1;
+      if (nonClaude) daytimeRunning += 1;
       console.log(`[hopper-engine] dispatch node ${node.id} (${reason}) → ${ext}`);
       void spawnWorker(fresh, tree);
     }

@@ -153,17 +153,21 @@ function readUsage(): { fiveHour: number | null; weekly: number | null; staleMin
 
 // Non-Claude pollers write a different shape: {windows:[{label, used_percentage}]}.
 // We take the worst window — one saturated window means that plan is spent.
-function readProviderUsage(file: string): number | null {
+// Also surfaces file age so a dead poller (timer stopped, CLI broken) reads as
+// "stale" instead of silently freezing at its last-known (possibly low) value
+// forever — the same protection readUsage() already gives the Claude gate.
+function readProviderUsage(file: string): { used: number | null; staleMinutes: number | null } {
   try {
+    const ageMs = Date.now() - statSync(file).mtimeMs;
     const parsed = JSON.parse(readFileSync(file, 'utf8')) as {
       windows?: { used_percentage?: number | null }[] | null;
     };
     const pcts = (parsed.windows ?? [])
       .map((w) => w?.used_percentage)
       .filter((p): p is number => typeof p === 'number' && Number.isFinite(p));
-    return pcts.length ? Math.max(...pcts) : null;
+    return { used: pcts.length ? Math.max(...pcts) : null, staleMinutes: ageMs / 60_000 };
   } catch {
-    return null;
+    return { used: null, staleMinutes: null };
   }
 }
 
@@ -225,7 +229,27 @@ function evaluate(provider: GovernorProvider = 'claude'): GovernorVerdict {
   // which drops these providers back onto the full Claude gate set below.
   if (provider !== 'claude' && CONFIG.daytime_mode) {
     const meter = PROVIDER_METERS[provider];
-    const used = meter.file ? readProviderUsage(meter.file) : null;
+    const { used, staleMinutes } = meter.file ? readProviderUsage(meter.file) : { used: null, staleMinutes: null };
+    // A configured meter that's gone missing or stale (poller died) must HOLD,
+    // not silently allow — an unmetered daytime lane is exactly the failure
+    // mode the ceiling exists to prevent. Providers with no meter (devin) have
+    // no file to go stale, so they keep their existing always-open behavior.
+    if (meter.file && (staleMinutes == null || staleMinutes > STALE_MINUTES)) {
+      notifyOnce(
+        `provider_stale:${provider}`,
+        'error',
+        `⛽ Hopper governor: ${provider} usage meter is stale`,
+        `${provider} usage snapshot ${staleMinutes == null ? 'unreadable' : `${Math.round(staleMinutes)}m stale`} — holding new ${provider} dispatches until the poller catches up.`,
+      );
+      return {
+        allow: false,
+        reason: 'usage_stale',
+        detail: `${provider} usage snapshot ${staleMinutes == null ? 'unreadable' : `${Math.round(staleMinutes)}m stale`}`,
+        provider,
+        provider_usage: used,
+        config: CONFIG,
+      };
+    }
     if (used != null && used >= meter.ceiling) {
       notifyOnce(
         `provider_ceiling:${provider}`,

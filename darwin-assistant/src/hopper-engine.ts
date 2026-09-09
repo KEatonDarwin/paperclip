@@ -106,7 +106,14 @@ const CROSS_PROVIDER_RETRY_LADDER: Partial<Record<GovernorProvider, WorkerLoadou
     CLAUDE_FALLBACK,
   ],
   codex: [
-    { adapter: 'auggie', model: 'claude-opus-5' },
+    // 'default' — auggie's model ids come from its own CLI catalog (`auggie
+    // model list`, ids like 'opus4.8'), not the claude adapter's 'claude-*'
+    // ids. Passing 'claude-opus-5' here would hand the auggie CLI an id it
+    // doesn't recognize and fail the retry outright. 'default' is a no-op
+    // model flag (buildArgs skips --model for it), so the retry lands on
+    // auggie's own configured default instead of guessing a catalog id that
+    // can also drift over time.
+    { adapter: 'auggie', model: 'default' },
     CLAUDE_FALLBACK,
   ],
   devin: [CLAUDE_FALLBACK],

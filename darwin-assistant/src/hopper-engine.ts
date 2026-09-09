@@ -529,16 +529,17 @@ export async function dispatchTick(reason: string): Promise<void> {
       }
     }
 
-    // 2) The governor gates every NEW claim (lease recovery above always runs;
-    //    running workers are never interrupted). Held = wait for the next tick.
-    if (!governorCheck().allow) return;
-
-    // 3) Fill free slots with ready leaves (deps satisfied), priority order.
+    // 2) Fill free slots with ready leaves (deps satisfied), priority order.
+    //    The governor gates every NEW claim per-node by that node's provider so
+    //    a maxed Claude window holds claude leaves while auggie/codex leaves in
+    //    the same tree still dispatch (lease recovery above always runs; running
+    //    workers are never interrupted). Held node = skip it, try the next.
     let free = MAX_SLOTS - (runningCountStmt.get()?.n ?? 0);
     if (free <= 0) return;
     for (const node of readyLeavesStmt.all()) {
       if (free <= 0) break;
       if (!depsSatisfied(node)) continue;
+      if (!governorCheck(node.adapter ?? WORKER_ADAPTER).allow) continue;
       const ext = `cockpit:hopper-node-${node.id}-${randomUUID().slice(0, 8)}`;
       const claimed = claimStmt.run(ext, `+${LEASE_MINUTES} minutes`, node.id);
       if (claimed.changes !== 1) continue; // raced — someone else claimed it

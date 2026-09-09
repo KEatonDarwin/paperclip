@@ -22,6 +22,9 @@ const WEEKLY_CEILING = num(process.env.HOPPER_GOV_WEEKLY_CEILING, 40);
 const IDLE_MINUTES = num(process.env.HOPPER_GOV_IDLE_MIN, 15);
 const STALE_MINUTES = num(process.env.HOPPER_GOV_STALE_MIN, 10);
 const USAGE_FILE = process.env.CLAUDE_USAGE_FILE ?? '/tmp/claude-usage-live.json';
+// Mirrors hopper-engine's WORKER_ADAPTER default so a null/unset node adapter
+// classifies the same way here as it spawns there.
+const WORKER_DEFAULT_ADAPTER = process.env.HOPPER_WORKER_ADAPTER ?? 'claude';
 
 function num(raw: string | undefined, fallback: number): number {
   const n = parseInt(raw ?? '', 10);
@@ -32,6 +35,10 @@ export interface GovernorVerdict {
   allow: boolean;
   reason: 'ok' | 'disabled' | 'five_hour_ceiling' | 'weekly_ceiling' | 'usage_stale' | 'kevin_active';
   detail: string;
+  // Which provider pool this verdict was evaluated against. The four gates below
+  // are Claude-window gates; non-claude adapters burn their own pools and bypass
+  // them entirely, so they always evaluate to 'ok'.
+  provider: 'claude' | 'non-claude';
   five_hour?: number | null;
   weekly?: number | null;
   config: {
@@ -94,26 +101,52 @@ function notifyOnce(key: string, severity: 'info' | 'error', title: string, body
   createNotification({ severity, title, body, source: 'hopper-engine' });
 }
 
-let lastReason: GovernorVerdict['reason'] | null = null;
+const lastReason: Partial<Record<GovernorVerdict['provider'], GovernorVerdict['reason'] | null>> = {};
 
-/** Consulted by dispatchTick before claiming new nodes. Logs on state change only. */
-export function governorCheck(): GovernorVerdict {
-  const verdict = evaluate();
-  if (verdict.reason !== lastReason) {
-    console.log(`[hopper-governor] ${verdict.allow ? 'OPEN' : 'HOLD'} (${verdict.reason}) — ${verdict.detail}`);
-    lastReason = verdict.reason;
+/**
+ * Consulted by dispatchTick before claiming each new node. Pass the node's
+ * adapter so Claude-window gates only hold claude-routed work; auggie/codex (and
+ * any non-claude) burn their own pools and are never held by Kevin's Claude
+ * ceilings. null/unset → the worker default adapter (claude today). Logs per
+ * provider on state change only.
+ */
+export function governorCheck(adapter?: string | null): GovernorVerdict {
+  const verdict = evaluate(adapter);
+  if (verdict.reason !== lastReason[verdict.provider]) {
+    console.log(`[hopper-governor] ${verdict.provider} ${verdict.allow ? 'OPEN' : 'HOLD'} (${verdict.reason}) — ${verdict.detail}`);
+    lastReason[verdict.provider] = verdict.reason;
   }
   return verdict;
 }
 
-/** Read-only status for the API — same evaluation, no logging side effects. */
+/**
+ * Read-only status for the API — same evaluation, no logging side effects.
+ * Defaults to claude semantics so GET /hopper-engine/governor keeps reporting
+ * the Claude-window truth Kevin reads.
+ */
 export function governorStatus(): GovernorVerdict {
-  return evaluate();
+  return evaluate('claude');
 }
 
-function evaluate(): GovernorVerdict {
+function evaluate(adapter?: string | null): GovernorVerdict {
+  const provider: GovernorVerdict['provider'] =
+    (adapter ?? WORKER_DEFAULT_ADAPTER) === 'claude' ? 'claude' : 'non-claude';
+
   if (!ENABLED) {
-    return { allow: true, reason: 'disabled', detail: 'governor disabled via HOPPER_GOV_ENABLED=0', config: CONFIG };
+    return { allow: true, reason: 'disabled', detail: 'governor disabled via HOPPER_GOV_ENABLED=0', provider, config: CONFIG };
+  }
+
+  // Non-claude adapters (auggie/codex/…) don't touch Kevin's Claude window, so
+  // none of the four Claude-window gates apply — they dispatch even when the 5h
+  // + weekly ceilings are maxed and while Kevin is at the keyboard.
+  if (provider === 'non-claude') {
+    return {
+      allow: true,
+      reason: 'ok',
+      detail: `${adapter} routed to its own pool — Claude ceilings do not apply`,
+      provider,
+      config: CONFIG,
+    };
   }
 
   const { fiveHour, weekly, staleMinutes } = readUsage();
@@ -129,6 +162,7 @@ function evaluate(): GovernorVerdict {
       allow: false,
       reason: 'usage_stale',
       detail: `usage snapshot ${staleMinutes == null ? 'unreadable' : `${Math.round(staleMinutes)}m stale`}`,
+      provider,
       five_hour: fiveHour,
       weekly,
       config: CONFIG,
@@ -151,6 +185,7 @@ function evaluate(): GovernorVerdict {
         allow: false,
         reason: 'weekly_ceiling',
         detail: `weekly ${weekly}% ≥ ${WEEKLY_CEILING}%`,
+        provider,
         five_hour: fiveHour,
         weekly,
         config: CONFIG,
@@ -163,6 +198,7 @@ function evaluate(): GovernorVerdict {
       allow: false,
       reason: 'five_hour_ceiling',
       detail: `5h window ${fiveHour}% ≥ ${FIVE_HOUR_CEILING}% — sleeping until the window resets`,
+      provider,
       five_hour: fiveHour,
       weekly,
       config: CONFIG,
@@ -174,6 +210,7 @@ function evaluate(): GovernorVerdict {
       allow: false,
       reason: 'kevin_active',
       detail: `Kevin active within the last ${IDLE_MINUTES}m — his subscription, his turn`,
+      provider,
       five_hour: fiveHour,
       weekly,
       config: CONFIG,
@@ -184,6 +221,7 @@ function evaluate(): GovernorVerdict {
     allow: true,
     reason: 'ok',
     detail: `5h ${fiveHour ?? '?'}% / weekly ${weekly ?? '?'}% — clear to dispatch`,
+    provider,
     five_hour: fiveHour,
     weekly,
     config: CONFIG,

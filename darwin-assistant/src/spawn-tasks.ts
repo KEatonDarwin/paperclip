@@ -20,6 +20,7 @@ export interface SpawnTaskRow {
   group_id: number | null;
   label: string | null;
   task_prompt: string | null;
+  adapter: string | null;
   model: string | null;
   status: SpawnStatus;
   pid: number | null;
@@ -59,6 +60,14 @@ sqliteDb.exec(`
   CREATE INDEX IF NOT EXISTS idx_spawn_tasks_parent
     ON spawn_tasks(parent_thread_ext, created_at DESC);
 `);
+
+for (const col of ['adapter TEXT']) {
+  try {
+    sqliteDb.exec(`ALTER TABLE spawn_tasks ADD COLUMN ${col}`);
+  } catch {
+    /* column already exists */
+  }
+}
 
 const listStmt = sqliteDb.prepare<[number], SpawnTaskRow>(`
   SELECT * FROM spawn_tasks ORDER BY created_at DESC, id DESC LIMIT ?

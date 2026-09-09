@@ -3,7 +3,7 @@ import './spawn-tasks.js'; // side-effect: guarantees the spawn_tasks DDL ran be
 import { sqliteDb, getOrCreateConversation, renameConversation, setThreadModelOverride, getSetting } from './conversation-db.js';
 import { sseBus, type HopperNodeEvent } from './sse-bus.js';
 import { createNotification } from './notifications.js';
-import { governorCheck } from './hopper-governor.js';
+import { governorCheck, governorStatus, providerFor, type GovernorProvider } from './hopper-governor.js';
 
 // HOPPER ENGINE — the autonomous work-tree executor (designed 2026-09-06 with
 // Kevin; worker-model details hashed out in cockpit:worker-engine-design-2026-09-06).
@@ -81,6 +81,54 @@ function escalateModel(model: string | null): string | null {
   if (!current) return null;
   const i = MODEL_LADDER.indexOf(current);
   return i >= 0 && i < MODEL_LADDER.length - 1 ? MODEL_LADDER[i + 1] : current;
+}
+
+interface WorkerLoadout {
+  adapter: string | null;
+  model: string | null;
+}
+
+interface RetryRoute extends WorkerLoadout {
+  note: string;
+}
+
+const CLAUDE_FALLBACK: WorkerLoadout = { adapter: 'claude', model: 'claude-sonnet-5' };
+const CROSS_PROVIDER_RETRY_LADDER: Partial<Record<GovernorProvider, WorkerLoadout[]>> = {
+  auggie: [
+    { adapter: 'codex', model: 'gpt-5.5' },
+    CLAUDE_FALLBACK,
+  ],
+  codex: [
+    { adapter: 'auggie', model: 'claude-opus-5' },
+    CLAUDE_FALLBACK,
+  ],
+  devin: [CLAUDE_FALLBACK],
+};
+
+function loadoutLabel(loadout: WorkerLoadout): string {
+  return `${loadout.adapter ?? WORKER_ADAPTER}/${loadout.model ?? defaultWorkerModel() ?? 'default'}`;
+}
+
+function retryRouteFor(node: HopperNodeRow): RetryRoute {
+  const current: WorkerLoadout = { adapter: node.adapter ?? WORKER_ADAPTER, model: node.model ?? defaultWorkerModel() };
+  const provider = providerFor(current.adapter);
+  if (provider === 'claude') {
+    const bumped = escalateModel(node.model);
+    return {
+      adapter: node.adapter,
+      model: bumped,
+      note: `claude tier retry: ${loadoutLabel(current)} -> ${loadoutLabel({ adapter: node.adapter ?? WORKER_ADAPTER, model: bumped })}`,
+    };
+  }
+
+  const ladder = CROSS_PROVIDER_RETRY_LADDER[provider] ?? [CLAUDE_FALLBACK];
+  const chosen =
+    ladder.find((candidate) => providerFor(candidate.adapter) !== 'claude' && governorStatus(candidate.adapter).allow) ??
+    ladder[ladder.length - 1];
+  return {
+    ...chosen,
+    note: `cross-provider retry: ${loadoutLabel(current)} -> ${loadoutLabel(chosen)}`,
+  };
 }
 
 sqliteDb.exec(`
@@ -168,6 +216,21 @@ const historyRecentStmt = sqliteDb.prepare<[], {
   LIMIT 30
 `);
 
+const historyRetryEventsStmt = sqliteDb.prepare<[], {
+  thread_ext: string;
+  label: string | null;
+  adapter: string | null;
+  model: string | null;
+  error: string | null;
+  updated_at: string;
+}>(`
+  SELECT thread_ext, label, adapter, model, error, updated_at
+  FROM spawn_tasks
+  WHERE error LIKE 'HOPPER_RETRY_REROUTE:%'
+  ORDER BY updated_at DESC
+  LIMIT 30
+`);
+
 // A node is DISPATCHABLE only if it's a pending LEAF (no children) in an active
 // tree — parents are containers that auto-complete off their children.
 const readyLeavesStmt = sqliteDb.prepare<[], HopperNodeRow>(`
@@ -237,9 +300,19 @@ export interface HopperHistoryRecentNode {
   updated_at: string;
 }
 
+export interface HopperHistoryRetryEvent {
+  thread_ext: string;
+  label: string | null;
+  adapter: string | null;
+  model: string | null;
+  error: string;
+  updated_at: string;
+}
+
 export interface HopperHistory {
   by_model: HopperHistoryByModel[];
   recent: HopperHistoryRecentNode[];
+  retry_events: HopperHistoryRetryEvent[];
 }
 
 /**
@@ -257,7 +330,11 @@ export function getHopperHistory(): HopperHistory {
     ...r,
     model: r.model ?? 'default',
   }));
-  return { by_model, recent };
+  const retry_events = historyRetryEventsStmt.all().map((r) => ({
+    ...r,
+    error: r.error ?? '',
+  }));
+  return { by_model, recent, retry_events };
 }
 
 export interface NewNodeInput {
@@ -387,8 +464,18 @@ export function startHopperEngine(processMessage: (input: string, conversationId
 }
 
 const spawnTaskInsert = sqliteDb.prepare(`
-  INSERT OR IGNORE INTO spawn_tasks (thread_ext, conversation_id, parent_thread_ext, label, task_prompt, status)
-  VALUES (?, ?, ?, ?, ?, 'running')
+  INSERT OR IGNORE INTO spawn_tasks (thread_ext, conversation_id, parent_thread_ext, label, task_prompt, adapter, model, status)
+  VALUES (?, ?, ?, ?, ?, ?, ?, 'running')
+`);
+
+const spawnTaskMarkRerouted = sqliteDb.prepare<[string, string | null, string | null, string]>(`
+  UPDATE spawn_tasks
+  SET status = 'failed',
+      adapter = COALESCE(adapter, ?),
+      model = COALESCE(model, ?),
+      error = ?,
+      updated_at = datetime('now')
+  WHERE thread_ext = ?
 `);
 
 async function spawnWorker(node: HopperNodeRow, tree: HopperTreeRow): Promise<void> {
@@ -400,7 +487,15 @@ async function spawnWorker(node: HopperNodeRow, tree: HopperTreeRow): Promise<vo
   const model = node.model ?? defaultWorkerModel();
   if (model) setThreadModelOverride(conv.id, node.adapter ?? WORKER_ADAPTER, model);
   const prompt = composeWorkerPrompt(node, tree);
-  spawnTaskInsert.run(ext, conv.id, tree.origin_thread_ext, `hopper #${node.id}: ${node.title.slice(0, 80)}`, prompt.slice(0, 2000));
+  spawnTaskInsert.run(
+    ext,
+    conv.id,
+    tree.origin_thread_ext,
+    `hopper #${node.id}: ${node.title.slice(0, 80)}`,
+    prompt.slice(0, 2000),
+    node.adapter ?? WORKER_ADAPTER,
+    model,
+  );
   try {
     await processMessageRef(prompt, ext, `turn:${conv.id}:0`);
   } catch (err) {
@@ -522,10 +617,21 @@ export async function dispatchTick(reason: string): Promise<void> {
           source: 'hopper-engine',
         });
       } else {
-        // Retry rides one tier up the ladder — a misrouted cheap node self-corrects.
-        const bumped = escalateModel(node.model);
-        if (bumped !== node.model) console.log(`[hopper-engine] node ${node.id} retry escalates ${node.model ?? 'default'} → ${bumped}`);
-        setNode(node.id, { status: 'pending', worker_thread_ext: null, lease_expires_at: null, model: bumped });
+        // Retry rides one rung up: Claude keeps its tier ladder; non-Claude
+        // hops provider so a provider-specific failure doesn't repeat itself.
+        const retry = retryRouteFor(node);
+        const note = `HOPPER_RETRY_REROUTE: node ${node.id} attempt ${node.attempts} lease expired; ${retry.note}; next attempt ${node.attempts + 1}`;
+        if (node.worker_thread_ext) {
+          spawnTaskMarkRerouted.run(node.adapter ?? WORKER_ADAPTER, node.model ?? defaultWorkerModel(), note, node.worker_thread_ext);
+        }
+        console.log(`[hopper-engine] node ${node.id} ${retry.note}`);
+        setNode(node.id, {
+          status: 'pending',
+          worker_thread_ext: null,
+          lease_expires_at: null,
+          adapter: retry.adapter,
+          model: retry.model,
+        });
       }
     }
 

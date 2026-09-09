@@ -79,7 +79,7 @@ import {
   getHopperHistory,
   type NewNodeInput,
 } from '../hopper-engine.js';
-import { governorStatus } from '../hopper-governor.js';
+import { governorStatus, governorStatusAll, daytimeMode, setDaytimeMode } from '../hopper-governor.js';
 import {
   listSmartTodoNodes,
   getSmartTodoNode,
@@ -1320,9 +1320,30 @@ export function createApiV1Router(): Router {
     res.json({ ok: true });
   });
 
-  // Governor status — is overnight dispatch currently open, and why/why not.
-  router.get('/hopper-engine/governor', (_req: AuthedRequest, res) => {
-    res.json(governorStatus());
+  // Governor status — is dispatch currently open, and why/why not. The default
+  // (Claude) verdict stays top-level for back-compat; `providers` shows every
+  // lane, since a non-Claude lane can be open while Claude is held.
+  router.get('/hopper-engine/governor', (req: AuthedRequest, res) => {
+    const adapter = typeof req.query.adapter === 'string' ? req.query.adapter : undefined;
+    res.json({ ...governorStatus(adapter), ...governorStatusAll() });
+  });
+
+  // Daytime mode — the kill-switch for the non-Claude bypass. On (default):
+  // codex/auggie/devin nodes run while Kevin works. Off: every provider obeys
+  // the full Claude gate set (Kevin-active, 5h/weekly ceilings, staleness).
+  router.get('/hopper-engine/daytime', (_req: AuthedRequest, res) => {
+    res.json({ daytime_mode: daytimeMode() });
+  });
+
+  router.post('/hopper-engine/daytime', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { enabled?: unknown };
+    if (typeof body.enabled !== 'boolean') {
+      sendError(res, 400, 'invalid_request', 'enabled is required and must be a boolean');
+      return;
+    }
+    setDaytimeMode(body.enabled);
+    void dispatchTick('daytime_mode_changed');
+    res.json({ daytime_mode: daytimeMode() });
   });
 
   // Decision memory — real settled-node outcomes by model, for the planner to

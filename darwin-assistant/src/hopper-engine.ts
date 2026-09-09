@@ -529,16 +529,24 @@ export async function dispatchTick(reason: string): Promise<void> {
       }
     }
 
-    // 2) The governor gates every NEW claim (lease recovery above always runs;
-    //    running workers are never interrupted). Held = wait for the next tick.
-    if (!governorCheck().allow) return;
-
-    // 3) Fill free slots with ready leaves (deps satisfied), priority order.
+    // 2) Fill free slots with ready leaves (deps satisfied), priority order.
+    //    The governor gates every NEW claim, PER PROVIDER: a node routed to
+    //    codex/auggie only answers to that plan's meter, so a Claude hold (Kevin
+    //    at the keyboard, 5h window spent) no longer parks the whole queue.
+    //    Lease recovery above always runs; running workers are never interrupted.
     let free = MAX_SLOTS - (runningCountStmt.get()?.n ?? 0);
     if (free <= 0) return;
+    const verdicts = new Map<string, boolean>(); // one governor eval per provider per tick
     for (const node of readyLeavesStmt.all()) {
       if (free <= 0) break;
       if (!depsSatisfied(node)) continue;
+      const adapter = node.adapter ?? WORKER_ADAPTER;
+      let allowed = verdicts.get(adapter);
+      if (allowed === undefined) {
+        allowed = governorCheck(adapter).allow;
+        verdicts.set(adapter, allowed);
+      }
+      if (!allowed) continue;
       const ext = `cockpit:hopper-node-${node.id}-${randomUUID().slice(0, 8)}`;
       const claimed = claimStmt.run(ext, `+${LEASE_MINUTES} minutes`, node.id);
       if (claimed.changes !== 1) continue; // raced — someone else claimed it

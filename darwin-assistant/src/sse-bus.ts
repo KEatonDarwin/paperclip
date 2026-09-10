@@ -12,6 +12,7 @@ import type { DispatchRow, DispatchWorkerRow } from './dispatches.js';
 import type { HopperItemRow } from './hopper.js';
 import type { HopperNodeRow } from './hopper-engine.js';
 import type { SmartTodoNodeRow } from './smart-todos.js';
+import type { MonitorRow, MonitorRunRow } from './monitors.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -239,6 +240,21 @@ export interface HopperNodeEvent {
   node: HopperNodeRow;
 }
 
+// COCKPIT MONITORS — scheduled prompt-check agents with durable pass/fail/error
+// history. Global, not conversation-scoped; monitor threads themselves still
+// emit normal thread events.
+export interface MonitorEvent {
+  type: 'monitor';
+  action: 'created' | 'updated' | 'deleted';
+  monitor: MonitorRow;
+}
+
+export interface MonitorRunEvent {
+  type: 'monitor_run';
+  action: 'created' | 'updated';
+  run: MonitorRunRow;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
@@ -248,7 +264,8 @@ export type SSEEvent =
   | QueuedMessageEvent | NoteEvent | QuickCaptureEvent
   | ThreadReminderEvent | ToolCallEvent | ThreadSummaryEvent
   | ThreadGroupEvent | NotificationEvent
-  | DispatchEvent | DispatchCueEvent | HopperItemEvent | HopperNodeEvent | SmartTodoEvent;
+  | DispatchEvent | DispatchCueEvent | HopperItemEvent | HopperNodeEvent | SmartTodoEvent
+  | MonitorEvent | MonitorRunEvent;
 
 class SSEBus extends EventEmitter {}
 

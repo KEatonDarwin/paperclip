@@ -67,6 +67,16 @@ import {
   type HopperStatus,
 } from '../hopper.js';
 import {
+  listMonitors,
+  getMonitor,
+  createMonitor,
+  patchMonitor,
+  deleteMonitor,
+  listMonitorRuns,
+  runMonitorNow,
+  type MonitorStatus,
+} from '../monitors.js';
+import {
   createHopperTree,
   agreeHopperTree,
   getHopperTree,
@@ -1112,6 +1122,216 @@ export function createApiV1Router(): Router {
     }
     deleteNotification(id);
     res.status(204).end();
+  });
+
+  // == Cockpit Monitors =======================================================
+  // Cheap scheduled prompt-check agents. The scheduler runs each monitor through
+  // the normal JARVIS thread/processMessage path, with an explicit per-thread
+  // model override every run, so model calls remain behind local CLI adapters.
+
+  const dateToSqliteUtc = (d: Date): string => d.toISOString().slice(0, 19).replace('T', ' ');
+  const parseDateField = (value: unknown): string | null | undefined => {
+    if (value === undefined) return undefined;
+    if (value === null || value === '') return null;
+    if (typeof value !== 'string') return undefined;
+    const d = new Date(value);
+    if (!Number.isFinite(d.getTime())) return undefined;
+    return dateToSqliteUtc(d);
+  };
+  const durationExpiresAt = (body: Record<string, unknown>): string | undefined => {
+    const minutes =
+      typeof body.duration_minutes === 'number' && Number.isFinite(body.duration_minutes)
+        ? body.duration_minutes
+        : typeof body.duration_hours === 'number' && Number.isFinite(body.duration_hours)
+          ? body.duration_hours * 60
+          : typeof body.duration_days === 'number' && Number.isFinite(body.duration_days)
+            ? body.duration_days * 24 * 60
+            : null;
+    if (minutes == null || minutes <= 0) return undefined;
+    return dateToSqliteUtc(new Date(Date.now() + minutes * 60_000));
+  };
+  const validateMonitorAdapterModel = (adapterRaw: unknown, modelRaw: unknown): { adapter?: string; model?: string } | { error: string } => {
+    const adapters = getAdapters();
+    if (adapterRaw === undefined && modelRaw === undefined) return {};
+    const adapter = typeof adapterRaw === 'string' && adapterRaw.trim() ? adapterRaw.trim() : 'claude';
+    if (!adapters[adapter]) return { error: `adapter must be one of ${Object.keys(adapters).join(', ')}` };
+    if (modelRaw === undefined || modelRaw === null || modelRaw === '') {
+      const defaultModel = adapter === 'claude'
+        ? 'claude-haiku-4-5-20251001'
+        : adapters[adapter].models[0]?.id;
+      return defaultModel ? { adapter, model: defaultModel } : { adapter };
+    }
+    if (typeof modelRaw !== 'string') return { error: 'model must be a string' };
+    const model = modelRaw.trim();
+    if (!adapters[adapter].models.some((m) => m.id === model)) {
+      return { error: `model must be one of ${adapters[adapter].models.map((m) => m.id).join(', ')} for adapter ${adapter}` };
+    }
+    return { adapter, model };
+  };
+
+  router.get('/monitors', (req: AuthedRequest, res) => {
+    const raw = typeof req.query.status === 'string' ? req.query.status : 'open';
+    const status: MonitorStatus | 'open' | 'all' =
+      raw === 'active' || raw === 'paused' || raw === 'completed' || raw === 'all' ? raw : 'open';
+    res.json({ monitors: listMonitors(status) });
+  });
+
+  router.post('/monitors', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const nameRaw = typeof body.name === 'string' ? body.name : typeof body.title === 'string' ? body.title : '';
+    const name = nameRaw.trim();
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+    const cadence = Number(body.cadence_minutes);
+    if (!name) {
+      sendError(res, 400, 'invalid_request', 'name is required and must be a non-empty string');
+      return;
+    }
+    if (!prompt) {
+      sendError(res, 400, 'invalid_request', 'prompt is required and must be a non-empty string');
+      return;
+    }
+    if (!Number.isFinite(cadence) || cadence < 1) {
+      sendError(res, 400, 'invalid_request', 'cadence_minutes must be a positive number');
+      return;
+    }
+    const modelChoice = validateMonitorAdapterModel(body.adapter, body.model);
+    if ('error' in modelChoice) {
+      sendError(res, 400, 'invalid_request', modelChoice.error);
+      return;
+    }
+    const parsedExpiresAt = parseDateField(body.expires_at);
+    if (body.expires_at !== undefined && parsedExpiresAt === undefined) {
+      sendError(res, 400, 'invalid_request', 'expires_at must be an ISO timestamp or null');
+      return;
+    }
+    const expiresAt = parsedExpiresAt !== undefined ? parsedExpiresAt : durationExpiresAt(body) ?? null;
+    const monitor = createMonitor({
+      name,
+      prompt,
+      cadence_minutes: cadence,
+      adapter: modelChoice.adapter,
+      model: modelChoice.model,
+      expires_at: expiresAt,
+    });
+    res.status(201).json({ monitor });
+  });
+
+  router.get('/monitors/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const monitor = getMonitor(id);
+    if (!monitor) {
+      sendError(res, 404, 'monitor_not_found', 'monitor not found');
+      return;
+    }
+    res.json({ monitor });
+  });
+
+  router.patch('/monitors/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const monitor = getMonitor(id);
+    if (!monitor) {
+      sendError(res, 404, 'monitor_not_found', 'monitor not found');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const patch: Parameters<typeof patchMonitor>[1] = {};
+    if (body.name !== undefined || body.title !== undefined) {
+      const nameRaw = typeof body.name === 'string' ? body.name : typeof body.title === 'string' ? body.title : '';
+      const name = nameRaw.trim();
+      if (!name) {
+        sendError(res, 400, 'invalid_request', 'name must be a non-empty string');
+        return;
+      }
+      patch.name = name;
+    }
+    if (body.prompt !== undefined) {
+      if (typeof body.prompt !== 'string' || !body.prompt.trim()) {
+        sendError(res, 400, 'invalid_request', 'prompt must be a non-empty string');
+        return;
+      }
+      patch.prompt = body.prompt.trim();
+    }
+    if (body.cadence_minutes !== undefined) {
+      const cadence = Number(body.cadence_minutes);
+      if (!Number.isFinite(cadence) || cadence < 1) {
+        sendError(res, 400, 'invalid_request', 'cadence_minutes must be a positive number');
+        return;
+      }
+      patch.cadence_minutes = cadence;
+    }
+    if (body.adapter !== undefined || body.model !== undefined) {
+      const modelChoice = validateMonitorAdapterModel(body.adapter ?? monitor.adapter, body.model);
+      if ('error' in modelChoice) {
+        sendError(res, 400, 'invalid_request', modelChoice.error);
+        return;
+      }
+      patch.adapter = modelChoice.adapter ?? monitor.adapter;
+      if (modelChoice.model !== undefined) patch.model = modelChoice.model;
+    }
+    if (body.expires_at !== undefined) {
+      const expiresAt = parseDateField(body.expires_at);
+      if (expiresAt === undefined) {
+        sendError(res, 400, 'invalid_request', 'expires_at must be an ISO timestamp or null');
+        return;
+      }
+      patch.expires_at = expiresAt;
+    } else {
+      const duration = durationExpiresAt(body);
+      if (duration) patch.expires_at = duration;
+    }
+    if (body.extend_minutes !== undefined) {
+      const minutes = Number(body.extend_minutes);
+      if (!Number.isFinite(minutes) || minutes <= 0) {
+        sendError(res, 400, 'invalid_request', 'extend_minutes must be a positive number');
+        return;
+      }
+      const base = monitor.expires_at
+        ? new Date(`${monitor.expires_at.replace(' ', 'T')}Z`)
+        : new Date();
+      const baseMs = Number.isFinite(base.getTime()) ? Math.max(base.getTime(), Date.now()) : Date.now();
+      patch.expires_at = dateToSqliteUtc(new Date(baseMs + minutes * 60_000));
+    }
+    if (body.status !== undefined) {
+      if (body.status !== 'active' && body.status !== 'paused' && body.status !== 'completed') {
+        sendError(res, 400, 'invalid_request', "status must be 'active', 'paused', or 'completed'");
+        return;
+      }
+      patch.status = body.status;
+    }
+    if (body.action === 'pause') patch.status = 'paused';
+    if (body.action === 'resume') patch.status = 'active';
+
+    const updated = patchMonitor(id, patch);
+    res.json({ monitor: updated });
+  });
+
+  router.delete('/monitors/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!deleteMonitor(id)) {
+      sendError(res, 404, 'monitor_not_found', 'monitor not found');
+      return;
+    }
+    res.status(204).end();
+  });
+
+  router.get('/monitors/:id/runs', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getMonitor(id)) {
+      sendError(res, 404, 'monitor_not_found', 'monitor not found');
+      return;
+    }
+    const limit = Math.max(1, Math.min(500, parseInt(String(req.query.limit ?? '50'), 10) || 50));
+    res.json({ runs: listMonitorRuns(id, limit) });
+  });
+
+  router.post('/monitors/:id/run-now', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const result = runMonitorNow(id);
+    if (result.status === 'not_found') {
+      sendError(res, 404, 'monitor_not_found', 'monitor not found');
+      return;
+    }
+    res.status(202).json(result);
   });
 
   // == Task Hopper (candidate tasks awaiting Kevin's yes/dismiss) ==============
@@ -3188,6 +3408,7 @@ export function createApiV1Router(): Router {
       'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
       'quick_capture', 'thread_summary', 'notification',
       'dispatch', 'dispatch_cue', 'hopper_item', 'hopper_node', 'smart_todo',
+      'monitor', 'monitor_run',
     ]);
 
     res.writeHead(200, {

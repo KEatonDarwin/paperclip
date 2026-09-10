@@ -8,8 +8,9 @@ import { enqueueCalendarCheckins } from './briefing.js';
 import { startUiServer } from './ui-server.js';
 import { reconcileInterruptedRuns, autoHideStaleThreads } from './conversation-db.js';
 import { getSetting } from './conversation-db.js';
-import { shutdownActiveRuns, processMessage } from './agent.js';
+import { shutdownActiveRuns, processMessage, abortConversationRun } from './agent.js';
 import { startHopperEngine } from './hopper-engine.js';
+import { startMonitorScheduler } from './monitors.js';
 
 const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT ?? '3200', 10);
 const SLACK_ENABLED = !!(process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN);
@@ -113,6 +114,10 @@ async function main() {
   // Hopper Engine — the autonomous work-tree dispatcher. Event-driven (ticks
   // fire on node state writes); the 60s interval inside is only the safety net.
   startHopperEngine(processMessage);
+
+  // Cockpit Monitors — cheap scheduled prompt-check agents. Runs through the
+  // same processMessage/local-CLI adapter seam as normal cockpit threads.
+  startMonitorScheduler(processMessage, abortConversationRun);
 
   if (slackApp) {
     await slackApp.start();

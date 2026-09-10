@@ -936,8 +936,25 @@ function parseCodexOutput(stdout: string): ClaudeResult {
     }
   }
 
-  const finalText = messages[messages.length - 1]?.trim();
-  return { text: finalText || stdout.trim(), sessionId, usage, rawOutput: stdout };
+  // Prefer the LAST NON-EMPTY agent_message. Codex sometimes ends a runaway
+  // turn with an empty final agent_message (text:"") — the old code then fell
+  // back to `stdout` and persisted the ENTIRE raw JSONL stream (every
+  // command_execution event, hundreds of KB) as the assistant turn content,
+  // which the markdown renderer dumped raw (CODEX RAW-JSONL PERSIST BUG,
+  // 2026-09-10, node 61). Never surface the raw stream as turn text: fall back
+  // to the last message that actually had content, then to a short stub. The
+  // full stream is still preserved in `rawOutput` for debugging.
+  let finalText = '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const t = messages[i]?.trim();
+    if (t) { finalText = t; break; }
+  }
+  return {
+    text: finalText || '[codex worker produced no final message]',
+    sessionId,
+    usage,
+    rawOutput: stdout,
+  };
 }
 
 // Codex's `--json` stream emits one `agent_message` per progress/final update.

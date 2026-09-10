@@ -1331,6 +1331,10 @@ export function createApiV1Router(): Router {
       sendError(res, 404, 'monitor_not_found', 'monitor not found');
       return;
     }
+    if (result.status === 'completed') {
+      sendError(res, 409, 'monitor_completed', 'monitor has completed its run window; extend it before running again');
+      return;
+    }
     res.status(202).json(result);
   });
 

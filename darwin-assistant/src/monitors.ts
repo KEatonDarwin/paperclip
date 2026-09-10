@@ -684,9 +684,15 @@ async function runMonitorRun(runId: number): Promise<void> {
   }
 }
 
-export function runMonitorNow(id: number): { status: 'started' | 'already_running' | 'not_found'; run?: MonitorRunRow } {
+export function runMonitorNow(
+  id: number,
+): { status: 'started' | 'already_running' | 'completed' | 'not_found'; run?: MonitorRunRow } {
   const monitor = getMonitor(id);
   if (!monitor) return { status: 'not_found' };
+  // The UI disables "Run now" once a monitor's window ended, but that's only a
+  // client-side courtesy — guard it here too so a direct API/curl call can't
+  // restart dispatch on a monitor whose window already closed.
+  if (monitor.status === 'completed') return { status: 'completed' };
   const open = openRunStmt.get(id);
   if (open) return { status: 'already_running', run: open };
   const run = beginMonitorRun(monitor, sqliteNow());

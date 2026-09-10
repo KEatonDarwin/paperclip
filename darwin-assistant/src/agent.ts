@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { buildSystemPrompt, loadMemoryBlock } from './prompt.js';
 import { getAuggieModels } from './auggie-catalog.js';
 import { getDevinModels } from './devin-catalog.js';
+import { getCodexModels } from './codex-catalog.js';
 import { ALL_TOOLS, TOOL_MAP } from './tools/index.js';
 import { withToolExecutionContext, type ToolExecutionContext } from './autonomy-ledger.js';
 import {
@@ -274,10 +275,11 @@ const ADAPTERS: Record<string, AdapterConfig> = {
     id: 'codex',
     name: 'Codex (OpenAI)',
     bin: process.env.CODEX_BIN ?? 'codex',
+    // Seed list only; refreshCodexModels() swaps in the live shelf from the
+    // codex app-server `model/list` RPC (this static one had gone stale —
+    // missing GPT-6-Astra, still offering retired 5.4 tiers).
     models: [
       { id: 'gpt-5.5', label: 'GPT-5.5' },
-      { id: 'gpt-5.4', label: 'GPT-5.4' },
-      { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
     ],
     runtime: {
       provider: 'openai',
@@ -427,6 +429,15 @@ export async function refreshDevinModels(): Promise<Array<{ id: string; label: s
   return ADAPTERS.devin.models;
 }
 void refreshDevinModels().catch(() => { /* best-effort */ });
+
+// Same pattern for Codex: the real shelf lives behind the CLI app-server's
+// `model/list` RPC (GPT-6-Astra, 5.6 Sol/Terra/Luna, …), not our static seed.
+export async function refreshCodexModels(): Promise<Array<{ id: string; label: string }>> {
+  const models = await getCodexModels();
+  if (models.length > 0) ADAPTERS.codex.models = models;
+  return ADAPTERS.codex.models;
+}
+void refreshCodexModels().catch(() => { /* best-effort */ });
 
 function getActiveAdapter(): AdapterConfig {
   const adapterId = getSetting('adapter') ?? 'claude';

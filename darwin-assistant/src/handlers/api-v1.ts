@@ -207,6 +207,7 @@ import {
   getActiveRuns,
   refreshAuggieModels,
   refreshDevinModels,
+  refreshCodexModels,
   type AdapterConfig,
 } from '../agent.js';
 import {
@@ -414,6 +415,13 @@ async function providerCatalog(): Promise<Array<Record<string, unknown>>> {
   // selector + per-thread model validation see all ~40 families, not the seed.
   try {
     await refreshDevinModels();
+  } catch {
+    // leave static models in place
+  }
+  // Codex's real shelf lives behind the CLI app-server `model/list` RPC —
+  // refresh so the selector tracks OpenAI's live models (GPT-6-Astra etc.).
+  try {
+    await refreshCodexModels();
   } catch {
     // leave static models in place
   }

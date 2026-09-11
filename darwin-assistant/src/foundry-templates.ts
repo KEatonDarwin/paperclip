@@ -16,7 +16,7 @@ GUARD:
 - Touch only modules/{{key}}/{{#if kind==contracts}} and contracts/{{/if}}.
 
 Worktree:
-git worktree add {{worktrees}}/{{project}}-{{key}} -b foundry/{{project}}/{{key}} origin/{{base_branch}}
+git -C {{repo}} worktree add {{worktrees}}/{{project}}-{{key}} -b foundry/{{project}}/{{key}} {{base_ref}}
 cd {{worktrees}}/{{project}}-{{key}}
 
 Provides:
@@ -69,7 +69,7 @@ Commit and push. Finish by POSTing to hopper node {{node_id}} with the docs comm
 `,
   'integrate-merge': `# FOUNDRY INTEGRATE MERGE - {{project}}
 
-Create foundry/{{project}}/integration from origin/{{base_branch}}, merge module branches, apply wiring, and run {{integration_test}}.
+Create foundry/{{project}}/integration from {{base_ref}}, merge {{remote_prefix}}foundry/{{project}}/<key> branches, apply wiring, and run {{integration_test}}.
 
 Repository: {{repo}}
 Worktree: {{worktrees}}/{{project}}-integration

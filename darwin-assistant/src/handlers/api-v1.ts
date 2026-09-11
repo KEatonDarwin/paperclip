@@ -1431,7 +1431,11 @@ export function createApiV1Router(): Router {
       sendError(res, 409, 'foundry_project_already_launched', 'project has already launched');
       return;
     }
-    if (!['draft', 'planning', 'planned'].includes(project.status)) {
+    if (project.status === 'planning') {
+      sendError(res, 409, 'foundry_project_planning', 'a planner run is already in flight for this project');
+      return;
+    }
+    if (!['draft', 'planned'].includes(project.status)) {
       sendError(res, 409, 'foundry_project_already_building', 'project already has build work in flight');
       return;
     }
@@ -1442,11 +1446,11 @@ export function createApiV1Router(): Router {
         : getFoundryModelSetting('planner', 'claude-opus-5');
     const updated = markProjectPlanning(id, plannerModel);
     if (!updated) {
-      sendError(res, 404, 'foundry_project_not_found', 'foundry project not found');
+      sendError(res, 409, 'foundry_project_planning', 'project is no longer plannable (already planning or building)');
       return;
     }
     setImmediate(() => {
-      runFoundryPlanner(id).catch((err: unknown) => {
+      runFoundryPlanner(id, plannerModel).catch((err: unknown) => {
         console.error('[foundry] planner failed', err);
       });
     });

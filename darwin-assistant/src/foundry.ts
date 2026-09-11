@@ -150,7 +150,11 @@ const STAGE_RANK: Record<FoundryModuleStage, number> = {
   needs_answer: -1,
   blocked: -1,
 };
-const COMPLETE_NODE_STATUSES = new Set<HopperNodeStatus>(['done', 'split']);
+// A 'split' node is terminal for ITSELF but its children are still doing the
+// work; the engine bubbles the parent to 'done' once every child settles. Until
+// then the stage must read as in-progress, never as complete (review #3).
+const COMPLETE_NODE_STATUSES = new Set<HopperNodeStatus>(['done']);
+const IN_PROGRESS_NODE_STATUSES = new Set<HopperNodeStatus>(['running', 'split']);
 
 sqliteDb.exec(`
   CREATE TABLE IF NOT EXISTS foundry_projects (
@@ -281,6 +285,16 @@ const setBlueprintStmt = sqliteDb.prepare<[string, string, string]>(`
   WHERE id = ?
     AND status IN ('draft','planning','planned')
 `);
+const setBlueprintWhilePlanningStmt = sqliteDb.prepare<[string, string, string]>(`
+  UPDATE foundry_projects
+  SET blueprint = ?,
+      run_command = ?,
+      status = 'planned',
+      last_error = NULL,
+      updated_at = datetime('now')
+  WHERE id = ?
+    AND status = 'planning'
+`);
 const setPlanningStmt = sqliteDb.prepare<[string | null, string]>(`
   UPDATE foundry_projects
   SET status = 'planning',
@@ -288,6 +302,7 @@ const setPlanningStmt = sqliteDb.prepare<[string | null, string]>(`
       last_error = NULL,
       updated_at = datetime('now')
   WHERE id = ?
+    AND status IN ('draft','planned')
 `);
 const setPlannerFailedStmt = sqliteDb.prepare<[string, string]>(`
   UPDATE foundry_projects
@@ -295,6 +310,7 @@ const setPlannerFailedStmt = sqliteDb.prepare<[string, string]>(`
       last_error = ?,
       updated_at = datetime('now')
   WHERE id = ?
+    AND status = 'planning'
 `);
 const setProjectStatusStmt = sqliteDb.prepare<[FoundryProjectStatus, string]>(`
   UPDATE foundry_projects
@@ -411,6 +427,11 @@ function stageNodeIds(row: FoundryModuleRow): Record<FoundryStageKey, number | n
 function stageNode(row: FoundryModuleRow, stage: FoundryStageKey): HopperNodeRow | null {
   const id = stageNodeIds(row)[stage];
   return id == null ? null : getHopperNode(id);
+}
+
+function integrationTreeBlocked(project: FoundryProjectRow): boolean {
+  if (!project.integration_tree_id) return false;
+  return listTreeNodes(project.integration_tree_id).some((node) => node.status === 'blocked' || node.status === 'blocked_question');
 }
 
 function integrationTreeDone(project: FoundryProjectRow): boolean {
@@ -671,6 +692,11 @@ export function validateBlueprint(input: unknown): { ok: boolean; errors: string
     if (provider && !provides.some((p) => provideNames(p).includes(w.requires!))) {
       errors.push(`wiring ${w.from}:${w.requires} -> ${w.to} does not bind to a provide named '${w.requires}'`);
     }
+    const consumer = byKey.get(w.from);
+    const consumerRequires = Array.isArray(consumer?.contract?.requires) ? consumer.contract.requires : [];
+    if (consumer && !consumerRequires.some((r) => moduleRequiresName(r) === w.requires)) {
+      errors.push(`wiring ${w.from}:${w.requires} -> ${w.to} is stray: '${w.from}' does not declare a requires named '${w.requires}'`);
+    }
   }
 
   for (const mod of byKey.values()) {
@@ -742,11 +768,11 @@ export function deriveStage(project: FoundryProjectRow, module: FoundryModuleRow
   if (nodes.some((node) => node.status === 'blocked')) return 'blocked';
   if (nodes.some((node) => node.status === 'blocked_question')) return 'needs_answer';
   if (integrationTreeDone(project) && completeNode(build) && completeNode(test) && completeNode(doc)) return 'integrated';
-  if (doc?.status === 'running') return 'documenting';
+  if (doc && IN_PROGRESS_NODE_STATUSES.has(doc.status)) return 'documenting';
   if (completeNode(doc)) return 'documented';
-  if (test?.status === 'running') return 'testing';
+  if (test && IN_PROGRESS_NODE_STATUSES.has(test.status)) return 'testing';
   if (completeNode(test)) return 'tested';
-  if (build?.status === 'running') return 'building';
+  if (build && IN_PROGRESS_NODE_STATUSES.has(build.status)) return 'building';
   if (completeNode(build)) return 'built';
   return 'planned';
 }
@@ -886,11 +912,20 @@ export function createProject(args: {
   return { project: serializeFoundryProject(created, []), modules: [] };
 }
 
-export function setBlueprint(id: string, blueprintInput: unknown): { project: FoundryProjectResponse; modules: FoundryModuleResponse[] } {
+export function setBlueprint(
+  id: string,
+  blueprintInput: unknown,
+  opts: { onlyWhilePlanning?: boolean } = {},
+): { project: FoundryProjectResponse; modules: FoundryModuleResponse[] } {
   const project = getProjectStmt.get(id) ?? null;
   if (!project) throw new FoundryError(404, 'foundry_project_not_found', 'foundry project not found');
   if (project.status !== 'draft' && project.status !== 'planning' && project.status !== 'planned') {
     throw new FoundryError(409, 'foundry_project_locked', 'blueprint can only be changed while project is draft, planning, or planned');
+  }
+  // The planner's own write must not clobber a blueprint Kevin edited (and
+  // possibly launched) while the planner was still running.
+  if (opts.onlyWhilePlanning && project.status !== 'planning') {
+    throw new FoundryError(409, 'foundry_plan_superseded', 'project left the planning state before the planner finished');
   }
   const bp = normalizeBlueprint(blueprintInput);
   const validation = validateBlueprint(bp);
@@ -899,7 +934,7 @@ export function setBlueprint(id: string, blueprintInput: unknown): { project: Fo
   }
   if (!bp) throw new FoundryError(400, 'invalid_blueprint', 'blueprint is invalid', { errors: validation.errors });
   const tx = sqliteDb.transaction(() => {
-    const info = setBlueprintStmt.run(JSON.stringify(bp), bp.run.command.trim(), id);
+    const info = (opts.onlyWhilePlanning ? setBlueprintWhilePlanningStmt : setBlueprintStmt).run(JSON.stringify(bp), bp.run.command.trim(), id);
     if (info.changes !== 1) throw new FoundryError(409, 'foundry_project_locked', 'blueprint can only be changed while project is draft, planning, or planned');
     deleteModulesStmt.run(id);
     for (const mod of bp.modules) {
@@ -927,17 +962,22 @@ export function setBlueprint(id: string, blueprintInput: unknown): { project: Fo
   return result;
 }
 
+/** Single-flight: returns null unless the project was draft/planned (i.e. a
+ *  second concurrent plan, or a plan on a building project, is refused). */
 export function markProjectPlanning(id: string, plannerModel?: string | null): FoundryProjectResponse | null {
-  setPlanningStmt.run(plannerModel ?? null, id);
+  const info = setPlanningStmt.run(plannerModel ?? null, id);
+  if (info.changes !== 1) return null;
   const row = getProjectStmt.get(id) ?? null;
   if (row) emitProject('updated', row);
   return row ? serializeFoundryProject(row) : null;
 }
 
+/** Only a project still in 'planning' drops back to draft — a late planner
+ *  failure can never drag a launched/building project backwards. */
 export function markProjectPlannerFailed(id: string, message: string): FoundryProjectResponse | null {
-  setPlannerFailedStmt.run(message.slice(0, 1000), id);
+  const info = setPlannerFailedStmt.run(message.slice(0, 1000), id);
   const row = getProjectStmt.get(id) ?? null;
-  if (row) emitProject('updated', row);
+  if (row && info.changes === 1) emitProject('updated', row);
   return row ? serializeFoundryProject(row) : null;
 }
 
@@ -955,8 +995,30 @@ function loadBlueprint(project: FoundryProjectRow): Blueprint | null {
   return normalizeBlueprint(parseJson<unknown>(project.blueprint, null));
 }
 
+/** True when the project repo has an `origin` remote. A freshly scaffolded
+ *  Foundry repo (the default `/home/kevin/foundry/<slug>`) has none, so
+ *  worktree/merge refs and push instructions must fall back to local branches. */
+function repoHasOrigin(project: FoundryProjectRow): boolean {
+  try {
+    execFileSync('git', ['-C', project.repo_path, 'remote', 'get-url', 'origin'], { stdio: 'ignore', timeout: 10_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function projectBaseRef(project: FoundryProjectRow): string {
-  return `origin/${project.base_branch}`;
+  return repoHasOrigin(project) ? `origin/${project.base_branch}` : project.base_branch;
+}
+
+function remoteTemplateVars(project: FoundryProjectRow): Record<string, string> {
+  const hasOrigin = repoHasOrigin(project);
+  return {
+    remote_prefix: hasOrigin ? 'origin/' : '',
+    push_hint: hasOrigin
+      ? 'Push ONLY your branch to origin.'
+      : 'This repo has NO remote — the branch stays local in the repo; do NOT try to push, and merge local branches directly.',
+  };
 }
 
 function worktreesRoot(): string {
@@ -1018,6 +1080,7 @@ function moduleTemplateVars(module: FoundryModuleRow, project: FoundryProjectRow
     module_worktree: worktreePath(project, module.key),
     module_branch: module.branch,
     base_ref: projectBaseRef(project),
+    ...remoteTemplateVars(project),
     skill_dir: getFoundrySkillDir(),
     node_id: '<hopper node id from this worker thread>',
     '#if kind==contracts': module.kind === 'contracts' ? ' and `contracts/`' : '',
@@ -1101,6 +1164,8 @@ function recomputeProjectStatus(projectId: string): FoundryProjectRow | null {
   let next: FoundryProjectStatus = project.blueprint ? 'planned' : 'draft';
   if (modules.some((module) => module.stage === 'blocked' || module.stage === 'needs_answer')) {
     next = 'blocked';
+  } else if (project.integration_tree_id && integrationTreeBlocked(project)) {
+    next = 'blocked';
   } else if (project.integration_tree_id && integrationTreeDone(project)) {
     next = 'ready';
   } else if (modules.length && modules.every((module) => stageAtLeast(module.stage, 'documented'))) {
@@ -1174,6 +1239,7 @@ function composeIntegrationSpec(stage: 'merge' | 'review' | 'docs', project: Fou
     repo: project.repo_path,
     base_branch: project.base_branch,
     base_ref: projectBaseRef(project),
+    ...remoteTemplateVars(project),
     worktrees: worktreesRoot(),
     integration_worktree: worktreePath(project, 'integration'),
     integration_branch: `foundry/${project.id}/integration`,
@@ -1288,9 +1354,15 @@ function handleIntegrationTreeEvent(project: FoundryProjectRow, node: HopperNode
     return;
   }
   if (!nodes.length || !nodes.every((n) => COMPLETE_NODE_STATUSES.has(n.status))) return;
+  // Never flip ready while any box is red/orange (review #6).
+  const projectModules = projectModulesStmt.all(project.id).map((module) => refreshModuleStage(project, module).module);
+  if (projectModules.some((module) => module.stage === 'blocked' || module.stage === 'needs_answer')) {
+    recomputeProjectStatus(project.id);
+    return;
+  }
 
   const wasReady = project.status === 'ready';
-  for (const module of projectModulesStmt.all(project.id)) {
+  for (const module of projectModules) {
     if (module.stage !== 'integrated') {
       setModuleIntegratedStmt.run(module.id);
       const updatedModule = moduleByKeyStmt.get(module.project_id, module.key);
@@ -1320,7 +1392,12 @@ function handleFoundrySse(ev: SSEEvent): void {
     if (!project) return;
     const refreshed = refreshModuleStage(project, module);
     recomputeProjectStatus(project.id);
-    if (refreshed.stageChanged && (refreshed.module.stage === 'tested' || refreshed.module.stage === 'documented')) {
+    // Plant on every event once the module is >= tested, not only on the
+    // change edge: maybePlantReadyModules/maybePlantIntegrationTree refresh
+    // every module's stage themselves (which can consume another module's
+    // change edge), and both are idempotent (tree_id / integration_tree_id
+    // guards), so re-running them is free and never double-plants.
+    if (stageAtLeast(refreshed.module.stage, 'tested')) {
       maybePlantReadyModules(project.id);
       maybePlantIntegrationTree(project.id);
     }

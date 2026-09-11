@@ -444,6 +444,145 @@ async function runBlockedQuestionProbe() {
 await runBlockedQuestionProbe();
 
 // =============================================================================
+// SCENARIO D — a 'split' build node must NOT read as built (adversarial review #3/#4)
+// The parent node goes 'split' (terminal for itself) while its children still
+// run; the module stays 'building', TEST must not dispatch until the children
+// settle and the engine bubbles the parent to 'done'.
+// =============================================================================
+function probeBlueprint(name, purposeSuffix) {
+  return {
+    name,
+    prompt: `Trivial single-module probe: ${purposeSuffix}`,
+    modules: [
+      {
+        key: 'probe',
+        name: 'probe',
+        kind: 'library',
+        purpose: 'A trivial probe module with no dependencies.',
+        contract: { provides: [{ type: 'fn', name: 'noop', summary: 'Does nothing' }], requires: [] },
+        acceptance: ['noop can be called without throwing'],
+        depends_on: [],
+      },
+    ],
+    wiring: [],
+    integration: { test: 'true', docs: 'README.md' },
+    run: { command: 'true' },
+  };
+}
+
+async function runSplitProbe() {
+  const repo = '/tmp/foundry-sim-repo-split';
+  rmrf(repo);
+  const blueprint = probeBlueprint('foundry-sim-split-probe', 'split lifecycle path');
+  const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+  foundry.setBlueprint(project.id, blueprint);
+  foundry.launchProject(project.id);
+  await hopperEngine.dispatchTick('split-probe-claim');
+  const pre = foundry.getProjectWithModules(project.id).modules[0];
+  const buildNodeId = pre.stage_nodes.build.node_id;
+  const testNodeId = pre.stage_nodes.test.node_id;
+  assert.ok(buildNodeId && testNodeId, 'split probe: stage nodes were never planted');
+
+  hopperEngine.finishHopperNode(buildNodeId, 'split', {
+    children: [
+      { title: 'probe part 1', spec: 'first half' },
+      { title: 'probe part 2', spec: 'second half', depends_on_prev: true },
+    ],
+  });
+  const stageAfterSplit = foundry.getProjectWithModules(project.id).modules[0].stage;
+  await hopperEngine.dispatchTick('split-probe-after-split');
+  const testAfterSplit = hopperEngine.getHopperNode(testNodeId).status;
+  const kids = hopperEngine.listTreeNodes(pre.tree_id).filter((n) => n.parent_id === buildNodeId);
+
+  check('9a', "a 'split' build node keeps the module at 'building' (not 'built')", () => {
+    assert.equal(stageAfterSplit, 'building', `expected 'building' while split children run, got '${stageAfterSplit}'`);
+    assert.equal(kids.length, 2, `expected 2 split children, got ${kids.length}`);
+    assert.ok(kids.every((k) => k.adapter && k.model), 'split children must inherit a non-null adapter/model');
+  });
+  check('9b', 'TEST does not dispatch while the split BUILD children are still unsettled', () => {
+    assert.equal(testAfterSplit, 'pending', `expected TEST node still 'pending', got '${testAfterSplit}'`);
+  });
+
+  // Duplicate-delivery probe: re-emit the last hopper_node event twice; nothing may double-plant.
+  const treesBefore = sqliteDb.prepare(`SELECT COUNT(*) AS n FROM hopper_trees`).get().n;
+  const lastNode = hopperEngine.getHopperNode(buildNodeId);
+  sseBus.emit('sse', { type: 'hopper_node', action: 'updated', node: lastNode });
+  sseBus.emit('sse', { type: 'hopper_node', action: 'updated', node: lastNode });
+  const treesAfter = sqliteDb.prepare(`SELECT COUNT(*) AS n FROM hopper_trees`).get().n;
+  check('9c', 'a duplicated hopper_node event plants nothing twice', () => {
+    assert.equal(treesAfter, treesBefore, `tree count changed on duplicate event: ${treesBefore} -> ${treesAfter}`);
+  });
+
+  const finalProject = await drain(project.id, { maxRounds: 20 });
+  check('9d', 'after the split children settle, the module walks to documented/integrated and the project reaches ready', () => {
+    const m = foundry.getProjectWithModules(project.id).modules[0];
+    assert.equal(hopperEngine.getHopperNode(buildNodeId).status, 'done', 'split parent should bubble to done');
+    assert.ok(m.stage === 'integrated' || m.stage === 'documented', `expected integrated/documented, got '${m.stage}'`);
+    assert.equal(finalProject.status, 'ready', `expected project 'ready', got '${finalProject.status}'`);
+  });
+}
+await runSplitProbe();
+
+// =============================================================================
+// SCENARIO E — settings-KV loadout overrides actually reach the planted nodes
+// =============================================================================
+async function runSettingsOverrideProbe() {
+  const repo = '/tmp/foundry-sim-repo-settings';
+  rmrf(repo);
+  convDb.setSetting('foundry_build_model', 'auggie/opus4.8');
+  convDb.setSetting('foundry_test_model', JSON.stringify({ adapter: 'devin', model: 'swe' }));
+  convDb.setSetting('foundry_doc_model', 'gpt-5.5');
+  try {
+    const blueprint = probeBlueprint('foundry-sim-settings-probe', 'settings override path');
+    const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+    foundry.setBlueprint(project.id, blueprint);
+    foundry.launchProject(project.id);
+    const m = foundry.getProjectWithModules(project.id).modules[0];
+    const nodes = hopperEngine.listTreeNodes(m.tree_id);
+    const byTitle = Object.fromEntries(nodes.map((n) => [n.title.split(' ')[0], n]));
+    check('10', 'foundry_{build,test,doc}_model settings override adapter+model on planted nodes', () => {
+      assert.deepEqual([byTitle.BUILD.adapter, byTitle.BUILD.model], ['auggie', 'opus4.8']);
+      assert.deepEqual([byTitle.TEST.adapter, byTitle.TEST.model], ['devin', 'swe']);
+      assert.deepEqual([byTitle.DOC.adapter, byTitle.DOC.model], ['codex', 'gpt-5.5']);
+    });
+  } finally {
+    convDb.deleteSetting('foundry_build_model');
+    convDb.deleteSetting('foundry_test_model');
+    convDb.deleteSetting('foundry_doc_model');
+  }
+}
+await runSettingsOverrideProbe();
+
+// =============================================================================
+// SCENARIO F — planner-state idempotency guards (no model call: only the
+// status transitions are exercised)
+// =============================================================================
+function runPlannerGuardProbe() {
+  const repo = '/tmp/foundry-sim-repo-planguard';
+  rmrf(repo);
+  const blueprint = probeBlueprint('foundry-sim-planguard-probe', 'planner guard path');
+  const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+  const first = foundry.markProjectPlanning(project.id, 'claude-opus-5');
+  const second = foundry.markProjectPlanning(project.id, 'claude-opus-5');
+  check('11a', 'markProjectPlanning is single-flight: a second call while planning returns null', () => {
+    assert.equal(first?.status, 'planning');
+    assert.equal(second, null, 'second markProjectPlanning should be refused while already planning');
+  });
+  foundry.setBlueprint(project.id, blueprint);
+  foundry.launchProject(project.id);
+  const failed = foundry.markProjectPlannerFailed(project.id, 'late planner failure');
+  check('11b', 'a late planner failure cannot drag a building project back to draft', () => {
+    assert.equal(failed?.status, 'building', `expected status to stay 'building', got '${failed?.status}'`);
+  });
+  const latePlan = foundry.markProjectPlanning(project.id, 'claude-opus-5');
+  check('11c', 'markProjectPlanning refuses a project that already has build work in flight', () => {
+    assert.equal(latePlan, null);
+    assert.equal(foundry.getProjectRow(project.id).status, 'building');
+  });
+}
+runPlannerGuardProbe();
+
+// =============================================================================
 // Report
 // =============================================================================
 console.log('');

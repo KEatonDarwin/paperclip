@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { getProjectRow, markProjectPlannerFailed, markProjectPlanning, setBlueprint, validateBlueprint } from './foundry.js';
+import { getProjectRow, markProjectPlannerFailed, setBlueprint, validateBlueprint } from './foundry.js';
 import { getFoundryModelSetting } from './foundry-settings.js';
 import { getFoundrySkillDir } from './foundry-templates.js';
 import { createNotification } from './notifications.js';
@@ -273,11 +273,13 @@ function notifyPlannerFailure(id: string, name: string, message: string): void {
   });
 }
 
-export async function planProject(id: string): Promise<void> {
+/** Runs the one-shot planner for a project the caller has ALREADY moved to
+ *  'planning' via markProjectPlanning (single-flight guard lives there). */
+export async function planProject(id: string, modelArg?: string | null): Promise<void> {
   const project = getProjectRow(id);
   if (!project) throw new Error(`Foundry project '${id}' not found`);
-  const model = getFoundryModelSetting('planner', 'claude-opus-5');
-  markProjectPlanning(id, model);
+  if (project.status !== 'planning') throw new Error(`Foundry project '${id}' is not in planning state (${project.status})`);
+  const model = modelArg?.trim() || project.planner_model?.trim() || getFoundryModelSetting('planner', 'claude-opus-5');
 
   try {
     const prompt = buildPlannerPrompt({
@@ -289,7 +291,7 @@ export async function planProject(id: string): Promise<void> {
     const parsed = JSON.parse(stripCodeFences(raw)) as unknown;
     const validation = validateBlueprint(parsed);
     if (!validation.ok) throw new Error(`planner returned an invalid blueprint: ${validation.errors.join('; ')}`);
-    setBlueprint(id, parsed);
+    setBlueprint(id, parsed, { onlyWhilePlanning: true });
   } catch (err) {
     const message = failureMessage(err);
     markProjectPlannerFailed(id, message);

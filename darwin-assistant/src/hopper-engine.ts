@@ -321,7 +321,10 @@ function depsSatisfied(node: HopperNodeRow): boolean {
     const deps = JSON.parse(node.depends_on) as number[];
     return deps.every((d) => {
       const dep = getNodeStmt.get(d);
-      return !dep || dep.status === 'done' || dep.status === 'split';
+      // 'split' is terminal for the parent but its children are still working;
+      // settleAncestors flips the parent to 'done' once every child settles, so
+      // only 'done' releases a dependent (foundry review #3/#4).
+      return !dep || dep.status === 'done';
     });
   } catch {
     return true;
@@ -420,7 +423,8 @@ function settleAncestors(node: HopperNodeRow): void {
   const parent = getNodeStmt.get(node.parent_id);
   if (!parent || parent.status === 'done') return;
   const kids = childrenStmt.all(parent.id);
-  const allSettled = kids.every((k) => k.status === 'done' || k.status === 'split');
+  // A 'split' child only counts once ITS children have bubbled it to 'done'.
+  const allSettled = kids.every((k) => k.status === 'done');
   if (allSettled) {
     const updated = setNode(parent.id, {
       status: 'done',

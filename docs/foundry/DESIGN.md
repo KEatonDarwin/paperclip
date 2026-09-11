@@ -124,8 +124,12 @@ Inputs:
 - doc node status: `stage_nodes.doc`
 - project integration state: `project.integration_tree_id` and its Hopper nodes
 
-Treat Hopper statuses `done` and `split` as stage-complete. A split node is complete because
-the Hopper Engine settles the parent only after children are settled.
+Only Hopper status `done` is stage-complete. **`split` is in-progress**, not complete: the
+engine marks the parent `split` the instant the worker decomposes it, while the children still
+have to run; `settleAncestors` bubbles the parent to `done` only once every child is `done`.
+(Corrected by the adversarial review, node 72 — the original "split is complete" premise
+produced a green box with the work still running, and let TEST dispatch before BUILD finished.
+`depsSatisfied`/`settleAncestors` in `hopper-engine.ts` were tightened to `done`-only to match.)
 
 Priority order for `deriveStage(project, module)`:
 
@@ -134,12 +138,12 @@ Priority order for `deriveStage(project, module)`:
 | Any build/test/doc node status is `blocked` | `blocked` |
 | Any build/test/doc node status is `blocked_question` | `needs_answer` |
 | Project integration tree is done and build/test/doc are complete | `integrated` |
-| Doc node status is `running` | `documenting` |
-| Doc node status is `done` or `split` | `documented` |
-| Test node status is `running` | `testing` |
-| Test node status is `done` or `split` | `tested` |
-| Build node status is `running` | `building` |
-| Build node status is `done` or `split` | `built` |
+| Doc node status is `running` or `split` | `documenting` |
+| Doc node status is `done` | `documented` |
+| Test node status is `running` or `split` | `testing` |
+| Test node status is `done` | `tested` |
+| Build node status is `running` or `split` | `building` |
+| Build node status is `done` | `built` |
 | Build node missing, `draft`, or `pending` | `planned` |
 | No stage nodes exist yet | `planned` |
 
@@ -211,7 +215,8 @@ Listener algorithm:
    - Run `maybePlantReadyModules(project_id)`.
    - Run `maybePlantIntegrationTree(project_id)`.
 4. If `node.tree_id` matches `foundry_projects.integration_tree_id`, recompute project integration:
-   - If every node in that tree is `done` or `split`, set all project modules with
+   - If every node in that tree is `done` (a `split` parent flips to `done` once its children
+     settle) AND no module is `blocked`/`needs_answer`, set all project modules with
      `stage='documented'` to `integrated`, set project `ready`, emit module/project events,
      and create a success notification.
    - If any integration node is `blocked_question`, set project `blocked`, create a warning
@@ -1145,3 +1150,35 @@ That avoids an idle gap where a dependency is tested but the dependent waits for
 - `POST /foundry/projects/:id/launch {}` -> `202 {project: building,modules}`
 - `POST /foundry/projects/:id/go {}` -> `202 {project: launched,launched:true,preview_url}`
 - `POST /foundry/projects/:id/modules/:key/retry {stage?}` -> `202 {module,tree,node}`
+
+## Adversarial review — node 72 (2026-09-10)
+
+Changes made to the contract after trying to refute it against the built code:
+
+1. **`split` ≠ complete** (above). `COMPLETE_NODE_STATUSES` is `done` only; `running`/`split`
+   read as in-progress. Engine-side, `depsSatisfied` and `settleAncestors` only accept `done`
+   (a split parent with a still-running or blocked child no longer releases dependents or
+   settles its own parent).
+2. **Plan is single-flight.** `markProjectPlanning` only succeeds from `draft`/`planned` and
+   returns `null` otherwise; `POST /plan` answers 409 `foundry_project_planning` when a run is
+   in flight. `markProjectPlannerFailed` only drops a project that is still `planning` — a late
+   failure can never pull a `building` project back to `draft`. The planner's own blueprint
+   write is `setBlueprint(id, bp, { onlyWhilePlanning: true })` so it cannot clobber a
+   blueprint Kevin edited (and possibly launched) while the CLI was still thinking.
+   `planProject(id, model?)` no longer re-marks the row; the route passes `planner_model` through.
+3. **Project status honours integration blockage.** `recomputeProjectStatus` returns `blocked`
+   when any integration-tree node is `blocked`/`blocked_question` (a duplicate module event
+   used to flip a blocked project back to `integrating`). Ready is refused while any module is
+   `blocked`/`needs_answer`.
+4. **Planting is edge-independent.** The listener runs `maybePlantReadyModules` +
+   `maybePlantIntegrationTree` on every module event once the module is ≥ `tested` (both are
+   idempotent via `tree_id` / `integration_tree_id` guards), instead of only on a stage-change
+   edge that another module's refresh could have consumed.
+5. **Blueprint validation rejects stray wiring** rows whose `from` module declares no such
+   `requires` (server `validateBlueprint` and kit `foundry-validate.mjs`), and the kit now also
+   checks `requires.module` agrees with the wiring target (two false-greens found).
+6. **UI:** `last_error` surfaced on the board; SKILL §4's editable blueprint draft (JSON, PATCH
+   `/blueprint`, only while draft/planned) added; `planning` state shown.
+
+Regression coverage: `scripts/foundry-sim.mjs` scenarios 9a–9d (split), 10 (settings-KV
+loadout overrides reach planted nodes), 11a–11c (planner guards).

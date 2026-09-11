@@ -504,6 +504,23 @@ export function answerHopperNode(id: number, answer: string): HopperNodeRow | nu
   return updated;
 }
 
+/** Foundry retry hook: put a blocked/question node back on the queue cleanly. */
+export function retryHopperNode(id: number): HopperNodeRow | null {
+  const node = getNodeStmt.get(id);
+  if (!node || (node.status !== 'blocked' && node.status !== 'blocked_question')) return node ?? null;
+  const updated = setNode(id, {
+    status: 'pending',
+    attempts: 0,
+    question: null,
+    answer: null,
+    result: null,
+    worker_thread_ext: null,
+    lease_expires_at: null,
+  });
+  queueMicrotask(() => void dispatchTick('node_retry'));
+  return updated;
+}
+
 let ticking = false;
 
 /** The dispatcher. Plain code, no model calls: requeue expired leases, then fill free slots. */

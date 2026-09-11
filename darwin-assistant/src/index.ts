@@ -10,6 +10,7 @@ import { reconcileInterruptedRuns, autoHideStaleThreads } from './conversation-d
 import { getSetting } from './conversation-db.js';
 import { shutdownActiveRuns, processMessage, abortConversationRun } from './agent.js';
 import { startHopperEngine } from './hopper-engine.js';
+import { startFoundry } from './foundry.js';
 import { startMonitorScheduler } from './monitors.js';
 
 const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT ?? '3200', 10);
@@ -114,6 +115,7 @@ async function main() {
   // Hopper Engine — the autonomous work-tree dispatcher. Event-driven (ticks
   // fire on node state writes); the 60s interval inside is only the safety net.
   startHopperEngine(processMessage);
+  startFoundry();
 
   // Cockpit Monitors — cheap scheduled prompt-check agents. Runs through the
   // same processMessage/local-CLI adapter seam as normal cockpit threads.

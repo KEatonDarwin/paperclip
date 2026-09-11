@@ -82,9 +82,12 @@ import {
   FoundryError,
   getProjectRow as getFoundryProjectRow,
   getProjectWithModules as getFoundryProjectWithModules,
+  goProject as goFoundryProject,
   isProjectStatus,
+  launchProject as launchFoundryProject,
   listProjects as listFoundryProjects,
   markProjectPlanning,
+  retryModule as retryFoundryModule,
   setBlueprint as setFoundryBlueprint,
 } from '../foundry.js';
 import { planProject as runFoundryPlanner } from '../foundry-planner.js';
@@ -1395,6 +1398,11 @@ export function createApiV1Router(): Router {
         prompt,
         repo_path: typeof body.repo_path === 'string' ? body.repo_path : null,
         base_branch: typeof body.base_branch === 'string' ? body.base_branch : null,
+        origin_thread_ext: typeof body.origin_thread_ext === 'string'
+          ? body.origin_thread_ext
+          : typeof body.origin_thread === 'string'
+            ? body.origin_thread
+            : null,
       });
       res.status(201).json(result);
     } catch (err) {
@@ -1463,16 +1471,33 @@ export function createApiV1Router(): Router {
     res.status(204).end();
   });
 
-  router.post('/foundry/projects/:id/launch', (_req: AuthedRequest, res) => {
-    sendError(res, 501, 'foundry_not_implemented', 'Foundry launch is wired in backend node 2b');
+  router.post('/foundry/projects/:id/launch', (req: AuthedRequest, res) => {
+    try {
+      res.status(202).json(launchFoundryProject(paramString(req.params.id)));
+    } catch (err) {
+      sendCaughtFoundryError(res, err);
+    }
   });
 
-  router.post('/foundry/projects/:id/go', (_req: AuthedRequest, res) => {
-    sendError(res, 501, 'foundry_not_implemented', 'Foundry GO is wired in backend node 2b');
+  router.post('/foundry/projects/:id/go', (req: AuthedRequest, res) => {
+    try {
+      res.status(202).json(goFoundryProject(paramString(req.params.id)));
+    } catch (err) {
+      sendCaughtFoundryError(res, err);
+    }
   });
 
-  router.post('/foundry/projects/:id/modules/:key/retry', (_req: AuthedRequest, res) => {
-    sendError(res, 501, 'foundry_not_implemented', 'Foundry module retry is wired in backend node 2b');
+  router.post('/foundry/projects/:id/modules/:key/retry', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    try {
+      res.status(202).json(retryFoundryModule(
+        paramString(req.params.id),
+        paramString(req.params.key),
+        typeof body.stage === 'string' ? body.stage : null,
+      ));
+    } catch (err) {
+      sendCaughtFoundryError(res, err);
+    }
   });
 
   // == Task Hopper (candidate tasks awaiting Kevin's yes/dismiss) ==============

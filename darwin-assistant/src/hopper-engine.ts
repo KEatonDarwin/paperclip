@@ -230,24 +230,33 @@ export function updateHopperNodeSpec(id: number, spec: string): HopperNodeRow | 
 
 /** Foundry auto-decision retry prep. This intentionally does not emit while the
  *  node is still blocked; retryHopperNode emits the re-pended state after the
- *  amendment is in place, which keeps the first auto-resolution quiet. */
+ *  amendment is in place, which keeps the first auto-resolution quiet.
+ *
+ *  The claim is an atomic compare-and-swap on the DB row (status must still be
+ *  blocked/blocked_question AND foundry_auto_retries must still be 0) rather
+ *  than trusting the caller's (possibly stale/replayed) in-memory node
+ *  snapshot — a duplicated hopper_node SSE event carrying an earlier
+ *  foundry_auto_retries value must not be able to win a second claim. Returns
+ *  null if this call did not win the claim (already retried, or the node
+ *  moved on before this ran). */
 export function prepareFoundryAutoRetry(
   id: number,
   amendedSpec: string,
   adapter: string,
   model: string,
 ): HopperNodeRow | null {
-  const node = getNodeStmt.get(id);
-  if (!node) return null;
-  sqliteDb.prepare(`
+  const info = sqliteDb.prepare(`
     UPDATE hopper_nodes
     SET spec = ?,
         adapter = ?,
         model = ?,
-        foundry_auto_retries = COALESCE(foundry_auto_retries, 0) + 1,
+        foundry_auto_retries = foundry_auto_retries + 1,
         updated_at = datetime('now')
     WHERE id = ?
+      AND status IN ('blocked', 'blocked_question')
+      AND COALESCE(foundry_auto_retries, 0) = 0
   `).run(amendedSpec, adapter, model, id);
+  if (info.changes !== 1) return null;
   return getNodeStmt.get(id) ?? null;
 }
 

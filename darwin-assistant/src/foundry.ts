@@ -120,6 +120,7 @@ export interface FoundryIntegrationNodeResponse {
   status: HopperNodeStatus;
   model: string | null;
   attempts: number;
+  worker_thread_ext: string | null;
 }
 
 export interface FoundryIntegrationResponse {
@@ -902,6 +903,7 @@ export function serializeFoundryIntegration(row: FoundryProjectRow): FoundryInte
       status: node.status,
       model: node.model,
       attempts: node.attempts,
+      worker_thread_ext: node.worker_thread_ext,
     })),
     auto_retried: nodes.some((node) => (node.foundry_auto_retries ?? 0) > 0),
   };

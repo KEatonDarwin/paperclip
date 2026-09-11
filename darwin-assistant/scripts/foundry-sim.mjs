@@ -683,6 +683,46 @@ async function runIntegrationAutoDecisionProbe() {
 await runIntegrationAutoDecisionProbe();
 
 // =============================================================================
+// SCENARIO H — a duplicated/replayed hopper_node SSE event carrying a STALE
+// pre-retry snapshot (foundry_auto_retries still 0) must not win a second
+// auto-retry claim. This is the same "duplicated event" class as check #9c,
+// applied to the auto-decision path specifically (prepareFoundryAutoRetry's
+// atomic CAS, not the caller's in-memory node object, is what must hold).
+// =============================================================================
+async function runAutoRetryDuplicateEventProbe() {
+  convDb.deleteSetting('foundry_auto_decide');
+  const repo = '/tmp/foundry-sim-repo-dup-retry';
+  rmrf(repo);
+  const blueprint = probeBlueprint('foundry-sim-dup-retry-probe', 'duplicate-event auto-retry path');
+  const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+  foundry.setBlueprint(project.id, blueprint);
+  foundry.launchProject(project.id);
+  await hopperEngine.dispatchTick('dup-retry-claim');
+  const pre = foundry.getProjectWithModules(project.id).modules[0];
+  const buildNodeId = pre.stage_nodes.build.node_id;
+  assert.ok(buildNodeId, 'dup-retry probe: BUILD node was never planted');
+
+  const marker = notificationMarker();
+  hopperEngine.finishHopperNode(buildNodeId, 'blocked', { result: 'contract conflict for dup-retry probe' });
+  const afterReal = hopperEngine.getHopperNode(buildNodeId);
+
+  // Replay a STALE snapshot of the node as it looked the instant it blocked,
+  // before the real auto-retry's atomic UPDATE landed (foundry_auto_retries: 0).
+  const staleSnapshot = { ...afterReal, foundry_auto_retries: 0, status: 'blocked' };
+  sseBus.emit('sse', { type: 'hopper_node', action: 'updated', node: staleSnapshot });
+  const afterReplay = hopperEngine.getHopperNode(buildNodeId);
+
+  check('13', 'a stale/replayed hopper_node event cannot win a second auto-retry claim', () => {
+    assert.equal(afterReal.foundry_auto_retries, 1, `expected the real block to auto-retry once, got ${afterReal.foundry_auto_retries}`);
+    assert.equal(afterReplay.foundry_auto_retries, 1, `stale replay must not re-increment foundry_auto_retries, got ${afterReplay.foundry_auto_retries}`);
+    assert.equal(afterReplay.status, 'pending', `stale replay must not disturb the re-pended node, got status '${afterReplay.status}'`);
+    const info = notificationCountSince(marker, 'foundry', { severity: 'info', titleLike: '%auto-decided per Contract Resolution Rule%' });
+    assert.equal(info, 1, `expected exactly 1 auto-decided notification despite the duplicate event, got ${info}`);
+  });
+}
+await runAutoRetryDuplicateEventProbe();
+
+// =============================================================================
 // Report
 // =============================================================================
 console.log('');

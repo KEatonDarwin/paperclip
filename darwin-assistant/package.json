@@ -8,7 +8,8 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "build": "tsc",
-    "build:run": "tsc && node dist/index.js"
+    "build:run": "tsc && node dist/index.js",
+    "foundry:sim": "node scripts/foundry-sim.mjs"
   },
   "dependencies": {
     "@slack/bolt": "^4.0.0",

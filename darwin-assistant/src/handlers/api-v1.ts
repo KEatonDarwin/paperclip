@@ -77,6 +77,22 @@ import {
   type MonitorStatus,
 } from '../monitors.js';
 import {
+  createProject as createFoundryProject,
+  deleteProject as deleteFoundryProject,
+  FoundryError,
+  getProjectRow as getFoundryProjectRow,
+  getProjectWithModules as getFoundryProjectWithModules,
+  goProject as goFoundryProject,
+  isProjectStatus,
+  launchProject as launchFoundryProject,
+  listProjects as listFoundryProjects,
+  markProjectPlanning,
+  retryModule as retryFoundryModule,
+  setBlueprint as setFoundryBlueprint,
+} from '../foundry.js';
+import { planProject as runFoundryPlanner } from '../foundry-planner.js';
+import { getFoundryModelSetting } from '../foundry-settings.js';
+import {
   createHopperTree,
   agreeHopperTree,
   getHopperTree,
@@ -286,6 +302,14 @@ function headerString(value: string | string[] | undefined): string | undefined 
 
 function sendError(res: Response, status: number, code: string, message: string, extra?: Record<string, unknown>): void {
   res.status(status).json({ error: { code, message, ...(extra ?? {}) } });
+}
+
+function sendCaughtFoundryError(res: Response, err: unknown): void {
+  if (err instanceof FoundryError) {
+    sendError(res, err.status, err.code, err.message, err.details);
+    return;
+  }
+  sendError(res, 500, 'foundry_error', err instanceof Error ? err.message : String(err));
 }
 
 function parseJsonSetting<T>(key: string): T | null {
@@ -1340,6 +1364,145 @@ export function createApiV1Router(): Router {
       return;
     }
     res.status(202).json(result);
+  });
+
+  // == Foundry ===============================================================
+  // Universal module build system: prompt → blueprint → independently built
+  // modules → integrate → GO. Node 66 owns project CRUD, blueprint validation,
+  // route skeletons, and SSE contracts. Launch/GO/retry get real lifecycle
+  // behavior in the follow-up backend node.
+
+  router.get('/foundry/projects', (req: AuthedRequest, res) => {
+    const rawStatus = typeof req.query.status === 'string' ? req.query.status : 'all';
+    if (rawStatus !== 'all' && !isProjectStatus(rawStatus)) {
+      sendError(res, 400, 'invalid_request', 'status must be a valid Foundry project status or all');
+      return;
+    }
+    res.json({ projects: listFoundryProjects(rawStatus === 'all' ? 'all' : rawStatus) });
+  });
+
+  router.post('/foundry/projects', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+    if (!name) {
+      sendError(res, 400, 'invalid_request', 'name is required and must be a non-empty string');
+      return;
+    }
+    if (!prompt) {
+      sendError(res, 400, 'invalid_request', 'prompt is required and must be a non-empty string');
+      return;
+    }
+    try {
+      const result = createFoundryProject({
+        name,
+        prompt,
+        repo_path: typeof body.repo_path === 'string' ? body.repo_path : null,
+        base_branch: typeof body.base_branch === 'string' ? body.base_branch : null,
+        origin_thread_ext: typeof body.origin_thread_ext === 'string'
+          ? body.origin_thread_ext
+          : typeof body.origin_thread === 'string'
+            ? body.origin_thread
+            : null,
+      });
+      res.status(201).json(result);
+    } catch (err) {
+      sendCaughtFoundryError(res, err);
+    }
+  });
+
+  router.get('/foundry/projects/:id', (req: AuthedRequest, res) => {
+    const result = getFoundryProjectWithModules(paramString(req.params.id));
+    if (!result) {
+      sendError(res, 404, 'foundry_project_not_found', 'foundry project not found');
+      return;
+    }
+    res.json(result);
+  });
+
+  router.post('/foundry/projects/:id/plan', (req: AuthedRequest, res) => {
+    const id = paramString(req.params.id);
+    const project = getFoundryProjectRow(id);
+    if (!project) {
+      sendError(res, 404, 'foundry_project_not_found', 'foundry project not found');
+      return;
+    }
+    if (project.status === 'launched') {
+      sendError(res, 409, 'foundry_project_already_launched', 'project has already launched');
+      return;
+    }
+    if (project.status === 'planning') {
+      sendError(res, 409, 'foundry_project_planning', 'a planner run is already in flight for this project');
+      return;
+    }
+    if (!['draft', 'planned'].includes(project.status)) {
+      sendError(res, 409, 'foundry_project_already_building', 'project already has build work in flight');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const plannerModel =
+      typeof body.planner_model === 'string' && body.planner_model.trim()
+        ? body.planner_model.trim()
+        : getFoundryModelSetting('planner', 'claude-opus-5');
+    const updated = markProjectPlanning(id, plannerModel);
+    if (!updated) {
+      sendError(res, 409, 'foundry_project_planning', 'project is no longer plannable (already planning or building)');
+      return;
+    }
+    setImmediate(() => {
+      runFoundryPlanner(id, plannerModel).catch((err: unknown) => {
+        console.error('[foundry] planner failed', err);
+      });
+    });
+    res.status(202).json({ project: updated });
+  });
+
+  router.patch('/foundry/projects/:id/blueprint', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const blueprint = Object.prototype.hasOwnProperty.call(body, 'blueprint') ? body.blueprint : body;
+    try {
+      res.json(setFoundryBlueprint(paramString(req.params.id), blueprint));
+    } catch (err) {
+      sendCaughtFoundryError(res, err);
+    }
+  });
+
+  router.delete('/foundry/projects/:id', (req: AuthedRequest, res) => {
+    const deleted = deleteFoundryProject(paramString(req.params.id));
+    if (!deleted) {
+      sendError(res, 404, 'foundry_project_not_found', 'foundry project not found');
+      return;
+    }
+    res.status(204).end();
+  });
+
+  router.post('/foundry/projects/:id/launch', (req: AuthedRequest, res) => {
+    try {
+      res.status(202).json(launchFoundryProject(paramString(req.params.id)));
+    } catch (err) {
+      sendCaughtFoundryError(res, err);
+    }
+  });
+
+  router.post('/foundry/projects/:id/go', (req: AuthedRequest, res) => {
+    try {
+      res.status(202).json(goFoundryProject(paramString(req.params.id)));
+    } catch (err) {
+      sendCaughtFoundryError(res, err);
+    }
+  });
+
+  router.post('/foundry/projects/:id/modules/:key/retry', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    try {
+      res.status(202).json(retryFoundryModule(
+        paramString(req.params.id),
+        paramString(req.params.key),
+        typeof body.stage === 'string' ? body.stage : null,
+      ));
+    } catch (err) {
+      sendCaughtFoundryError(res, err);
+    }
   });
 
   // == Task Hopper (candidate tasks awaiting Kevin's yes/dismiss) ==============
@@ -3416,7 +3579,7 @@ export function createApiV1Router(): Router {
       'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
       'quick_capture', 'thread_summary', 'notification',
       'dispatch', 'dispatch_cue', 'hopper_item', 'hopper_node', 'smart_todo',
-      'monitor', 'monitor_run',
+      'monitor', 'monitor_run', 'foundry_project', 'foundry_module',
     ]);
 
     res.writeHead(200, {

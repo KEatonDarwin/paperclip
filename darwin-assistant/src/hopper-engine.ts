@@ -321,7 +321,10 @@ function depsSatisfied(node: HopperNodeRow): boolean {
     const deps = JSON.parse(node.depends_on) as number[];
     return deps.every((d) => {
       const dep = getNodeStmt.get(d);
-      return !dep || dep.status === 'done' || dep.status === 'split';
+      // 'split' is terminal for the parent but its children are still working;
+      // settleAncestors flips the parent to 'done' once every child settles, so
+      // only 'done' releases a dependent (foundry review #3/#4).
+      return !dep || dep.status === 'done';
     });
   } catch {
     return true;
@@ -420,7 +423,8 @@ function settleAncestors(node: HopperNodeRow): void {
   const parent = getNodeStmt.get(node.parent_id);
   if (!parent || parent.status === 'done') return;
   const kids = childrenStmt.all(parent.id);
-  const allSettled = kids.every((k) => k.status === 'done' || k.status === 'split');
+  // A 'split' child only counts once ITS children have bubbled it to 'done'.
+  const allSettled = kids.every((k) => k.status === 'done');
   if (allSettled) {
     const updated = setNode(parent.id, {
       status: 'done',
@@ -501,6 +505,23 @@ export function answerHopperNode(id: number, answer: string): HopperNodeRow | nu
   if (!node || node.status !== 'blocked_question') return node ?? null;
   const updated = setNode(id, { status: 'pending', answer, worker_thread_ext: null });
   queueMicrotask(() => void dispatchTick('question_answered'));
+  return updated;
+}
+
+/** Foundry retry hook: put a blocked/question node back on the queue cleanly. */
+export function retryHopperNode(id: number): HopperNodeRow | null {
+  const node = getNodeStmt.get(id);
+  if (!node || (node.status !== 'blocked' && node.status !== 'blocked_question')) return node ?? null;
+  const updated = setNode(id, {
+    status: 'pending',
+    attempts: 0,
+    question: null,
+    answer: null,
+    result: null,
+    worker_thread_ext: null,
+    lease_expires_at: null,
+  });
+  queueMicrotask(() => void dispatchTick('node_retry'));
   return updated;
 }
 

@@ -1,7 +1,9 @@
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { getOrCreateConversation, getSetting, sqliteDb } from './conversation-db.js';
+import { getOrCreateConversation, sqliteDb } from './conversation-db.js';
+import { getFoundrySetting } from './foundry-settings.js';
+import { getFoundrySkillDir, renderTemplate } from './foundry-templates.js';
 import {
   agreeHopperTree,
   createHopperTree,
@@ -277,7 +279,7 @@ const setBlueprintStmt = sqliteDb.prepare<[string, string, string]>(`
       last_error = NULL,
       updated_at = datetime('now')
   WHERE id = ?
-    AND status IN ('draft','planned')
+    AND status IN ('draft','planning','planned')
 `);
 const setPlanningStmt = sqliteDb.prepare<[string | null, string]>(`
   UPDATE foundry_projects
@@ -454,9 +456,7 @@ function stageLoadout(stage: FoundryStageKey): { adapter: string; model: string 
     doc: { adapter: 'claude', model: 'claude-haiku-4-5-20251001' },
   };
   const fallback = defaults[stage];
-  const raw = getSetting(`foundry_${stage}_model`)?.trim()
-    || process.env[`FOUNDRY_${stage.toUpperCase()}_MODEL`]?.trim()
-    || '';
+  const raw = getFoundrySetting(`${stage}_model`) ?? '';
   if (!raw) return fallback;
   try {
     const parsed = JSON.parse(raw) as unknown;
@@ -543,6 +543,14 @@ function provideName(value: unknown): string | null {
   return isRecord(value) ? nonEmptyString(value.name) : null;
 }
 
+function provideNames(value: unknown): string[] {
+  const name = provideName(value);
+  if (!name) return [];
+  if (!isRecord(value)) return [name];
+  const type = nonEmptyString(value.type);
+  return type ? [name, `${type}:${name}`] : [name];
+}
+
 function wiringFields(value: unknown): { from: string | null; requires: string | null; to: string | null } {
   if (!isRecord(value)) return { from: null, requires: null, to: null };
   return {
@@ -552,10 +560,39 @@ function wiringFields(value: unknown): { from: string | null; requires: string |
   };
 }
 
+function normalizeModuleSpec(input: unknown): unknown {
+  if (!isRecord(input)) return input;
+  const existingContract = isRecord(input.contract) ? input.contract : {};
+  const provides = Array.isArray(existingContract.provides)
+    ? existingContract.provides
+    : Array.isArray(input.provides)
+      ? input.provides
+      : undefined;
+  const requires = Array.isArray(existingContract.requires)
+    ? existingContract.requires
+    : Array.isArray(input.requires)
+      ? input.requires
+      : undefined;
+  const normalized: Record<string, unknown> = {
+    ...input,
+    contract: {
+      ...existingContract,
+      provides,
+      requires,
+    },
+  };
+  delete normalized.provides;
+  delete normalized.requires;
+  return normalized;
+}
+
 function normalizeBlueprint(input: unknown): Blueprint | null {
   if (!isRecord(input)) return null;
   if (!Array.isArray(input.modules)) return null;
-  return input as unknown as Blueprint;
+  return {
+    ...input,
+    modules: input.modules.map(normalizeModuleSpec),
+  } as unknown as Blueprint;
 }
 
 export function validateBlueprint(input: unknown): { ok: boolean; errors: string[] } {
@@ -631,7 +668,7 @@ export function validateBlueprint(input: unknown): { ok: boolean; errors: string
     if (!byKey.has(w.to)) errors.push(`wiring to '${w.to}' does not match a module`);
     const provider = byKey.get(w.to);
     const provides = Array.isArray(provider?.contract?.provides) ? provider.contract.provides : [];
-    if (provider && !provides.some((p) => provideName(p) === w.requires)) {
+    if (provider && !provides.some((p) => provideNames(p).includes(w.requires!))) {
       errors.push(`wiring ${w.from}:${w.requires} -> ${w.to} does not bind to a provide named '${w.requires}'`);
     }
   }
@@ -852,17 +889,18 @@ export function createProject(args: {
 export function setBlueprint(id: string, blueprintInput: unknown): { project: FoundryProjectResponse; modules: FoundryModuleResponse[] } {
   const project = getProjectStmt.get(id) ?? null;
   if (!project) throw new FoundryError(404, 'foundry_project_not_found', 'foundry project not found');
-  if (project.status !== 'draft' && project.status !== 'planned') {
-    throw new FoundryError(409, 'foundry_project_locked', 'blueprint can only be changed while project is draft or planned');
+  if (project.status !== 'draft' && project.status !== 'planning' && project.status !== 'planned') {
+    throw new FoundryError(409, 'foundry_project_locked', 'blueprint can only be changed while project is draft, planning, or planned');
   }
-  const validation = validateBlueprint(blueprintInput);
+  const bp = normalizeBlueprint(blueprintInput);
+  const validation = validateBlueprint(bp);
   if (!validation.ok) {
     throw new FoundryError(400, 'invalid_blueprint', 'blueprint is invalid', { errors: validation.errors });
   }
-  const bp = blueprintInput as Blueprint;
+  if (!bp) throw new FoundryError(400, 'invalid_blueprint', 'blueprint is invalid', { errors: validation.errors });
   const tx = sqliteDb.transaction(() => {
     const info = setBlueprintStmt.run(JSON.stringify(bp), bp.run.command.trim(), id);
-    if (info.changes !== 1) throw new FoundryError(409, 'foundry_project_locked', 'blueprint can only be changed while project is draft or planned');
+    if (info.changes !== 1) throw new FoundryError(409, 'foundry_project_locked', 'blueprint can only be changed while project is draft, planning, or planned');
     deleteModulesStmt.run(id);
     for (const mod of bp.modules) {
       insertModuleStmt.run(
@@ -921,9 +959,12 @@ function projectBaseRef(project: FoundryProjectRow): string {
   return `origin/${project.base_branch}`;
 }
 
+function worktreesRoot(): string {
+  return process.env.FOUNDRY_WORKTREES ?? '/home/kevin/foundry-worktrees';
+}
+
 function worktreePath(project: FoundryProjectRow, suffix: string): string {
-  const root = process.env.FOUNDRY_WORKTREES ?? '/home/kevin/foundry-worktrees';
-  return path.join(root, `${project.id}-${suffix}`);
+  return path.join(worktreesRoot(), `${project.id}-${suffix}`);
 }
 
 function moduleDetails(project: FoundryProjectRow, module: FoundryModuleRow): string {
@@ -948,71 +989,44 @@ function moduleDetails(project: FoundryProjectRow, module: FoundryModuleRow): st
   }, null, 2);
 }
 
+function formatList(value: unknown): string {
+  const list = Array.isArray(value) ? value : [];
+  if (!list.length) return '- (none)';
+  return list.map((item) => `- ${typeof item === 'string' ? item : JSON.stringify(item)}`).join('\n');
+}
+
+function formatStringList(value: unknown): string {
+  const list = Array.isArray(value) ? value.map((item) => String(item).trim()).filter(Boolean) : [];
+  return list.length ? list.map((item) => `- ${item}`).join('\n') : '- (none)';
+}
+
+function moduleTemplateVars(module: FoundryModuleRow, project: FoundryProjectRow): Record<string, unknown> {
+  const contract = parseJson<{ provides: unknown[]; requires: unknown[] }>(module.contract, { provides: [], requires: [] });
+  return {
+    project: project.id,
+    project_name: project.name,
+    key: module.key,
+    name: module.name,
+    kind: module.kind,
+    purpose: module.purpose,
+    provides: formatList(contract.provides),
+    requires: formatList(contract.requires),
+    acceptance: formatStringList(parseJson(module.acceptance, [])),
+    repo: project.repo_path,
+    base_branch: project.base_branch,
+    worktrees: worktreesRoot(),
+    module_worktree: worktreePath(project, module.key),
+    module_branch: module.branch,
+    base_ref: projectBaseRef(project),
+    skill_dir: getFoundrySkillDir(),
+    node_id: '<hopper node id from this worker thread>',
+    '#if kind==contracts': module.kind === 'contracts' ? ' and `contracts/`' : '',
+    '/if': '',
+  };
+}
+
 export function composeStageSpec(stage: FoundryStageKey, module: FoundryModuleRow, project: FoundryProjectRow): string {
-  const wt = worktreePath(project, module.key);
-  const base = projectBaseRef(project);
-  const allowContracts = module.kind === 'contracts'
-    ? 'You may also write shared interface artifacts under contracts/.'
-    : 'You may read contracts/ but do not edit it unless a failing test requires a tiny compatibility fix.';
-  const common = [
-    `Foundry project: ${project.name} (${project.id})`,
-    `Original prompt: ${project.prompt}`,
-    `Repository: ${project.repo_path}`,
-    `Module branch: ${module.branch}`,
-    `Module worktree: ${wt}`,
-    '',
-    'Module contract:',
-    '```json',
-    moduleDetails(project, module),
-    '```',
-    '',
-    'GUARD:',
-    '- Work only in the named module worktree. Never edit /home/kevin/paperclip/darwin-assistant or /home/kevin/paperclip/jarvis-command-center.',
-    '- Do not touch production systems or production databases. No destructive git operations. No merges to main. No external sends.',
-    '- NO API KEYS for model calls. If a model call is needed, use local subscription CLI binaries only.',
-    `- Scope: edit only modules/${module.key}/. ${allowContracts}`,
-    '- Commit your work before finishing. Push the module branch if the repository has a usable origin.',
-    '',
-    'Worktree setup:',
-    '```bash',
-    `mkdir -p ${JSON.stringify(path.dirname(wt))}`,
-    `git -C ${JSON.stringify(project.repo_path)} fetch origin ${JSON.stringify(project.base_branch)} || true`,
-    `git -C ${JSON.stringify(project.repo_path)} worktree add ${JSON.stringify(wt)} -b ${JSON.stringify(module.branch)} ${JSON.stringify(base)}`,
-    '```',
-    `If ${base} is unavailable because this is a local-only scaffold, use ${project.base_branch} as the base and report that push was skipped.`,
-  ].join('\n');
-
-  if (stage === 'build') {
-    return [
-      common,
-      '',
-      'STAGE 1 — BUILD',
-      `Implement ONLY modules/${module.key}/ plus allowed contract files. Create the universal module deliverables: module.json, src/, tests/, and README.md.`,
-      'Every provided interface needs at least one contract test. Run the module test command green.',
-      'Finish done with commit sha, files changed, implemented provides, and exact test command/result. Finish split only if this module truly cannot fit one worker. Finish blocked_question for the one decision only Kevin can make.',
-    ].join('\n');
-  }
-
-  if (stage === 'test') {
-    return [
-      common,
-      '',
-      'STAGE 2 — TEST',
-      'You are the independent tester. Do not rely on the build worker reasoning; use the contract, acceptance criteria, and branch diff.',
-      'Run the module tests. Add refutation/contract tests for each acceptance criterion where needed. Check Module Standard compliance: isolation, declared interfaces, four deliverables, docs present.',
-      `Write modules/${module.key}/VERIFY.md with verdict, evidence per criterion, and limitations. Small fixes are allowed; structural problems should block with specifics.`,
-      'Commit and push any test/fix/VERIFY.md changes. Finish done with the verdict summary and commands run.',
-    ].join('\n');
-  }
-
-  return [
-    common,
-    '',
-    'STAGE 3 — DOC',
-    `Fill modules/${module.key}/README.md from what actually exists in the diff, module.json, tests, and VERIFY.md evidence.`,
-    'Sections: What it does, Interface, How to run, How to test, Evidence, Limitations, Depends on.',
-    'Commit and push the docs. Finish done with the docs commit sha and anything intentionally left undocumented.',
-  ].join('\n');
+  return renderTemplate(stage, moduleTemplateVars(module, project));
 }
 
 export function plantModuleTree(module: FoundryModuleRow, projectArg?: FoundryProjectRow): {
@@ -1122,57 +1136,58 @@ function maybePlantReadyModules(projectId: string): number {
   return planted;
 }
 
+function integrationModuleSummary(modules: FoundryModuleRow[]): string {
+  if (!modules.length) return '- (none)';
+  return modules.map((module) => {
+    const contract = parseJson<{ provides: unknown[]; requires: unknown[] }>(module.contract, { provides: [], requires: [] });
+    const deps = parseJson<string[]>(module.depends_on, []);
+    return [
+      `- ${module.key} (${module.kind}) -> ${module.branch}`,
+      `  purpose: ${module.purpose}`,
+      `  depends_on: ${deps.length ? deps.join(', ') : '(none)'}`,
+      `  provides: ${contract.provides.length ? contract.provides.map((item) => typeof item === 'string' ? item : JSON.stringify(item)).join('; ') : '(none)'}`,
+      `  requires: ${contract.requires.length ? contract.requires.map((item) => typeof item === 'string' ? item : JSON.stringify(item)).join('; ') : '(none)'}`,
+    ].join('\n');
+  }).join('\n');
+}
+
+function integrationAcceptanceSummary(modules: FoundryModuleRow[]): string {
+  if (!modules.length) return '- (none)';
+  return modules.map((module) => [
+    `${module.key}:`,
+    formatStringList(parseJson(module.acceptance, [])),
+  ].join('\n')).join('\n\n');
+}
+
+function integrationTemplateName(stage: 'merge' | 'review' | 'docs'): string {
+  if (stage === 'merge') return 'integrate-merge';
+  if (stage === 'review') return 'integrate-review';
+  return 'integrate-docs';
+}
+
 function composeIntegrationSpec(stage: 'merge' | 'review' | 'docs', project: FoundryProjectRow, modules: FoundryModuleRow[]): string {
   const bp = loadBlueprint(project);
-  const branch = `foundry/${project.id}/integration`;
-  const wt = worktreePath(project, 'integration');
-  const branches = modules.map((module) => module.branch);
-  const common = [
-    `Foundry integration for ${project.name} (${project.id})`,
-    `Original prompt: ${project.prompt}`,
-    `Repository: ${project.repo_path}`,
-    `Integration branch: ${branch}`,
-    `Integration worktree: ${wt}`,
-    '',
-    'Blueprint:',
-    '```json',
-    JSON.stringify(bp, null, 2),
-    '```',
-    '',
-    'Module branches:',
-    ...branches.map((moduleBranch) => `- ${moduleBranch}`),
-    '',
-    'GUARD: no production systems/databases, no API keys for model calls, no merges to main, no external sends. Work only in the integration branch/worktree and commit before finishing.',
-  ].join('\n');
-  if (stage === 'merge') {
-    return [
-      common,
-      '',
-      'INTEGRATION STAGE 1 — MERGE AND WIRE',
-      `Create branch ${branch} off ${projectBaseRef(project)} in the integration worktree. Merge every module branch listed above.`,
-      'Apply blueprint wiring only where needed: env examples, imports, compose files, or adapters that let the modules run together.',
-      `Run the integration command: ${bp?.integration?.test ?? '(missing integration.test)'}.`,
-      'Finish done with merge commit sha, integration command/result, and any wiring files changed. Block with concrete conflicts or failed integration evidence.',
-    ].join('\n');
+  const vars: Record<string, unknown> = {
+    project: project.id,
+    project_name: project.name,
+    prompt: project.prompt,
+    repo: project.repo_path,
+    base_branch: project.base_branch,
+    base_ref: projectBaseRef(project),
+    worktrees: worktreesRoot(),
+    integration_worktree: worktreePath(project, 'integration'),
+    integration_branch: `foundry/${project.id}/integration`,
+    integration_test: bp?.integration?.test ?? '(missing integration.test)',
+    wiring: formatList(bp?.wiring ?? []),
+    acceptance_all: integrationAcceptanceSummary(modules),
+    node_id: '<hopper node id from this worker thread>',
+  };
+  if (stage === 'docs') {
+    vars.modules = modules.map((module) => module.key).join(' ');
+  } else {
+    vars.modules = integrationModuleSummary(modules);
   }
-  if (stage === 'review') {
-    return [
-      common,
-      '',
-      'INTEGRATION STAGE 2 — ADVERSARIAL REVIEW',
-      'Review the integrated whole against the original prompt, every module acceptance list, the declared contracts, and the integration test evidence.',
-      'Try to refute the claim that this project is ready. Do not make broad rewrites; small verification fixes are acceptable if obvious.',
-      'Finish done with a verdict, risks, and exact evidence reviewed. Block if a correctness or integration issue must be fixed first.',
-    ].join('\n');
-  }
-  return [
-    common,
-    '',
-    'INTEGRATION STAGE 3 — PROJECT DOCS',
-    'Write or update project README.md and ARCHITECTURE.md from foundry.json plus the module READMEs/VERIFY files.',
-    'Document module map, wiring, run command, integration command, and known limits. Commit and push.',
-    'Finish done with docs commit sha and doc files touched.',
-  ].join('\n');
+  return renderTemplate(integrationTemplateName(stage), vars);
 }
 
 function maybePlantIntegrationTree(projectId: string): HopperTreeRow | null {

@@ -91,6 +91,7 @@ import {
   setBlueprint as setFoundryBlueprint,
 } from '../foundry.js';
 import { planProject as runFoundryPlanner } from '../foundry-planner.js';
+import { getFoundryModelSetting } from '../foundry-settings.js';
 import {
   createHopperTree,
   agreeHopperTree,
@@ -1438,7 +1439,7 @@ export function createApiV1Router(): Router {
     const plannerModel =
       typeof body.planner_model === 'string' && body.planner_model.trim()
         ? body.planner_model.trim()
-        : (getSetting('foundry_planner_model')?.trim() || process.env.FOUNDRY_PLANNER_MODEL || 'claude-opus-5');
+        : getFoundryModelSetting('planner', 'claude-opus-5');
     const updated = markProjectPlanning(id, plannerModel);
     if (!updated) {
       sendError(res, 404, 'foundry_project_not_found', 'foundry project not found');

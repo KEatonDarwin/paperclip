@@ -77,6 +77,18 @@ import {
   type MonitorStatus,
 } from '../monitors.js';
 import {
+  createProject as createFoundryProject,
+  deleteProject as deleteFoundryProject,
+  FoundryError,
+  getProjectRow as getFoundryProjectRow,
+  getProjectWithModules as getFoundryProjectWithModules,
+  isProjectStatus,
+  listProjects as listFoundryProjects,
+  markProjectPlanning,
+  setBlueprint as setFoundryBlueprint,
+} from '../foundry.js';
+import { planProject as runFoundryPlanner } from '../foundry-planner.js';
+import {
   createHopperTree,
   agreeHopperTree,
   getHopperTree,
@@ -286,6 +298,14 @@ function headerString(value: string | string[] | undefined): string | undefined 
 
 function sendError(res: Response, status: number, code: string, message: string, extra?: Record<string, unknown>): void {
   res.status(status).json({ error: { code, message, ...(extra ?? {}) } });
+}
+
+function sendCaughtFoundryError(res: Response, err: unknown): void {
+  if (err instanceof FoundryError) {
+    sendError(res, err.status, err.code, err.message, err.details);
+    return;
+  }
+  sendError(res, 500, 'foundry_error', err instanceof Error ? err.message : String(err));
 }
 
 function parseJsonSetting<T>(key: string): T | null {
@@ -1340,6 +1360,119 @@ export function createApiV1Router(): Router {
       return;
     }
     res.status(202).json(result);
+  });
+
+  // == Foundry ===============================================================
+  // Universal module build system: prompt → blueprint → independently built
+  // modules → integrate → GO. Node 66 owns project CRUD, blueprint validation,
+  // route skeletons, and SSE contracts. Launch/GO/retry get real lifecycle
+  // behavior in the follow-up backend node.
+
+  router.get('/foundry/projects', (req: AuthedRequest, res) => {
+    const rawStatus = typeof req.query.status === 'string' ? req.query.status : 'all';
+    if (rawStatus !== 'all' && !isProjectStatus(rawStatus)) {
+      sendError(res, 400, 'invalid_request', 'status must be a valid Foundry project status or all');
+      return;
+    }
+    res.json({ projects: listFoundryProjects(rawStatus === 'all' ? 'all' : rawStatus) });
+  });
+
+  router.post('/foundry/projects', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+    if (!name) {
+      sendError(res, 400, 'invalid_request', 'name is required and must be a non-empty string');
+      return;
+    }
+    if (!prompt) {
+      sendError(res, 400, 'invalid_request', 'prompt is required and must be a non-empty string');
+      return;
+    }
+    try {
+      const result = createFoundryProject({
+        name,
+        prompt,
+        repo_path: typeof body.repo_path === 'string' ? body.repo_path : null,
+        base_branch: typeof body.base_branch === 'string' ? body.base_branch : null,
+      });
+      res.status(201).json(result);
+    } catch (err) {
+      sendCaughtFoundryError(res, err);
+    }
+  });
+
+  router.get('/foundry/projects/:id', (req: AuthedRequest, res) => {
+    const result = getFoundryProjectWithModules(paramString(req.params.id));
+    if (!result) {
+      sendError(res, 404, 'foundry_project_not_found', 'foundry project not found');
+      return;
+    }
+    res.json(result);
+  });
+
+  router.post('/foundry/projects/:id/plan', (req: AuthedRequest, res) => {
+    const id = paramString(req.params.id);
+    const project = getFoundryProjectRow(id);
+    if (!project) {
+      sendError(res, 404, 'foundry_project_not_found', 'foundry project not found');
+      return;
+    }
+    if (project.status === 'launched') {
+      sendError(res, 409, 'foundry_project_already_launched', 'project has already launched');
+      return;
+    }
+    if (!['draft', 'planning', 'planned'].includes(project.status)) {
+      sendError(res, 409, 'foundry_project_already_building', 'project already has build work in flight');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const plannerModel =
+      typeof body.planner_model === 'string' && body.planner_model.trim()
+        ? body.planner_model.trim()
+        : (getSetting('foundry_planner_model')?.trim() || process.env.FOUNDRY_PLANNER_MODEL || 'claude-opus-5');
+    const updated = markProjectPlanning(id, plannerModel);
+    if (!updated) {
+      sendError(res, 404, 'foundry_project_not_found', 'foundry project not found');
+      return;
+    }
+    setImmediate(() => {
+      runFoundryPlanner(id).catch((err: unknown) => {
+        console.error('[foundry] planner failed', err);
+      });
+    });
+    res.status(202).json({ project: updated });
+  });
+
+  router.patch('/foundry/projects/:id/blueprint', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const blueprint = Object.prototype.hasOwnProperty.call(body, 'blueprint') ? body.blueprint : body;
+    try {
+      res.json(setFoundryBlueprint(paramString(req.params.id), blueprint));
+    } catch (err) {
+      sendCaughtFoundryError(res, err);
+    }
+  });
+
+  router.delete('/foundry/projects/:id', (req: AuthedRequest, res) => {
+    const deleted = deleteFoundryProject(paramString(req.params.id));
+    if (!deleted) {
+      sendError(res, 404, 'foundry_project_not_found', 'foundry project not found');
+      return;
+    }
+    res.status(204).end();
+  });
+
+  router.post('/foundry/projects/:id/launch', (_req: AuthedRequest, res) => {
+    sendError(res, 501, 'foundry_not_implemented', 'Foundry launch is wired in backend node 2b');
+  });
+
+  router.post('/foundry/projects/:id/go', (_req: AuthedRequest, res) => {
+    sendError(res, 501, 'foundry_not_implemented', 'Foundry GO is wired in backend node 2b');
+  });
+
+  router.post('/foundry/projects/:id/modules/:key/retry', (_req: AuthedRequest, res) => {
+    sendError(res, 501, 'foundry_not_implemented', 'Foundry module retry is wired in backend node 2b');
   });
 
   // == Task Hopper (candidate tasks awaiting Kevin's yes/dismiss) ==============
@@ -3416,7 +3549,7 @@ export function createApiV1Router(): Router {
       'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
       'quick_capture', 'thread_summary', 'notification',
       'dispatch', 'dispatch_cue', 'hopper_item', 'hopper_node', 'smart_todo',
-      'monitor', 'monitor_run',
+      'monitor', 'monitor_run', 'foundry_project', 'foundry_module',
     ]);
 
     res.writeHead(200, {

@@ -13,6 +13,7 @@ import type { HopperItemRow } from './hopper.js';
 import type { HopperNodeRow } from './hopper-engine.js';
 import type { SmartTodoNodeRow } from './smart-todos.js';
 import type { MonitorRow, MonitorRunRow } from './monitors.js';
+import type { FoundryModuleResponse, FoundryProjectResponse } from './foundry.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -255,6 +256,19 @@ export interface MonitorRunEvent {
   run: MonitorRunRow;
 }
 
+export interface FoundryProjectEvent {
+  type: 'foundry_project';
+  action: 'created' | 'updated' | 'deleted';
+  project: FoundryProjectResponse;
+}
+
+export interface FoundryModuleEvent {
+  type: 'foundry_module';
+  action: 'created' | 'updated' | 'deleted';
+  project_id: string;
+  module: FoundryModuleResponse;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
@@ -265,7 +279,7 @@ export type SSEEvent =
   | ThreadReminderEvent | ToolCallEvent | ThreadSummaryEvent
   | ThreadGroupEvent | NotificationEvent
   | DispatchEvent | DispatchCueEvent | HopperItemEvent | HopperNodeEvent | SmartTodoEvent
-  | MonitorEvent | MonitorRunEvent;
+  | MonitorEvent | MonitorRunEvent | FoundryProjectEvent | FoundryModuleEvent;
 
 class SSEBus extends EventEmitter {}
 

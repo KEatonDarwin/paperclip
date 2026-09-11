@@ -10,7 +10,9 @@ import {
   getHopperTree,
   getHopperNode,
   listTreeNodes,
+  prepareFoundryAutoRetry,
   retryHopperNode,
+  updateHopperNodeSpec,
   type HopperNodeRow,
   type HopperNodeStatus,
   type HopperTreeRow,
@@ -112,6 +114,26 @@ export interface FoundryModuleResponse extends Omit<FoundryModuleRow, 'contract'
   stage_nodes: Record<'build' | 'test' | 'doc', FoundryStageNodeResponse>;
 }
 
+export interface FoundryIntegrationNodeResponse {
+  id: number;
+  title: string;
+  status: HopperNodeStatus;
+  model: string | null;
+  attempts: number;
+}
+
+export interface FoundryIntegrationResponse {
+  tree_id: string | null;
+  nodes: FoundryIntegrationNodeResponse[];
+  auto_retried: boolean;
+}
+
+export interface FoundryProjectWithModulesResponse {
+  project: FoundryProjectResponse;
+  modules: FoundryModuleResponse[];
+  integration: FoundryIntegrationResponse;
+}
+
 interface BlueprintModule {
   key: string;
   name: string;
@@ -155,6 +177,14 @@ const STAGE_RANK: Record<FoundryModuleStage, number> = {
 // then the stage must read as in-progress, never as complete (review #3).
 const COMPLETE_NODE_STATUSES = new Set<HopperNodeStatus>(['done']);
 const IN_PROGRESS_NODE_STATUSES = new Set<HopperNodeStatus>(['running', 'split']);
+
+const CONTRACT_RESOLUTION_RULE = [
+  'The contracts module is authoritative. If there is no contracts module, the blueprint declared provides/requires are authoritative.',
+  'The deviating module conforms to the contract. Tests that contradict the contract are corrected, never the contract.',
+  'Every resolution is appended to DECISIONS.md with the date, module/integration node, conflict, and rule applied.',
+  'blocked_question is reserved only for cases where the contract is silent AND the choice changes user-visible behavior with no sane default.',
+  'Interface, shape, error-code, naming, and test-vs-contract conflicts must be resolved toward the contract and DECISIONS.md, never sent to Kevin as a question.',
+].join('\n');
 
 sqliteDb.exec(`
   CREATE TABLE IF NOT EXISTS foundry_projects (
@@ -470,14 +500,7 @@ function inferAdapter(model: string, fallback: string): string {
   return fallback;
 }
 
-function stageLoadout(stage: FoundryStageKey): { adapter: string; model: string } {
-  const defaults: Record<FoundryStageKey, { adapter: string; model: string }> = {
-    build: { adapter: 'codex', model: 'gpt-5.5' },
-    test: { adapter: 'claude', model: 'claude-sonnet-5' },
-    doc: { adapter: 'claude', model: 'claude-haiku-4-5-20251001' },
-  };
-  const fallback = defaults[stage];
-  const raw = getFoundrySetting(`${stage}_model`) ?? '';
+function parseFoundryLoadout(raw: string | null, fallback: { adapter: string; model: string }): { adapter: string; model: string } {
   if (!raw) return fallback;
   try {
     const parsed = JSON.parse(raw) as unknown;
@@ -494,6 +517,19 @@ function stageLoadout(stage: FoundryStageKey): { adapter: string; model: string 
     if (adapter.trim() && model) return { adapter: adapter.trim(), model };
   }
   return { adapter: inferAdapter(raw, fallback.adapter), model: raw };
+}
+
+function stageLoadout(stage: FoundryStageKey): { adapter: string; model: string } {
+  const defaults: Record<FoundryStageKey, { adapter: string; model: string }> = {
+    build: { adapter: 'codex', model: 'gpt-5.5' },
+    test: { adapter: 'claude', model: 'claude-sonnet-5' },
+    doc: { adapter: 'claude', model: 'claude-haiku-4-5-20251001' },
+  };
+  return parseFoundryLoadout(getFoundrySetting(`${stage}_model`), defaults[stage]);
+}
+
+function integrationLoadout(): { adapter: string; model: string } {
+  return parseFoundryLoadout(getFoundrySetting('integrate_model'), { adapter: 'auggie', model: 'opus4.8' });
 }
 
 function slugify(name: string): string {
@@ -853,6 +889,24 @@ export function serializeFoundryProject(row: FoundryProjectRow, modules = projec
   };
 }
 
+export function serializeFoundryIntegration(row: FoundryProjectRow): FoundryIntegrationResponse {
+  if (!row.integration_tree_id) {
+    return { tree_id: null, nodes: [], auto_retried: false };
+  }
+  const nodes = listTreeNodes(row.integration_tree_id);
+  return {
+    tree_id: row.integration_tree_id,
+    nodes: nodes.map((node) => ({
+      id: node.id,
+      title: node.title,
+      status: node.status,
+      model: node.model,
+      attempts: node.attempts,
+    })),
+    auto_retried: nodes.some((node) => (node.foundry_auto_retries ?? 0) > 0),
+  };
+}
+
 function emitProject(action: 'created' | 'updated' | 'deleted', project: FoundryProjectRow, modules?: FoundryModuleRow[]): void {
   sseBus.emit('sse', { type: 'foundry_project', action, project: serializeFoundryProject(project, modules) });
 }
@@ -875,13 +929,14 @@ export function getProjectRow(id: string): FoundryProjectRow | null {
   return getProjectStmt.get(id) ?? null;
 }
 
-export function getProjectWithModules(id: string): { project: FoundryProjectResponse; modules: FoundryModuleResponse[] } | null {
+export function getProjectWithModules(id: string): FoundryProjectWithModulesResponse | null {
   const row = getProjectStmt.get(id) ?? null;
   if (!row) return null;
   const modules = projectModulesStmt.all(id);
   return {
     project: serializeFoundryProject(row, modules),
     modules: modules.map(serializeFoundryModule),
+    integration: serializeFoundryIntegration(row),
   };
 }
 
@@ -1062,7 +1117,7 @@ function formatStringList(value: unknown): string {
   return list.length ? list.map((item) => `- ${item}`).join('\n') : '- (none)';
 }
 
-function moduleTemplateVars(module: FoundryModuleRow, project: FoundryProjectRow): Record<string, unknown> {
+function moduleTemplateVars(module: FoundryModuleRow, project: FoundryProjectRow, nodeId: number): Record<string, unknown> {
   const contract = parseJson<{ provides: unknown[]; requires: unknown[] }>(module.contract, { provides: [], requires: [] });
   return {
     project: project.id,
@@ -1082,14 +1137,14 @@ function moduleTemplateVars(module: FoundryModuleRow, project: FoundryProjectRow
     base_ref: projectBaseRef(project),
     ...remoteTemplateVars(project),
     skill_dir: getFoundrySkillDir(),
-    node_id: '<hopper node id from this worker thread>',
+    node_id: nodeId,
     '#if kind==contracts': module.kind === 'contracts' ? ' and `contracts/`' : '',
     '/if': '',
   };
 }
 
-export function composeStageSpec(stage: FoundryStageKey, module: FoundryModuleRow, project: FoundryProjectRow): string {
-  return renderTemplate(stage, moduleTemplateVars(module, project));
+export function composeStageSpec(stage: FoundryStageKey, module: FoundryModuleRow, project: FoundryProjectRow, nodeId: number): string {
+  return renderTemplate(stage, moduleTemplateVars(module, project, nodeId));
 }
 
 export function plantModuleTree(module: FoundryModuleRow, projectArg?: FoundryProjectRow): {
@@ -1115,14 +1170,14 @@ export function plantModuleTree(module: FoundryModuleRow, projectArg?: FoundryPr
   const nodeInputs: NewNodeInput[] = [
     {
       title: `BUILD ${module.key}`,
-      spec: composeStageSpec('build', module, project),
+      spec: null,
       priority: 30,
       adapter: build.adapter,
       model: build.model,
     },
     {
       title: `TEST ${module.key}`,
-      spec: composeStageSpec('test', module, project),
+      spec: null,
       depends_on_indexes: [0],
       priority: 20,
       adapter: test.adapter,
@@ -1130,7 +1185,7 @@ export function plantModuleTree(module: FoundryModuleRow, projectArg?: FoundryPr
     },
     {
       title: `DOC ${module.key}`,
-      spec: composeStageSpec('doc', module, project),
+      spec: null,
       depends_on_indexes: [1],
       priority: 10,
       adapter: doc.adapter,
@@ -1138,11 +1193,17 @@ export function plantModuleTree(module: FoundryModuleRow, projectArg?: FoundryPr
     },
   ];
   const created = createHopperTree(`foundry:${project.id}/${module.key}`, project.origin_thread_ext ?? null, nodeInputs);
+  const buildNodeId = created.nodes[0]?.id ?? null;
+  const testNodeId = created.nodes[1]?.id ?? null;
+  const docNodeId = created.nodes[2]?.id ?? null;
+  if (buildNodeId != null) updateHopperNodeSpec(buildNodeId, composeStageSpec('build', module, project, buildNodeId));
+  if (testNodeId != null) updateHopperNodeSpec(testNodeId, composeStageSpec('test', module, project, testNodeId));
+  if (docNodeId != null) updateHopperNodeSpec(docNodeId, composeStageSpec('doc', module, project, docNodeId));
   agreeHopperTree(created.tree.id);
   const stageNodes = {
-    build: created.nodes[0]?.id ?? null,
-    test: created.nodes[1]?.id ?? null,
-    doc: created.nodes[2]?.id ?? null,
+    build: buildNodeId,
+    test: testNodeId,
+    doc: docNodeId,
   };
   const staged = {
     ...module,
@@ -1154,7 +1215,7 @@ export function plantModuleTree(module: FoundryModuleRow, projectArg?: FoundryPr
   const updated = moduleByKeyStmt.get(module.project_id, module.key);
   if (!updated) throw new FoundryError(500, 'foundry_module_missing', 'module disappeared after tree planting');
   emitModule('updated', updated);
-  return { tree: created.tree, nodes: created.nodes, module: updated };
+  return { tree: created.tree, nodes: listTreeNodes(created.tree.id), module: updated };
 }
 
 function recomputeProjectStatus(projectId: string): FoundryProjectRow | null {
@@ -1230,7 +1291,12 @@ function integrationTemplateName(stage: 'merge' | 'review' | 'docs'): string {
   return 'integrate-docs';
 }
 
-function composeIntegrationSpec(stage: 'merge' | 'review' | 'docs', project: FoundryProjectRow, modules: FoundryModuleRow[]): string {
+function composeIntegrationSpec(
+  stage: 'merge' | 'review' | 'docs',
+  project: FoundryProjectRow,
+  modules: FoundryModuleRow[],
+  nodeId: number,
+): string {
   const bp = loadBlueprint(project);
   const vars: Record<string, unknown> = {
     project: project.id,
@@ -1246,7 +1312,7 @@ function composeIntegrationSpec(stage: 'merge' | 'review' | 'docs', project: Fou
     integration_test: bp?.integration?.test ?? '(missing integration.test)',
     wiring: formatList(bp?.wiring ?? []),
     acceptance_all: integrationAcceptanceSummary(modules),
-    node_id: '<hopper node id from this worker thread>',
+    node_id: nodeId,
   };
   if (stage === 'docs') {
     vars.modules = modules.map((module) => module.key).join(' ');
@@ -1262,20 +1328,20 @@ function maybePlantIntegrationTree(projectId: string): HopperTreeRow | null {
   const modules = projectModulesStmt.all(projectId).map((module) => refreshModuleStage(project, module).module);
   if (!modules.length || !modules.every((module) => stageAtLeast(module.stage, 'documented'))) return null;
 
-  const merge = { adapter: 'codex', model: 'gpt-5.5' };
+  const merge = integrationLoadout();
   const review = { adapter: 'claude', model: 'claude-opus-5' };
-  const docs = { adapter: 'codex', model: 'gpt-5.5' };
+  const docs = integrationLoadout();
   const created = createHopperTree(`foundry:${project.id}/integration`, project.origin_thread_ext ?? null, [
     {
       title: `MERGE ${project.id}`,
-      spec: composeIntegrationSpec('merge', project, modules),
+      spec: null,
       priority: 30,
       adapter: merge.adapter,
       model: merge.model,
     },
     {
       title: `REVIEW ${project.id}`,
-      spec: composeIntegrationSpec('review', project, modules),
+      spec: null,
       depends_on_indexes: [0],
       priority: 20,
       adapter: review.adapter,
@@ -1283,13 +1349,19 @@ function maybePlantIntegrationTree(projectId: string): HopperTreeRow | null {
     },
     {
       title: `DOCS ${project.id}`,
-      spec: composeIntegrationSpec('docs', project, modules),
+      spec: null,
       depends_on_indexes: [1],
       priority: 10,
       adapter: docs.adapter,
       model: docs.model,
     },
   ]);
+  const mergeNodeId = created.nodes[0]?.id ?? null;
+  const reviewNodeId = created.nodes[1]?.id ?? null;
+  const docsNodeId = created.nodes[2]?.id ?? null;
+  if (mergeNodeId != null) updateHopperNodeSpec(mergeNodeId, composeIntegrationSpec('merge', project, modules, mergeNodeId));
+  if (reviewNodeId != null) updateHopperNodeSpec(reviewNodeId, composeIntegrationSpec('review', project, modules, reviewNodeId));
+  if (docsNodeId != null) updateHopperNodeSpec(docsNodeId, composeIntegrationSpec('docs', project, modules, docsNodeId));
   const branch = `foundry/${project.id}/integration`;
   const saved = setProjectIntegrationStmt.run(created.tree.id, branch, project.id);
   if (saved.changes !== 1) return null;
@@ -1317,8 +1389,94 @@ export function launchProject(id: string): { project: FoundryProjectResponse; mo
   return result;
 }
 
+function foundryAutoDecideEnabled(): boolean {
+  const raw = (getFoundrySetting('auto_decide') ?? '1').trim().toLowerCase();
+  return !['0', 'false', 'off', 'no'].includes(raw);
+}
+
+function foundryConflictText(node: HopperNodeRow): string {
+  if (node.status === 'blocked_question') return node.question?.trim() || '(no question text)';
+  if (node.result?.trim()) return node.result.trim();
+  if (node.attempts > 0) {
+    return `The worker lease expired or the node blocked after ${node.attempts} attempt(s) without a precise result.`;
+  }
+  return '(no blocked reason text)';
+}
+
+function autoDecisionSpec(node: HopperNodeRow, label: string): string {
+  const base = node.spec?.trim() || `# ${node.title}`;
+  const conflict = foundryConflictText(node);
+  return [
+    base,
+    '',
+    '## AUTO-DECISION (JARVIS policy)',
+    '',
+    '### Contract Resolution Rule',
+    CONTRACT_RESOLUTION_RULE,
+    '',
+    '### The conflict you must resolve',
+    `Node ${node.id} (${node.title}) reported:`,
+    '',
+    conflict,
+    '',
+    `Scope: ${label}. Resolve the conflict yourself under the Contract Resolution Rule, correct any tests that contradict the authoritative contract, append the resolution to DECISIONS.md, then finish this same Hopper node. Do not ask Kevin unless the contract is silent and the choice changes user-visible behavior with no sane default.`,
+  ].join('\n');
+}
+
+function retryFoundryNodeWithDecision(args: {
+  project: FoundryProjectRow;
+  node: HopperNodeRow;
+  label: string;
+  link: string;
+  notify: boolean;
+}): HopperNodeRow | null {
+  const loadout = integrationLoadout();
+  const prepared = prepareFoundryAutoRetry(
+    args.node.id,
+    autoDecisionSpec(args.node, args.label),
+    loadout.adapter,
+    loadout.model,
+  );
+  if (!prepared) return null;
+  const retried = retryHopperNode(args.node.id);
+  if (!retried || retried.status !== 'pending') return null;
+  if (args.notify) {
+    createNotification({
+      severity: 'info',
+      title: `🏭 ${args.project.name}/${args.label}: auto-decided per Contract Resolution Rule, retrying`,
+      body: foundryConflictText(args.node).slice(0, 1000),
+      source: 'foundry',
+      link: args.link,
+    });
+  }
+  return retried;
+}
+
+function maybeAutoRetryFoundryNode(args: {
+  project: FoundryProjectRow;
+  node: HopperNodeRow;
+  label: string;
+  link: string;
+}): boolean {
+  if (args.node.status !== 'blocked' && args.node.status !== 'blocked_question') return false;
+  if (!foundryAutoDecideEnabled()) return false;
+  if ((args.node.foundry_auto_retries ?? 0) > 0) return false;
+  return !!retryFoundryNodeWithDecision({ ...args, notify: true });
+}
+
 function handleIntegrationTreeEvent(project: FoundryProjectRow, node: HopperNodeRow): void {
   const nodes = listTreeNodes(project.integration_tree_id ?? node.tree_id);
+  const retryable = nodes.find((n) => n.id === node.id && (n.status === 'blocked' || n.status === 'blocked_question'))
+    ?? nodes.find((n) => n.status === 'blocked_question')
+    ?? nodes.find((n) => n.status === 'blocked');
+  if (retryable && maybeAutoRetryFoundryNode({
+    project,
+    node: retryable,
+    label: 'integration',
+    link: `/foundry?project=${encodeURIComponent(project.id)}`,
+  })) {
+    return;
+  }
   const blockedQuestion = nodes.find((n) => n.status === 'blocked_question');
   if (blockedQuestion) {
     const reason = blockedQuestion.question ?? `${blockedQuestion.title} needs an answer`;
@@ -1390,6 +1548,14 @@ function handleFoundrySse(ev: SSEEvent): void {
   if (module) {
     const project = getProjectStmt.get(module.project_id) ?? null;
     if (!project) return;
+    if (maybeAutoRetryFoundryNode({
+      project,
+      node,
+      label: module.key,
+      link: `/foundry?project=${encodeURIComponent(project.id)}&module=${encodeURIComponent(module.key)}`,
+    })) {
+      return;
+    }
     const refreshed = refreshModuleStage(project, module);
     recomputeProjectStatus(project.id);
     // Plant on every event once the module is >= tested, not only on the
@@ -1489,6 +1655,41 @@ export function retryModule(projectId: string, key: string, stage?: string | nul
     module: serializeFoundryModule(refreshed),
     node: stageNodeFromRaw(stageNodeIds(refreshed), retryStage),
   };
+}
+
+export function retryIntegration(projectId: string): {
+  integration: FoundryIntegrationResponse;
+  node: FoundryIntegrationNodeResponse;
+} {
+  const project = getProjectStmt.get(projectId) ?? null;
+  if (!project) throw new FoundryError(404, 'foundry_project_not_found', 'foundry project not found');
+  if (!project.integration_tree_id) {
+    throw new FoundryError(409, 'foundry_integration_not_retryable', 'project has no integration tree');
+  }
+  const nodes = listTreeNodes(project.integration_tree_id);
+  const blocked = nodes.find((node) => node.status === 'blocked_question') ?? nodes.find((node) => node.status === 'blocked');
+  if (!blocked) {
+    throw new FoundryError(409, 'foundry_integration_not_retryable', 'integration has no blocked node to retry');
+  }
+  const retried = retryFoundryNodeWithDecision({
+    project,
+    node: blocked,
+    label: 'integration',
+    link: `/foundry?project=${encodeURIComponent(project.id)}`,
+    notify: false,
+  });
+  if (!retried || retried.status !== 'pending') {
+    throw new FoundryError(409, 'foundry_integration_not_retryable', 'blocked integration node could not be re-pended');
+  }
+  setProjectStatusStmt.run('integrating', project.id);
+  const updated = getProjectStmt.get(project.id) ?? project;
+  emitProject('updated', updated, projectModulesStmt.all(project.id));
+  const integration = serializeFoundryIntegration(updated);
+  const responseNode = integration.nodes.find((item) => item.id === retried.id);
+  if (!responseNode) {
+    throw new FoundryError(500, 'foundry_integration_retry_failed', 'retried node could not be loaded');
+  }
+  return { integration, node: responseNode };
 }
 
 export function isProjectStatus(value: string): value is FoundryProjectStatus {

@@ -58,6 +58,7 @@ export interface HopperNodeRow {
   lease_expires_at: string | null;
   adapter: string | null;
   model: string | null;
+  foundry_auto_retries: number;
   created_at: string;
   updated_at: string;
 }
@@ -120,7 +121,7 @@ sqliteDb.exec(`
 // ROUTER (phase 1, 2026-09-07): per-node model/adapter chosen by the PLANNER at
 // decomposition time — the tree-breakdown conversation IS the router brain, so
 // there's no separate scoring service. Additive columns; null = default loadout.
-for (const col of ['adapter TEXT', 'model TEXT']) {
+for (const col of ['adapter TEXT', 'model TEXT', 'foundry_auto_retries INTEGER NOT NULL DEFAULT 0']) {
   try {
     sqliteDb.exec(`ALTER TABLE hopper_nodes ADD COLUMN ${col}`);
   } catch {
@@ -193,6 +194,10 @@ function emitNode(action: HopperNodeEvent['action'], node: HopperNodeRow): void 
   sseBus.emit('sse', { type: 'hopper_node', action, node } satisfies HopperNodeEvent);
 }
 
+function isFoundryTree(tree: HopperTreeRow | null | undefined): boolean {
+  return !!tree && tree.topic.startsWith('foundry:');
+}
+
 function setNode(id: number, fields: Partial<Record<keyof HopperNodeRow, unknown>>): HopperNodeRow | null {
   const keys = Object.keys(fields);
   if (keys.length) {
@@ -217,6 +222,33 @@ export function getHopperNode(id: number): HopperNodeRow | null {
 }
 export function listTreeNodes(treeId: string): HopperNodeRow[] {
   return treeNodesStmt.all(treeId);
+}
+
+export function updateHopperNodeSpec(id: number, spec: string): HopperNodeRow | null {
+  return setNode(id, { spec });
+}
+
+/** Foundry auto-decision retry prep. This intentionally does not emit while the
+ *  node is still blocked; retryHopperNode emits the re-pended state after the
+ *  amendment is in place, which keeps the first auto-resolution quiet. */
+export function prepareFoundryAutoRetry(
+  id: number,
+  amendedSpec: string,
+  adapter: string,
+  model: string,
+): HopperNodeRow | null {
+  const node = getNodeStmt.get(id);
+  if (!node) return null;
+  sqliteDb.prepare(`
+    UPDATE hopper_nodes
+    SET spec = ?,
+        adapter = ?,
+        model = ?,
+        foundry_auto_retries = COALESCE(foundry_auto_retries, 0) + 1,
+        updated_at = datetime('now')
+    WHERE id = ?
+  `).run(amendedSpec, adapter, model, id);
+  return getNodeStmt.get(id) ?? null;
 }
 
 export interface HopperHistoryByModel {
@@ -480,20 +512,26 @@ export function finishHopperNode(
     setNode(id, { status: 'split', lease_expires_at: null });
   } else if (outcome === 'blocked_question') {
     setNode(id, { status: 'blocked_question', question: payload.question ?? '(no question text)', lease_expires_at: null });
-    createNotification({
-      severity: 'warning',
-      title: `❓ Hopper worker needs your call: ${node.title.slice(0, 100)}`,
-      body: `${payload.question ?? ''}\n\n(Answer from any JARVIS chat: "answer hopper node ${id}: <your answer>" — a fresh worker resumes with it.)`,
-      source: 'hopper-engine',
-    });
+    const latest = getNodeStmt.get(id) ?? null;
+    if (latest?.status === 'blocked_question' && !isFoundryTree(tree)) {
+      createNotification({
+        severity: 'warning',
+        title: `❓ Hopper worker needs your call: ${node.title.slice(0, 100)}`,
+        body: `${payload.question ?? ''}\n\n(Answer from any JARVIS chat: "answer hopper node ${id}: <your answer>" — a fresh worker resumes with it.)`,
+        source: 'hopper-engine',
+      });
+    }
   } else {
     setNode(id, { status: 'blocked', result: payload.result ?? null, lease_expires_at: null });
-    createNotification({
-      severity: 'error',
-      title: `🚧 Hopper task blocked: ${node.title.slice(0, 100)}`,
-      body: `${payload.result ?? 'No reason given.'}\nNode ${id}, tree ${node.tree_id}.`,
-      source: 'hopper-engine',
-    });
+    const latest = getNodeStmt.get(id) ?? null;
+    if (latest?.status === 'blocked' && !isFoundryTree(tree)) {
+      createNotification({
+        severity: 'error',
+        title: `🚧 Hopper task blocked: ${node.title.slice(0, 100)}`,
+        body: `${payload.result ?? 'No reason given.'}\nNode ${id}, tree ${node.tree_id}.`,
+        source: 'hopper-engine',
+      });
+    }
   }
   queueMicrotask(() => void dispatchTick('node_finished'));
   return getNodeStmt.get(id) ?? null;
@@ -536,12 +574,16 @@ export async function dispatchTick(reason: string): Promise<void> {
     for (const node of expiredLeasesStmt.all()) {
       if (node.attempts >= MAX_ATTEMPTS) {
         setNode(node.id, { status: 'blocked', lease_expires_at: null });
-        createNotification({
-          severity: 'error',
-          title: `🚧 Hopper task exhausted retries: ${node.title.slice(0, 100)}`,
-          body: `${node.attempts} attempts, lease expired without a finish report. Node ${node.id}, tree ${node.tree_id}. Needs a human.`,
-          source: 'hopper-engine',
-        });
+        const latest = getNodeStmt.get(node.id) ?? null;
+        const tree = getHopperTree(node.tree_id);
+        if (latest?.status === 'blocked' && !isFoundryTree(tree)) {
+          createNotification({
+            severity: 'error',
+            title: `🚧 Hopper task exhausted retries: ${node.title.slice(0, 100)}`,
+            body: `${node.attempts} attempts, lease expired without a finish report. Node ${node.id}, tree ${node.tree_id}. Needs a human.`,
+            source: 'hopper-engine',
+          });
+        }
       } else {
         // Retry rides one tier up the ladder — a misrouted cheap node self-corrects.
         const bumped = escalateModel(node.model);

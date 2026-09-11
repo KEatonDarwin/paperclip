@@ -87,6 +87,7 @@ import {
   launchProject as launchFoundryProject,
   listProjects as listFoundryProjects,
   markProjectPlanning,
+  retryIntegration as retryFoundryIntegration,
   retryModule as retryFoundryModule,
   setBlueprint as setFoundryBlueprint,
 } from '../foundry.js';
@@ -1487,6 +1488,14 @@ export function createApiV1Router(): Router {
   router.post('/foundry/projects/:id/go', (req: AuthedRequest, res) => {
     try {
       res.status(202).json(goFoundryProject(paramString(req.params.id)));
+    } catch (err) {
+      sendCaughtFoundryError(res, err);
+    }
+  });
+
+  router.post('/foundry/projects/:id/integration/retry', (req: AuthedRequest, res) => {
+    try {
+      res.status(202).json(retryFoundryIntegration(paramString(req.params.id)));
     } catch (err) {
       sendCaughtFoundryError(res, err);
     }

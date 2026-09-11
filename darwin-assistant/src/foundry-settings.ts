@@ -1,6 +1,6 @@
 import { getSetting } from './conversation-db.js';
 
-export type FoundryModelPurpose = 'planner' | 'build' | 'test' | 'doc';
+export type FoundryModelPurpose = 'planner' | 'build' | 'test' | 'doc' | 'integrate';
 
 function normalizeSettingKey(name: string): string {
   const trimmed = name.trim();

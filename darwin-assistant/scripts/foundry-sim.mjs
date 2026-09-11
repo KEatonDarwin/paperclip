@@ -112,6 +112,15 @@ function notificationMarker() {
   return sqliteDb.prepare(`SELECT COALESCE(MAX(id), 0) AS id FROM notifications`).get().id;
 }
 
+function warningErrorNotificationCountSince(marker) {
+  return sqliteDb.prepare(`
+    SELECT COUNT(*) AS n
+    FROM notifications
+    WHERE id > ?
+      AND severity IN ('warning', 'error')
+  `).get(marker).n;
+}
+
 // ---------------------------------------------------------------------------
 // Drain helper — repeatedly ticks the dispatcher and finishes whatever it
 // claims as 'done', until the project goes quiescent (ready/blocked) or an
@@ -270,6 +279,10 @@ check('2', 'every hopper node has a non-null adapter and model', () => {
       total += 1;
       assert.ok(node.adapter, `node ${node.id} (${node.title}) has a null adapter`);
       assert.ok(node.model, `node ${node.id} (${node.title}) has a null model`);
+      assert.ok(node.spec, `node ${node.id} (${node.title}) has no rendered spec`);
+      assert.ok(!node.spec.includes('{{'), `node ${node.id} (${node.title}) has an unrendered template marker`);
+      assert.ok(!node.spec.includes('<hopper node id from this worker thread>'), `node ${node.id} (${node.title}) still has the placeholder node id`);
+      assert.ok(node.spec.includes(`/hopper-nodes/${node.id}/finish`), `node ${node.id} (${node.title}) spec does not point at its own finish endpoint`);
     }
   }
   assert.ok(total >= 12, `expected >= 12 nodes total (3 modules x 3 stages + 3 integration), found ${total}`);
@@ -343,43 +356,48 @@ check('8', 'GO runs run.command and flips status to launched', () => {
 // SCENARIO B — a 'blocked' finish on a fresh single-module run
 // =============================================================================
 async function runBlockedProbe() {
+  convDb.setSetting('foundry_auto_decide', '0');
   const repo = '/tmp/foundry-sim-repo-blocked';
   rmrf(repo);
-  const blueprint = {
-    name: 'foundry-sim-blocked-probe',
-    prompt: 'Trivial single-module probe used to test the blocked lifecycle path.',
-    modules: [
-      {
-        key: 'probe',
-        name: 'probe',
-        kind: 'library',
-        purpose: 'A trivial probe module with no dependencies.',
-        contract: { provides: [{ type: 'fn', name: 'noop', summary: 'Does nothing' }], requires: [] },
-        acceptance: ['noop can be called without throwing'],
-        depends_on: [],
-      },
-    ],
-    wiring: [],
-    integration: { test: 'true', docs: 'README.md' },
-    run: { command: 'true' },
-  };
-  const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
-  foundry.setBlueprint(project.id, blueprint);
-  foundry.launchProject(project.id);
-  await hopperEngine.dispatchTick('blocked-probe-claim');
-  const { modules: preModules } = foundry.getProjectWithModules(project.id);
-  const buildNodeId = preModules[0].stage_nodes.build.node_id;
-  assert.ok(buildNodeId, 'blocked probe: build node was never planted/claimed');
+  try {
+    const blueprint = {
+      name: 'foundry-sim-blocked-probe',
+      prompt: 'Trivial single-module probe used to test the blocked lifecycle path.',
+      modules: [
+        {
+          key: 'probe',
+          name: 'probe',
+          kind: 'library',
+          purpose: 'A trivial probe module with no dependencies.',
+          contract: { provides: [{ type: 'fn', name: 'noop', summary: 'Does nothing' }], requires: [] },
+          acceptance: ['noop can be called without throwing'],
+          depends_on: [],
+        },
+      ],
+      wiring: [],
+      integration: { test: 'true', docs: 'README.md' },
+      run: { command: 'true' },
+    };
+    const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+    foundry.setBlueprint(project.id, blueprint);
+    foundry.launchProject(project.id);
+    await hopperEngine.dispatchTick('blocked-probe-claim');
+    const { modules: preModules } = foundry.getProjectWithModules(project.id);
+    const buildNodeId = preModules[0].stage_nodes.build.node_id;
+    assert.ok(buildNodeId, 'blocked probe: build node was never planted/claimed');
 
-  const marker = notificationMarker();
-  hopperEngine.finishHopperNode(buildNodeId, 'blocked', { result: 'simulated blocker: missing access to an external system' });
+    const marker = notificationMarker();
+    hopperEngine.finishHopperNode(buildNodeId, 'blocked', { result: 'simulated blocker: missing access to an external system' });
 
-  check('7a', "a 'blocked' finish turns the module red with exactly one foundry notification", () => {
-    const { modules } = foundry.getProjectWithModules(project.id);
-    assert.equal(modules[0].stage, 'blocked', `expected module stage 'blocked', got '${modules[0].stage}'`);
-    const n = notificationCountSince(marker, 'foundry', { severity: 'error' });
-    assert.equal(n, 1, `expected exactly 1 foundry error notification for the blocked module, got ${n}`);
-  });
+    check('7a', "a 'blocked' finish turns the module red with exactly one foundry notification when auto-decide is off", () => {
+      const { modules } = foundry.getProjectWithModules(project.id);
+      assert.equal(modules[0].stage, 'blocked', `expected module stage 'blocked', got '${modules[0].stage}'`);
+      const n = notificationCountSince(marker, 'foundry', { severity: 'error' });
+      assert.equal(n, 1, `expected exactly 1 foundry error notification for the blocked module, got ${n}`);
+    });
+  } finally {
+    convDb.deleteSetting('foundry_auto_decide');
+  }
 }
 await runBlockedProbe();
 
@@ -387,59 +405,64 @@ await runBlockedProbe();
 // SCENARIO C — a 'blocked_question' finish + answerHopperNode recovery
 // =============================================================================
 async function runBlockedQuestionProbe() {
+  convDb.setSetting('foundry_auto_decide', '0');
   const repo = '/tmp/foundry-sim-repo-blockedq';
   rmrf(repo);
-  const blueprint = {
-    name: 'foundry-sim-blockedq-probe',
-    prompt: 'Trivial single-module probe used to test the blocked_question / answer lifecycle path.',
-    modules: [
-      {
-        key: 'probe',
-        name: 'probe',
-        kind: 'library',
-        purpose: 'A trivial probe module with no dependencies.',
-        contract: { provides: [{ type: 'fn', name: 'noop', summary: 'Does nothing' }], requires: [] },
-        acceptance: ['noop can be called without throwing'],
-        depends_on: [],
-      },
-    ],
-    wiring: [],
-    integration: { test: 'true', docs: 'README.md' },
-    run: { command: 'true' },
-  };
-  const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
-  foundry.setBlueprint(project.id, blueprint);
-  foundry.launchProject(project.id);
-  await hopperEngine.dispatchTick('blockedq-probe-claim');
-  const { modules: preModules } = foundry.getProjectWithModules(project.id);
-  const buildNodeId = preModules[0].stage_nodes.build.node_id;
-  assert.ok(buildNodeId, 'blocked_question probe: build node was never planted/claimed');
+  try {
+    const blueprint = {
+      name: 'foundry-sim-blockedq-probe',
+      prompt: 'Trivial single-module probe used to test the blocked_question / answer lifecycle path.',
+      modules: [
+        {
+          key: 'probe',
+          name: 'probe',
+          kind: 'library',
+          purpose: 'A trivial probe module with no dependencies.',
+          contract: { provides: [{ type: 'fn', name: 'noop', summary: 'Does nothing' }], requires: [] },
+          acceptance: ['noop can be called without throwing'],
+          depends_on: [],
+        },
+      ],
+      wiring: [],
+      integration: { test: 'true', docs: 'README.md' },
+      run: { command: 'true' },
+    };
+    const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+    foundry.setBlueprint(project.id, blueprint);
+    foundry.launchProject(project.id);
+    await hopperEngine.dispatchTick('blockedq-probe-claim');
+    const { modules: preModules } = foundry.getProjectWithModules(project.id);
+    const buildNodeId = preModules[0].stage_nodes.build.node_id;
+    assert.ok(buildNodeId, 'blocked_question probe: build node was never planted/claimed');
 
-  hopperEngine.finishHopperNode(buildNodeId, 'blocked_question', { question: 'Which storage backend should probe use?' });
+    hopperEngine.finishHopperNode(buildNodeId, 'blocked_question', { question: 'Which storage backend should probe use?' });
 
-  const afterQuestion = foundry.getProjectWithModules(project.id).modules[0];
-  const stageAtQuestion = afterQuestion.stage;
+    const afterQuestion = foundry.getProjectWithModules(project.id).modules[0];
+    const stageAtQuestion = afterQuestion.stage;
 
-  hopperEngine.answerHopperNode(buildNodeId, 'Use an in-memory backend.');
-  const afterAnswer = foundry.getProjectWithModules(project.id).modules[0];
+    hopperEngine.answerHopperNode(buildNodeId, 'Use an in-memory backend.');
+    const afterAnswer = foundry.getProjectWithModules(project.id).modules[0];
 
-  check('7b', "a 'blocked_question' finish sets needs_answer; answerHopperNode re-queues and clears it", () => {
-    assert.equal(stageAtQuestion, 'needs_answer', `expected module stage 'needs_answer' after blocked_question, got '${stageAtQuestion}'`);
-    assert.notEqual(afterAnswer.stage, 'needs_answer', `module stage still 'needs_answer' after answerHopperNode`);
-    const node = hopperEngine.getHopperNode(buildNodeId);
-    assert.equal(node.status, 'pending', `expected node status 'pending' after answering, got '${node.status}'`);
-    assert.equal(node.answer, 'Use an in-memory backend.');
-  });
+    check('7b', "a 'blocked_question' finish sets needs_answer; answerHopperNode re-queues and clears it when auto-decide is off", () => {
+      assert.equal(stageAtQuestion, 'needs_answer', `expected module stage 'needs_answer' after blocked_question, got '${stageAtQuestion}'`);
+      assert.notEqual(afterAnswer.stage, 'needs_answer', `module stage still 'needs_answer' after answerHopperNode`);
+      const node = hopperEngine.getHopperNode(buildNodeId);
+      assert.equal(node.status, 'pending', `expected node status 'pending' after answering, got '${node.status}'`);
+      assert.equal(node.answer, 'Use an in-memory backend.');
+    });
 
-  // Bonus confirmation: the answered node actually resumes and completes cleanly.
-  const finalProject = await drain(project.id, { maxRounds: 10 });
-  check('7c', 'an answered blocked_question node resumes to normal completion', () => {
-    const finalModule = foundry.getProjectWithModules(project.id).modules[0];
-    assert.ok(
-      STAGE_ORDER.indexOf(finalModule.stage) > STAGE_ORDER.indexOf('planned'),
-      `expected the module to progress past 'planned' after resuming, stuck at '${finalModule.stage}' (project status '${finalProject.status}')`,
-    );
-  });
+    // Bonus confirmation: the answered node actually resumes and completes cleanly.
+    const finalProject = await drain(project.id, { maxRounds: 10 });
+    check('7c', 'an answered blocked_question node resumes to normal completion', () => {
+      const finalModule = foundry.getProjectWithModules(project.id).modules[0];
+      assert.ok(
+        STAGE_ORDER.indexOf(finalModule.stage) > STAGE_ORDER.indexOf('planned'),
+        `expected the module to progress past 'planned' after resuming, stuck at '${finalModule.stage}' (project status '${finalProject.status}')`,
+      );
+    });
+  } finally {
+    convDb.deleteSetting('foundry_auto_decide');
+  }
 }
 await runBlockedQuestionProbe();
 
@@ -581,6 +604,83 @@ function runPlannerGuardProbe() {
   });
 }
 runPlannerGuardProbe();
+
+// =============================================================================
+// SCENARIO G — Foundry's decide-then-ask ladder on an integration MERGE block
+// First failure: append the Contract Resolution Rule, route to foundry_integrate_model,
+// re-pend once, and emit only an info notification. Second failure: project blocks
+// and the normal Kevin-facing warning/error appears.
+// =============================================================================
+async function runIntegrationAutoDecisionProbe() {
+  convDb.deleteSetting('foundry_auto_decide');
+  convDb.deleteSetting('foundry_integrate_model');
+  const repo = '/tmp/foundry-sim-repo-integration-auto';
+  rmrf(repo);
+  const blueprint = probeBlueprint('foundry-sim-integration-auto-probe', 'integration auto-decision path');
+  const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+  foundry.setBlueprint(project.id, blueprint);
+  foundry.launchProject(project.id);
+
+  async function claimMergeNode() {
+    for (let round = 0; round < 40; round++) {
+      await hopperEngine.dispatchTick(`integration-auto-${round}`);
+      const state = foundry.getProjectWithModules(project.id);
+      const integrationTreeId = state.project.integration_tree_id;
+      if (integrationTreeId) {
+        const merge = hopperEngine.listTreeNodes(integrationTreeId).find((n) => n.title.startsWith('MERGE '));
+        if (merge?.status === 'running') return merge;
+      }
+      const treeIds = new Set();
+      for (const m of state.modules) if (m.tree_id) treeIds.add(m.tree_id);
+      for (const tid of treeIds) {
+        for (const node of hopperEngine.listTreeNodes(tid).filter((n) => n.status === 'running')) {
+          hopperEngine.finishHopperNode(node.id, 'done', { result: `[sim] ${node.title} completed OK — no model call made.` });
+        }
+      }
+    }
+    throw new Error('integration auto-decision probe: MERGE node never reached running');
+  }
+
+  const merge = await claimMergeNode();
+  const marker = notificationMarker();
+  const conflict = 'contracts/RecordInput is strict {source,payload}; api module accepted extra keys and its test expected 201.';
+  hopperEngine.finishHopperNode(merge.id, 'blocked', { result: conflict });
+  const afterFirstNode = hopperEngine.getHopperNode(merge.id);
+  const afterFirstProject = foundry.getProjectWithModules(project.id);
+
+  check('12a', 'integration MERGE first block auto-amends and re-pends once with no Kevin warning/error bell', () => {
+    assert.equal(afterFirstNode.status, 'pending', `expected MERGE node re-pended, got '${afterFirstNode.status}'`);
+    assert.equal(afterFirstNode.attempts, 0, `expected attempts reset to 0, got ${afterFirstNode.attempts}`);
+    assert.equal(afterFirstNode.foundry_auto_retries, 1, `expected foundry_auto_retries=1, got ${afterFirstNode.foundry_auto_retries}`);
+    assert.deepEqual([afterFirstNode.adapter, afterFirstNode.model], ['auggie', 'opus4.8']);
+    assert.ok(afterFirstNode.spec.includes('## AUTO-DECISION (JARVIS policy)'), 'amended spec is missing AUTO-DECISION section');
+    assert.ok(afterFirstNode.spec.includes('Contract Resolution Rule'), 'amended spec is missing Contract Resolution Rule');
+    assert.ok(afterFirstNode.spec.includes(conflict), 'amended spec is missing the original conflict');
+    assert.equal(afterFirstProject.project.status, 'integrating', `expected project to stay integrating, got '${afterFirstProject.project.status}'`);
+    assert.equal(afterFirstProject.integration.auto_retried, true, 'integration.auto_retried should be true after the first auto retry');
+    assert.equal(warningErrorNotificationCountSince(marker), 0, 'first auto retry should not create a warning/error notification');
+    const info = notificationCountSince(marker, 'foundry', { severity: 'info', titleLike: '%auto-decided per Contract Resolution Rule%' });
+    assert.equal(info, 1, `expected exactly 1 foundry info notification for auto retry, got ${info}`);
+  });
+
+  await hopperEngine.dispatchTick('integration-auto-second-claim');
+  const runningAgain = hopperEngine.getHopperNode(merge.id);
+  assert.equal(runningAgain.status, 'running', `expected MERGE node running for second attempt, got '${runningAgain.status}'`);
+  const secondMarker = notificationMarker();
+  hopperEngine.finishHopperNode(merge.id, 'blocked', { result: 'same conflict remained after the auto-decision retry' });
+  const afterSecondNode = hopperEngine.getHopperNode(merge.id);
+  const afterSecondProject = foundry.getProjectWithModules(project.id);
+
+  check('12b', 'integration MERGE second block creates the Kevin bell and blocks the project', () => {
+    assert.equal(afterSecondNode.status, 'blocked', `expected MERGE node blocked on second failure, got '${afterSecondNode.status}'`);
+    assert.equal(afterSecondNode.foundry_auto_retries, 1, `expected no second auto retry, got ${afterSecondNode.foundry_auto_retries}`);
+    assert.equal(afterSecondProject.project.status, 'blocked', `expected project blocked, got '${afterSecondProject.project.status}'`);
+    assert.equal(afterSecondProject.integration.auto_retried, true, 'integration.auto_retried should remain true after the second failure');
+    const foundryErrors = notificationCountSince(secondMarker, 'foundry', { severity: 'error', titleLike: '%integration is blocked%' });
+    assert.equal(foundryErrors, 1, `expected exactly 1 foundry integration error notification, got ${foundryErrors}`);
+  });
+}
+await runIntegrationAutoDecisionProbe();
 
 // =============================================================================
 // Report

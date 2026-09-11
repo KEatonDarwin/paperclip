@@ -24,7 +24,7 @@ Return this shape:
       "name": "<human name>",
       "kind": "service|library|ui|job|data|contracts",
       "purpose": "<1-2 sentences>",
-      "provides": [{ "type": "http|fn|event|cli|data|ui", "name": "...", "summary": "...", "schema": "contracts/..." }],
+      "provides": [{ "type": "http|fn|event|cli|data|ui|schema", "name": "...", "summary": "...", "schema": "contracts/..." }],
       "requires": [{ "module": "<key>", "interface": "<fn:name|http:...>" }],
       "acceptance": ["<checkable by script or curl>"],
       "depends_on": ["<key>"]
@@ -38,8 +38,9 @@ Return this shape:
 
 Rules:
 - Prefer 3-9 modules, each buildable by one worker in a 30-minute lease.
-- If modules share schemas/types, create a contracts module first.
-- Acceptance criteria must be checkable by script or curl.
+- If two or more modules share a type/schema/error shape, create a contracts module first.
+- Every shared type must specify required fields, optional fields, strict-vs-lenient handling of unknown fields, and error shapes.
+- Acceptance criteria must be checkable by script or curl and must reference the contract by name when they touch a shared interface.
 - depends_on is build-order only; interface callers can build in parallel from contracts.
 - No dependency cycles.
 - Every requires entry must have exactly one wiring row to the module that provides it.

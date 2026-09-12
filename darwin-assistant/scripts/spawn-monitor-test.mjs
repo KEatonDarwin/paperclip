@@ -119,7 +119,10 @@ check('attention-ordering', 'clusters order attention-first, then active/draft/d
     node({ id: 1, tree_id: 't-active-attn', title: 'blocked node', status: 'blocked_question', question: 'need answer' }),
     node({ id: 2, tree_id: 't-active-plain', title: 'running node', status: 'running' }),
   ];
-  const snap = buildSpawnMonitorSnapshot({ trees, nodes, spawnTasks: [], governor: {} });
+  const spawnTasks = [
+    spawnTask({ id: 1, thread_ext: 'cockpit:hopper-node-2-abc123', status: 'running', hopper_node_id: 2, hopper_tree_id: 't-active-plain' }),
+  ];
+  const snap = buildSpawnMonitorSnapshot({ trees, nodes, spawnTasks, governor: {} });
   assert.deepEqual(
     snap.clusters.map((c) => c.key),
     ['t-active-attn', 't-active-plain', 't-draft', 't-done'],
@@ -220,6 +223,10 @@ check('unmatched-to-adhoc', 'genuinely non-hopper spawn_tasks land in adhoc, gro
   );
   const allAdhocExts = snap.adhoc.flatMap((g) => g.workers.map((w) => w.thread_ext));
   assert.ok(!allAdhocExts.includes('cockpit:hopper-node-5-cccccccc'), 'matched hopper attempt must not leak into adhoc');
+  assert.equal(
+    snap.totals.running_workers, 1,
+    'the running ad-hoc worker (id 3, no hopper node of its own) must still count toward the header total',
+  );
 });
 
 // ---------------------------------------------------------------------------

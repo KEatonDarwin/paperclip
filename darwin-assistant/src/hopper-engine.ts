@@ -130,6 +130,7 @@ for (const col of ['adapter TEXT', 'model TEXT']) {
 
 const getTreeStmt = sqliteDb.prepare<[string], HopperTreeRow>(`SELECT * FROM hopper_trees WHERE id = ?`);
 const listTreesStmt = sqliteDb.prepare<[], HopperTreeRow>(`SELECT * FROM hopper_trees ORDER BY created_at DESC LIMIT 100`);
+const listAllTreesStmt = sqliteDb.prepare<[], HopperTreeRow>(`SELECT * FROM hopper_trees ORDER BY created_at DESC`);
 const getNodeStmt = sqliteDb.prepare<[number], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE id = ?`);
 const treeNodesStmt = sqliteDb.prepare<[string], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE tree_id = ? ORDER BY id`);
 const childrenStmt = sqliteDb.prepare<[number], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE parent_id = ? ORDER BY id`);
@@ -211,6 +212,11 @@ export function getHopperTree(id: string): HopperTreeRow | null {
 }
 export function listHopperTrees(): HopperTreeRow[] {
   return listTreesStmt.all();
+}
+/** Unbounded — Mission Control's contract is "every tree," not the most-recent
+ *  100 `listHopperTrees()` caps at for its existing (unrelated) callers. */
+export function listAllHopperTrees(): HopperTreeRow[] {
+  return listAllTreesStmt.all();
 }
 export function getHopperNode(id: number): HopperNodeRow | null {
   return getNodeStmt.get(id) ?? null;

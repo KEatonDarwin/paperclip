@@ -98,6 +98,7 @@ import {
   agreeHopperTree,
   getHopperTree,
   listHopperTrees,
+  listAllHopperTrees,
   listTreeNodes,
   getHopperNode,
   finishHopperNode,
@@ -1753,7 +1754,7 @@ export function createApiV1Router(): Router {
 
   router.get('/spawn-monitor', (req: AuthedRequest, res) => {
     const includeArchived = req.query.include_archived === '1';
-    const trees = listHopperTrees();
+    const trees = listAllHopperTrees();
     const snapshot = buildSpawnMonitorSnapshot({
       trees,
       nodes: trees.flatMap((t) => listTreeNodes(t.id)),

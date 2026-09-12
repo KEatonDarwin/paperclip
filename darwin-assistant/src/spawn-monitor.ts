@@ -278,7 +278,9 @@ function treeTier(s: SpawnMonitorTreeSummary): number {
 
 function buildAdhoc(unmatched: SpawnTaskRow[]): SpawnMonitorAdhocGroup[] {
   const groups = new Map<string, SpawnTaskRow[]>();
-  const NO_PARENT = ' __no_parent__';
+  // Sentinel key for parentless ad-hoc rows. Prefixed so it can never collide
+  // with a real thread_ext (those are always "<scheme>:..." like "cockpit:...").
+  const NO_PARENT = '__spawn_monitor_no_parent__';
   for (const s of unmatched) {
     const key = s.parent_thread_ext ?? NO_PARENT;
     if (!groups.has(key)) groups.set(key, []);
@@ -337,16 +339,27 @@ export function buildSpawnMonitorSnapshot(input: SpawnMonitorInput): SpawnMonito
   });
 
   const visibleNodes = input.nodes.filter((n) => visibleTreeIds.has(n.tree_id));
-  const totals = {
-    active_trees: visibleTrees.filter((t) => t.status === 'active').length,
-    running_workers: visibleNodes.filter((n) => n.status === 'running').length,
-    needs_attention: visibleNodes.filter((n) => n.status === 'blocked' || n.status === 'blocked_question').length,
-  };
 
   // Match against ALL nodes (not just visible-tree ones) so an attempt tied to
   // an archived tree's node is never mistaken for a genuine ad-hoc worker.
-  const { unmatched } = matchSpawnTasksToNodes(input.spawnTasks, input.nodes);
+  const { byNode, unmatched } = matchSpawnTasksToNodes(input.spawnTasks, input.nodes);
   const adhoc = buildAdhoc(unmatched);
+
+  // running_workers = actual live spawn_tasks workers (status='running'), not
+  // hopper node status — an ad-hoc/unmatched running worker has no hopper node
+  // at all, so counting nodes silently dropped it from the header total.
+  let runningWorkers = 0;
+  for (const n of visibleNodes) {
+    const spawns = byNode.get(n.id);
+    if (spawns) runningWorkers += spawns.filter((s) => s.status === 'running').length;
+  }
+  runningWorkers += unmatched.filter((s) => s.status === 'running').length;
+
+  const totals = {
+    active_trees: visibleTrees.filter((t) => t.status === 'active').length,
+    running_workers: runningWorkers,
+    needs_attention: visibleNodes.filter((n) => n.status === 'blocked' || n.status === 'blocked_question').length,
+  };
 
   return { governor: input.governor, totals, clusters, adhoc };
 }

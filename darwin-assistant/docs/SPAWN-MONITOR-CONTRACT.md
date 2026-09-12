@@ -176,3 +176,65 @@ active; stop polling when done/archived (foundry.tsx has this pattern).
     `{ error: { code, message } }` envelope (`CockpitApiError` reads `.message`).
   - `answerHopperNode(id, answer)` already existed in `cockpit-api.ts` (Foundry drawer); reused,
     not duplicated.
+- **2026-09-12 (node #144, adversarial review fixes):**
+  - `totals.running_workers` is defined as **live `spawn_tasks` rows with `status='running'`**
+    (visible-tree-matched + ad-hoc), not hopper-node `status='running'` count. A node's status
+    flips to `running` independently of whether its worker's `spawn_tasks` row has landed yet,
+    and an ad-hoc (unmatched) running worker has no hopper node at all — counting nodes silently
+    dropped it from the header total. `buildSpawnMonitorSnapshot` now derives it from
+    `matchSpawnTasksToNodes`'s own `byNode`/`unmatched` output (no second matching pass).
+  - `GET /spawn-monitor` now reads `listAllHopperTrees()` (new export, unbounded `SELECT`), not
+    `listHopperTrees()` (existing 100-row-capped query used by `GET /hopper-trees` and left
+    unchanged for that route). Mission Control's stated contract is "every tree" — capping it
+    could drop an old active/blocked tree's spawns into `adhoc` once history exceeds 100 rows.
+  - `buildAdhoc`'s `NO_PARENT` sentinel was written with a stray embedded NUL byte
+    (`'\0__no_parent__'` instead of a plain string), which made `grep`/any line-based tool treat
+    `spawn-monitor.ts` as a binary file. Replaced with the plain string
+    `'__spawn_monitor_no_parent__'` (prefixed so it can't collide with a real `thread_ext`, which
+    always starts with a scheme like `cockpit:`/`slack:`). Behavior unchanged.
+  - Drill-in Retry button (`spawn-tree_.$treeId.tsx`) was shown for both `blocked` and
+    `blocked_question` nodes; the contract (§ Drill-in: "Retry button (blocked/failed states)")
+    and the overview page (already correct — `node.status === "blocked"` only) both say Retry is
+    for `blocked` only, with `blocked_question` routed to the AnswerBox instead — retrying a
+    `blocked_question` node discards the question/answer via `retryHopperNode`'s existing clear-
+    and-re-pend behavior and re-runs the worker blind. Fixed to `n.status === "blocked"`.
+    `POST /hopper-nodes/:id/retry` itself was left as-is (mirrors the pre-existing
+    `retryHopperNode` guard, which is intentionally shared with Foundry's own retry button — see
+    `foundry.tsx`'s `retryable = status === "blocked" || status === "blocked_question"`); this is
+    a UI-affordance fix for Mission Control, not a backend contract change.
+  - `AnswerBox`/`RetryButton` (`components/spawn-monitor.tsx`) double-submit guard was
+    `useState`-only, which can't close the window between two rapid activations landing before
+    React re-renders the `disabled` attribute. Added a synchronous `useRef` in-flight guard
+    checked/set ahead of the `await`, alongside the existing `busy` state (which still drives the
+    spinner/disabled styling).
+  - Disputed: none of the review's should-fix findings were disputed; the nit (finding #5, NUL
+    byte) is folded into the same fix as finding #1 since both touch `buildAdhoc`.
+
+## As built
+
+Final shipped surface (both branches, after node #144's fixes):
+
+- **Backend** (`hopper/spawn-monitor`): `GET /api/v1/spawn-monitor[?include_archived=1]`,
+  `GET /api/v1/spawn-monitor/trees/:id`, `POST /hopper-nodes/:id/retry`,
+  `POST /hopper-trees/:id/archive`, `POST /hopper-trees/:id/unarchive` — all in
+  `src/handlers/api-v1.ts`, same bearer-auth router as the other `/hopper-*` routes. Aggregation
+  lives in `src/spawn-monitor.ts` as pure functions (`buildSpawnMonitorSnapshot`,
+  `buildSpawnMonitorTreeDetail`, `matchSpawnTasksToNodes`) over injected rows; the routes are
+  thin fetch-and-hand-over wrappers. `hopper_tree_id`/`hopper_node_id` columns on `spawn_tasks`
+  (lazy `ALTER TABLE`, stamped at spawn time in `hopper-engine.ts`, one-time startup backfill for
+  pre-existing rows). New `listAllHopperTrees()` export in `hopper-engine.ts` (unbounded, used
+  only by `/spawn-monitor`; the pre-existing 100-row-capped `listHopperTrees()` is untouched for
+  `GET /hopper-trees`). Payload shapes exactly as documented in §1b/§1c plus the Corrections
+  pinning `SpawnTaskLite`/envelopes above. Regression suite: `scripts/spawn-monitor-test.mjs`
+  (`npm run spawn-monitor:test`, 6 cases incl. the running-worker/ad-hoc and NO_PARENT-grouping
+  fixes) — 6/6 passing.
+- **UI** (`hopper/spawn-tree-mission-control`): `src/routes/spawn-tree.tsx` (overview) +
+  `src/routes/spawn-tree_.$treeId.tsx` (drill-in, non-nested route) + shared building blocks in
+  `src/components/spawn-monitor.tsx` + client fns/types in `src/lib/cockpit-api.ts`. Matches
+  §Part 2 exactly, with the Retry/blocked_question and double-submit-guard fixes above applied.
+  `npx tsc --noEmit`: 9 errors, all pre-existing/unrelated (same 9 as the review's baseline —
+  zero new). ESLint: 0 errors (pre-existing `react-refresh/only-export-components` warnings
+  only). Prettier: clean on all touched files.
+- **Not built (v1.1, noted in the contract as out of scope):** SSE-driven live updates for
+  `hopper_node`/`spawn_task` on this page — polling only (5s overview / 4s drill-in, matching
+  `foundry.tsx`).

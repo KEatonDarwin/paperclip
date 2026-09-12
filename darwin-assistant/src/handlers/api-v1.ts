@@ -89,6 +89,7 @@ import {
   markProjectPlanning,
   retryModule as retryFoundryModule,
   setBlueprint as setFoundryBlueprint,
+  buildFoundryAdvisor,
 } from '../foundry.js';
 import { planProject as runFoundryPlanner } from '../foundry-planner.js';
 import { getFoundryModelSetting } from '../foundry-settings.js';
@@ -1503,6 +1504,22 @@ export function createApiV1Router(): Router {
     } catch (err) {
       sendCaughtFoundryError(res, err);
     }
+  });
+
+  // "Open thread" advisor — ensures a standing primed Q&A thread for the whole
+  // project (orchestrator) or one module, and returns the priming seed. The
+  // cockpit posts seed_text to /threads/:ext/messages only when primed=false
+  // (first open), then navigates to it. Mirrors the hopper-promote 2-step.
+  router.post('/foundry/projects/:id/advisor', (req: AuthedRequest, res) => {
+    const out = buildFoundryAdvisor(paramString(req.params.id));
+    if (!out) { res.status(404).json({ error: { code: 'not_found', message: 'project not found' } }); return; }
+    res.json(out);
+  });
+
+  router.post('/foundry/projects/:id/modules/:key/advisor', (req: AuthedRequest, res) => {
+    const out = buildFoundryAdvisor(paramString(req.params.id), paramString(req.params.key));
+    if (!out) { res.status(404).json({ error: { code: 'not_found', message: 'project or module not found' } }); return; }
+    res.json(out);
   });
 
   // == Task Hopper (candidate tasks awaiting Kevin's yes/dismiss) ==============

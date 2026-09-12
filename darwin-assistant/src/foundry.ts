@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { getOrCreateConversation, sqliteDb } from './conversation-db.js';
+import { getConversation, getOrCreateConversation, setThreadModelOverride, sqliteDb } from './conversation-db.js';
 import { getFoundrySetting } from './foundry-settings.js';
 import { getFoundrySkillDir, renderTemplate } from './foundry-templates.js';
 import {
@@ -19,6 +19,90 @@ import {
 import { createNotification } from './notifications.js';
 import { sseBus, type SSEEvent } from './sse-bus.js';
 import { setPreviewLink } from './thread-links.js';
+
+/**
+ * "Open thread" advisor — a fresh cockpit thread primed to understand either
+ * the whole project (orchestrator) or one module, so Kevin can ask questions
+ * as they come up. Deterministic external_id per scope so it's reused (one
+ * standing advisor per project / per module), lazily primed on first open.
+ * Returns the seed text; the cockpit posts it to /threads/:ext/messages only
+ * when `primed` is false (mirrors the hopper-promote 2-step). Sonnet-routed.
+ */
+function readModuleDoc(repoPath: string, key: string, file: string): string | null {
+  try {
+    const p = path.join(repoPath, 'modules', key, file);
+    if (!fs.existsSync(p)) return null;
+    const body = fs.readFileSync(p, 'utf8').trim();
+    if (!body) return null;
+    return body.length > 4000 ? body.slice(0, 4000) + '\n…(truncated)' : body;
+  } catch { return null; }
+}
+
+export function buildFoundryAdvisor(
+  projectId: string,
+  moduleKey?: string,
+): { external_id: string; seed_text: string; primed: boolean } | null {
+  const project = getProjectStmt.get(projectId);
+  if (!project) return null;
+
+  const parseJson = <T,>(s: string | null | undefined, fallback: T): T => {
+    try { return s ? (JSON.parse(s) as T) : fallback; } catch { return fallback; }
+  };
+
+  let ext: string;
+  let seed: string;
+
+  if (moduleKey) {
+    const m = moduleByKeyStmt.get(projectId, moduleKey);
+    if (!m) return null;
+    ext = `cockpit:foundry-advisor-${projectId}--${moduleKey}`;
+    const contract = parseJson<{ provides: unknown[]; requires: unknown[] }>(m.contract, { provides: [], requires: [] });
+    const acceptance = parseJson<string[]>(m.acceptance, []);
+    const verify = readModuleDoc(project.repo_path, moduleKey, 'VERIFY.md');
+    const readme = readModuleDoc(project.repo_path, moduleKey, 'README.md');
+    seed = [
+      `You are the **Foundry advisor** for the \`${moduleKey}\` module in project \`${projectId}\` (${project.name}).`,
+      `Answer Kevin's questions about THIS module — what it does, its contract, why it's in its current state, and what fixing/changing it would take. Be concise and concrete; you have the real artifacts below.`,
+      ``,
+      `PURPOSE: ${m.purpose ?? '(none)'}`,
+      `KIND: ${m.kind}   STAGE: ${m.stage ?? '(unknown)'}   BRANCH: ${m.branch ?? '(none)'}`,
+      m.blocked_reason ? `BLOCKED REASON: ${m.blocked_reason}` : '',
+      ``,
+      `CONTRACT provides: ${JSON.stringify(contract.provides)}`,
+      `CONTRACT requires: ${JSON.stringify(contract.requires)}`,
+      `ACCEPTANCE:\n${acceptance.map((a) => `  - ${a}`).join('\n') || '  (none)'}`,
+      ``,
+      m.last_result ? `LATEST STAGE RESULT:\n${m.last_result}` : '',
+      verify ? `\n=== VERIFY.md ===\n${verify}` : '',
+      readme ? `\n=== README.md ===\n${readme}` : '',
+      ``,
+      `Reply with a one-line "oriented on <module>, ask away" and then wait for Kevin's questions.`,
+    ].filter((l) => l !== '').join('\n');
+  } else {
+    ext = `cockpit:foundry-advisor-${projectId}`;
+    const mods = projectModulesStmt.all(projectId);
+    const lines = mods.map((m) => `  - ${m.key} [${m.kind}] — ${m.stage ?? '?'}${m.blocked_reason ? ' ⚠ ' + m.blocked_reason.slice(0, 80) : ''} — ${(m.purpose ?? '').slice(0, 90)}`);
+    seed = [
+      `You are the **Foundry advisor / orchestrator** for project \`${projectId}\` (${project.name}), status **${project.status}**.`,
+      `You help Kevin understand and steer the whole build — the plan, how the modules fit, the current state, and what any blocker means / takes to clear. Be concise; you have the live blueprint below. For deep per-module questions, note that each module box has its own advisor thread too.`,
+      ``,
+      `PROMPT (the goal): ${project.prompt}`,
+      ``,
+      `MODULES (${mods.length}):\n${lines.join('\n')}`,
+      ``,
+      project.last_error ? `INTEGRATION / LAST ERROR:\n${project.last_error}` : `INTEGRATION: no error recorded (status ${project.status}).`,
+      ``,
+      `Reply with a one-line "oriented on ${projectId}, ask away" and then wait for Kevin's questions.`,
+    ].filter((l) => l !== '').join('\n');
+  }
+
+  const existing = getConversation(ext);
+  const primed = !!(existing && existing.status === 'active');
+  const conv = getOrCreateConversation(ext);
+  // Advisor Q&A → Sonnet (cheap, capable; off the frontier window).
+  setThreadModelOverride(conv.id, 'claude', 'claude-sonnet-5');
+  return { external_id: ext, seed_text: seed, primed };
+}
 
 export type FoundryProjectStatus =
   | 'draft'

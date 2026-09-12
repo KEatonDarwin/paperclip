@@ -9,7 +9,8 @@
     "start": "tsx src/index.ts",
     "build": "tsc",
     "build:run": "tsc && node dist/index.js",
-    "foundry:sim": "node scripts/foundry-sim.mjs"
+    "foundry:sim": "node scripts/foundry-sim.mjs",
+    "spawn-monitor:test": "node scripts/spawn-monitor-test.mjs"
   },
   "dependencies": {
     "@slack/bolt": "^4.0.0",

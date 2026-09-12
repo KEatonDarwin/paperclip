@@ -390,8 +390,8 @@ export function startHopperEngine(processMessage: (input: string, conversationId
 }
 
 const spawnTaskInsert = sqliteDb.prepare(`
-  INSERT OR IGNORE INTO spawn_tasks (thread_ext, conversation_id, parent_thread_ext, label, task_prompt, status)
-  VALUES (?, ?, ?, ?, ?, 'running')
+  INSERT OR IGNORE INTO spawn_tasks (thread_ext, conversation_id, parent_thread_ext, label, task_prompt, status, hopper_tree_id, hopper_node_id)
+  VALUES (?, ?, ?, ?, ?, 'running', ?, ?)
 `);
 
 async function spawnWorker(node: HopperNodeRow, tree: HopperTreeRow): Promise<void> {
@@ -403,7 +403,10 @@ async function spawnWorker(node: HopperNodeRow, tree: HopperTreeRow): Promise<vo
   const model = node.model ?? defaultWorkerModel();
   if (model) setThreadModelOverride(conv.id, node.adapter ?? WORKER_ADAPTER, model);
   const prompt = composeWorkerPrompt(node, tree);
-  spawnTaskInsert.run(ext, conv.id, tree.origin_thread_ext, `hopper #${node.id}: ${node.title.slice(0, 80)}`, prompt.slice(0, 2000));
+  // Stamp hopper_tree_id/hopper_node_id at spawn time — the bulletproof grouping
+  // key for spawn-monitor, so a retried node's attempts don't rely solely on
+  // parsing the ext pattern (see src/spawn-monitor.ts).
+  spawnTaskInsert.run(ext, conv.id, tree.origin_thread_ext, `hopper #${node.id}: ${node.title.slice(0, 80)}`, prompt.slice(0, 2000), tree.id, node.id);
   try {
     await processMessageRef(prompt, ext, `turn:${conv.id}:0`);
   } catch (err) {

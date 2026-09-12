@@ -31,6 +31,8 @@ export interface SpawnTaskRow {
   created_at: string;
   updated_at: string;
   last_heartbeat: string | null;
+  hopper_tree_id: string | null;
+  hopper_node_id: number | null;
 }
 
 sqliteDb.exec(`
@@ -60,6 +62,21 @@ sqliteDb.exec(`
     ON spawn_tasks(parent_thread_ext, created_at DESC);
 `);
 
+// SPAWN-MONITOR bulletproof grouping (2026-09-12): additive stamp columns so an
+// attempt can be tied to its hopper tree/node directly, instead of relying only
+// on parsing `cockpit:hopper-node-<id>-<hex>` out of thread_ext. Lazy migration,
+// same pattern as hopper_nodes' adapter/model columns in hopper-engine.ts.
+for (const col of ['hopper_tree_id TEXT', 'hopper_node_id INTEGER']) {
+  try {
+    sqliteDb.exec(`ALTER TABLE spawn_tasks ADD COLUMN ${col}`);
+  } catch {
+    /* column already exists */
+  }
+}
+sqliteDb.exec(`
+  CREATE INDEX IF NOT EXISTS idx_spawn_tasks_hopper_node ON spawn_tasks(hopper_node_id);
+`);
+
 const listStmt = sqliteDb.prepare<[number], SpawnTaskRow>(`
   SELECT * FROM spawn_tasks ORDER BY created_at DESC, id DESC LIMIT ?
 `);
@@ -68,4 +85,13 @@ const listStmt = sqliteDb.prepare<[number], SpawnTaskRow>(`
 export function listSpawnTasks(limit = 300): SpawnTaskRow[] {
   const n = Math.max(1, Math.min(limit, 1000));
   return listStmt.all(n);
+}
+
+const listAllStmt = sqliteDb.prepare<[], SpawnTaskRow>(`
+  SELECT * FROM spawn_tasks ORDER BY created_at ASC, id ASC
+`);
+
+/** Every spawn-task row, oldest first, uncapped — the spawn-monitor aggregator's input. */
+export function listAllSpawnTasks(): SpawnTaskRow[] {
+  return listAllStmt.all();
 }

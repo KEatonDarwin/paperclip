@@ -102,11 +102,18 @@ import {
   getHopperNode,
   finishHopperNode,
   answerHopperNode,
+  retryHopperNode,
   dispatchTick,
   getHopperHistory,
   type NewNodeInput,
 } from '../hopper-engine.js';
 import { governorStatus } from '../hopper-governor.js';
+import {
+  buildSpawnMonitorSnapshot,
+  buildSpawnMonitorTreeDetail,
+  archiveHopperTreeAction,
+  unarchiveHopperTreeAction,
+} from '../spawn-monitor.js';
 import {
   listSmartTodoNodes,
   getSmartTodoNode,
@@ -120,7 +127,7 @@ import {
   type SmartTodoStatus,
 } from '../smart-todos.js';
 import { decomposeNote } from '../smart-todos-decompose.js';
-import { listSpawnTasks } from '../spawn-tasks.js';
+import { listSpawnTasks, listAllSpawnTasks } from '../spawn-tasks.js';
 import {
   listActiveQuickCaptureItems,
   createQuickCaptureItem,
@@ -1737,6 +1744,68 @@ export function createApiV1Router(): Router {
   // read before routing a new tree's nodes.
   router.get('/hopper-engine/history', (_req: AuthedRequest, res) => {
     res.json(getHopperHistory());
+  });
+
+  // == Spawn-Tree Mission Control =============================================
+  // Foundry-style aggregate view over hopper_trees/hopper_nodes + spawn_tasks.
+  // See docs/SPAWN-MONITOR-CONTRACT.md. Aggregation itself is a pure function
+  // (src/spawn-monitor.ts); these routes just fetch rows and hand them over.
+
+  router.get('/spawn-monitor', (req: AuthedRequest, res) => {
+    const includeArchived = req.query.include_archived === '1';
+    const trees = listHopperTrees();
+    const snapshot = buildSpawnMonitorSnapshot({
+      trees,
+      nodes: trees.flatMap((t) => listTreeNodes(t.id)),
+      spawnTasks: listAllSpawnTasks(),
+      governor: governorStatus(),
+      includeArchived,
+    });
+    res.json(snapshot);
+  });
+
+  router.get('/spawn-monitor/trees/:id', (req: AuthedRequest, res) => {
+    const tree = getHopperTree(paramString(req.params.id));
+    if (!tree) {
+      sendError(res, 404, 'hopper_tree_not_found', 'hopper tree not found');
+      return;
+    }
+    const nodes = listTreeNodes(tree.id);
+    const detail = buildSpawnMonitorTreeDetail(tree, nodes, listAllSpawnTasks());
+    res.json(detail);
+  });
+
+  // Wraps the existing retryHopperNode — bulletproof-grouping's "Retry" button.
+  router.post('/hopper-nodes/:id/retry', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const node = getHopperNode(id);
+    if (!node) {
+      sendError(res, 404, 'hopper_node_not_found', 'hopper node not found');
+      return;
+    }
+    if (node.status !== 'blocked' && node.status !== 'blocked_question') {
+      sendError(res, 409, 'hopper_node_not_retryable', `node is ${node.status}, not blocked/blocked_question`);
+      return;
+    }
+    res.json({ node: retryHopperNode(id) });
+  });
+
+  router.post('/hopper-trees/:id/archive', (req: AuthedRequest, res) => {
+    const result = archiveHopperTreeAction(paramString(req.params.id));
+    if (!result.ok) {
+      sendError(res, result.code, result.code === 404 ? 'hopper_tree_not_found' : 'hopper_tree_active', result.message);
+      return;
+    }
+    res.json({ tree: result.tree });
+  });
+
+  router.post('/hopper-trees/:id/unarchive', (req: AuthedRequest, res) => {
+    const result = unarchiveHopperTreeAction(paramString(req.params.id));
+    if (!result.ok) {
+      sendError(res, result.code, result.code === 404 ? 'hopper_tree_not_found' : 'hopper_tree_not_archived', result.message);
+      return;
+    }
+    res.json({ tree: result.tree });
   });
 
   // == Smart Todo Tree ========================================================

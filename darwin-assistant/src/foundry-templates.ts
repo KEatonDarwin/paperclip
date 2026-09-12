@@ -28,8 +28,19 @@ Requires:
 Acceptance:
 {{acceptance}}
 
+Contract Resolution Rule:
+- The contracts module is authoritative. If there is no contracts module, the blueprint declared provides/requires are authoritative.
+- The deviating module conforms to the contract. Tests that contradict the contract are corrected, never the contract.
+- Every resolution is appended to DECISIONS.md with the date, module, conflict, and rule applied.
+- blocked_question is reserved only when the contract is silent AND the choice changes user-visible behavior with no sane default.
+- Interface/shape/error-code/naming/test-vs-contract conflicts resolve toward the contract + DECISIONS.md, never a question for Kevin.
+
 Create module.json, src/, tests/, and README.md. Run the module test command green.
-Finish by POSTing to hopper node {{node_id}} with commit sha, files, provides implemented, and test result.
+Finish by POSTing to hopper node {{node_id}} with one outcome:
+- done: commit sha, files, provides implemented, and test result.
+- split: only if it genuinely needs more than one worker.
+- blocked_question: ONLY when the contract is silent AND the choice changes user-visible behavior with no sane default.
+- blocked: missing access or a broken dependency, stated precisely.
 `,
   test: `# FOUNDRY TEST - {{project}} / {{key}}
 
@@ -48,10 +59,20 @@ Requires:
 Acceptance:
 {{acceptance}}
 
+Contract Resolution Rule:
+- The contracts module is authoritative. If there is no contracts module, the blueprint declared provides/requires are authoritative.
+- The deviating module conforms to the contract. Tests that contradict the contract are corrected, never the contract.
+- Every resolution is appended to DECISIONS.md with the date, module, conflict, and rule applied.
+- blocked_question is reserved only when the contract is silent AND the choice changes user-visible behavior with no sane default.
+- Interface/shape/error-code/naming/test-vs-contract conflicts resolve toward the contract + DECISIONS.md, never a question for Kevin.
+
 Run commands.test, add/refine tests that try to refute the acceptance criteria, run:
 node {{skill_dir}}/templates/foundry-validate.mjs --module modules/{{key}}
 Write modules/{{key}}/VERIFY.md, commit, and push.
-Finish by POSTing to hopper node {{node_id}} with verdict and evidence.
+Finish by POSTing to hopper node {{node_id}} with one outcome:
+- done: verdict and evidence.
+- blocked: missing/impossible contract, missing access, or broken dependency.
+- blocked_question: ONLY when the contract is silent AND the choice changes user-visible behavior with no sane default.
 `,
   doc: `# FOUNDRY DOC - {{project}} / {{key}}
 
@@ -81,7 +102,18 @@ Wiring:
 {{wiring}}
 
 GUARD: no production systems, no API keys, no merges to main, no external sends.
-Finish by POSTing to hopper node {{node_id}} with integration commit sha and green test evidence.
+
+Contract Resolution Rule:
+- The contracts module is authoritative. If there is no contracts module, the blueprint declared provides/requires are authoritative.
+- The deviating module conforms to the contract. Tests that contradict the contract are corrected, never the contract.
+- Every resolution is appended to DECISIONS.md with the date, module/integration node, conflict, and rule applied.
+- blocked_question is reserved only when the contract is silent AND the choice changes user-visible behavior with no sane default.
+- Interface/shape/error-code/naming/test-vs-contract conflicts resolve toward the contract + DECISIONS.md, never a question for Kevin.
+
+Finish by POSTing to hopper node {{node_id}} with one outcome:
+- done: integration commit sha and green test evidence.
+- blocked: missing/impossible contract, missing access, or broken dependency.
+- blocked_question: ONLY when the contract is silent AND the choice changes user-visible behavior with no sane default.
 `,
   'integrate-review': `# FOUNDRY INTEGRATE REVIEW - {{project}}
 
@@ -145,10 +177,14 @@ function loadTemplate(name: string): string {
 
 export function renderTemplate(name: string, vars: Record<string, unknown>): string {
   const normalized = normalizeTemplateName(name);
-  return loadTemplate(normalized).replace(/\{\{\s*([^{}]+?)\s*\}\}/g, (placeholder, keyRaw: string) => {
+  const rendered = loadTemplate(normalized).replace(/\{\{\s*([^{}]+?)\s*\}\}/g, (placeholder, keyRaw: string) => {
     const key = keyRaw.trim();
     if (Object.prototype.hasOwnProperty.call(vars, key)) return stringifyValue(vars[key]);
     console.warn(`[foundry-template] unknown placeholder ${placeholder} in ${normalized}`);
     return placeholder;
   });
+  if (rendered.includes('{{')) {
+    console.warn(`[foundry-template] leftover placeholder marker in ${normalized}`);
+  }
+  return rendered;
 }

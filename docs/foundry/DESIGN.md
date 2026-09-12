@@ -370,6 +370,37 @@ shape as monitors and Hopper.
 { "node_id": null, "status": "missing", "model": null, "attempts": 0, "worker_thread_ext": null, "result": null }
 ```
 
+`FoundryIntegration` response object:
+
+```json
+{
+  "tree_id": "tree-a1b2c3d4",
+  "nodes": [
+    {
+      "id": 201,
+      "title": "MERGE hello-foundry",
+      "status": "blocked",
+      "model": "opus4.8",
+      "attempts": 2
+    },
+    {
+      "id": 202,
+      "title": "REVIEW hello-foundry",
+      "status": "pending",
+      "model": "claude-opus-5",
+      "attempts": 0
+    }
+  ],
+  "auto_retried": true
+}
+```
+
+For a project with no integration tree yet, return:
+
+```json
+{ "tree_id": null, "nodes": [], "auto_retried": false }
+```
+
 ### `GET /foundry/projects`
 
 Lists projects for the `/foundry` index. Default order: newest first.
@@ -617,7 +648,16 @@ Response `200` full example:
       "created_at": "2026-09-11 01:22:00",
       "updated_at": "2026-09-11 01:31:00"
     }
-  ]
+  ],
+  "integration": {
+    "tree_id": "tree-a1b2c3d4",
+    "nodes": [
+      { "id": 201, "title": "MERGE hello-foundry", "status": "running", "model": "opus4.8", "attempts": 1 },
+      { "id": 202, "title": "REVIEW hello-foundry", "status": "pending", "model": "claude-opus-5", "attempts": 0 },
+      { "id": 203, "title": "DOCS hello-foundry", "status": "pending", "model": "opus4.8", "attempts": 0 }
+    ],
+    "auto_retried": false
+  }
 }
 ```
 
@@ -789,6 +829,57 @@ Errors:
 - `409 foundry_project_not_ready`
 - `400 foundry_missing_run_command`
 - `500 foundry_go_failed`
+
+### `POST /foundry/projects/:id/integration/retry`
+
+Re-pends a blocked integration node with the Contract Resolution Rule amendment and resets
+`attempts` to `0`. The retry uses `foundry_integrate_model` from settings/env, defaulting to
+`auggie/opus4.8`; initial integration merge/docs nodes use the same default so the integration
+path does not default to Codex.
+
+Request:
+
+```json
+{}
+```
+
+Rules:
+
+- Project must already have an `integration_tree_id`.
+- Pick the first `blocked_question` node if present, otherwise the first `blocked` node.
+- Append an `## AUTO-DECISION (JARVIS policy)` amendment containing the Contract Resolution Rule
+  and the node's blocked result/question as "the conflict you must resolve".
+- Increment `hopper_nodes.foundry_auto_retries`, clear question/answer/result, reset attempts,
+  set the integration loadout, and move the node back to `pending`.
+- Set project status back to `integrating` unless it is already launched.
+
+Response `202`:
+
+```json
+{
+  "integration": {
+    "tree_id": "tree-a1b2c3d4",
+    "nodes": [
+      { "id": 201, "title": "MERGE hello-foundry", "status": "pending", "model": "opus4.8", "attempts": 0 },
+      { "id": 202, "title": "REVIEW hello-foundry", "status": "pending", "model": "claude-opus-5", "attempts": 0 },
+      { "id": 203, "title": "DOCS hello-foundry", "status": "pending", "model": "opus4.8", "attempts": 0 }
+    ],
+    "auto_retried": true
+  },
+  "node": {
+    "id": 201,
+    "title": "MERGE hello-foundry",
+    "status": "pending",
+    "model": "opus4.8",
+    "attempts": 0
+  }
+}
+```
+
+Errors:
+
+- `404 foundry_project_not_found`
+- `409 foundry_integration_not_retryable`
 
 ### `POST /foundry/projects/:id/modules/:key/retry`
 
@@ -1112,10 +1203,12 @@ Docs/push worker:
   - `foundry_build_model`: `gpt-5.5`
   - `foundry_test_model`: `claude-sonnet-5`
   - `foundry_doc_model`: `claude-haiku-4-5-20251001`
+  - `foundry_integrate_model`: `auggie/opus4.8`
 - Suggested adapters:
   - build: `codex` for `gpt-5.5`, unless the selected model is a Claude model
   - test: `claude`
   - doc: `claude`
+  - integrate merge/docs and auto-decision retries: `auggie` (`opus4.8`) by default
 - If a setting is blank, fall back to the defaults above. Do not fall back to a null model.
 - `createHopperTree` dependencies should be expressed with `depends_on_indexes`:
   - test depends on build
@@ -1127,6 +1220,23 @@ Docs/push worker:
   - module blocked/question with project/module names
   - GO failed
 - Route errors must be structured as `{ "error": { "code": "...", "message": "..." } }`.
+
+## Contract Resolution Retry State
+
+Foundry stores the decide-then-ask retry marker directly on `hopper_nodes` as an additive column:
+
+```sql
+ALTER TABLE hopper_nodes ADD COLUMN foundry_auto_retries INTEGER NOT NULL DEFAULT 0;
+```
+
+Reason: the retry decision belongs to the exact Hopper node attempt being amended, not to the
+module/project JSON blob. A first Foundry-owned `blocked`, `blocked_question`, or max-attempt lease
+exhaustion with `foundry_auto_retries=0` and `foundry_auto_decide` enabled gets one automatic
+Contract Resolution Rule retry. The retry increments the column, appends the
+`## AUTO-DECISION (JARVIS policy)` amendment to the node spec, resets attempts to `0`, clears
+question/answer/result, routes to `foundry_integrate_model`, and moves the node back to `pending`.
+If that same node blocks again, Foundry does not auto-retry; it creates the normal project/module
+warning/error notification for Kevin and sets the project/module blocked state.
 
 ## Changes I Would Make To The Skill
 
@@ -1149,6 +1259,7 @@ That avoids an idle gap where a dependency is tested but the dependent waits for
 - `PATCH /foundry/projects/:id/blueprint {blueprint}` -> `200 {project: planned,modules}`
 - `POST /foundry/projects/:id/launch {}` -> `202 {project: building,modules}`
 - `POST /foundry/projects/:id/go {}` -> `202 {project: launched,launched:true,preview_url}`
+- `POST /foundry/projects/:id/integration/retry {}` -> `202 {integration,node}`
 - `POST /foundry/projects/:id/modules/:key/retry {stage?}` -> `202 {module,tree,node}`
 
 ## Adversarial review — node 72 (2026-09-10)

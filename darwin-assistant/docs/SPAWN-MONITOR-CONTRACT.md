@@ -155,3 +155,24 @@ active; stop polling when done/archived (foundry.tsx has this pattern).
 ## Corrections
 
 (append dated corrections here — builders amend, never silently deviate)
+
+- **2026-09-12 (UI node #142, verified in `jarvis-command-center`):** the drill-in file is
+  **`src/routes/spawn-tree_.$treeId.tsx`**, not `spawn-tree.$treeId.tsx`. TanStack file-routing
+  nests `spawn-tree.$treeId` *under* `spawn-tree.tsx` (child route → only renders through an
+  `<Outlet/>` in the overview, which Part 2 doesn't want). The trailing-underscore form is the
+  documented "non-nested" escape hatch and yields the same URL, `/spawn-tree/$treeId`, as a
+  root-level route. `src/routeTree.gen.ts` was regenerated with the router-generator and the
+  TanStack Start `Register` tail block re-appended (the plain generator omits it; the Start
+  plugin adds it at build time — dropping it changes `Link` typing project-wide).
+- **2026-09-12 (UI node #142) — payload details the contract left implicit, pinned so Part 1
+  matches the UI's types (`src/lib/cockpit-api.ts`):**
+  - `SpawnTaskLite` = `{ id?, thread_ext, parent_thread_ext?, label, status, model, turn_count,
+    created_at?, updated_at }` (a `spawn_tasks` row minus `result`/`error`). UI keys on `thread_ext`.
+  - `GET /spawn-monitor/trees/:id` → `{ "tree": <hopper_trees row>, "nodes": [ ...node + spawns ] }`
+    — same envelope as the existing `GET /hopper-trees/:id`. The UI derives counts client-side
+    from `nodes[].status`, so `tree` needs no `counts`.
+  - `POST /hopper-nodes/:id/retry` returns `{ node }`; archive/unarchive return `{ tree }`. The
+    UI ignores the bodies and re-fetches, so any 2xx JSON works; errors must use the standard
+    `{ error: { code, message } }` envelope (`CockpitApiError` reads `.message`).
+  - `answerHopperNode(id, answer)` already existed in `cockpit-api.ts` (Foundry drawer); reused,
+    not duplicated.

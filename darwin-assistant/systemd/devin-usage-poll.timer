@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll Devin ACU usage every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

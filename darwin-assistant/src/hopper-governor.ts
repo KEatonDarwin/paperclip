@@ -36,6 +36,7 @@ const STALE_MINUTES = num(process.env.HOPPER_GOV_STALE_MIN, 10);
 const USAGE_FILE = process.env.CLAUDE_USAGE_FILE ?? '/tmp/claude-usage-live.json';
 const CODEX_USAGE_FILE = process.env.CODEX_USAGE_FILE ?? '/tmp/codex-usage-live.json';
 const AUGGIE_USAGE_FILE = process.env.AUGGIE_USAGE_FILE ?? '/tmp/auggie-usage-live.json';
+const DEVIN_USAGE_FILE = process.env.DEVIN_USAGE_FILE ?? '/tmp/devin-usage-live.json';
 // Mirrors hopper-engine's WORKER_ADAPTER default so a null/unset node adapter
 // classifies the same way here as it spawns there.
 const WORKER_DEFAULT_ADAPTER = process.env.HOPPER_WORKER_ADAPTER ?? 'claude';
@@ -92,6 +93,14 @@ function codexCeiling(): number {
 function auggieCeiling(): number {
   // Stops new Auggie claims at/above 85% burned — Augment was ~80% tonight.
   return numSetting('auggie_ceiling', 85, ['HOPPER_GOV_AUGGIE_CEILING']);
+}
+function devinCeiling(): number {
+  const pool = Number(getSetting('devin_acu_pool') ?? process.env.DEVIN_ACU_POOL ?? '');
+  const ceiling = Number(getSetting('gov_devin_acu_ceiling') ?? process.env.GOV_DEVIN_ACU_CEILING ?? process.env.HOPPER_GOV_DEVIN_ACU_CEILING ?? '');
+  if (Number.isFinite(pool) && pool > 0 && Number.isFinite(ceiling) && ceiling >= 0) {
+    return Math.max(0, Math.min(100, (ceiling / pool) * 100));
+  }
+  return 100;
 }
 /** Exported so dispatchTick can apply the active-window non-Claude cap without
  *  round-tripping through a full governorCheck() evaluation + its logging. */
@@ -230,7 +239,7 @@ function providerMeters(): Record<Exclude<GovernorProvider, 'claude'>, ProviderM
   return {
     codex: { file: CODEX_USAGE_FILE, ceiling: codexCeiling },
     auggie: { file: AUGGIE_USAGE_FILE, ceiling: auggieCeiling },
-    devin: { file: null, ceiling: () => 100 },
+    devin: { file: DEVIN_USAGE_FILE, ceiling: devinCeiling },
   };
 }
 

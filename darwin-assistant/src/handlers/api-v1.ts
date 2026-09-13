@@ -600,6 +600,12 @@ type CodexProviderUsage = {
   email: string | null;
   source: string | null;
   updated_at: number;
+  status?: string | null;
+  used_acus?: number | null;
+  pool_acus?: number | null;
+  ceiling_acus?: number | null;
+  cycle_start?: string | null;
+  cycle_end?: string | null;
   error?: string | null;
 };
 
@@ -748,6 +754,61 @@ function readAugmentUsage(): CodexProviderUsage | null {
       email: typeof raw.email === 'string' ? raw.email : null,
       source: typeof raw.source === 'string' ? raw.source : null,
       updated_at: typeof raw.updated_at === 'number' ? raw.updated_at : Math.floor(st.mtimeMs / 1000),
+      error: typeof raw.error === 'string' ? raw.error : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readDevinUsage(): CodexProviderUsage | null {
+  const LIVE_PATH = process.env.DEVIN_USAGE_FILE ?? '/tmp/devin-usage-live.json';
+  try {
+    const st = statSync(LIVE_PATH);
+    const raw = JSON.parse(readFileSync(LIVE_PATH, 'utf8')) as {
+      windows?: Array<Partial<ProviderUsageWindow>>;
+      plan?: string | null;
+      email?: string | null;
+      source?: string | null;
+      updated_at?: number;
+      status?: string | null;
+      used_acus?: number | null;
+      pool_acus?: number | null;
+      ceiling_acus?: number | null;
+      cycle_start?: string | null;
+      cycle_end?: string | null;
+      error?: string | null;
+    };
+    const windows = Array.isArray(raw.windows)
+      ? raw.windows
+          .map((w): ProviderUsageWindow | null => {
+            const usedPercentage = typeof w.used_percentage === 'number' ? w.used_percentage : null;
+            const resetsAt = typeof w.resets_at === 'number' ? w.resets_at : null;
+            const label = typeof w.label === 'string' && w.label.trim() ? w.label.trim() : undefined;
+            if (usedPercentage == null && resetsAt == null && !w.value_label) return null;
+            return {
+              used_percentage: usedPercentage,
+              resets_at: resetsAt,
+              ...(label ? { label } : {}),
+              value_label: typeof w.value_label === 'string' ? w.value_label : null,
+              detail: typeof w.detail === 'string' ? w.detail : null,
+            };
+          })
+          .filter((w): w is ProviderUsageWindow => w != null)
+      : [];
+    if (!windows.length && !raw.error) return null;
+    return {
+      windows,
+      plan: typeof raw.plan === 'string' ? raw.plan : null,
+      email: typeof raw.email === 'string' ? raw.email : null,
+      source: typeof raw.source === 'string' ? raw.source : null,
+      updated_at: typeof raw.updated_at === 'number' ? raw.updated_at : Math.floor(st.mtimeMs / 1000),
+      status: typeof raw.status === 'string' ? raw.status : null,
+      used_acus: typeof raw.used_acus === 'number' ? raw.used_acus : null,
+      pool_acus: typeof raw.pool_acus === 'number' ? raw.pool_acus : null,
+      ceiling_acus: typeof raw.ceiling_acus === 'number' ? raw.ceiling_acus : null,
+      cycle_start: typeof raw.cycle_start === 'string' ? raw.cycle_start : null,
+      cycle_end: typeof raw.cycle_end === 'string' ? raw.cycle_end : null,
       error: typeof raw.error === 'string' ? raw.error : null,
     };
   } catch {
@@ -996,6 +1057,7 @@ export function createApiV1Router(): Router {
       claude: readClaudeLiveUsage(),
       openai_codex: readCodexUsage(),
       augment: readAugmentUsage(),
+      devin: readDevinUsage(),
     });
   });
 

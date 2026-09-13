@@ -1,0 +1,9 @@
+[Unit]
+Description=Poll Devin ACU usage for JARVIS
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/kevin/paperclip/darwin-assistant
+EnvironmentFile=/home/kevin/paperclip/darwin-assistant/.env
+Environment=DEVIN_USAGE_FILE=/tmp/devin-usage-live.json
+ExecStart=/usr/bin/env node dist/scripts/poll-devin-usage.js

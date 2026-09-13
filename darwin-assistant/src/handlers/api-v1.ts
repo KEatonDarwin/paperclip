@@ -68,6 +68,17 @@ import {
   type HopperStatus,
 } from '../hopper.js';
 import {
+  listDevinJobs,
+  getDevinJob,
+  serializeDevinJob,
+  resolveDevinConcurrencyGate,
+  resolveDevinAcuGate,
+  createDevinJobAndDispatch,
+  sendDevinJobMessageAndSync,
+  DevinSessionMissing,
+} from '../devin-jobs.js';
+import { hasDevinKey, DevinKeyMissing, DEVIN_MODES, type DevinMode } from '../devin-client.js';
+import {
   INTEL_LANES,
   createIntelRun,
   getActiveIntelRun,
@@ -305,6 +316,12 @@ const GOVERNOR_SETTING_SPECS: Record<string, { type: 'number' } | { type: 'enum'
   gov_codex_ceiling: { type: 'number' },
   gov_auggie_ceiling: { type: 'number' },
   gov_concurrency_cap: { type: 'number' },
+  // Devin jobs spend guards (docs/devin-jobs/CONTRACT.md section 6.2) — read
+  // directly by resolveDevinConcurrencyGate/resolveDevinAcuGate in
+  // devin-jobs.ts, not by hopper-governor.ts. Listed here only so the same
+  // GET/PATCH /hopper-engine/settings surface can read and save them.
+  devin_max_concurrent: { type: 'number' },
+  gov_devin_acu_ceiling: { type: 'number' },
 };
 const GOVERNOR_SETTING_KEYS = Object.keys(GOVERNOR_SETTING_SPECS);
 
@@ -1771,6 +1788,153 @@ export function createApiV1Router(): Router {
     const out = buildFoundryAdvisor(paramString(req.params.id), paramString(req.params.key));
     if (!out) { res.status(404).json({ error: { code: 'not_found', message: 'project or module not found' } }); return; }
     res.json(out);
+  });
+
+  // == Devin Jobs (Devin cloud-session dispatch, docs/devin-jobs/CONTRACT.md) ==
+  // Global list, not thread-scoped. A job is a Devin v3 cloud session created
+  // on Kevin's DEVIN_API_KEY, spend-gated by local concurrency + ACU-ceiling
+  // settings-KV, and reconciled every 60s (src/devin-jobs-reconciler.ts). A
+  // missing key is a normal, non-crashing state — every route below degrades
+  // to a clear 409 rather than exploding.
+
+  router.get('/devin/jobs', (req: AuthedRequest, res) => {
+    const raw = typeof req.query.status === 'string' ? req.query.status : 'all';
+    const status: 'active' | 'settled' | 'all' = raw === 'active' || raw === 'settled' ? raw : 'all';
+    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : 100;
+    const items = listDevinJobs(status, Number.isFinite(limit) ? limit : 100).map(serializeDevinJob);
+    const concurrency = resolveDevinConcurrencyGate();
+    const acu = resolveDevinAcuGate();
+    res.json({
+      items,
+      config: {
+        key_ready: hasDevinKey(),
+        max_concurrent: concurrency.max_concurrent,
+        active_jobs: concurrency.active_jobs,
+        cycle_acus_used: acu.cycle_acus_used,
+        acu_ceiling: acu.acu_ceiling,
+      },
+    });
+  });
+
+  router.post('/devin/jobs', (req: AuthedRequest, res) => {
+    if (!hasDevinKey()) {
+      sendError(
+        res,
+        409,
+        'devin_key_missing',
+        'DEVIN_API_KEY is not configured. Mint one in app.devin.ai -> Settings -> API Keys and add it to darwin-assistant/.env.',
+      );
+      return;
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const title = typeof body.title === 'string' ? body.title.trim() : '';
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+    if (!title || title.length > 160) {
+      sendError(res, 400, 'invalid_request', 'title is required, non-empty, and max 160 characters');
+      return;
+    }
+    if (!prompt) {
+      sendError(res, 400, 'invalid_request', 'prompt is required and must be a non-empty string');
+      return;
+    }
+    const devinMode = typeof body.devin_mode === 'string' && DEVIN_MODES.includes(body.devin_mode as DevinMode)
+      ? (body.devin_mode as DevinMode)
+      : 'lite';
+    const schema =
+      body.schema && typeof body.schema === 'object' && !Array.isArray(body.schema)
+        ? (body.schema as Record<string, unknown>)
+        : null;
+    const extraTags = Array.isArray(body.tags) ? body.tags.filter((t): t is string => typeof t === 'string') : [];
+    if (extraTags.length > 50) {
+      sendError(res, 400, 'invalid_request', 'tags: max 50 extra tags after system tags');
+      return;
+    }
+    let nodeId: number | null = null;
+    if (body.node_id !== undefined && body.node_id !== null) {
+      const n = typeof body.node_id === 'number' ? body.node_id : parseInt(String(body.node_id), 10);
+      if (!Number.isFinite(n) || n <= 0) {
+        sendError(res, 400, 'invalid_request', 'node_id must be a positive integer');
+        return;
+      }
+      nodeId = n;
+    }
+    const threadExt = typeof body.thread_ext === 'string' && body.thread_ext.trim() ? body.thread_ext.trim() : null;
+
+    const concurrency = resolveDevinConcurrencyGate();
+    if (concurrency.blocked) {
+      sendError(
+        res,
+        409,
+        'devin_concurrency_limit',
+        `Devin already has ${concurrency.active_jobs} active job(s) (limit ${concurrency.max_concurrent}). Wait for one to settle or raise devin_max_concurrent.`,
+      );
+      return;
+    }
+    const acu = resolveDevinAcuGate();
+    if (acu.blocked) {
+      sendError(
+        res,
+        409,
+        'devin_acu_ceiling',
+        `Devin ACU ceiling reached for the current cycle (${acu.cycle_acus_used} used, ceiling ${acu.acu_ceiling}). Raise gov_devin_acu_ceiling or devin_acu_pool to allow more.`,
+      );
+      return;
+    }
+
+    createDevinJobAndDispatch({ title, prompt, devinMode, schema, tags: extraTags, nodeId, threadExt })
+      .then((row) => res.status(201).json({ job: serializeDevinJob(row) }))
+      .catch((err) => {
+        if (err instanceof DevinKeyMissing) {
+          sendError(res, 409, 'devin_key_missing', err.message);
+          return;
+        }
+        const message = err instanceof Error ? err.message : 'Devin session create failed';
+        sendError(res, 502, 'devin_create_failed', message);
+      });
+  });
+
+  router.post('/devin/jobs/:id/message', (req: AuthedRequest, res) => {
+    if (!hasDevinKey()) {
+      sendError(
+        res,
+        409,
+        'devin_key_missing',
+        'DEVIN_API_KEY is not configured. Mint one in app.devin.ai -> Settings -> API Keys and add it to darwin-assistant/.env.',
+      );
+      return;
+    }
+    const id = parseInt(String(req.params.id), 10);
+    const job = getDevinJob(id);
+    if (!job) {
+      sendError(res, 404, 'devin_job_not_found', 'devin job not found');
+      return;
+    }
+    if (!job.session_id) {
+      sendError(res, 409, 'devin_session_missing', 'This job has no Devin session yet (create is still in flight or failed).');
+      return;
+    }
+    const body = (req.body ?? {}) as { message?: unknown };
+    const message = typeof body.message === 'string' ? body.message.trim() : '';
+    if (!message) {
+      sendError(res, 400, 'invalid_request', 'message is required and must be a non-empty string');
+      return;
+    }
+
+    sendDevinJobMessageAndSync(id, message)
+      .then((row) => res.json({ job: serializeDevinJob(row) }))
+      .catch((err) => {
+        if (err instanceof DevinKeyMissing) {
+          sendError(res, 409, 'devin_key_missing', err.message);
+          return;
+        }
+        if (err instanceof DevinSessionMissing) {
+          sendError(res, 409, 'devin_session_missing', err.message);
+          return;
+        }
+        const message2 = err instanceof Error ? err.message : 'Devin message send failed';
+        sendError(res, 502, 'devin_message_failed', message2);
+      });
   });
 
   // == Task Hopper (candidate tasks awaiting Kevin's yes/dismiss) ==============
@@ -3981,7 +4145,7 @@ export function createApiV1Router(): Router {
       'quick_capture', 'thread_summary', 'notification',
       'dispatch', 'dispatch_cue', 'hopper_item', 'hopper_node', 'smart_todo',
       'monitor', 'monitor_run', 'foundry_project', 'foundry_module',
-      'intel_run', 'intel_item',
+      'intel_run', 'intel_item', 'devin_job',
     ]);
 
     res.writeHead(200, {

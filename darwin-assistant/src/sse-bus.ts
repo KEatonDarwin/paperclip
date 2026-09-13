@@ -15,6 +15,7 @@ import type { SmartTodoNodeRow } from './smart-todos.js';
 import type { MonitorRow, MonitorRunRow } from './monitors.js';
 import type { FoundryModuleResponse, FoundryProjectResponse } from './foundry.js';
 import type { IntelItem, IntelRun } from './intel-desk.js';
+import type { DevinJobRow } from './devin-jobs.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -282,6 +283,15 @@ export interface IntelItemEvent {
   item: IntelItem;
 }
 
+// DEVIN JOBS — Devin cloud-session dispatch board (docs/devin-jobs/CONTRACT.md).
+// Global, not conversation-scoped — same treatment as HopperItemEvent. Fired
+// on job create, any field sync from Devin, message send, and settle.
+export interface DevinJobEvent {
+  type: 'devin_job';
+  action: 'created' | 'updated';
+  job: DevinJobRow;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
@@ -293,7 +303,7 @@ export type SSEEvent =
   | ThreadGroupEvent | NotificationEvent
   | DispatchEvent | DispatchCueEvent | HopperItemEvent | HopperNodeEvent | SmartTodoEvent
   | MonitorEvent | MonitorRunEvent | FoundryProjectEvent | FoundryModuleEvent
-  | IntelRunEvent | IntelItemEvent;
+  | IntelRunEvent | IntelItemEvent | DevinJobEvent;
 
 class SSEBus extends EventEmitter {}
 

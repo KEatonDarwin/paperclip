@@ -12,6 +12,7 @@ import { shutdownActiveRuns, processMessage, abortConversationRun } from './agen
 import { startHopperEngine } from './hopper-engine.js';
 import { startFoundry } from './foundry.js';
 import { startMonitorScheduler } from './monitors.js';
+import { startDevinJobsReconciler } from './devin-jobs-reconciler.js';
 
 const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT ?? '3200', 10);
 const SLACK_ENABLED = !!(process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN);
@@ -116,6 +117,10 @@ async function main() {
   // fire on node state writes); the 60s interval inside is only the safety net.
   startHopperEngine(processMessage);
   startFoundry();
+
+  // Devin cloud-job reconciler — 60s tick, graceful no-op when DEVIN_API_KEY
+  // is absent (docs/devin-jobs/CONTRACT.md).
+  startDevinJobsReconciler();
 
   // Cockpit Monitors — cheap scheduled prompt-check agents. Runs through the
   // same processMessage/local-CLI adapter seam as normal cockpit threads.

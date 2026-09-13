@@ -440,6 +440,19 @@ function spawnIntelRunner(runId: number, lanes: IntelLane[]): void {
       summary: 'Intel Desk runner failed to launch',
     });
   });
+  // Detached + unref'd so a jarvis.service restart doesn't kill a pull mid-lane,
+  // but while we ARE alive we still reap the child (no zombie) and catch a
+  // runner that died before reporting — otherwise the run would sit
+  // queued/running and the single-active-run guard would 409 every "Pull now"
+  // until the stale sweep caught it.
+  child.on('exit', (code, signal) => {
+    const run = getIntelRun(runId);
+    if (!run || (run.status !== 'queued' && run.status !== 'running')) return;
+    updateIntelRunStatus(runId, 'failed', {
+      error: `runner exited before reporting (code ${code ?? 'null'}, signal ${signal ?? 'null'})`,
+      summary: run.summary ?? 'Intel Desk runner died mid-pull',
+    });
+  });
   child.unref();
 }
 

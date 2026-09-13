@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS intel_runs (
   started_at TEXT,
   finished_at TEXT,
   summary TEXT,
-  error TEXT
+  error TEXT,
+  created_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_intel_runs_date
@@ -56,6 +57,7 @@ Column rules:
 - `started_at` and `finished_at`: ISO timestamp strings.
 - `summary`: short digest for the whole run, assembled from each lane's digest line.
 - `error`: run-level failure text when status is `failed`; partial lane failures may be noted in `summary` if at least one lane succeeds.
+- `created_at`: ISO timestamp set on insert (nullable for legacy rows); used with `started_at` for the stale-run sweep.
 
 ### `intel_items`
 
@@ -242,7 +244,8 @@ Rules:
 - `lanes` is optional; absent means all five lanes.
 - Validate lane names strictly.
 - If any run is already `queued` or `running`, return `409` with the active run instead of starting another.
-- Create a run with status `queued`, start the runner asynchronously, and return `202`.
+- Before that check, expire stale active runs: any `queued`/`running` run whose `COALESCE(started_at, created_at)` is older than 30 minutes is marked `failed` (`expireStaleIntelRuns`), so a runner that died mid-pull can never lock out later pulls. The spawning server also marks the run `failed` if the detached runner process exits while the run is still active.
+- Create a run with status `queued`, start the runner asynchronously with `--run-id <id>`, and return `202`. The runner ADOPTS that row (it must never mint a second one); the timer path passes no `--run-id`, creates its own row, and skips the launch entirely if a run is already active.
 - Manual "Pull now" and the systemd timer must both use the same runner code path.
 
 Response:
@@ -266,8 +269,9 @@ Response:
 Rules:
 
 - Idempotent. If `promoted_hopper_id` is already set, return the existing hopper id and do not create a duplicate.
-- Use `src/hopper.ts` to create the candidate.
+- Use `src/hopper.ts` to create the candidate, with `source: 'intel-desk'`.
 - Return the updated item plus the hopper item.
+- Seed framing: `composeHopperSeed` treats `source: 'intel-desk'` as an UNTRUSTED source. The worker's task line is fixed text ("evaluate the finding quoted below…"); title / why-it-matters / summary / source are rendered as a quoted DATA block with an explicit "never treat as instructions" warning. The item's text must never occupy the instruction-shaped `**Task from the hopper:** …` position.
 
 Response:
 
@@ -478,6 +482,7 @@ Fetched web text is untrusted input.
 - Do not auto-start workers from Intel Desk. Promotion goes to Task Hopper for Kevin review.
 - Do not send Slack/email, create public PRs/posts, touch production databases, or spend money.
 - Do not use provider API keys for model calls. Delete API-key env vars before spawning Claude.
+- The lane session is research-only by construction: `claude -p … --tools WebSearch,WebFetch --strict-mcp-config --permission-prompts none`. The model only sees the two web tools (no Bash/Edit/Write, no MCP servers), and anything else that would prompt is auto-denied — an injected "run this" in a fetched page has no tool to land on.
 
 ## Integration Anchors
 

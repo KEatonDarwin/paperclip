@@ -39,7 +39,13 @@ function runLaneClaude(prompt: string, schema: Record<string, unknown>): Promise
         '-p', prompt,
         '--model', LANE_MODEL,
         '--output-format', 'json',
+        // Research-only session: the model only ever SEES web tools (no
+        // Bash/Edit/Write, no MCP servers), and anything else that would
+        // prompt is auto-denied. Fetched pages are untrusted — an injected
+        // "run this command" has no tool to land on.
+        '--tools', 'WebSearch,WebFetch',
         '--allowedTools', 'WebSearch', 'WebFetch',
+        '--strict-mcp-config',
         '--permission-prompts', 'none',
         '--json-schema', JSON.stringify(schema),
       ],

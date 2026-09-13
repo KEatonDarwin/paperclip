@@ -38,6 +38,7 @@ export interface IntelRun {
   finished_at: string | null;
   summary: string | null;
   error: string | null;
+  created_at?: string | null;
 }
 
 export interface IntelItem {
@@ -77,6 +78,9 @@ export interface IntelStoreModule {
   createIntelRun(runDate: string): IntelRun;
   updateIntelRunStatus(id: number, status: IntelRunStatus, fields?: IntelRunStatusFields): IntelRun | null;
   getIntelRun(id: number): IntelRun | null;
+  /** Optional (real backend only): the single queued/running run, after
+   *  expiring stale ones. The fallback store has no stale sweep, so it omits it. */
+  getActiveIntelRun?(): IntelRun | null;
   createIntelItems(runId: number, items: NewIntelItem[]): IntelItem[];
 }
 
@@ -94,7 +98,8 @@ function buildFallbackStore(): IntelStoreModule {
       started_at TEXT,
       finished_at TEXT,
       summary TEXT,
-      error TEXT
+      error TEXT,
+      created_at TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_intel_runs_date
@@ -130,8 +135,8 @@ function buildFallbackStore(): IntelStoreModule {
       ON intel_items(promoted_hopper_id);
   `);
 
-  const insertRunStmt = sqliteDb.prepare<[string]>(
-    `INSERT INTO intel_runs (run_date, status) VALUES (?, 'queued')`,
+  const insertRunStmt = sqliteDb.prepare<[string, string]>(
+    `INSERT INTO intel_runs (run_date, status, created_at) VALUES (?, 'queued', ?)`,
   );
   const getRunStmt = sqliteDb.prepare<[number], IntelRun>(`SELECT * FROM intel_runs WHERE id = ?`);
   const updateRunStatusStmt = sqliteDb.prepare<
@@ -178,7 +183,7 @@ function buildFallbackStore(): IntelStoreModule {
 
   return {
     createIntelRun(runDate: string): IntelRun {
-      const info = insertRunStmt.run(runDate);
+      const info = insertRunStmt.run(runDate, new Date().toISOString());
       const run = getRunStmt.get(Number(info.lastInsertRowid));
       if (!run) throw new Error('Failed to load intel run after insert');
       emitRun('created', run);

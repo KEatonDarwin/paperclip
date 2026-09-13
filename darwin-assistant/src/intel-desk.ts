@@ -25,6 +25,7 @@ export interface IntelRun {
   finished_at: string | null;
   summary: string | null;
   error: string | null;
+  created_at: string | null;
 }
 
 export interface IntelItem {
@@ -75,7 +76,8 @@ sqliteDb.exec(`
     started_at  TEXT,
     finished_at TEXT,
     summary     TEXT,
-    error       TEXT
+    error       TEXT,
+    created_at  TEXT
   );
 
   CREATE INDEX IF NOT EXISTS idx_intel_runs_date
@@ -121,6 +123,7 @@ sqliteDb.exec(`
 for (const col of [
   'summary TEXT',
   'error TEXT',
+  'created_at TEXT',
 ]) {
   try { sqliteDb.exec(`ALTER TABLE intel_runs ADD COLUMN ${col}`); } catch {}
 }
@@ -152,9 +155,19 @@ const listRunsByStatusStmt = sqliteDb.prepare<[IntelRunStatus, number], IntelRun
   ORDER BY run_date DESC, id DESC
   LIMIT ?
 `);
-const insertRunStmt = sqliteDb.prepare<[string, IntelRunStatus]>(`
-  INSERT INTO intel_runs (run_date, status)
-  VALUES (?, ?)
+const insertRunStmt = sqliteDb.prepare<[string, IntelRunStatus, string]>(`
+  INSERT INTO intel_runs (run_date, status, created_at)
+  VALUES (?, ?, ?)
+`);
+// Runs whose runner died without reporting (crash, SIGKILL, host reboot)
+// would otherwise sit queued/running forever and lock out every later pull
+// via the single-active-run guard. Anything older than this is a corpse.
+const STALE_RUN_MS = 30 * 60 * 1000;
+const staleActiveRunsStmt = sqliteDb.prepare<[string], IntelRun>(`
+  SELECT * FROM intel_runs
+  WHERE status IN ('queued', 'running')
+    AND COALESCE(started_at, created_at) IS NOT NULL
+    AND COALESCE(started_at, created_at) < ?
 `);
 const updateRunStmt = sqliteDb.prepare<[
   IntelRunStatus,
@@ -307,7 +320,24 @@ export function getIntelRun(id: number): IntelRun | null {
   return getRunStmt.get(id) ?? null;
 }
 
+/** Mark queued/running runs that are older than STALE_RUN_MS as failed.
+ *  Returns the runs it expired. Called before every active-run check so a
+ *  dead runner can never permanently block "Pull now" or the daily timer. */
+export function expireStaleIntelRuns(maxAgeMs = STALE_RUN_MS): IntelRun[] {
+  const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+  const expired: IntelRun[] = [];
+  for (const run of staleActiveRunsStmt.all(cutoff)) {
+    const updated = updateIntelRunStatus(run.id, 'failed', {
+      error: `stale: runner never reported completion within ${Math.round(maxAgeMs / 60000)} min`,
+      summary: run.summary ?? 'Intel Desk run expired (runner died or hung)',
+    });
+    if (updated) expired.push(updated);
+  }
+  return expired;
+}
+
 export function getActiveIntelRun(): IntelRun | null {
+  expireStaleIntelRuns();
   return activeRunStmt.get() ?? null;
 }
 
@@ -324,7 +354,7 @@ export function createIntelRun(args: {
   const runDate = typeof args === 'string' ? args : args.run_date;
   const status = typeof args === 'string' ? 'queued' : args.status ?? 'queued';
   if (!isIntelRunStatus(status)) throw new Error('invalid intel run status');
-  const info = insertRunStmt.run(runDate ?? intelRunDate(), status);
+  const info = insertRunStmt.run(runDate ?? intelRunDate(), status, nowIso());
   const created = getIntelRun(Number(info.lastInsertRowid));
   if (!created) throw new Error('Failed to load intel run after insert');
   emitRun('created', created);

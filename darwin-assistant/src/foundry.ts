@@ -1,5 +1,6 @@
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { getConversation, getOrCreateConversation, setThreadModelOverride, sqliteDb } from './conversation-db.js';
 import { getFoundrySetting } from './foundry-settings.js';
@@ -229,14 +230,43 @@ interface BlueprintModule {
   depends_on: string[];
 }
 
+interface FoundryFoundationCheck {
+  cmd: string;
+  expect_regex?: string;
+}
+
+interface FoundryFoundation {
+  stack: string;
+  scaffold_cmd: string;
+  checks: FoundryFoundationCheck[];
+}
+
 interface Blueprint {
   name: string;
   prompt: string;
+  foundation?: FoundryFoundation;
   modules: BlueprintModule[];
   wiring: unknown[];
   integration: { test: string; docs?: string };
   run: { command: string; preview_url?: string };
   assumptions?: string[];
+}
+
+interface FoundationCheckResult {
+  cmd: string;
+  ok: boolean;
+  exitCode: number | null;
+  timedOut: boolean;
+  output: string;
+  expect_regex?: string;
+  error?: string;
+}
+
+interface ShellCommandResult {
+  exitCode: number | null;
+  timedOut: boolean;
+  output: string;
+  error?: string;
 }
 
 const PROJECT_STATUSES: FoundryProjectStatus[] = ['draft', 'planning', 'planned', 'building', 'integrating', 'ready', 'launched', 'blocked'];
@@ -270,6 +300,17 @@ const CONTRACT_RESOLUTION_RULE = [
   'blocked_question is reserved only for cases where the contract is silent AND the choice changes user-visible behavior with no sane default.',
   'Interface, shape, error-code, naming, and test-vs-contract conflicts must be resolved toward the contract and DECISIONS.md, never sent to Kevin as a question.',
 ].join('\n');
+
+const FRAMEWORK_PROMPT_RE =
+  /\b(laravel|rails|ruby on rails|django|next(?:\.js)?|nuxt|sveltekit|phoenix|express(?:\.js)?(?:\s+(?:app|application|server|shell))?|nestjs|fastapi|flask|spring boot)\b/i;
+const FORBIDDEN_FOUNDATION_CHECK_RE =
+  /\b(artisan\s+migrate|migrate(?::|$|\s)|db:wipe|db:seed|drop\s+(?:database|table)|truncate\s+table|rm\s+-rf|git\s+reset|git\s+clean|supabase\s+db\s+(?:push|reset))\b/i;
+const FOUNDATION_CHECK_TIMEOUT_MS = Math.max(
+  1_000,
+  parseInt(process.env.FOUNDRY_FOUNDATION_CHECK_TIMEOUT_MS ?? '120000', 10) || 120_000,
+);
+const FOUNDATION_PATH_PREFIX = '/home/kevin/.local/bin:/home/kevin/.npm-global/bin:/usr/local/bin:/usr/bin:/bin';
+const FOUNDATION_OUTPUT_TAIL_BYTES = 12_000;
 
 sqliteDb.exec(`
   CREATE TABLE IF NOT EXISTS foundry_projects (
@@ -633,6 +674,51 @@ function git(args: string[], cwd: string): void {
   execFileSync('git', args, { cwd, stdio: 'ignore', timeout: 30_000 });
 }
 
+function gitText(args: string[], cwd: string): string {
+  return execFileSync('git', args, { cwd, encoding: 'utf8', timeout: 30_000 });
+}
+
+function outputTail(text: string, maxBytes = FOUNDATION_OUTPUT_TAIL_BYTES): string {
+  const buf = Buffer.from(text, 'utf8');
+  if (buf.length <= maxBytes) return text.trim();
+  return `…(truncated)\n${buf.subarray(buf.length - maxBytes).toString('utf8').trim()}`;
+}
+
+function foundationEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.ANTHROPIC_API_KEY;
+  delete env.OPENAI_API_KEY;
+  delete env.GEMINI_API_KEY;
+  delete env.GOOGLE_API_KEY;
+  env.PATH = env.PATH ? `${FOUNDATION_PATH_PREFIX}:${env.PATH}` : FOUNDATION_PATH_PREFIX;
+  return env;
+}
+
+function runFoundationShell(cmd: string, cwd: string, timeoutMs = FOUNDATION_CHECK_TIMEOUT_MS): ShellCommandResult {
+  const result = spawnSync('/bin/bash', ['-lc', cmd], {
+    cwd,
+    env: foundationEnv(),
+    encoding: 'utf8',
+    timeout: timeoutMs,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  const stdout = typeof result.stdout === 'string' ? result.stdout : '';
+  const stderr = typeof result.stderr === 'string' ? result.stderr : '';
+  const output = outputTail([stdout, stderr].filter(Boolean).join('\n'));
+  const error = result.error instanceof Error ? result.error.message : undefined;
+  return {
+    exitCode: typeof result.status === 'number' ? result.status : null,
+    timedOut: (result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT',
+    output,
+    error,
+  };
+}
+
+function ensureGitIdentity(repoPath: string): void {
+  try { git(['config', 'user.name', 'JARVIS Foundry'], repoPath); } catch {}
+  try { git(['config', 'user.email', 'jarvis-foundry@local'], repoPath); } catch {}
+}
+
 function scaffoldRepo(repoPath: string, name: string, prompt: string, baseBranch: string): void {
   fs.mkdirSync(repoPath, { recursive: true });
   try {
@@ -728,13 +814,59 @@ function normalizeModuleSpec(input: unknown): unknown {
   return normalized;
 }
 
+function normalizeFoundationCheck(input: unknown): unknown {
+  if (!isRecord(input)) return input;
+  const normalized: Record<string, unknown> = {
+    cmd: typeof input.cmd === 'string' ? input.cmd.trim() : input.cmd,
+  };
+  if (Object.prototype.hasOwnProperty.call(input, 'expect_regex')) {
+    normalized.expect_regex = typeof input.expect_regex === 'string'
+      ? input.expect_regex.trim()
+      : input.expect_regex;
+  }
+  return normalized;
+}
+
+function normalizeFoundationSpec(input: unknown): unknown {
+  if (input == null) return undefined;
+  if (!isRecord(input)) return input;
+  return {
+    stack: typeof input.stack === 'string' ? input.stack.trim() : input.stack,
+    scaffold_cmd: typeof input.scaffold_cmd === 'string' ? input.scaffold_cmd.trim() : input.scaffold_cmd,
+    checks: Array.isArray(input.checks) ? input.checks.map(normalizeFoundationCheck) : input.checks,
+  };
+}
+
 function normalizeBlueprint(input: unknown): Blueprint | null {
   if (!isRecord(input)) return null;
   if (!Array.isArray(input.modules)) return null;
-  return {
+  const normalized: Record<string, unknown> = {
     ...input,
     modules: input.modules.map(normalizeModuleSpec),
-  } as unknown as Blueprint;
+  };
+  if (Object.prototype.hasOwnProperty.call(input, 'foundation')) {
+    normalized.foundation = normalizeFoundationSpec(input.foundation);
+  }
+  return normalized as unknown as Blueprint;
+}
+
+function blueprintLooksLikeFrameworkApp(bp: Blueprint): boolean {
+  const parts: string[] = [
+    bp.name,
+    bp.prompt,
+    bp.integration?.test,
+    bp.run?.command,
+    ...(Array.isArray(bp.assumptions) ? bp.assumptions : []),
+  ].filter((part): part is string => typeof part === 'string');
+  for (const mod of Array.isArray(bp.modules) ? bp.modules : []) {
+    if (isRecord(mod)) {
+      for (const field of ['key', 'name', 'kind', 'purpose']) {
+        const value = mod[field];
+        if (typeof value === 'string') parts.push(value);
+      }
+    }
+  }
+  return FRAMEWORK_PROMPT_RE.test(parts.join('\n'));
 }
 
 export function validateBlueprint(input: unknown): { ok: boolean; errors: string[] } {
@@ -748,6 +880,45 @@ export function validateBlueprint(input: unknown): { ok: boolean; errors: string
   if (!Array.isArray(bp.wiring)) errors.push('wiring must be an array');
   if (!isRecord(bp.integration) || !nonEmptyString(bp.integration.test)) errors.push('integration.test is required');
   if (!isRecord(bp.run) || !nonEmptyString(bp.run.command)) errors.push('run.command is required');
+
+  const foundation = Object.prototype.hasOwnProperty.call(bp, 'foundation') ? bp.foundation : undefined;
+  if (foundation != null) {
+    if (!isRecord(foundation)) {
+      errors.push('foundation must be an object when present');
+    } else {
+      if (!nonEmptyString(foundation.stack)) errors.push('foundation.stack is required');
+      if (!nonEmptyString(foundation.scaffold_cmd)) errors.push('foundation.scaffold_cmd is required');
+      if (!Array.isArray(foundation.checks) || foundation.checks.length < 1) {
+        errors.push('foundation.checks must contain at least one check');
+      } else {
+        for (const [i, check] of foundation.checks.entries()) {
+          if (!isRecord(check)) {
+            errors.push(`foundation.checks[${i}] must be an object`);
+            continue;
+          }
+          const checkCmd = nonEmptyString(check.cmd);
+          if (!checkCmd) {
+            errors.push(`foundation.checks[${i}].cmd is required`);
+          } else if (FORBIDDEN_FOUNDATION_CHECK_RE.test(checkCmd)) {
+            errors.push(`foundation.checks[${i}].cmd must be a read-only assertion, not a migration/destructive command`);
+          }
+          if (Object.prototype.hasOwnProperty.call(check, 'expect_regex')) {
+            if (typeof check.expect_regex !== 'string' || !check.expect_regex.trim()) {
+              errors.push(`foundation.checks[${i}].expect_regex must be a non-empty string when present`);
+            } else {
+              try {
+                new RegExp(check.expect_regex);
+              } catch (err) {
+                errors.push(`foundation.checks[${i}].expect_regex is invalid: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            }
+          }
+        }
+      }
+    }
+  } else if (blueprintLooksLikeFrameworkApp(bp)) {
+    errors.push('foundation is required for framework application blueprints');
+  }
 
   const modules = Array.isArray(bp.modules) ? bp.modules : [];
   if (modules.length < 1 || modules.length > 12) errors.push('modules must contain between 1 and 12 modules');
@@ -860,6 +1031,10 @@ export function validateBlueprint(input: unknown): { ok: boolean; errors: string
     visited.add(key);
   };
   for (const key of byKey.keys()) visit(key, []);
+
+  if (foundation != null && isRecord(foundation) && !byKey.has('app-shell')) {
+    errors.push('foundation blueprints must include an app-shell module that owns root framework wiring');
+  }
 
   return { ok: errors.length === 0, errors };
 }
@@ -1134,6 +1309,404 @@ export function deleteProject(id: string): FoundryProjectResponse | null {
 
 function loadBlueprint(project: FoundryProjectRow): Blueprint | null {
   return normalizeBlueprint(parseJson<unknown>(project.blueprint, null));
+}
+
+function foundationFromBlueprint(blueprint: Blueprint | null): FoundryFoundation | null {
+  const raw = blueprint?.foundation;
+  if (!isRecord(raw)) return null;
+  const stack = nonEmptyString(raw.stack);
+  const scaffoldCmd = nonEmptyString(raw.scaffold_cmd);
+  if (!stack || !scaffoldCmd || !Array.isArray(raw.checks)) return null;
+  const checks: FoundryFoundationCheck[] = [];
+  for (const check of raw.checks) {
+    if (!isRecord(check)) return null;
+    const cmd = nonEmptyString(check.cmd);
+    if (!cmd) return null;
+    const expectRegex = Object.prototype.hasOwnProperty.call(check, 'expect_regex')
+      ? nonEmptyString(check.expect_regex)
+      : null;
+    checks.push(expectRegex ? { cmd, expect_regex: expectRegex } : { cmd });
+  }
+  return { stack, scaffold_cmd: scaffoldCmd, checks };
+}
+
+function persistFoundryJson(project: FoundryProjectRow, blueprint: Blueprint): void {
+  fs.writeFileSync(path.join(project.repo_path, 'foundry.json'), `${JSON.stringify(blueprint, null, 2)}\n`);
+}
+
+function gitStatusPaths(repoPath: string): string[] {
+  const status = gitText(['status', '--porcelain'], repoPath);
+  return status
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .map((line) => line.slice(3).split(' -> ').pop()?.trim() ?? line.slice(3).trim())
+    .filter(Boolean);
+}
+
+function commitSelectedIfChanged(repoPath: string, files: string[], message: string): string | null {
+  ensureGitIdentity(repoPath);
+  for (const file of files) {
+    if (fs.existsSync(path.join(repoPath, file))) git(['add', file], repoPath);
+  }
+  try {
+    execFileSync('git', ['diff', '--cached', '--quiet'], { cwd: repoPath, stdio: 'ignore', timeout: 30_000 });
+    return null;
+  } catch {
+    git(['commit', '-m', message], repoPath);
+    return gitText(['rev-parse', 'HEAD'], repoPath).trim();
+  }
+}
+
+function commitAllIfChanged(repoPath: string, message: string): string | null {
+  ensureGitIdentity(repoPath);
+  git(['add', '-A'], repoPath);
+  try {
+    execFileSync('git', ['diff', '--cached', '--quiet'], { cwd: repoPath, stdio: 'ignore', timeout: 30_000 });
+    return null;
+  } catch {
+    git(['commit', '-m', message], repoPath);
+    return gitText(['rev-parse', 'HEAD'], repoPath).trim();
+  }
+}
+
+function readFoundationNote(repoPath: string, sha: string): { scaffold_cmd?: string; stack?: string } | null {
+  try {
+    const raw = gitText(['notes', '--ref=foundry.scaffold', 'show', sha], repoPath).trim();
+    return JSON.parse(raw) as { scaffold_cmd?: string; stack?: string };
+  } catch {
+    return null;
+  }
+}
+
+function writeFoundationNote(repoPath: string, sha: string, foundation: FoundryFoundation, mode: 'scaffold' | 'adopt'): void {
+  const note = JSON.stringify({
+    stack: foundation.stack,
+    scaffold_cmd: foundation.scaffold_cmd,
+    mode,
+    created_at: new Date().toISOString(),
+  }, null, 2);
+  try {
+    execFileSync('git', ['notes', '--ref=foundry.scaffold', 'add', '-f', '-m', note, sha], { cwd: repoPath, stdio: 'ignore', timeout: 30_000 });
+  } catch {
+    // Git notes are an idempotency aid, not the authoritative gate. The DB-owned
+    // blueprint and the FOUNDATION commit subject still control launch/finish.
+  }
+}
+
+function foundationCommitState(repoPath: string, foundation: FoundryFoundation): {
+  current: { sha: string; subject: string; note: { scaffold_cmd?: string; stack?: string } | null } | null;
+  other: { sha: string; subject: string } | null;
+} {
+  let log = '';
+  try {
+    log = gitText(['log', '--format=%H%x09%s'], repoPath);
+  } catch {
+    return { current: null, other: null };
+  }
+  const wantedSubjects = new Set([
+    `FOUNDATION scaffold: ${foundation.stack}`,
+    `FOUNDATION adopt: ${foundation.stack}`,
+  ]);
+  let current: { sha: string; subject: string; note: { scaffold_cmd?: string; stack?: string } | null } | null = null;
+  let other: { sha: string; subject: string } | null = null;
+  for (const line of log.split('\n').filter(Boolean)) {
+    const [sha, ...subjectParts] = line.split('\t');
+    const subject = subjectParts.join('\t');
+    if (!sha || !subject.startsWith('FOUNDATION ')) continue;
+    if (wantedSubjects.has(subject) && !current) {
+      current = { sha, subject, note: readFoundationNote(repoPath, sha) };
+    } else if (/^FOUNDATION (?:scaffold|adopt): /.test(subject) && !wantedSubjects.has(subject) && !other) {
+      other = { sha, subject };
+    }
+  }
+  return { current, other };
+}
+
+function ensureFoundationRepoClean(project: FoundryProjectRow): void {
+  const dirty = gitStatusPaths(project.repo_path).filter((file) => file !== 'foundry.json');
+  if (dirty.length) {
+    throw new FoundryError(
+      409,
+      'foundry_foundation_dirty_repo',
+      `foundation scaffold refused to run because the project repo has dirty files: ${dirty.slice(0, 12).join(', ')}`,
+    );
+  }
+}
+
+function maybeMoveInitialFoundryBootstrap(repoPath: string): { restoreOnFailure: () => void; cleanup: () => void } {
+  const bootstrapEntries = ['foundry.json', 'README.md', 'modules', 'contracts'];
+  const appMarkers = ['artisan', 'composer.json', 'package.json', 'pyproject.toml', 'manage.py', 'app', 'bootstrap', 'routes', 'src'];
+  if (appMarkers.some((entry) => fs.existsSync(path.join(repoPath, entry)))) {
+    return { restoreOnFailure: () => {}, cleanup: () => {} };
+  }
+  const entries = fs.readdirSync(repoPath).filter((entry) => entry !== '.git');
+  if (entries.some((entry) => !bootstrapEntries.includes(entry))) {
+    return { restoreOnFailure: () => {}, cleanup: () => {} };
+  }
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'foundry-bootstrap-'));
+  const moved: string[] = [];
+  for (const entry of bootstrapEntries) {
+    const source = path.join(repoPath, entry);
+    if (!fs.existsSync(source)) continue;
+    fs.renameSync(source, path.join(tmp, entry));
+    moved.push(entry);
+  }
+  return {
+    restoreOnFailure: () => {
+      for (const entry of moved) {
+        const dest = path.join(repoPath, entry);
+        if (!fs.existsSync(dest)) fs.renameSync(path.join(tmp, entry), dest);
+      }
+    },
+    cleanup: () => {
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+    },
+  };
+}
+
+// Foundation checks are a server trust boundary: they are read-only assertions
+// authored into the DB-owned blueprint by the planner. Workers can edit the
+// repo's transparent foundry.json copy, but this runner never trusts it.
+function runFoundationChecksInCwd(cwd: string, foundation: FoundryFoundation): FoundationCheckResult[] {
+  const results: FoundationCheckResult[] = [];
+  for (const check of foundation.checks) {
+    if (FORBIDDEN_FOUNDATION_CHECK_RE.test(check.cmd)) {
+      results.push({
+        cmd: check.cmd,
+        ok: false,
+        exitCode: null,
+        timedOut: false,
+        output: '',
+        expect_regex: check.expect_regex,
+        error: 'foundation checks must be read-only assertions; destructive/migration commands are refused by the server',
+      });
+      break;
+    }
+    let regex: RegExp | null = null;
+    if (check.expect_regex) {
+      try {
+        regex = new RegExp(check.expect_regex);
+      } catch (err) {
+        results.push({
+          cmd: check.cmd,
+          ok: false,
+          exitCode: null,
+          timedOut: false,
+          output: '',
+          expect_regex: check.expect_regex,
+          error: `invalid expect_regex: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        break;
+      }
+    }
+    const shell = runFoundationShell(check.cmd, cwd);
+    const regexOk = regex ? regex.test(shell.output) : true;
+    const ok = !shell.timedOut && shell.exitCode === 0 && regexOk;
+    results.push({
+      cmd: check.cmd,
+      ok,
+      exitCode: shell.exitCode,
+      timedOut: shell.timedOut,
+      output: shell.output,
+      expect_regex: check.expect_regex,
+      error: shell.error || (!regexOk ? `output did not match /${check.expect_regex}/` : undefined),
+    });
+    if (!ok) break;
+  }
+  return results;
+}
+
+function foundationFailureText(foundation: FoundryFoundation, cwd: string, results: FoundationCheckResult[]): string {
+  const failing = results.find((result) => !result.ok) ?? results[results.length - 1];
+  return [
+    'FOUNDATION CHECK FAILED',
+    `Stack: ${foundation.stack}`,
+    `Checkout: ${cwd}`,
+    `Command: ${failing?.cmd ?? '(no command)'}`,
+    failing?.timedOut ? `Timed out after ${FOUNDATION_CHECK_TIMEOUT_MS}ms` : `Exit code: ${failing?.exitCode ?? 'null'}`,
+    failing?.expect_regex ? `Expected output regex: ${failing.expect_regex}` : null,
+    failing?.error ? `Error: ${failing.error}` : null,
+    '',
+    'Output tail:',
+    failing?.output || '(no output)',
+  ].filter((line): line is string => line != null).join('\n');
+}
+
+function blockProjectForFoundation(project: FoundryProjectRow, code: string, message: string): never {
+  const clipped = message.slice(0, 4000);
+  setProjectBlockedStmt.run(clipped, project.id);
+  const updated = getProjectStmt.get(project.id);
+  if (updated) emitProject('updated', updated, projectModulesStmt.all(project.id));
+  createNotification({
+    severity: 'error',
+    title: `🏭 ${project.name} foundation is blocked`,
+    body: clipped.slice(0, 1000),
+    source: 'foundry',
+    link: `/foundry?project=${encodeURIComponent(project.id)}`,
+  });
+  throw new FoundryError(409, code, message);
+}
+
+function runLaunchFoundationChecksOrBlock(project: FoundryProjectRow, foundation: FoundryFoundation): void {
+  const results = runFoundationChecksInCwd(project.repo_path, foundation);
+  if (results.some((result) => !result.ok)) {
+    blockProjectForFoundation(project, 'foundry_foundation_check_failed', foundationFailureText(foundation, project.repo_path, results));
+  }
+}
+
+function runFoundationScaffoldAtLaunch(project: FoundryProjectRow, blueprint: Blueprint): void {
+  const foundation = foundationFromBlueprint(blueprint);
+  if (!foundation) {
+    persistFoundryJson(project, blueprint);
+    commitSelectedIfChanged(project.repo_path, ['foundry.json'], 'foundry: persist blueprint');
+    return;
+  }
+
+  const commitState = foundationCommitState(project.repo_path, foundation);
+  if (commitState.other) {
+    blockProjectForFoundation(
+      project,
+      'foundry_foundation_stack_changed',
+      `foundation scaffold refused to run: repo already has ${commitState.other.subject} (${commitState.other.sha}), but blueprint declares ${foundation.stack}`,
+    );
+  }
+  if (commitState.current?.note?.scaffold_cmd && commitState.current.note.scaffold_cmd !== foundation.scaffold_cmd) {
+    blockProjectForFoundation(
+      project,
+      'foundry_foundation_scaffold_changed',
+      `foundation scaffold refused to run: ${commitState.current.subject} already exists with scaffold_cmd "${commitState.current.note.scaffold_cmd}", but blueprint now declares "${foundation.scaffold_cmd}". Replan instead of rerunning a non-idempotent scaffold.`,
+    );
+  }
+
+  ensureFoundationRepoClean(project);
+
+  if (commitState.current) {
+    persistFoundryJson(project, blueprint);
+    runLaunchFoundationChecksOrBlock(project, foundation);
+    commitSelectedIfChanged(project.repo_path, ['foundry.json'], 'foundry: update blueprint');
+    return;
+  }
+
+  const preScaffoldChecks = runFoundationChecksInCwd(project.repo_path, foundation);
+  if (preScaffoldChecks.length && preScaffoldChecks.every((result) => result.ok)) {
+    persistFoundryJson(project, blueprint);
+    runLaunchFoundationChecksOrBlock(project, foundation);
+    const sha = commitSelectedIfChanged(project.repo_path, ['foundry.json'], `FOUNDATION adopt: ${foundation.stack}`);
+    if (sha) writeFoundationNote(project.repo_path, sha, foundation, 'adopt');
+    return;
+  }
+
+  const bootstrap = maybeMoveInitialFoundryBootstrap(project.repo_path);
+  const scaffold = runFoundationShell(foundation.scaffold_cmd, project.repo_path, FOUNDATION_CHECK_TIMEOUT_MS);
+  if (scaffold.timedOut || scaffold.exitCode !== 0) {
+    bootstrap.restoreOnFailure();
+    bootstrap.cleanup();
+    blockProjectForFoundation(project, 'foundry_foundation_scaffold_failed', [
+      'FOUNDATION SCAFFOLD FAILED',
+      `Stack: ${foundation.stack}`,
+      `Command: ${foundation.scaffold_cmd}`,
+      scaffold.timedOut ? `Timed out after ${FOUNDATION_CHECK_TIMEOUT_MS}ms` : `Exit code: ${scaffold.exitCode ?? 'null'}`,
+      scaffold.error ? `Error: ${scaffold.error}` : null,
+      '',
+      'Output tail:',
+      scaffold.output || '(no output)',
+    ].filter((line): line is string => line != null).join('\n'));
+  }
+  bootstrap.cleanup();
+
+  persistFoundryJson(project, blueprint);
+  fs.mkdirSync(path.join(project.repo_path, 'modules'), { recursive: true });
+  fs.mkdirSync(path.join(project.repo_path, 'contracts'), { recursive: true });
+  runLaunchFoundationChecksOrBlock(project, foundation);
+  const sha = commitAllIfChanged(project.repo_path, `FOUNDATION scaffold: ${foundation.stack}`);
+  if (sha) writeFoundationNote(project.repo_path, sha, foundation, 'scaffold');
+}
+
+function findFoundationGatedCheckout(nodeId: number): {
+  project: FoundryProjectRow;
+  foundation: FoundryFoundation;
+  label: string;
+  checkoutPath: string;
+} | null {
+  const node = getHopperNode(nodeId);
+  if (!node) return null;
+  const module = moduleByTreeStmt.get(node.tree_id) ?? null;
+  if (module) {
+    const ids = stageNodeIds(module);
+    if (ids.build !== nodeId) return null;
+    const project = getProjectStmt.get(module.project_id) ?? null;
+    if (!project) return null;
+    const foundation = foundationFromBlueprint(loadBlueprint(project));
+    if (!foundation) return null;
+    return {
+      project,
+      foundation,
+      label: `module BUILD ${module.key}`,
+      checkoutPath: worktreePath(project, module.key),
+    };
+  }
+
+  const project = projectByIntegrationTreeStmt.get(node.tree_id) ?? null;
+  if (!project) return null;
+  const nodes = listTreeNodes(node.tree_id);
+  const first = nodes[0] ?? null;
+  if (!first || first.id !== nodeId || !node.title.startsWith(`MERGE ${project.id}`)) return null;
+  const foundation = foundationFromBlueprint(loadBlueprint(project));
+  if (!foundation) return null;
+  return {
+    project,
+    foundation,
+    label: `integration MERGE ${project.id}`,
+    checkoutPath: worktreePath(project, 'integration'),
+  };
+}
+
+export function runFoundryFoundationFinishGate(
+  nodeId: number,
+  outcome: 'done' | 'split' | 'blocked_question' | 'blocked',
+): { ok: true; gated: boolean } | { ok: false; gated: true; result: string } {
+  const gated = findFoundationGatedCheckout(nodeId);
+  if (!gated) return { ok: true, gated: false };
+  if (outcome === 'split') {
+    return {
+      ok: false,
+      gated: true,
+      result: [
+        'FOUNDATION CHECK FAILED',
+        `Stack: ${gated.foundation.stack}`,
+        `Checkout: ${gated.checkoutPath}`,
+        `Node: ${gated.label}`,
+        '',
+        'A foundation-gated BUILD/MERGE node cannot finish with outcome=split.',
+        'Only outcome=done can unblock dependents, and done is accepted only after the DB-owned foundation checks pass.',
+      ].join('\n'),
+    };
+  }
+  if (outcome !== 'done') return { ok: true, gated: true };
+  if (!fs.existsSync(gated.checkoutPath) || !fs.statSync(gated.checkoutPath).isDirectory()) {
+    return {
+      ok: false,
+      gated: true,
+      result: [
+        'FOUNDATION CHECK FAILED',
+        `Stack: ${gated.foundation.stack}`,
+        `Checkout: ${gated.checkoutPath}`,
+        `Node: ${gated.label}`,
+        '',
+        'The expected checkout/worktree does not exist, so the server cannot verify the framework foundation.',
+      ].join('\n'),
+    };
+  }
+  const results = runFoundationChecksInCwd(gated.checkoutPath, gated.foundation);
+  if (results.some((result) => !result.ok)) {
+    return {
+      ok: false,
+      gated: true,
+      result: foundationFailureText(gated.foundation, gated.checkoutPath, results),
+    };
+  }
+  return { ok: true, gated: true };
 }
 
 /** True when the project repo has an `origin` remote. A freshly scaffolded
@@ -1466,6 +2039,8 @@ export function launchProject(id: string): { project: FoundryProjectResponse; mo
   const blueprint = loadBlueprint(project);
   const validation = validateBlueprint(blueprint);
   if (!validation.ok) throw new FoundryError(400, 'invalid_blueprint', 'blueprint is invalid', { errors: validation.errors });
+  if (!blueprint) throw new FoundryError(400, 'invalid_blueprint', 'blueprint is invalid', { errors: validation.errors });
+  runFoundationScaffoldAtLaunch(project, blueprint);
   setProjectStatusStmt.run('building', id);
   maybePlantReadyModules(id);
   maybePlantIntegrationTree(id);

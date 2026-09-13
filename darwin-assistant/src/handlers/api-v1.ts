@@ -89,6 +89,7 @@ import {
   markProjectPlanning,
   retryIntegration as retryFoundryIntegration,
   retryModule as retryFoundryModule,
+  runFoundryFoundationFinishGate,
   setBlueprint as setFoundryBlueprint,
   buildFoundryAdvisor,
 } from '../foundry.js';
@@ -1709,6 +1710,12 @@ export function createApiV1Router(): Router {
     }
     if (outcome === 'split' && (!Array.isArray(body.children) || !body.children.length)) {
       sendError(res, 400, 'invalid_request', 'split requires a non-empty children array');
+      return;
+    }
+    const foundationGate = runFoundryFoundationFinishGate(id, outcome);
+    if (!foundationGate.ok) {
+      const updated = finishHopperNode(id, 'blocked', { result: foundationGate.result });
+      res.json({ node: updated });
       return;
     }
     const updated = finishHopperNode(id, outcome, {

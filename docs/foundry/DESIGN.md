@@ -8,6 +8,22 @@ against the API without reading the backend implementation first.
 
 Source of truth read first: `/home/kevin/obsidian/paperclip-wiki/skills/foundry/SKILL.md`.
 
+## Foundation Gate (added 2026-09-12, tree-53a87489)
+
+Framework-app blueprints (Laravel/Rails/Django/Next/etc.) carry a top-level `foundation` object:
+`{ stack, scaffold_cmd, checks[] }`. The full contract — blueprint shape, launch-time scaffold
+sequencing, the finish-time server gate, edge cases, and the as-built hardening from the node #149
+adversarial review — lives in **`docs/foundry/FOUNDATION-GATE-CONTRACT.md`**. Treat that file as
+authoritative for anything foundation-related; this section is only a pointer plus the two things
+that change in THIS document's existing contracts (the blueprint shape and the launch route).
+
+Two sentences on why it exists: the `suppression-manager` dogfood asked for a Laravel app, no
+module owned the skeleton, and the integration MERGE worker faked an `artisan` script to pass its
+own checks. The gate makes the root framework skeleton **server-scaffolded with real tooling**
+(`composer create-project`, etc.) before any worker tree plants, and makes it **structurally
+impossible** for a worker to report `done` on a BUILD or MERGE node unless the checkout both passes
+the blueprint's declared checks AND descends from the real scaffold commit.
+
 ## Baseline
 
 - Backend worktree: `/home/kevin/paperclip-worktrees/foundry`
@@ -280,7 +296,8 @@ shape as monitors and Hopper.
     "wiring": [],
     "integration": { "test": "npm run test:integration", "docs": "README.md" },
     "run": { "command": "npm run dev", "preview_url": "http://localhost:8090" },
-    "assumptions": []
+    "assumptions": [],
+    "foundation": null
   },
   "integration_tree_id": null,
   "integration_branch": null,
@@ -299,6 +316,10 @@ shape as monitors and Hopper.
   }
 }
 ```
+
+`blueprint.foundation` is `null`/absent for library-style projects (like `hello-foundry` above)
+and a `{stack, scaffold_cmd, checks[]}` object for framework-app projects. See
+`FOUNDATION-GATE-CONTRACT.md` for the shape and validation rules.
 
 `FoundryModule` response object:
 
@@ -772,6 +793,12 @@ Rules:
 
 - Status must be `planned` or `blocked` with only retryable/question-resolved modules.
 - Blueprint must exist and validate.
+- **If `blueprint.foundation` is set** (added 2026-09-12, `runFoundationScaffoldAtLaunch`,
+  `foundry.ts`): before any module plants, run `scaffold_cmd` in an empty sibling staging dir,
+  overlay it onto the repo, commit it as `FOUNDATION scaffold: <stack>` (idempotent — skipped if
+  that commit already exists), then run `foundation.checks` in the repo root. A failing scaffold
+  or check sets status `blocked` and plants nothing. See `FOUNDATION-GATE-CONTRACT.md` for the full
+  sequence and edge cases.
 - Plant every unplanted module whose dependencies are all `tested` or better. On first launch,
   this means modules with no deps plus modules depending only on an already-planted and tested
   `contracts` module if such a prior run exists.

@@ -93,7 +93,9 @@ function auggieCeiling(): number {
   // Stops new Auggie claims at/above 85% burned — Augment was ~80% tonight.
   return numSetting('auggie_ceiling', 85, ['HOPPER_GOV_AUGGIE_CEILING']);
 }
-function concurrencyCap(): number {
+/** Exported so dispatchTick can apply the active-window non-Claude cap without
+ *  round-tripping through a full governorCheck() evaluation + its logging. */
+export function concurrencyCap(): number {
   return numSetting('concurrency_cap', 2, ['HOPPER_DAYTIME_MAX_WORKERS']);
 }
 

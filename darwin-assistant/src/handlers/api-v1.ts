@@ -109,7 +109,7 @@ import {
   getHopperHistory,
   type NewNodeInput,
 } from '../hopper-engine.js';
-import { governorStatus } from '../hopper-governor.js';
+import { governorStatus, governorStatusAll } from '../hopper-governor.js';
 import {
   buildSpawnMonitorSnapshot,
   buildSpawnMonitorTreeDetail,
@@ -276,6 +276,21 @@ import {
 const MAX_TEXT_LENGTH = 50_000;
 const UI_PORT = parseInt(process.env.JARVIS_UI_PORT ?? '3201', 10);
 const PROTECTED_THREAD_IDS = new Set(['checkin:notifications']);
+
+// Governor v2 settings-KV schema (docs/hopper/GOVERNOR-V2-CONTRACT.md
+// §Settings-KV Schema). Single source of truth for GET/PATCH
+// /hopper-engine/settings — every key here is a settings-KV row read
+// uncached by hopper-governor.ts, env-fallback baked in there.
+const GOVERNOR_SETTING_SPECS: Record<string, { type: 'number' } | { type: 'enum'; values: readonly string[] }> = {
+  gov_kevin_active_claude_max_5h: { type: 'number' },
+  gov_5h_ceiling: { type: 'number' },
+  gov_weekly_ceiling: { type: 'number' },
+  gov_weekly_mode: { type: 'enum', values: ['soft', 'hard'] },
+  gov_codex_ceiling: { type: 'number' },
+  gov_auggie_ceiling: { type: 'number' },
+  gov_concurrency_cap: { type: 'number' },
+};
+const GOVERNOR_SETTING_KEYS = Object.keys(GOVERNOR_SETTING_SPECS);
 
 interface AuthedRequest extends Request {
   apiKey?: ApiKeyRow;
@@ -1746,8 +1761,60 @@ export function createApiV1Router(): Router {
   });
 
   // Governor status — is overnight dispatch currently open, and why/why not.
-  router.get('/hopper-engine/governor', (_req: AuthedRequest, res) => {
-    res.json(governorStatus());
+  // The default (Claude) verdict stays top-level for back-compat with
+  // existing callers (e.g. /spawn-monitor); `?adapter=` checks a specific
+  // lane; `providers` always reports every lane so a non-Claude pool's state
+  // is visible even while Claude is held (and vice versa).
+  router.get('/hopper-engine/governor', (req: AuthedRequest, res) => {
+    const adapter = typeof req.query.adapter === 'string' ? req.query.adapter : undefined;
+    res.json({ ...governorStatus(adapter), providers: governorStatusAll() });
+  });
+
+  // Governor settings-KV — the machine/governor knobs Kevin asked for
+  // (2026-09-11: "settings for the levels and their variables"). Reads are
+  // always live (getSetting is uncached); writes are admin-scoped and take
+  // effect on the very next governor check, no restart. See
+  // docs/hopper/GOVERNOR-V2-CONTRACT.md for the schema.
+  router.get('/hopper-engine/settings', (_req: AuthedRequest, res) => {
+    const raw: Record<string, string | null> = {};
+    for (const key of GOVERNOR_SETTING_KEYS) raw[key] = getSetting(key);
+    res.json({ effective: governorStatus('claude').config, raw });
+  });
+
+  router.patch('/hopper-engine/settings', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Changing governor settings requires an admin-scoped key');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const updates: Record<string, string> = {};
+    for (const [key, spec] of Object.entries(GOVERNOR_SETTING_SPECS)) {
+      if (!(key in body)) continue;
+      const value = body[key];
+      if (spec.type === 'enum') {
+        if (typeof value !== 'string' || !spec.values.includes(value)) {
+          sendError(res, 400, 'invalid_setting', `${key} must be one of: ${spec.values.join(', ')}`);
+          return;
+        }
+        updates[key] = value;
+      } else {
+        const n = typeof value === 'number' ? value : parseFloat(String(value));
+        if (!Number.isFinite(n) || n < 0) {
+          sendError(res, 400, 'invalid_setting', `${key} must be a non-negative number`);
+          return;
+        }
+        updates[key] = String(n);
+      }
+    }
+    if (!Object.keys(updates).length) {
+      sendError(res, 400, 'invalid_request', `No recognized governor settings in body. Valid keys: ${GOVERNOR_SETTING_KEYS.join(', ')}`);
+      return;
+    }
+    for (const [key, value] of Object.entries(updates)) setSetting(key, value);
+    void dispatchTick('governor_settings_changed');
+    const raw: Record<string, string | null> = {};
+    for (const key of GOVERNOR_SETTING_KEYS) raw[key] = getSetting(key);
+    res.json({ ok: true, updated: Object.keys(updates), effective: governorStatus('claude').config, raw });
   });
 
   // Decision memory — real settled-node outcomes by model, for the planner to

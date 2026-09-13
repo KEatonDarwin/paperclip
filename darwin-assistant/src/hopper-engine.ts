@@ -367,7 +367,7 @@ export function getHopperHistory(): HopperHistory {
 export interface NewNodeInput {
   title: string;
   spec?: string | null;
-  parent_index?: number | null;      // index into the same input array
+  parent_index?: number | null;      // reserved for a future explicit nested-tree API mode
   depends_on_indexes?: number[];     // indexes into the same input array
   priority?: number;
   adapter?: string | null;           // router: planner-assigned worker loadout
@@ -388,10 +388,13 @@ export function createHopperTree(topic: string, originThreadExt: string | null, 
     `INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, priority, adapter, model) VALUES (?, ?, ?, ?, ?, ?, ?)`,
   );
   for (const n of nodes) {
-    const parentId =
-      n.parent_index != null && n.parent_index >= 0 && n.parent_index < ids.length ? ids[n.parent_index] : null;
+    if (n.parent_index != null) {
+      console.warn(
+        `[hopper-engine] createHopperTree ignored parent_index=${n.parent_index} for "${n.title.slice(0, 80)}"; use depends_on_indexes for planner DAG ordering`,
+      );
+    }
     const info = insert.run(
-      treeId, parentId, n.title.slice(0, 300), n.spec ?? null, n.priority ?? 0, n.adapter ?? null, n.model ?? null,
+      treeId, null, n.title.slice(0, 300), n.spec ?? null, n.priority ?? 0, n.adapter ?? null, n.model ?? null,
     );
     ids.push(Number(info.lastInsertRowid));
   }
@@ -406,10 +409,27 @@ export function createHopperTree(topic: string, originThreadExt: string | null, 
   return { tree: getHopperTree(treeId)!, nodes: created };
 }
 
+function sanitizeInitialDagParentIds(treeId: string): number {
+  const nodes = listTreeNodes(treeId);
+  if (!nodes.some((n) => n.parent_id != null)) return 0;
+  // Split parents are the one legitimate current use of parent_id: the children
+  // created by outcome='split' must stay nested so ancestor bubbling still works.
+  if (nodes.some((n) => n.status === 'split')) return 0;
+  if (!nodes.some((n) => n.status === 'draft' || n.status === 'pending')) return 0;
+  const info = sqliteDb
+    .prepare(`UPDATE hopper_nodes SET parent_id = NULL, updated_at = datetime('now') WHERE tree_id = ? AND parent_id IS NOT NULL`)
+    .run(treeId);
+  if (info.changes) {
+    console.warn(`[hopper-engine] sanitized ${info.changes} stale parent_id value(s) on initial DAG tree ${treeId}`);
+  }
+  return Number(info.changes ?? 0);
+}
+
 /** Kevin's "yep that looks good" — flips the whole tree live and starts dispatch. */
 export function agreeHopperTree(treeId: string): HopperTreeRow | null {
   const tree = getHopperTree(treeId);
   if (!tree) return null;
+  sanitizeInitialDagParentIds(treeId);
   sqliteDb.prepare(`UPDATE hopper_trees SET status = 'active', updated_at = datetime('now') WHERE id = ?`).run(treeId);
   sqliteDb
     .prepare(`UPDATE hopper_nodes SET status = 'pending', updated_at = datetime('now') WHERE tree_id = ? AND status = 'draft'`)
@@ -472,6 +492,8 @@ function composeWorkerPrompt(node: HopperNodeRow, tree: HopperTreeRow): string {
     `KEY=$(grep -E '^JARVIS_COCKPIT_KEY=' /home/kevin/paperclip/jarvis-command-center/.env | head -1 | cut -d= -f2)`,
     `curl -s -X POST http://localhost:3201/api/v1/hopper-nodes/${node.id}/finish -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d '<PAYLOAD>'`,
     '```',
+    'If the finish curl fails, retry the same exact curl up to three times with a few seconds between attempts. If it still fails, print the exact JSON payload as your final assistant message so the reconciler can recover it. Never invent a successful finish: either the POST succeeds or the payload is visible for recovery.',
+    '',
     'Pick ONE payload:',
     `- Task complete → {"outcome":"done","result":"<what you did + artifacts/paths/commits, concise but complete — dependents read this>"}`,
     `- Task too big for one worker → {"outcome":"split","children":[{"title":"...","spec":"...","depends_on_prev":false}, ...]} — make NO changes yourself; you exited as a planner. Set depends_on_prev true on a child that must wait for the one before it.`,

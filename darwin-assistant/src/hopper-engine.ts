@@ -3,7 +3,7 @@ import './spawn-tasks.js'; // side-effect: guarantees the spawn_tasks DDL ran be
 import { sqliteDb, getOrCreateConversation, renameConversation, setThreadModelOverride, getSetting } from './conversation-db.js';
 import { sseBus, type HopperNodeEvent } from './sse-bus.js';
 import { createNotification } from './notifications.js';
-import { governorCheck } from './hopper-governor.js';
+import { governorCheck, governorStatus, kevinActive, providerFor, concurrencyCap, type GovernorProvider } from './hopper-governor.js';
 
 // HOPPER ENGINE — the autonomous work-tree executor (designed 2026-09-06 with
 // Kevin; worker-model details hashed out in cockpit:worker-engine-design-2026-09-06).
@@ -84,6 +84,60 @@ function escalateModel(model: string | null): string | null {
   return i >= 0 && i < MODEL_LADDER.length - 1 ? MODEL_LADDER[i + 1] : current;
 }
 
+// Cross-provider retry ladder (governor-v2, ported from hopper/provider-daytime):
+// a Claude node keeps riding the tier ladder above; a non-Claude node instead
+// HOPS PROVIDER on retry, since a provider-specific failure (rate limit, a
+// broken CLI auth) is unlikely to un-happen on the same pool a few minutes
+// later. Each candidate is governor-checked before being chosen so a capped
+// Auggie pool never receives a Codex retry (or vice versa).
+interface WorkerLoadout {
+  adapter: string | null;
+  model: string | null;
+}
+interface RetryRoute extends WorkerLoadout {
+  note: string;
+}
+const CLAUDE_FALLBACK: WorkerLoadout = { adapter: 'claude', model: 'claude-sonnet-5' };
+const CROSS_PROVIDER_RETRY_LADDER: Partial<Record<GovernorProvider, WorkerLoadout[]>> = {
+  auggie: [
+    { adapter: 'codex', model: 'gpt-5.5' },
+    CLAUDE_FALLBACK,
+  ],
+  codex: [
+    // auggie's model ids come from its own CLI catalog (`auggie model list`,
+    // ids like 'opus4.8'), not the claude adapter's 'claude-*' ids. 'default'
+    // is a no-op model flag (buildArgs skips --model for it), so the retry
+    // lands on auggie's own configured default instead of guessing a catalog
+    // id that can also drift over time.
+    { adapter: 'auggie', model: 'default' },
+    CLAUDE_FALLBACK,
+  ],
+  devin: [CLAUDE_FALLBACK],
+};
+
+function loadoutLabel(loadout: WorkerLoadout): string {
+  return `${loadout.adapter ?? WORKER_ADAPTER}/${loadout.model ?? defaultWorkerModel() ?? 'default'}`;
+}
+
+/** Lease-expiry retry routing: Claude bumps a tier, non-Claude hops provider. */
+function retryRouteFor(node: HopperNodeRow): RetryRoute {
+  const current: WorkerLoadout = { adapter: node.adapter ?? WORKER_ADAPTER, model: node.model ?? defaultWorkerModel() };
+  const provider = providerFor(current.adapter);
+  if (provider === 'claude') {
+    const bumped = escalateModel(node.model);
+    return {
+      adapter: node.adapter,
+      model: bumped,
+      note: `claude tier retry: ${loadoutLabel(current)} -> ${loadoutLabel({ adapter: node.adapter ?? WORKER_ADAPTER, model: bumped })}`,
+    };
+  }
+  const ladder = CROSS_PROVIDER_RETRY_LADDER[provider] ?? [CLAUDE_FALLBACK];
+  const chosen =
+    ladder.find((candidate) => providerFor(candidate.adapter) !== provider && governorStatus(candidate.adapter).allow) ??
+    ladder[ladder.length - 1];
+  return { ...chosen, note: `cross-provider retry: ${loadoutLabel(current)} -> ${loadoutLabel(chosen)}` };
+}
+
 sqliteDb.exec(`
   CREATE TABLE IF NOT EXISTS hopper_trees (
     id                TEXT PRIMARY KEY,
@@ -136,6 +190,9 @@ const getNodeStmt = sqliteDb.prepare<[number], HopperNodeRow>(`SELECT * FROM hop
 const treeNodesStmt = sqliteDb.prepare<[string], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE tree_id = ? ORDER BY id`);
 const childrenStmt = sqliteDb.prepare<[number], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE parent_id = ? ORDER BY id`);
 const runningCountStmt = sqliteDb.prepare<[], { n: number }>(`SELECT COUNT(*) AS n FROM hopper_nodes WHERE status = 'running'`);
+const runningAdaptersStmt = sqliteDb.prepare<[], { adapter: string | null }>(
+  `SELECT adapter FROM hopper_nodes WHERE status = 'running'`,
+);
 const historyByModelStmt = sqliteDb.prepare<[], {
   model: string;
   done: number;
@@ -441,6 +498,12 @@ const spawnTaskInsert = sqliteDb.prepare(`
   VALUES (?, ?, ?, ?, ?, 'running', ?, ?)
 `);
 
+// Marks the EXPIRED attempt's spawn_tasks row with why it's being rerouted —
+// informational history only; the node's own row is what actually re-dispatches.
+const spawnTaskMarkRerouted = sqliteDb.prepare<[string, string]>(`
+  UPDATE spawn_tasks SET status = 'failed', error = ?, updated_at = datetime('now') WHERE thread_ext = ?
+`);
+
 async function spawnWorker(node: HopperNodeRow, tree: HopperTreeRow): Promise<void> {
   if (!processMessageRef) return;
   const ext = node.worker_thread_ext!;
@@ -603,10 +666,23 @@ export async function dispatchTick(reason: string): Promise<void> {
           });
         }
       } else {
-        // Retry rides one tier up the ladder — a misrouted cheap node self-corrects.
-        const bumped = escalateModel(node.model);
-        if (bumped !== node.model) console.log(`[hopper-engine] node ${node.id} retry escalates ${node.model ?? 'default'} → ${bumped}`);
-        setNode(node.id, { status: 'pending', worker_thread_ext: null, lease_expires_at: null, model: bumped });
+        // Retry rides one rung up: Claude keeps its tier ladder; non-Claude
+        // hops provider so a provider-specific failure doesn't repeat itself.
+        const retry = retryRouteFor(node);
+        if (node.worker_thread_ext) {
+          spawnTaskMarkRerouted.run(
+            `HOPPER_RETRY_REROUTE: node ${node.id} attempt ${node.attempts} lease expired; ${retry.note}; next attempt ${node.attempts + 1}`,
+            node.worker_thread_ext,
+          );
+        }
+        console.log(`[hopper-engine] node ${node.id} ${retry.note}`);
+        setNode(node.id, {
+          status: 'pending',
+          worker_thread_ext: null,
+          lease_expires_at: null,
+          adapter: retry.adapter,
+          model: retry.model,
+        });
       }
     }
 
@@ -617,10 +693,35 @@ export async function dispatchTick(reason: string): Promise<void> {
     //    workers are never interrupted). Held node = skip it, try the next.
     let free = MAX_SLOTS - (runningCountStmt.get()?.n ?? 0);
     if (free <= 0) return;
+    // While Kevin is active, non-Claude lanes stay open (separate plans) but
+    // narrowed by gov_concurrency_cap so the box he's working on isn't hosting
+    // a full worker pool behind his back. Claude lanes are governed entirely
+    // by governorCheck's kevin_active gate above, not this cap.
+    const daytime = kevinActive();
+    const cap = daytime ? concurrencyCap() : Infinity;
+    let daytimeRunning = daytime
+      ? runningAdaptersStmt.all().filter((r) => providerFor(r.adapter ?? WORKER_ADAPTER) !== 'claude').length
+      : 0;
+    let cappedLogged = false;
+    const verdicts = new Map<string, boolean>(); // one governor eval per adapter per tick
     for (const node of readyLeavesStmt.all()) {
       if (free <= 0) break;
       if (!depsSatisfied(node)) continue;
-      if (!governorCheck(node.adapter ?? WORKER_ADAPTER).allow) continue;
+      const adapter = node.adapter ?? WORKER_ADAPTER;
+      let allowed = verdicts.get(adapter);
+      if (allowed === undefined) {
+        allowed = governorCheck(adapter).allow;
+        verdicts.set(adapter, allowed);
+      }
+      if (!allowed) continue;
+      const nonClaude = providerFor(adapter) !== 'claude';
+      if (daytime && nonClaude && daytimeRunning >= cap) {
+        if (!cappedLogged) {
+          console.log(`[hopper-engine] concurrency cap: ${daytimeRunning}/${cap} non-claude workers running while Kevin is active — holding the rest`);
+          cappedLogged = true;
+        }
+        continue;
+      }
       const ext = `cockpit:hopper-node-${node.id}-${randomUUID().slice(0, 8)}`;
       const claimed = claimStmt.run(ext, `+${LEASE_MINUTES} minutes`, node.id);
       if (claimed.changes !== 1) continue; // raced — someone else claimed it
@@ -628,6 +729,7 @@ export async function dispatchTick(reason: string): Promise<void> {
       emitNode('updated', fresh);
       const tree = getHopperTree(node.tree_id)!;
       free -= 1;
+      if (nonClaude) daytimeRunning += 1;
       console.log(`[hopper-engine] dispatch node ${node.id} (${reason}) → ${ext}`);
       void spawnWorker(fresh, tree);
     }

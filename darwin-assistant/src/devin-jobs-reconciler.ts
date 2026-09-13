@@ -1,8 +1,9 @@
-import { getDevinSession, hasDevinKey } from './devin-client.js';
+import { getDevinSession, hasDevinKey, DevinApiError } from './devin-client.js';
 import {
   listUnsettledDevinJobs,
   updateDevinJobFromSession,
   markDevinJobSettled,
+  markDevinJobGone,
   type DevinJobRow,
 } from './devin-jobs.js';
 import { createNotification } from './notifications.js';
@@ -66,11 +67,22 @@ function determineSettlement(status: string, statusDetail: string | null, outcom
   return null;
 }
 
-function quoteStructuredOutput(job: DevinJobRow): string {
-  let parsed: Record<string, unknown> | null = null;
-  if (job.structured_output) {
+// Each quoted field is capped and has its line breaks folded so Devin's text
+// can never "escape" the `> ` quote prefix onto an unquoted line (the result
+// is read by downstream model workers as dependency context).
+const QUOTE_FIELD_MAX = 1500;
+function quoteField(value: unknown): string {
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  const folded = (text ?? '').replace(/\r?\n/g, ' ⏎ ').replace(/\s+/g, ' ').trim();
+  return folded.length > QUOTE_FIELD_MAX ? `${folded.slice(0, QUOTE_FIELD_MAX)}… [truncated]` : folded;
+}
+
+function quoteStructuredOutput(job: DevinJobRow, override?: Record<string, unknown>): string {
+  let parsed: Record<string, unknown> | null = override ?? null;
+  if (!parsed && job.structured_output) {
     try {
-      parsed = JSON.parse(job.structured_output) as Record<string, unknown>;
+      const p = JSON.parse(job.structured_output) as unknown;
+      parsed = p && typeof p === 'object' && !Array.isArray(p) ? (p as Record<string, unknown>) : null;
     } catch {
       parsed = null;
     }
@@ -80,21 +92,21 @@ function quoteStructuredOutput(job: DevinJobRow): string {
   const summary = get('summary') ?? '(no summary provided)';
   const branch = get('branch') ?? 'none';
   const commitsRaw = get('commits');
-  const commits = Array.isArray(commitsRaw) ? commitsRaw.join(', ') : 'none';
+  const commits = Array.isArray(commitsRaw) ? commitsRaw.map(quoteField).join(', ') : 'none';
   const notesRaw = get('notes');
-  const notes = Array.isArray(notesRaw) ? notesRaw.join('; ') : 'none';
+  const notes = Array.isArray(notesRaw) ? notesRaw.map(quoteField).join('; ') : 'none';
   return [
-    `> outcome: ${String(outcome)}`,
-    `> summary: ${String(summary)}`,
-    `> branch: ${String(branch)}`,
-    `> commits: ${String(commits)}`,
-    `> notes: ${String(notes)}`,
+    `> outcome: ${quoteField(outcome)}`,
+    `> summary: ${quoteField(summary)}`,
+    `> branch: ${quoteField(branch)}`,
+    `> commits: ${quoteField(commits)}`,
+    `> notes: ${quoteField(notes)}`,
   ].join('\n');
 }
 
-function settleJob(job: DevinJobRow, settlement: Settlement): void {
+function settleJob(job: DevinJobRow, settlement: Settlement, override?: Record<string, unknown>): void {
   markDevinJobSettled(job.id);
-  const quoted = quoteStructuredOutput(job);
+  const quoted = quoteStructuredOutput(job, override);
   const verb = settlement === 'done' ? 'settled' : 'blocked';
   // Explicit "UNTRUSTED WORKER REPORT (quoted)" frame — Devin's own text never
   // appears unquoted in a Hopper result or notification body.
@@ -127,6 +139,13 @@ function settleJob(job: DevinJobRow, settlement: Settlement): void {
 // tick — same debounce spirit as the rest of the notification layer.
 const notifiedWaiting = new Set<number>();
 
+// A session Devin says no longer exists (404) is polled a few more times in
+// case it's a transient read, then settled blocked so the row can't sit
+// unsettled forever — holding a concurrency slot AND spamming a warning every
+// 60s. Consecutive count only; any successful poll resets it.
+const GONE_AFTER_CONSECUTIVE_404 = 3;
+const consecutiveNotFound = new Map<number, number>();
+
 async function reconcileOnce(): Promise<void> {
   if (!hasDevinKey()) return; // graceful no-key idle — never poll, never crash
   const jobs = listUnsettledDevinJobs();
@@ -137,10 +156,27 @@ async function reconcileOnce(): Promise<void> {
       session = await getDevinSession(job.session_id);
     } catch (err) {
       // One failed poll never marks a job blocked and never stops the loop —
-      // just try again next tick.
+      // just try again next tick. The exception is a session Devin reports as
+      // gone: after GONE_AFTER_CONSECUTIVE_404 straight 404s it's settled
+      // blocked (never `done` — we have no output to trust).
+      if (err instanceof DevinApiError && err.status === 404) {
+        const n = (consecutiveNotFound.get(job.id) ?? 0) + 1;
+        consecutiveNotFound.set(job.id, n);
+        if (n >= GONE_AFTER_CONSECUTIVE_404) {
+          consecutiveNotFound.delete(job.id);
+          notifiedWaiting.delete(job.id);
+          console.warn(`[devin-jobs-reconciler] session ${job.session_id} gone (404 x${n}) — settling job ${job.id} blocked`);
+          settleJob(markDevinJobGone(job.id) ?? job, 'blocked', {
+            outcome: 'blocked',
+            summary: `Devin session not found (${n} consecutive 404s) — deleted or expired on Devin's side before it produced output.`,
+          });
+          continue;
+        }
+      }
       console.warn(`[devin-jobs-reconciler] poll failed for job ${job.id} (session ${job.session_id}): ${sanitize(err)}`);
       continue;
     }
+    consecutiveNotFound.delete(job.id);
 
     const updated = updateDevinJobFromSession(job.id, session) ?? job;
     const outcome = readOutcome(updated.structured_output);

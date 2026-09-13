@@ -75,6 +75,7 @@ import {
   resolveDevinAcuGate,
   createDevinJobAndDispatch,
   sendDevinJobMessageAndSync,
+  textCarriesLocalSecret,
   DevinSessionMissing,
 } from '../devin-jobs.js';
 import { hasDevinKey, DevinKeyMissing, DEVIN_MODES, type DevinMode } from '../devin-client.js';
@@ -322,6 +323,7 @@ const GOVERNOR_SETTING_SPECS: Record<string, { type: 'number' } | { type: 'enum'
   // GET/PATCH /hopper-engine/settings surface can read and save them.
   devin_max_concurrent: { type: 'number' },
   gov_devin_acu_ceiling: { type: 'number' },
+  devin_job_max_acu: { type: 'number' },
 };
 const GOVERNOR_SETTING_KEYS = Object.keys(GOVERNOR_SETTING_SPECS);
 
@@ -1812,6 +1814,11 @@ export function createApiV1Router(): Router {
         active_jobs: concurrency.active_jobs,
         cycle_acus_used: acu.cycle_acus_used,
         acu_ceiling: acu.acu_ceiling,
+        // Per-session max_acu_limit the next job would be created with (null =
+        // none sent). Knob: settings-KV devin_job_max_acu.
+        session_acu_limit: acu.session_acu_limit,
+        // Why dispatch is currently refused, if it is (null = allowed).
+        dispatch_block: concurrency.blocked ? 'concurrency' : acu.block_reason,
       },
     });
   });
@@ -1836,6 +1843,10 @@ export function createApiV1Router(): Router {
     }
     if (!prompt) {
       sendError(res, 400, 'invalid_request', 'prompt is required and must be a non-empty string');
+      return;
+    }
+    if (textCarriesLocalSecret(prompt) || textCarriesLocalSecret(title)) {
+      sendError(res, 400, 'secret_in_prompt', 'Refusing to send a local secret (API key / bearer) to Devin. Remove it from the prompt.');
       return;
     }
     const devinMode = typeof body.devin_mode === 'string' && DEVIN_MODES.includes(body.devin_mode as DevinMode)
@@ -1877,12 +1888,23 @@ export function createApiV1Router(): Router {
         res,
         409,
         'devin_acu_ceiling',
-        `Devin ACU ceiling reached for the current cycle (${acu.cycle_acus_used} used, ceiling ${acu.acu_ceiling}). Raise gov_devin_acu_ceiling or devin_acu_pool to allow more.`,
+        acu.block_reason === 'usage_unknown'
+          ? `Devin ACU ceiling is configured (${acu.acu_ceiling}) but the usage meter is missing or stale — refusing to dispatch blind. Check devin-usage-poll.timer / /tmp/devin-usage-live.json.`
+          : `Devin ACU ceiling reached for the current cycle (${acu.cycle_acus_used} used, ceiling ${acu.acu_ceiling}). Raise gov_devin_acu_ceiling or devin_acu_pool to allow more.`,
       );
       return;
     }
 
-    createDevinJobAndDispatch({ title, prompt, devinMode, schema, tags: extraTags, nodeId, threadExt })
+    createDevinJobAndDispatch({
+      title,
+      prompt,
+      devinMode,
+      schema,
+      tags: extraTags,
+      nodeId,
+      threadExt,
+      maxAcuLimit: acu.session_acu_limit,
+    })
       .then((row) => res.status(201).json({ job: serializeDevinJob(row) }))
       .catch((err) => {
         if (err instanceof DevinKeyMissing) {
@@ -1918,6 +1940,10 @@ export function createApiV1Router(): Router {
     const message = typeof body.message === 'string' ? body.message.trim() : '';
     if (!message) {
       sendError(res, 400, 'invalid_request', 'message is required and must be a non-empty string');
+      return;
+    }
+    if (textCarriesLocalSecret(message)) {
+      sendError(res, 400, 'secret_in_prompt', 'Refusing to send a local secret (API key / bearer) to Devin. Remove it from the message.');
       return;
     }
 

@@ -941,3 +941,16 @@ No implementation worker should block on these. The defaults above are safe enou
 - Default job mode is `lite`.
 - Devin cloud sessions can be used conversationally now; an engine-native Hopper adapter is a v2 step after this contract ships.
 
+
+## 15. Review Addenda (adversarial review, 2026-09-13)
+
+Behaviors added by the review pass — these supersede the corresponding lines above where they differ.
+
+- **Kill switch.** settings-KV `devin_max_concurrent = 0` refuses every new session (`409 devin_concurrency_limit`). Unset/garbage still falls back to `2`.
+- **ACU gate fails closed.** When a ceiling is configured (`gov_devin_acu_ceiling` or `devin_acu_pool`) but `/tmp/devin-usage-live.json` is missing, errored (`used_acus: null`), or older than 10 minutes, `POST /devin/jobs` returns `409 devin_acu_ceiling` with a "usage meter missing or stale" message. No ceiling configured = display-only, unchanged.
+- **Per-session `max_acu_limit`** is now sent on create as `min(devin_job_max_acu, ceiling − used)` when either is known (section 4.2's optional rule, now implemented). `GET /devin/jobs` `config.session_acu_limit` shows what the next job would be created with; `config.dispatch_block` (`concurrency | ceiling_reached | usage_unknown | null`) says why dispatch is currently refused.
+- **Secret-in-prompt guard.** A `prompt`, `title`, or follow-up `message` containing the literal value of `DEVIN_API_KEY`, `JARVIS_COCKPIT_KEY`, or `PAPERCLIP_BOARD_API_KEY` is refused with `400 secret_in_prompt`.
+- **Gone sessions.** Three consecutive `404`s on the session poll settle the job `blocked` (row `status = error`, `status_detail = session_not_found`) and finish a linked node `blocked` with a quoted reason. Any successful poll resets the counter. Never settles `done`.
+- **Quote frame hardening.** Each quoted field in the Hopper/notification result is line-folded (`⏎`) and capped at 1500 chars so Devin text cannot escape the `> ` prefix onto an unquoted line.
+- **UI.** `session_url` is only rendered as a link when it is `https://`; `structured_output` is rendered as escaped plain text in a `<pre>` (never HTML).
+- **Known v0 gap (not a bug).** With no engine-native `devin` adapter yet, a Hopper node linked via `node_id` is only finished by the reconciler if it is still `running` when Devin settles; if the dispatching worker already finished it, or the lease expired and re-pended it, the reconciler's finish is a no-op (`finishHopperNode` only acts on `running`). The v2 adapter owns that lifecycle.

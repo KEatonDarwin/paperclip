@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { sqliteDb, getSetting } from './conversation-db.js';
 import { sseBus, type DevinJobEvent } from './sse-bus.js';
 import { createDevinSession, sendDevinMessage, type DevinMode, type DevinSession } from './devin-client.js';
@@ -137,6 +137,10 @@ const markSettledStmt = sqliteDb.prepare<[number]>(`
   UPDATE devin_jobs SET settled_at = datetime('now') WHERE id = ?
 `);
 
+const markGoneStmt = sqliteDb.prepare<[number]>(`
+  UPDATE devin_jobs SET status = 'error', status_detail = 'session_not_found' WHERE id = ?
+`);
+
 function emit(action: DevinJobEvent['action'], job: DevinJobRow): void {
   sseBus.emit('sse', { type: 'devin_job', action, job } satisfies DevinJobEvent);
 }
@@ -206,7 +210,9 @@ export interface DevinConcurrencyGate {
 export function resolveDevinConcurrencyGate(): DevinConcurrencyGate {
   const raw = getSetting('devin_max_concurrent');
   const parsed = raw != null && raw.trim() !== '' ? parseInt(raw, 10) : NaN;
-  const maxConcurrent = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_CONCURRENT;
+  // `0` is an explicit kill switch (no new sessions at all); unset/garbage
+  // falls back to the default. Negative values are treated as garbage.
+  const maxConcurrent = Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_MAX_CONCURRENT;
   const activeJobs = countActiveDevinJobs();
   return { active_jobs: activeJobs, max_concurrent: maxConcurrent, blocked: activeJobs >= maxConcurrent };
 }
@@ -214,27 +220,75 @@ export function resolveDevinConcurrencyGate(): DevinConcurrencyGate {
 export interface DevinAcuGate {
   cycle_acus_used: number | null;
   acu_ceiling: number | null;
+  /** Per-session `max_acu_limit` to hand Devin (CONTRACT.md 4.2): the smaller
+   *  of settings-KV `devin_job_max_acu` and the ACUs remaining before the
+   *  ceiling. null = neither is known → don't send one. */
+  session_acu_limit: number | null;
   blocked: boolean;
+  /** Why `blocked` is true: the ceiling is reached, or a ceiling is configured
+   *  but the usage meter is missing/stale/errored (fail-closed — the account
+   *  has hit usage_limit_exceeded before, so "unknown" is not "fine"). */
+  block_reason: 'ceiling_reached' | 'usage_unknown' | null;
 }
+
+// Usage snapshots older than this are treated as unknown when a ceiling is
+// configured — same posture as the Claude governor's usage-staleness hold.
+const DEVIN_USAGE_STALE_MS = 10 * 60 * 1000;
 
 function readDevinUsedAcus(): number | null {
   try {
-    const raw = JSON.parse(readFileSync(DEVIN_USAGE_FILE, 'utf8')) as { used_acus?: unknown };
+    const st = statSync(DEVIN_USAGE_FILE);
+    const raw = JSON.parse(readFileSync(DEVIN_USAGE_FILE, 'utf8')) as { used_acus?: unknown; updated_at?: unknown };
+    const updatedMs =
+      typeof raw.updated_at === 'number' && Number.isFinite(raw.updated_at) ? raw.updated_at * 1000 : st.mtimeMs;
+    if (Date.now() - updatedMs > DEVIN_USAGE_STALE_MS) return null;
     return typeof raw.used_acus === 'number' && Number.isFinite(raw.used_acus) ? raw.used_acus : null;
   } catch {
     return null;
   }
 }
 
+function positiveSetting(key: string): number | null {
+  const raw = getSetting(key);
+  const parsed = raw != null && raw.trim() !== '' ? parseFloat(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 /** ACU ceiling resolution per CONTRACT.md section 6.2: `gov_devin_acu_ceiling`
- *  if set, else `devin_acu_pool`, else no ceiling (usage still shown, not gated). */
+ *  if set, else `devin_acu_pool`, else no ceiling (usage still shown, not gated).
+ *  When a ceiling IS set, an unknown/stale usage reading blocks (fail-closed). */
 export function resolveDevinAcuGate(): DevinAcuGate {
-  const ceilingRaw = getSetting('gov_devin_acu_ceiling') ?? getSetting('devin_acu_pool');
-  const parsedCeiling = ceilingRaw != null && ceilingRaw.trim() !== '' ? parseFloat(ceilingRaw) : NaN;
-  const acuCeiling = Number.isFinite(parsedCeiling) && parsedCeiling > 0 ? parsedCeiling : null;
+  const acuCeiling = positiveSetting('gov_devin_acu_ceiling') ?? positiveSetting('devin_acu_pool');
   const used = readDevinUsedAcus();
-  const blocked = acuCeiling != null && used != null && used >= acuCeiling;
-  return { cycle_acus_used: used, acu_ceiling: acuCeiling, blocked };
+  const perJob = positiveSetting('devin_job_max_acu');
+  const remaining = acuCeiling != null && used != null ? Math.max(0, acuCeiling - used) : null;
+  const candidates = [perJob, remaining].filter((v): v is number => v != null && v > 0);
+  const sessionAcuLimit = candidates.length ? Math.min(...candidates) : null;
+  let blockReason: DevinAcuGate['block_reason'] = null;
+  if (acuCeiling != null) {
+    if (used == null) blockReason = 'usage_unknown';
+    else if (used >= acuCeiling) blockReason = 'ceiling_reached';
+  }
+  return {
+    cycle_acus_used: used,
+    acu_ceiling: acuCeiling,
+    session_acu_limit: sessionAcuLimit,
+    blocked: blockReason != null,
+    block_reason: blockReason,
+  };
+}
+
+/** Refuses text that carries one of OUR secrets (CONTRACT.md section 12: never
+ *  put DEVIN_API_KEY / JARVIS_COCKPIT_KEY / provider tokens in a Devin prompt).
+ *  Cheap literal check against the live env values — catches the copy-paste
+ *  accident, not a determined exfiltration. */
+export function textCarriesLocalSecret(text: string): boolean {
+  const secrets = [process.env.DEVIN_API_KEY, process.env.JARVIS_COCKPIT_KEY, process.env.PAPERCLIP_BOARD_API_KEY];
+  for (const s of secrets) {
+    const v = s?.trim();
+    if (v && v.length >= 12 && text.includes(v)) return true;
+  }
+  return false;
 }
 
 export function insertLocalPendingDevinJob(args: {
@@ -302,6 +356,13 @@ export function markDevinJobCreateFailed(id: number, reason: string): DevinJobRo
   return updated;
 }
 
+/** Devin reports the session no longer exists — stamp the row so the board
+ *  shows WHY it settled (status error / session_not_found). Caller settles it. */
+export function markDevinJobGone(id: number): DevinJobRow | null {
+  markGoneStmt.run(id);
+  return getDevinJob(id);
+}
+
 export function markDevinJobSettled(id: number): DevinJobRow | null {
   markSettledStmt.run(id);
   const updated = getDevinJob(id);
@@ -330,6 +391,8 @@ export async function createDevinJobAndDispatch(args: {
   tags?: string[];
   nodeId?: number | null;
   threadExt?: string | null;
+  /** Per-session ACU cap handed to Devin (`max_acu_limit`). Omit/null = none. */
+  maxAcuLimit?: number | null;
 }): Promise<DevinJobRow> {
   const tags = buildDevinJobTags(args.tags, args.nodeId ?? null);
   const promptSummary = args.prompt.length > 240 ? `${args.prompt.slice(0, 237)}...` : args.prompt;
@@ -348,6 +411,7 @@ export async function createDevinJobAndDispatch(args: {
       devin_mode: args.devinMode,
       structured_output_schema: args.schema ?? undefined,
       tags,
+      max_acu_limit: args.maxAcuLimit ?? undefined,
     });
     const attached = attachDevinSession(local.id, session);
     return attached ?? local;

@@ -35,6 +35,12 @@ Contract Resolution Rule:
 - blocked_question is reserved only when the contract is silent AND the choice changes user-visible behavior with no sane default.
 - Interface/shape/error-code/naming/test-vs-contract conflicts resolve toward the contract + DECISIONS.md, never a question for Kevin.
 
+Foundation Gate:
+- If the blueprint has foundation, the root framework skeleton is server-created before this node runs.
+- Do not create or fake framework entrypoints to satisfy checks. Missing artisan, vendor/, framework directories, or toolchain => finish blocked.
+- Do not edit foundry.json.foundation.checks to bypass the gate. The server runs DB-owned checks before accepting done.
+- Dependencies are not committed (vendor/, node_modules/): run the stack's install step in your worktree first, or the checks fail on a missing autoloader. Never work in a bare directory or re-init git: the server also verifies the checkout descends from the FOUNDATION commit.
+
 Create module.json, src/, tests/, and README.md. Run the module test command green.
 Finish by POSTing to hopper node {{node_id}} with one outcome:
 - done: commit sha, files, provides implemented, and test result.
@@ -65,6 +71,12 @@ Contract Resolution Rule:
 - Every resolution is appended to DECISIONS.md with the date, module, conflict, and rule applied.
 - blocked_question is reserved only when the contract is silent AND the choice changes user-visible behavior with no sane default.
 - Interface/shape/error-code/naming/test-vs-contract conflicts resolve toward the contract + DECISIONS.md, never a question for Kevin.
+
+Foundation Gate:
+- If the blueprint has foundation, the root framework skeleton is server-created before this node runs.
+- Do not create or fake framework entrypoints to satisfy checks. Missing artisan, vendor/, framework directories, or toolchain => finish blocked.
+- Do not edit foundry.json.foundation.checks to bypass the gate. The server runs DB-owned checks before accepting done.
+- Dependencies are not committed (vendor/, node_modules/): run the stack's install step in your worktree first, or the checks fail on a missing autoloader. Never work in a bare directory or re-init git: the server also verifies the checkout descends from the FOUNDATION commit.
 
 Run commands.test, add/refine tests that try to refute the acceptance criteria, run:
 node {{skill_dir}}/templates/foundry-validate.mjs --module modules/{{key}}
@@ -110,6 +122,12 @@ Contract Resolution Rule:
 - blocked_question is reserved only when the contract is silent AND the choice changes user-visible behavior with no sane default.
 - Interface/shape/error-code/naming/test-vs-contract conflicts resolve toward the contract + DECISIONS.md, never a question for Kevin.
 
+Foundation Gate:
+- If the blueprint has foundation, the root framework skeleton is server-created before this node runs.
+- Do not create or fake framework entrypoints to satisfy checks. Missing artisan, vendor/, framework directories, or toolchain => finish blocked.
+- Do not edit foundry.json.foundation.checks to bypass the gate. The server runs DB-owned checks before accepting done.
+- Dependencies are not committed (vendor/, node_modules/): run the stack's install step in your worktree first, or the checks fail on a missing autoloader. Never work in a bare directory or re-init git: the server also verifies the checkout descends from the FOUNDATION commit.
+
 Finish by POSTing to hopper node {{node_id}} with one outcome:
 - done: integration commit sha and green test evidence.
 - blocked: missing/impossible contract, missing access, or broken dependency.
@@ -130,6 +148,7 @@ Acceptance:
 {{acceptance_all}}
 
 GUARD: review only; no production systems, no API keys, no merges to main.
+Foundation reality (framework apps): the FOUNDATION scaffold/adopt commit must be an ancestor of this branch; block on any hand-rolled framework entrypoint (fake artisan/manage.py/binstubs, re-implemented test runners) and on foundry.json.foundation drifting from the DB-owned spec.
 Finish by POSTing to hopper node {{node_id}} with verdict, seams tested, and risks.
 `,
   'integrate-docs': `# FOUNDRY INTEGRATE DOCS - {{project}}

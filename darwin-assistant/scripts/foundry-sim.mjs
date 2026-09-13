@@ -11,6 +11,7 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -36,6 +37,31 @@ function guardDbPath() {
 
 const DB_PATH = guardDbPath();
 console.log(`[foundry-sim] scratch DB: ${DB_PATH}`);
+
+// Foundation Gate scenarios (I-L below) create real module/integration
+// checkout directories to drive the finish-time check runner. Point
+// FOUNDRY_WORKTREES at a scratch dir so this never touches the real
+// /home/kevin/foundry-worktrees tree.
+const WORKTREES_ROOT = process.env.FOUNDRY_WORKTREES ?? '/tmp/foundry-sim-worktrees';
+process.env.FOUNDRY_WORKTREES = WORKTREES_ROOT;
+fs.rmSync(WORKTREES_ROOT, { recursive: true, force: true });
+console.log(`[foundry-sim] scratch worktrees root: ${WORKTREES_ROOT}`);
+
+// This file runs ~15 independent probe scenarios back-to-back in ONE process
+// against ONE dispatcher (dispatchTick's running-node count is global, not
+// per-project). Several probes deliberately launch a project without ever
+// draining it (they only care about the state right after launch/plant), so
+// their ready leaves get opportunistically vacuumed into 'running' later by
+// an unrelated probe's queueMicrotask(dispatchTick) — and then sit there
+// forever, since nobody ever finishes them. With a low slot count that
+// starves later probes of a slot to claim their own node into (a real
+// blocker hit once already — see FOUNDATION-GATE-CONTRACT.md node #148
+// dependencies). None of this reflects a production bug: a live server
+// finishes real nodes. Floor the slot count well above what this file could
+// ever legitimately need concurrently so the harness itself never starves.
+const MIN_SIM_SLOTS = 24;
+const requestedSlots = parseInt(process.env.HOPPER_ENGINE_SLOTS ?? '', 10);
+process.env.HOPPER_ENGINE_SLOTS = String(Math.max(Number.isFinite(requestedSlots) ? requestedSlots : 0, MIN_SIM_SLOTS));
 
 // Dynamic imports ONLY after the guard passes.
 const distDir = path.join(__dirname, '..', 'dist');
@@ -122,6 +148,22 @@ function warningErrorNotificationCountSince(marker) {
 }
 
 // ---------------------------------------------------------------------------
+// serverFinishNode — mirrors the production POST /hopper-nodes/:id/finish
+// route (handlers/api-v1.ts) exactly: run the Foundation Gate first, and only
+// hand a raw 'done'/'split'/'blocked_question'/'blocked' to finishHopperNode
+// when the gate doesn't reject it. Foundation-less blueprints (scenarios A-H)
+// get {ok:true, gated:false} back immediately, so this is a no-op drop-in
+// for every pre-existing scenario.
+// ---------------------------------------------------------------------------
+function serverFinishNode(nodeId, outcome, payload = {}) {
+  const gate = foundry.runFoundryFoundationFinishGate(nodeId, outcome);
+  if (!gate.ok) {
+    return hopperEngine.finishHopperNode(nodeId, 'blocked', { result: gate.result });
+  }
+  return hopperEngine.finishHopperNode(nodeId, outcome, payload);
+}
+
+// ---------------------------------------------------------------------------
 // Drain helper — repeatedly ticks the dispatcher and finishes whatever it
 // claims as 'done', until the project goes quiescent (ready/blocked) or an
 // idle streak suggests nothing more will ever run.
@@ -145,7 +187,7 @@ async function drain(projectId, { maxRounds = 80 } = {}) {
     }
     idleRounds = 0;
     for (const n of running) {
-      hopperEngine.finishHopperNode(n.id, 'done', { result: `[sim] ${n.title} completed OK — no model call made.` });
+      serverFinishNode(n.id, 'done', { result: `[sim] ${n.title} completed OK — no model call made.` });
     }
   }
   return foundry.getProjectRow(projectId);
@@ -153,6 +195,63 @@ async function drain(projectId, { maxRounds = 80 } = {}) {
 
 function rmrf(p) {
   fs.rmSync(p, { recursive: true, force: true });
+}
+
+// Foundation Gate checkout-path helpers — mirror the private worktreePath()
+// convention in foundry.ts exactly (worktreesRoot() reads FOUNDRY_WORKTREES,
+// pinned to WORKTREES_ROOT above).
+function moduleCheckoutPath(projectId, moduleKey) {
+  return path.join(WORKTREES_ROOT, `${projectId}-${moduleKey}`);
+}
+function integrationCheckoutPath(projectId) {
+  return path.join(WORKTREES_ROOT, `${projectId}-integration`);
+}
+/** Seed a checkout the way a well-behaved worker does: a git worktree branched
+ *  from the project base branch, so it DERIVES from the FOUNDATION commit and
+ *  already carries whatever scaffold_cmd produced. */
+function seedDerivedCheckout(repoPath, checkoutPath, branch) {
+  rmrf(checkoutPath);
+  try { execFileSync('git', ['worktree', 'prune'], { cwd: repoPath, stdio: 'ignore' }); } catch {}
+  try { execFileSync('git', ['branch', '-D', branch], { cwd: repoPath, stdio: 'ignore' }); } catch {}
+  execFileSync('git', ['worktree', 'add', checkoutPath, '-b', branch, 'HEAD'], { cwd: repoPath, stdio: 'ignore' });
+}
+/** Seed the fake-Laravel shape: a bare directory (or re-initialised repo) that
+ *  hand-writes whatever the checks look for but never derived from the scaffold. */
+function seedFakeCheckout(checkoutPath, files = {}) {
+  rmrf(checkoutPath);
+  fs.mkdirSync(checkoutPath, { recursive: true });
+  for (const [name, content] of Object.entries(files)) fs.writeFileSync(path.join(checkoutPath, name), content);
+}
+function moduleBranch(projectId, moduleKey) {
+  return `foundry/${projectId}/${moduleKey}`;
+}
+function gitCommitSubjects(repoPath) {
+  return execFileSync('git', ['log', '--format=%s'], { cwd: repoPath, encoding: 'utf8' })
+    .trim()
+    .split('\n')
+    .filter(Boolean);
+}
+function appShellModule() {
+  return {
+    key: 'app-shell',
+    name: 'app-shell',
+    kind: 'service',
+    purpose: 'Owns the scaffolded application skeleton.',
+    contract: { provides: [{ type: 'fn', name: 'noop', summary: 'Does nothing' }], requires: [] },
+    acceptance: ['noop can be called without throwing'],
+    depends_on: [],
+  };
+}
+function foundationBlueprint(name, foundation) {
+  return {
+    name,
+    prompt: `Trivial framework-app probe: ${name}`,
+    foundation,
+    modules: [appShellModule()],
+    wiring: [],
+    integration: { test: 'true', docs: 'README.md' },
+    run: { command: 'true' },
+  };
 }
 
 // =============================================================================
@@ -721,6 +820,363 @@ async function runAutoRetryDuplicateEventProbe() {
   });
 }
 await runAutoRetryDuplicateEventProbe();
+
+// =============================================================================
+// SCENARIO I — Foundation Gate: launch scaffolds deterministically, checks run
+// green, and module trees plant only after (tree-53a87489 node #145 recon /
+// FOUNDATION-GATE-CONTRACT.md "Launch-Time Scaffold Gate").
+// =============================================================================
+async function runFoundationLaunchHappyProbe() {
+  const repo = '/tmp/foundry-sim-repo-foundation-launch';
+  rmrf(repo);
+  const blueprint = foundationBlueprint('foundry-sim-foundation-launch-probe', {
+    stack: 'sim-stack',
+    scaffold_cmd: "printf 'scaffolded\\n' > FOUNDATION_MARKER.txt",
+    checks: [
+      { cmd: 'test -f FOUNDATION_MARKER.txt' },
+      { cmd: 'cat FOUNDATION_MARKER.txt', expect_regex: '^scaffolded' },
+    ],
+  });
+  const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+  foundry.setBlueprint(project.id, blueprint);
+  assert.ok(!fs.existsSync(path.join(repo, 'FOUNDATION_MARKER.txt')), 'sanity: marker must not exist before launch');
+
+  foundry.launchProject(project.id);
+
+  check('14', 'launch scaffolds a framework foundation deterministically, checks run green, and module trees plant only after', () => {
+    assert.ok(fs.existsSync(path.join(repo, 'FOUNDATION_MARKER.txt')), 'scaffold_cmd never ran (marker file missing)');
+    assert.equal(fs.readFileSync(path.join(repo, 'FOUNDATION_MARKER.txt'), 'utf8').trim(), 'scaffolded');
+    const subjects = gitCommitSubjects(repo);
+    assert.ok(subjects.includes('FOUNDATION scaffold: sim-stack'), `expected a FOUNDATION scaffold commit, got subjects: ${JSON.stringify(subjects)}`);
+    const { project: after, modules } = foundry.getProjectWithModules(project.id);
+    assert.equal(after.status, 'building', `expected project 'building' post-launch, got '${after.status}'`);
+    const appShell = modules.find((m) => m.key === 'app-shell');
+    assert.ok(appShell?.tree_id, 'app-shell module tree was never planted after a successful foundation scaffold');
+  });
+
+  // Drain to completion (rather than leaving nodes dangling) so this probe's
+  // module tree can't later get opportunistically claimed by an unrelated
+  // scenario's queueMicrotask(dispatchTick) and starve it of a slot — seed
+  // both checkouts with the same real scaffold output the checks require.
+  seedDerivedCheckout(repo, moduleCheckoutPath(project.id, 'app-shell'), moduleBranch(project.id, 'app-shell'));
+  seedDerivedCheckout(repo, integrationCheckoutPath(project.id), moduleBranch(project.id, 'integration'));
+  await drain(project.id);
+}
+await runFoundationLaunchHappyProbe();
+
+// =============================================================================
+// SCENARIO J — Foundation Gate: a failing scaffold_cmd blocks the project and
+// plants NO module trees (the fake-Laravel incident, prevented at the door).
+// =============================================================================
+async function runFoundationLaunchScaffoldFailureProbe() {
+  const repo = '/tmp/foundry-sim-repo-foundation-scaffold-fail';
+  rmrf(repo);
+  const blueprint = foundationBlueprint('foundry-sim-foundation-scaffold-fail-probe', {
+    stack: 'sim-stack-fail',
+    scaffold_cmd: 'exit 1',
+    checks: [{ cmd: 'test -f FOUNDATION_MARKER.txt' }],
+  });
+  const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+  foundry.setBlueprint(project.id, blueprint);
+
+  let threw = null;
+  try {
+    foundry.launchProject(project.id);
+  } catch (err) {
+    threw = err;
+  }
+
+  check('15', 'a failing scaffold_cmd blocks the project and plants no module trees', () => {
+    assert.ok(threw, 'launchProject did not throw on a failing scaffold_cmd');
+    const after = foundry.getProjectRow(project.id);
+    assert.equal(after?.status, 'blocked', `expected project 'blocked' after scaffold failure, got '${after?.status}'`);
+    assert.ok(/FOUNDATION SCAFFOLD FAILED/.test(after?.last_error ?? ''), `last_error missing FOUNDATION SCAFFOLD FAILED marker: ${after?.last_error}`);
+    assert.ok(!fs.existsSync(path.join(repo, 'FOUNDATION_MARKER.txt')), 'scaffold_cmd partially ran despite exiting non-zero');
+    const { modules } = foundry.getProjectWithModules(project.id);
+    assert.ok(modules.every((m) => !m.tree_id), `expected no module trees planted, got ${JSON.stringify(modules.map((m) => [m.key, m.tree_id]))}`);
+  });
+}
+await runFoundationLaunchScaffoldFailureProbe();
+
+// =============================================================================
+// SCENARIO K — Foundation Gate: finish-time check on a module BUILD node.
+// A worker POSTs done while a foundation check fails -> server rejects to
+// blocked with the check output, dependents stay put; fix the checkout and
+// finish again -> done is accepted and dependents unblock.
+// =============================================================================
+async function runFoundationBuildFinishGateProbe() {
+  convDb.setSetting('foundry_auto_decide', '0');
+  const repo = '/tmp/foundry-sim-repo-foundation-build-gate';
+  rmrf(repo);
+  try {
+    // Foundation checks run at BOTH launch time (cwd=repo_path, right after
+    // scaffold_cmd) and finish time (cwd=the node's checkout) — so the single
+    // check here must be something scaffold_cmd genuinely produces, not a
+    // module-specific deliverable (that would fail launch itself). The
+    // "check fails" case is a checkout that didn't actually derive from the
+    // real scaffolded commit (the literal fake-Laravel incident shape).
+    const blueprint = foundationBlueprint('foundry-sim-foundation-build-gate-probe', {
+      stack: 'sim-stack',
+      scaffold_cmd: "printf 'scaffolded\\n' > FOUNDATION_MARKER.txt",
+      checks: [{ cmd: 'test -f FOUNDATION_MARKER.txt' }],
+    });
+    const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+    foundry.setBlueprint(project.id, blueprint);
+    foundry.launchProject(project.id);
+    await hopperEngine.dispatchTick('foundation-build-gate-claim');
+
+    const pre = foundry.getProjectWithModules(project.id).modules[0];
+    const buildNodeId = pre.stage_nodes.build.node_id;
+    const testNodeId = pre.stage_nodes.test.node_id;
+    assert.ok(buildNodeId && testNodeId, 'foundation build-gate probe: stage nodes were never planted');
+
+    // The literal fake-Laravel shape: the worker's checkout is a bare directory
+    // that HAND-WRITES the very file the check looks for. The planner check
+    // passes; the server must still refuse because the checkout never derived
+    // from the FOUNDATION commit.
+    const buildCheckout = moduleCheckoutPath(project.id, 'app-shell');
+    seedFakeCheckout(buildCheckout, { 'FOUNDATION_MARKER.txt': 'scaffolded\n' });
+
+    const rejected = serverFinishNode(buildNodeId, 'done', { result: 'BUILD complete (hand-built checkout that satisfies the check — should be rejected)' });
+
+    check('16a', "a BUILD node cannot finish 'done' from a hand-built checkout even when the checks pass — derivation from the FOUNDATION commit is enforced", () => {
+      assert.equal(rejected?.status, 'blocked', `expected node 'blocked', got '${rejected?.status}'`);
+      assert.ok(/FOUNDATION CHECK FAILED/.test(rejected?.result ?? ''), 'blocked result is missing the FOUNDATION CHECK FAILED marker');
+      assert.ok(/FOUNDATION DERIVATION FAILED/.test(rejected?.result ?? ''), 'blocked result is missing the FOUNDATION DERIVATION FAILED marker');
+      const testNode = hopperEngine.getHopperNode(testNodeId);
+      assert.equal(testNode.status, 'pending', `dependents must not dispatch on a rejected done — TEST was '${testNode.status}'`);
+      const module = foundry.getProjectWithModules(project.id).modules[0];
+      assert.equal(module.stage, 'blocked', `expected module stage 'blocked', got '${module.stage}'`);
+    });
+
+    // Fix: the checkout now genuinely derives from the scaffolded commit, and
+    // (since this probe also drains to completion below) the integration
+    // checkout is seeded the same way so MERGE's own foundation gate — proven
+    // separately in scenario L — doesn't block this run on an unrelated
+    // missing checkout.
+    seedDerivedCheckout(repo, buildCheckout, moduleBranch(project.id, 'app-shell'));
+    seedDerivedCheckout(repo, integrationCheckoutPath(project.id), moduleBranch(project.id, 'integration'));
+
+    foundry.retryModule(project.id, 'app-shell');
+    await hopperEngine.dispatchTick('foundation-build-gate-retry-claim');
+    const runningAgain = hopperEngine.getHopperNode(buildNodeId);
+    assert.equal(runningAgain.status, 'running', `expected BUILD node running again after retry, got '${runningAgain.status}'`);
+    const accepted = serverFinishNode(buildNodeId, 'done', { result: 'BUILD complete, real files present' });
+
+    check('16b', 'the same BUILD node finishes done once the foundation checks actually pass', () => {
+      assert.equal(accepted?.status, 'done', `expected node 'done' once checks pass, got '${accepted?.status}'`);
+    });
+
+    const finalProject = await drain(project.id, { maxRounds: 20 });
+    check('16c', 'after the BUILD gate clears, dependents unblock and the project walks to ready', () => {
+      assert.equal(hopperEngine.getHopperNode(testNodeId).status, 'done', 'TEST never dispatched/completed after BUILD was accepted');
+      assert.equal(finalProject.status, 'ready', `expected project 'ready', got '${finalProject.status}' (last_error: ${finalProject.last_error})`);
+    });
+  } finally {
+    convDb.deleteSetting('foundry_auto_decide');
+  }
+}
+await runFoundationBuildFinishGateProbe();
+
+// =============================================================================
+// SCENARIO L — Foundation Gate: finish-time check on the integration MERGE
+// node. Same gate, same reject/fix/retry shape as K, applied to integration.
+// =============================================================================
+async function runFoundationIntegrationFinishGateProbe() {
+  convDb.setSetting('foundry_auto_decide', '0');
+  const repo = '/tmp/foundry-sim-repo-foundation-merge-gate';
+  rmrf(repo);
+  try {
+    const blueprint = foundationBlueprint('foundry-sim-foundation-merge-gate-probe', {
+      stack: 'sim-stack',
+      scaffold_cmd: "printf 'scaffolded\\n' > FOUNDATION_MARKER.txt",
+      checks: [{ cmd: 'test -f FOUNDATION_MARKER.txt' }],
+    });
+    const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+    foundry.setBlueprint(project.id, blueprint);
+    foundry.launchProject(project.id);
+
+    // Walk the single module through BUILD/TEST/DOC — seed its own checkout
+    // up front so its BUILD gate passes trivially; this probe targets the
+    // MERGE gate specifically (BUILD's own gate is scenario K's job).
+    let mergeNode = null;
+    for (let round = 0; round < 40 && !mergeNode; round++) {
+      await hopperEngine.dispatchTick(`foundation-merge-gate-${round}`);
+      const state = foundry.getProjectWithModules(project.id);
+      const integrationTreeId = state.project.integration_tree_id;
+      if (integrationTreeId) {
+        const candidate = hopperEngine.listTreeNodes(integrationTreeId).find((n) => n.title.startsWith('MERGE '));
+        if (candidate?.status === 'running') {
+          mergeNode = candidate;
+          break;
+        }
+      }
+      const moduleTreeId = state.modules[0]?.tree_id;
+      if (moduleTreeId) {
+        for (const node of hopperEngine.listTreeNodes(moduleTreeId).filter((n) => n.status === 'running')) {
+          if (node.title.startsWith('BUILD')) {
+            // Its own BUILD gate isn't this probe's focus (that's scenario K)
+            // — seed the checkout so it derives from the real scaffold and
+            // passes trivially.
+            seedDerivedCheckout(repo, moduleCheckoutPath(project.id, 'app-shell'), moduleBranch(project.id, 'app-shell'));
+          }
+          serverFinishNode(node.id, 'done', { result: `[sim] ${node.title} completed OK — no model call made.` });
+        }
+      }
+    }
+    assert.ok(mergeNode, 'foundation merge-gate probe: MERGE node never reached running');
+
+    // The integration checkout exists but does NOT actually derive from the
+    // real scaffolded commit — the merge never landed anything real.
+    const mergeCheckout = integrationCheckoutPath(project.id);
+    seedFakeCheckout(mergeCheckout);
+
+    const rejected = serverFinishNode(mergeNode.id, 'done', { result: 'merge complete (checkout never derived from the real scaffold — should be rejected)' });
+
+    check('17a', "the integration MERGE node cannot finish 'done' while a foundation check fails — the server converts it to blocked", () => {
+      assert.equal(rejected?.status, 'blocked', `expected MERGE node 'blocked', got '${rejected?.status}'`);
+      assert.ok(/FOUNDATION CHECK FAILED/.test(rejected?.result ?? ''), 'blocked result is missing the FOUNDATION CHECK FAILED marker');
+      assert.ok((rejected?.result ?? '').includes('test -f FOUNDATION_MARKER.txt'), 'blocked result does not name the failing check command');
+      const reviewNode = hopperEngine.listTreeNodes(mergeNode.tree_id).find((n) => n.title.startsWith('REVIEW'));
+      assert.equal(reviewNode?.status, 'pending', `REVIEW must not dispatch on a rejected MERGE done, got '${reviewNode?.status}'`);
+      const afterProject = foundry.getProjectRow(project.id);
+      assert.equal(afterProject?.status, 'blocked', `expected project 'blocked' after MERGE gate rejection, got '${afterProject?.status}'`);
+    });
+
+    // Fix: the merge actually lands real integrated output (derived from the
+    // scaffold), then retry via the same production path Kevin's cockpit
+    // "retry" button uses.
+    seedDerivedCheckout(repo, mergeCheckout, moduleBranch(project.id, 'integration'));
+    foundry.retryIntegration(project.id);
+    await hopperEngine.dispatchTick('foundation-merge-gate-retry-claim');
+    const runningAgain = hopperEngine.getHopperNode(mergeNode.id);
+    assert.equal(runningAgain.status, 'running', `expected MERGE node running again after retry, got '${runningAgain.status}'`);
+    const accepted = serverFinishNode(mergeNode.id, 'done', { result: 'merge complete, integration verified' });
+
+    check('17b', 'the same MERGE node finishes done once the foundation checks actually pass', () => {
+      assert.equal(accepted?.status, 'done', `expected MERGE node 'done' once checks pass, got '${accepted?.status}'`);
+    });
+
+    const finalProject = await drain(project.id, { maxRounds: 20 });
+    check('17c', 'after the MERGE gate clears, the project reaches ready', () => {
+      assert.equal(finalProject.status, 'ready', `expected project 'ready', got '${finalProject.status}' (last_error: ${finalProject.last_error})`);
+    });
+  } finally {
+    convDb.deleteSetting('foundry_auto_decide');
+  }
+}
+await runFoundationIntegrationFinishGateProbe();
+
+// =============================================================================
+// SCENARIO M — Foundation Gate hardening (adversarial review, node #149):
+//  #18 vacuous checks (pass on an empty repo) are refused at launch, the
+//      blueprint stays editable while foundation-blocked, and a fixed
+//      blueprint relaunches cleanly.
+//  #19 scaffold_cmd runs in an EMPTY staging dir (real scaffolders refuse a
+//      non-empty target — `composer create-project … .` dies on `.git/`).
+//  #20 a scaffold that exits 0 but whose check is wrong commits the real bones,
+//      blocks, and relaunch after fixing the check is idempotent (no re-scaffold).
+// =============================================================================
+async function runFoundationHardeningProbe() {
+  // #18 — vacuous checks
+  {
+    const repo = '/tmp/foundry-sim-repo-foundation-vacuous';
+    rmrf(repo);
+    const blueprint = foundationBlueprint('foundry-sim-foundation-vacuous-probe', {
+      stack: 'sim-stack-vacuous',
+      scaffold_cmd: "printf 'scaffolded\\n' > FOUNDATION_MARKER.txt",
+      checks: [{ cmd: 'true' }],
+    });
+    const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+    foundry.setBlueprint(project.id, blueprint);
+    let threw = null;
+    try { foundry.launchProject(project.id); } catch (err) { threw = err; }
+    let relaunched = null;
+    check('18', 'checks that pass on an empty repo are refused at launch; blueprint stays editable while foundation-blocked; fixed blueprint relaunches', () => {
+      assert.ok(threw, 'launchProject did not throw on vacuous checks');
+      assert.equal(threw?.code, 'foundry_foundation_checks_vacuous', `expected foundry_foundation_checks_vacuous, got ${threw?.code}`);
+      const after = foundry.getProjectRow(project.id);
+      assert.equal(after?.status, 'blocked');
+      assert.ok(!fs.existsSync(path.join(repo, 'FOUNDATION_MARKER.txt')), 'scaffold_cmd must not run when the checks are vacuous');
+      // Fix the checks (allowed: nothing planted yet) and relaunch.
+      foundry.setBlueprint(project.id, { ...blueprint, foundation: { ...blueprint.foundation, checks: [{ cmd: 'test -f FOUNDATION_MARKER.txt' }] } });
+      assert.equal(foundry.getProjectRow(project.id)?.status, 'planned');
+      relaunched = foundry.launchProject(project.id);
+      assert.equal(relaunched.project.status, 'building');
+      assert.ok(gitCommitSubjects(repo).includes('FOUNDATION scaffold: sim-stack-vacuous'));
+    });
+    if (relaunched) {
+      seedDerivedCheckout(repo, moduleCheckoutPath(project.id, 'app-shell'), moduleBranch(project.id, 'app-shell'));
+      seedDerivedCheckout(repo, integrationCheckoutPath(project.id), moduleBranch(project.id, 'integration'));
+      await drain(project.id);
+    }
+  }
+
+  // #19 — scaffold sees an empty directory
+  {
+    const repo = '/tmp/foundry-sim-repo-foundation-staging';
+    rmrf(repo);
+    const blueprint = foundationBlueprint('foundry-sim-foundation-staging-probe', {
+      stack: 'sim-stack-staging',
+      // Mirrors composer/create-next-app/rails: refuse a non-empty target.
+      scaffold_cmd: "[ -z \"$(ls -A)\" ] && mkdir -p app && printf 'scaffolded\\n' > FOUNDATION_MARKER.txt && git init -q . && printf 'ignored\\n' > .gitignore",
+      checks: [{ cmd: 'test -f FOUNDATION_MARKER.txt' }, { cmd: 'test -d app' }],
+    });
+    const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+    foundry.setBlueprint(project.id, blueprint);
+    foundry.launchProject(project.id);
+    check('19', 'scaffold_cmd runs in an empty staging dir and its output (minus any .git it made) overlays the repo', () => {
+      assert.equal(foundry.getProjectRow(project.id)?.status, 'building');
+      assert.ok(fs.existsSync(path.join(repo, 'FOUNDATION_MARKER.txt')));
+      assert.ok(fs.existsSync(path.join(repo, 'app')));
+      assert.ok(fs.existsSync(path.join(repo, 'foundry.json')), 'bootstrap foundry.json must survive the overlay');
+      assert.ok(fs.existsSync(path.join(repo, '.gitignore')), 'scaffold dotfiles must be overlaid too');
+      const head = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+      assert.ok(gitCommitSubjects(repo).includes('FOUNDATION scaffold: sim-stack-staging'), 'scaffold commit missing (did the scaffolder\'s own git init clobber the repo?)');
+      assert.ok(gitCommitSubjects(repo).includes('Initial Foundry scaffold'), 'repo history was replaced by the scaffolder\'s .git');
+      assert.ok(!fs.readdirSync(path.dirname(repo)).some((e) => e.startsWith('.foundry-scaffold-')), 'staging dir leaked');
+      assert.ok(head.length > 0);
+    });
+    seedDerivedCheckout(repo, moduleCheckoutPath(project.id, 'app-shell'), moduleBranch(project.id, 'app-shell'));
+    seedDerivedCheckout(repo, integrationCheckoutPath(project.id), moduleBranch(project.id, 'integration'));
+    await drain(project.id);
+  }
+
+  // #20 — real scaffold, wrong check → commit bones, block, fix, idempotent relaunch
+  {
+    const repo = '/tmp/foundry-sim-repo-foundation-badcheck';
+    rmrf(repo);
+    const counter = '/tmp/foundry-sim-foundation-badcheck-runs';
+    rmrf(counter);
+    const blueprint = foundationBlueprint('foundry-sim-foundation-badcheck-probe', {
+      stack: 'sim-stack-badcheck',
+      scaffold_cmd: `printf 'scaffolded\\n' > FOUNDATION_MARKER.txt && echo run >> ${counter}`,
+      checks: [{ cmd: 'cat FOUNDATION_MARKER.txt', expect_regex: '^Laravel Framework' }],
+    });
+    const { project } = foundry.createProject({ name: blueprint.name, prompt: blueprint.prompt, repo_path: repo });
+    foundry.setBlueprint(project.id, blueprint);
+    let threw = null;
+    try { foundry.launchProject(project.id); } catch (err) { threw = err; }
+    let relaunched = null;
+    check('20', 'a scaffold that exits 0 with a wrong check commits the real bones, blocks with the check output, and relaunch after the fix is idempotent', () => {
+      assert.equal(threw?.code, 'foundry_foundation_check_failed', `expected foundry_foundation_check_failed, got ${threw?.code}`);
+      assert.ok(/FOUNDATION CHECK FAILED/.test(foundry.getProjectRow(project.id)?.last_error ?? ''));
+      assert.ok(gitCommitSubjects(repo).includes('FOUNDATION scaffold: sim-stack-badcheck'), 'real bones must be committed even when the check is wrong');
+      const dirty = execFileSync('git', ['status', '--porcelain'], { cwd: repo, encoding: 'utf8' }).trim();
+      assert.equal(dirty, '', `repo left dirty after a post-scaffold check failure: ${dirty}`);
+      foundry.setBlueprint(project.id, { ...blueprint, foundation: { ...blueprint.foundation, checks: [{ cmd: 'cat FOUNDATION_MARKER.txt', expect_regex: '^scaffolded' }] } });
+      relaunched = foundry.launchProject(project.id);
+      assert.equal(relaunched.project.status, 'building');
+      assert.equal(fs.readFileSync(counter, 'utf8').trim(), 'run', 'scaffold_cmd re-ran on relaunch (must be idempotent)');
+    });
+    if (relaunched) {
+      seedDerivedCheckout(repo, moduleCheckoutPath(project.id, 'app-shell'), moduleBranch(project.id, 'app-shell'));
+      seedDerivedCheckout(repo, integrationCheckoutPath(project.id), moduleBranch(project.id, 'integration'));
+      await drain(project.id);
+    }
+  }
+}
+await runFoundationHardeningProbe();
 
 // =============================================================================
 // Report

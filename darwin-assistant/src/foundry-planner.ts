@@ -18,6 +18,13 @@ Return this shape:
 {
   "name": "<project-slug-kebab>",
   "prompt": "<the prompt, verbatim>",
+  "foundation": {
+    "stack": "<framework stack, e.g. Laravel 12; omit only for non-framework libraries/tools>",
+    "scaffold_cmd": "<deterministic scaffold command, e.g. composer create-project laravel/laravel .>",
+    "checks": [
+      { "cmd": "<read-only assertion command>", "expect_regex": "<optional regex matched against stdout+stderr>" }
+    ]
+  },
   "modules": [
     {
       "key": "<kebab>",
@@ -38,6 +45,8 @@ Return this shape:
 
 Rules:
 - Prefer 3-9 modules, each buildable by one worker in a 30-minute lease.
+- Framework apps (Laravel, Rails, Django, Next, Nuxt, SvelteKit, Phoenix, Express app shells, etc.) MUST include foundation. The server scaffolds it deterministically before workers run; workers never model-generate framework bones.
+- For framework apps, emit an app-shell module that owns root framework wiring. Other modules that need the shell depend on app-shell.
 - If two or more modules share a type/schema/error shape, create a contracts module first.
 - Every shared type must specify required fields, optional fields, strict-vs-lenient handling of unknown fields, and error shapes.
 - Acceptance criteria must be checkable by script or curl and must reference the contract by name when they touch a shared interface.

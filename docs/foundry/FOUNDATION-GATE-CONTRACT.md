@@ -109,10 +109,10 @@ export function launchProject(id: string) {
 Implementation details:
 
 - Create a helper in `foundry.ts` or a new `foundry-foundation.ts` module. Keep it plain code: `child_process.execFile` or `spawn`, no model calls.
-- Run `foundation.scaffold_cmd` in `project.repo_path`, not in a worker worktree.
+- Run `foundation.scaffold_cmd` in an EMPTY staging directory beside `project.repo_path`, then overlay the result onto the repo (see As-Built Hardening §1) — never inside the repo (`.git/` makes it non-empty and real scaffolders refuse), never in a worker worktree.
 - Run under `/bin/bash -lc <scaffold_cmd>` so normal shell commands work, but still sanitize env by deleting model API keys if inherited.
 - Ensure the repo is clean before scaffold except for server-written `foundry.json`. If unrelated dirty files exist, block the project before running the command.
-- Commit all scaffold changes, including `foundry.json`, with:
+- Commit all scaffold changes, including `foundry.json`, BEFORE asserting the checks (a wrong check must not strand real bones uncommitted — As-Built §4), with:
 
 ```txt
 FOUNDATION scaffold: <foundation.stack>
@@ -227,6 +227,7 @@ Failure behavior:
   - regex mismatch if applicable
   - output tail
 - Dependents do not dispatch because the node is not `done`.
+- In addition to the checks, the checkout must be a git checkout whose HEAD descends from the FOUNDATION commit (`FOUNDATION DERIVATION FAILED` otherwise) — see As-Built Hardening §2.
 
 ## Template Changes Required
 
@@ -278,7 +279,34 @@ For framework app blueprints, `checks` must contain at least one command. A fram
 
 Persist `foundation.checks` to `foundry.json` for transparency, but always execute the DB-owned blueprint copy. If the integration REVIEW worker sees drift between root `foundry.json.foundation` and the DB-owned prompt/spec, it should block the project.
 
-## Implementation Anchor List
+## As-Built Hardening (adversarial review, tree-53a87489 node #149, 2026-09-12)
+
+The review attacked the built gate with a real `composer create-project laravel/laravel` run on a scratch DB and found four holes, all fixed on `hopper/foundry-foundation` and proven by sim checks #16a/#18/#19/#20:
+
+1. **Scaffold ran in the repo → real scaffolders refuse it.** `composer create-project laravel/laravel .` (the planner-prompt example), `create-next-app`, and `rails new` all die on a non-empty target, and `.git/` alone makes the Foundry repo non-empty ("Project directory is not empty", verified). Fix: `runStagedFoundationScaffold()` runs `scaffold_cmd` in an EMPTY sibling staging dir (`<parent>/.foundry-scaffold-<slug>-XXXX`, same filesystem), then overlays the output onto the repo, skipping any `.git` the scaffolder itself created (create-next-app / rails init one). The repo is untouched until the scaffold has exited 0. Scaffold has its own timeout knob, `FOUNDRY_FOUNDATION_SCAFFOLD_TIMEOUT_MS` (default 600 000), separate from the 120 s check timeout. Measured: Laravel 12 scaffold 6–8 s on the current box, warm or cold cache.
+
+2. **Checks alone cannot tell real bones from a hand-built skeleton.** A bare directory containing `<?php echo "Laravel Framework 12.0.0";` as `artisan` PASSES `php artisan --version =~ /^Laravel Framework/` — the literal suppression-manager shape. Fix: the finish gate now ALSO requires the checkout to be a git checkout whose HEAD descends from the `FOUNDATION scaffold|adopt: <stack>` commit (`git merge-base --is-ancestor`). Result carries `FOUNDATION DERIVATION FAILED` under the `FOUNDATION CHECK FAILED` header. A worker branching from the project base ref satisfies this for free; a re-initialised or bare tree never can. Planner checks are still run first (they are the planner-visible assertion); derivation is the planner-independent floor.
+
+3. **Vacuous checks silently "adopted" nothing.** If every check passed on the bare bootstrap repo (e.g. `{cmd: "php --version"}`), the old flow took the adopt path and committed `FOUNDATION adopt` with no skeleton. Fix: when the repo is a bare Foundry bootstrap (only `foundry.json`/`README.md`/`modules`/`contracts`, no app markers) and the pre-scaffold checks all pass, launch blocks with `foundry_foundation_checks_vacuous`. Adopt only fires on a repo that already has real app content.
+
+4. **A wrong check after a good scaffold killed the project permanently.** Old order: scaffold → checks → commit. A bad `expect_regex` after a successful `composer create-project` left the scaffold uncommitted and the working tree dirty, and the blueprint was locked (status `blocked`), so relaunch 409'd forever on `foundry_foundation_dirty_repo`. Fix: (a) the scaffold (exit 0) is committed as `FOUNDATION scaffold: <stack>` BEFORE the checks are asserted — bones are real, only the assertion was wrong; (b) `setBlueprint` accepts edits while the project is `blocked` **and nothing has been planted** (no module `tree_id`, no `integration_tree_id`) — the SQL guard enforces the same condition atomically; (c) relaunch takes the idempotent path (commit exists → re-assert checks, never re-scaffold). A changed `scaffold_cmd` or stack still blocks as before.
+
+Also shipped in the same pass:
+
+- Every planner-authored command the server executes is logged verbatim: `[foundry-foundation] cwd=… exit=… ms=… cmd="…"` (plus `TIMED_OUT`/`error=` when relevant). Output tails stay on the node/project result.
+- A gate-rejected `done` that gets auto-retried (`foundry_auto_decide`) now receives a foundation-specific retry block instead of the Contract Resolution Rule text — the failure is not a contract conflict, and the worker is told the checks are DB-owned and the worktree must derive from the base ref.
+- Worker templates (wiki kit + embedded fallbacks) say that dependencies are NOT committed: `vendor/`, `node_modules/` are git-ignored by every real scaffold, so a fresh worktree fails `php artisan --version` until the worker runs `composer install` / `npm ci`. That is intended — a worker that never installed deps never ran its tests either — but it must be stated, or the first real Laravel BUILD blocks on "vendor/autoload.php: No such file".
+- The integration REVIEW template gets an explicit foundation-reality step (confirm the FOUNDATION commit is an ancestor, no hand-rolled framework binstubs anywhere, `foundry.json.foundation` matches the DB-owned spec).
+
+### Known limitations left open (deliberately, with the numbers)
+
+- **The server runs scaffold and checks synchronously (`spawnSync`) inside Express handlers.** `POST /launch` blocks the whole `jarvis.service` event loop for the scaffold duration (6–8 s for Laravel here; minutes on a Raspberry-Pi-class box or a cold `create-next-app`), and every gated finish blocks it for the checks' duration (~100 ms for `php artisan --version`; up to 120 s × N on a hung check). While blocked, no SSE, chat, dispatcher tick, or cockpit call is served. The synchronous form is also what currently makes "two finishes on one node" and "lease expiry during checks" impossible to interleave. Converting to async `spawn` is the right follow-up but requires `launchProject`/the finish gate/the sim to go async AND a claim-token guard in `finishHopperNode` (compare `attempts`/`worker_thread_ext` captured before the checks) so a re-dispatched node cannot be finished by the previous worker's late gate. Not done in this pass; sized as its own node.
+- **Timeout kills the `bash -lc` process, not its process group.** A compound scaffold command (`a && b | c`) that times out can leave a child running; a simple command is exec'd by bash and receives the signal directly. `composer`/`npx` invocations are simple commands, so this is theoretical today.
+- **The gate proves derivation and the planner's assertions, not that a worker's COMMITTED state matches its working tree.** A worker that has real bones on disk but commits garbage is caught one stage later by the MERGE gate (which runs in the integration worktree after the merge), not at BUILD.
+- **`expect_regex` is matched against `stdout + "\n" + stderr`, un-flagged.** `^` anchors the whole string; a PHP deprecation printed to stdout before the version line would fail `^Laravel Framework`. Prefer un-anchored or `(?m)`-style patterns, or `test -f` style checks, when authoring.
+- **`FORBIDDEN_FOUNDATION_CHECK_RE` over-blocks** read-only `artisan migrate:status`. Safe direction; noted.
+
+
 
 - `darwin-assistant/src/foundry.ts:132-149` - `FoundryProjectRow`, DB-backed project shape.
 - `darwin-assistant/src/foundry.ts:232-240` - current `Blueprint` interface; add `foundation`.

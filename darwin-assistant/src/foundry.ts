@@ -1,6 +1,5 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { getConversation, getOrCreateConversation, setThreadModelOverride, sqliteDb } from './conversation-db.js';
 import { getFoundrySetting } from './foundry-settings.js';
@@ -309,6 +308,10 @@ const FOUNDATION_CHECK_TIMEOUT_MS = Math.max(
   1_000,
   parseInt(process.env.FOUNDRY_FOUNDATION_CHECK_TIMEOUT_MS ?? '120000', 10) || 120_000,
 );
+const FOUNDATION_SCAFFOLD_TIMEOUT_MS = Math.max(
+  FOUNDATION_CHECK_TIMEOUT_MS,
+  parseInt(process.env.FOUNDRY_FOUNDATION_SCAFFOLD_TIMEOUT_MS ?? '600000', 10) || 600_000,
+);
 const FOUNDATION_PATH_PREFIX = '/home/kevin/.local/bin:/home/kevin/.npm-global/bin:/usr/local/bin:/usr/bin:/bin';
 const FOUNDATION_OUTPUT_TAIL_BYTES = 12_000;
 
@@ -439,7 +442,14 @@ const setBlueprintStmt = sqliteDb.prepare<[string, string, string]>(`
       last_error = NULL,
       updated_at = datetime('now')
   WHERE id = ?
-    AND status IN ('draft','planning','planned')
+    AND (
+      status IN ('draft','planning','planned')
+      OR (
+        status = 'blocked'
+        AND integration_tree_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM foundry_modules m WHERE m.project_id = foundry_projects.id AND m.tree_id IS NOT NULL)
+      )
+    )
 `);
 const setBlueprintWhilePlanningStmt = sqliteDb.prepare<[string, string, string]>(`
   UPDATE foundry_projects
@@ -695,6 +705,7 @@ function foundationEnv(): NodeJS.ProcessEnv {
 }
 
 function runFoundationShell(cmd: string, cwd: string, timeoutMs = FOUNDATION_CHECK_TIMEOUT_MS): ShellCommandResult {
+  const startedAt = Date.now();
   const result = spawnSync('/bin/bash', ['-lc', cmd], {
     cwd,
     env: foundationEnv(),
@@ -706,12 +717,14 @@ function runFoundationShell(cmd: string, cwd: string, timeoutMs = FOUNDATION_CHE
   const stderr = typeof result.stderr === 'string' ? result.stderr : '';
   const output = outputTail([stdout, stderr].filter(Boolean).join('\n'));
   const error = result.error instanceof Error ? result.error.message : undefined;
-  return {
-    exitCode: typeof result.status === 'number' ? result.status : null,
-    timedOut: (result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT',
-    output,
-    error,
-  };
+  const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT';
+  const exitCode = typeof result.status === 'number' ? result.status : null;
+  // Verbatim audit line: every planner-authored command the server executes,
+  // where, and how it ended. Output tails live on the node/project result.
+  console.log(
+    `[foundry-foundation] cwd=${cwd} exit=${exitCode ?? 'null'}${timedOut ? ' TIMED_OUT' : ''} ms=${Date.now() - startedAt} cmd=${JSON.stringify(cmd)}${error ? ` error=${JSON.stringify(error)}` : ''}`,
+  );
+  return { exitCode, timedOut, output, error };
 }
 
 function ensureGitIdentity(repoPath: string): void {
@@ -1235,8 +1248,11 @@ export function setBlueprint(
 ): { project: FoundryProjectResponse; modules: FoundryModuleResponse[] } {
   const project = getProjectStmt.get(id) ?? null;
   if (!project) throw new FoundryError(404, 'foundry_project_not_found', 'foundry project not found');
-  if (project.status !== 'draft' && project.status !== 'planning' && project.status !== 'planned') {
-    throw new FoundryError(409, 'foundry_project_locked', 'blueprint can only be changed while project is draft, planning, or planned');
+  const foundationBlocked = project.status === 'blocked'
+    && !project.integration_tree_id
+    && projectModulesStmt.all(id).every((module) => !module.tree_id);
+  if (project.status !== 'draft' && project.status !== 'planning' && project.status !== 'planned' && !foundationBlocked) {
+    throw new FoundryError(409, 'foundry_project_locked', 'blueprint can only be changed while project is draft, planning, planned, or blocked before any tree was planted');
   }
   // The planner's own write must not clobber a blueprint Kevin edited (and
   // possibly launched) while the planner was still running.
@@ -1251,7 +1267,7 @@ export function setBlueprint(
   if (!bp) throw new FoundryError(400, 'invalid_blueprint', 'blueprint is invalid', { errors: validation.errors });
   const tx = sqliteDb.transaction(() => {
     const info = (opts.onlyWhilePlanning ? setBlueprintWhilePlanningStmt : setBlueprintStmt).run(JSON.stringify(bp), bp.run.command.trim(), id);
-    if (info.changes !== 1) throw new FoundryError(409, 'foundry_project_locked', 'blueprint can only be changed while project is draft, planning, or planned');
+    if (info.changes !== 1) throw new FoundryError(409, 'foundry_project_locked', 'blueprint can only be changed while project is draft, planning, planned, or blocked before any tree was planted');
     deleteModulesStmt.run(id);
     for (const mod of bp.modules) {
       insertModuleStmt.run(
@@ -1434,35 +1450,42 @@ function ensureFoundationRepoClean(project: FoundryProjectRow): void {
   }
 }
 
-function maybeMoveInitialFoundryBootstrap(repoPath: string): { restoreOnFailure: () => void; cleanup: () => void } {
-  const bootstrapEntries = ['foundry.json', 'README.md', 'modules', 'contracts'];
-  const appMarkers = ['artisan', 'composer.json', 'package.json', 'pyproject.toml', 'manage.py', 'app', 'bootstrap', 'routes', 'src'];
-  if (appMarkers.some((entry) => fs.existsSync(path.join(repoPath, entry)))) {
-    return { restoreOnFailure: () => {}, cleanup: () => {} };
-  }
+const FOUNDRY_BOOTSTRAP_ENTRIES = ['foundry.json', 'README.md', 'modules', 'contracts'];
+const FOUNDRY_APP_MARKERS = ['artisan', 'composer.json', 'package.json', 'pyproject.toml', 'manage.py', 'app', 'bootstrap', 'routes', 'src'];
+
+/** True when the repo holds nothing but the initial Foundry bootstrap
+ *  (foundry.json/README/modules/contracts) — i.e. no framework skeleton and no
+ *  hand-written app content exists yet. */
+function isBareFoundryBootstrap(repoPath: string): boolean {
+  if (FOUNDRY_APP_MARKERS.some((entry) => fs.existsSync(path.join(repoPath, entry)))) return false;
   const entries = fs.readdirSync(repoPath).filter((entry) => entry !== '.git');
-  if (entries.some((entry) => !bootstrapEntries.includes(entry))) {
-    return { restoreOnFailure: () => {}, cleanup: () => {} };
+  return entries.every((entry) => FOUNDRY_BOOTSTRAP_ENTRIES.includes(entry));
+}
+
+/** Runs scaffold_cmd in an EMPTY sibling staging directory, then overlays the
+ *  result onto the repo (skipping any .git the scaffolder itself created).
+ *  Real scaffolders refuse a non-empty target — `composer create-project
+ *  laravel/laravel .` fails with "Project directory is not empty" the moment
+ *  `.git/` exists (verified 2026-09-12), and create-next-app / rails new are
+ *  the same — so the scaffold can never run in the repo itself. A sibling
+ *  (same filesystem) keeps the overlay a plain copy with no cross-device
+ *  surprises, and the repo is untouched until the scaffold has exited 0. */
+function runStagedFoundationScaffold(repoPath: string, foundation: FoundryFoundation): ShellCommandResult {
+  const parent = path.dirname(repoPath);
+  fs.mkdirSync(parent, { recursive: true });
+  const staging = fs.mkdtempSync(path.join(parent, `.foundry-scaffold-${path.basename(repoPath)}-`));
+  try {
+    const result = runFoundationShell(foundation.scaffold_cmd, staging, FOUNDATION_SCAFFOLD_TIMEOUT_MS);
+    if (result.timedOut || result.exitCode !== 0) return result;
+    fs.cpSync(staging, repoPath, {
+      recursive: true,
+      force: true,
+      filter: (source) => path.relative(staging, source).split(path.sep)[0] !== '.git',
+    });
+    return result;
+  } finally {
+    try { fs.rmSync(staging, { recursive: true, force: true }); } catch {}
   }
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'foundry-bootstrap-'));
-  const moved: string[] = [];
-  for (const entry of bootstrapEntries) {
-    const source = path.join(repoPath, entry);
-    if (!fs.existsSync(source)) continue;
-    fs.renameSync(source, path.join(tmp, entry));
-    moved.push(entry);
-  }
-  return {
-    restoreOnFailure: () => {
-      for (const entry of moved) {
-        const dest = path.join(repoPath, entry);
-        if (!fs.existsSync(dest)) fs.renameSync(path.join(tmp, entry), dest);
-      }
-    },
-    cleanup: () => {
-      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
-    },
-  };
 }
 
 // Foundation checks are a server trust boundary: they are read-only assertions
@@ -1582,14 +1605,30 @@ function runFoundationScaffoldAtLaunch(project: FoundryProjectRow, blueprint: Bl
   ensureFoundationRepoClean(project);
 
   if (commitState.current) {
+    // Idempotent relaunch: bones already committed, only re-assert them.
     persistFoundryJson(project, blueprint);
     runLaunchFoundationChecksOrBlock(project, foundation);
     commitSelectedIfChanged(project.repo_path, ['foundry.json'], 'foundry: update blueprint');
     return;
   }
 
+  const bare = isBareFoundryBootstrap(project.repo_path);
   const preScaffoldChecks = runFoundationChecksInCwd(project.repo_path, foundation);
   if (preScaffoldChecks.length && preScaffoldChecks.every((result) => result.ok)) {
+    if (bare) {
+      // A gate that passes on an empty repo cannot fail on a faked one. The
+      // checks are the only finish-time assertion the planner controls, so a
+      // vacuous set is refused at the door rather than silently adopted.
+      blockProjectForFoundation(project, 'foundry_foundation_checks_vacuous', [
+        'FOUNDATION CHECKS VACUOUS',
+        `Stack: ${foundation.stack}`,
+        'Every foundation check passed on a repo that has no framework skeleton yet, so the checks assert nothing about the bones.',
+        'Fix the blueprint so at least one check fails before scaffold_cmd runs (e.g. `php artisan --version` with expect_regex, `test -f artisan`, `ls vendor/autoload.php`), then relaunch.',
+        '',
+        ...preScaffoldChecks.map((result) => `- ${result.cmd} => exit ${result.exitCode ?? 'null'}`),
+      ].join('\n'));
+    }
+    // Existing real app content already satisfies the gate: adopt it as the foundation.
     persistFoundryJson(project, blueprint);
     runLaunchFoundationChecksOrBlock(project, foundation);
     const sha = commitSelectedIfChanged(project.repo_path, ['foundry.json'], `FOUNDATION adopt: ${foundation.stack}`);
@@ -1597,30 +1636,55 @@ function runFoundationScaffoldAtLaunch(project: FoundryProjectRow, blueprint: Bl
     return;
   }
 
-  const bootstrap = maybeMoveInitialFoundryBootstrap(project.repo_path);
-  const scaffold = runFoundationShell(foundation.scaffold_cmd, project.repo_path, FOUNDATION_CHECK_TIMEOUT_MS);
+  const scaffold = runStagedFoundationScaffold(project.repo_path, foundation);
   if (scaffold.timedOut || scaffold.exitCode !== 0) {
-    bootstrap.restoreOnFailure();
-    bootstrap.cleanup();
     blockProjectForFoundation(project, 'foundry_foundation_scaffold_failed', [
       'FOUNDATION SCAFFOLD FAILED',
       `Stack: ${foundation.stack}`,
       `Command: ${foundation.scaffold_cmd}`,
-      scaffold.timedOut ? `Timed out after ${FOUNDATION_CHECK_TIMEOUT_MS}ms` : `Exit code: ${scaffold.exitCode ?? 'null'}`,
+      scaffold.timedOut ? `Timed out after ${FOUNDATION_SCAFFOLD_TIMEOUT_MS}ms` : `Exit code: ${scaffold.exitCode ?? 'null'}`,
       scaffold.error ? `Error: ${scaffold.error}` : null,
       '',
       'Output tail:',
       scaffold.output || '(no output)',
     ].filter((line): line is string => line != null).join('\n'));
   }
-  bootstrap.cleanup();
 
   persistFoundryJson(project, blueprint);
   fs.mkdirSync(path.join(project.repo_path, 'modules'), { recursive: true });
   fs.mkdirSync(path.join(project.repo_path, 'contracts'), { recursive: true });
-  runLaunchFoundationChecksOrBlock(project, foundation);
+  // The scaffold exited 0, so the bones are real: commit them BEFORE asserting
+  // the checks. If a planner-authored check is wrong (bad regex, wrong binary
+  // name), the project blocks with the check output, the blueprint stays
+  // editable (nothing planted yet), and relaunch takes the idempotent path
+  // above instead of re-running a non-idempotent scaffold into a dirty repo.
   const sha = commitAllIfChanged(project.repo_path, `FOUNDATION scaffold: ${foundation.stack}`);
   if (sha) writeFoundationNote(project.repo_path, sha, foundation, 'scaffold');
+  runLaunchFoundationChecksOrBlock(project, foundation);
+}
+
+/** The checkout must be a git checkout whose HEAD descends from the
+ *  server-made FOUNDATION commit. This is the planner-independent half of the
+ *  gate: a worker that reinitialised, orphaned, or hand-built a tree that
+ *  happens to satisfy the checks (a fake `artisan` printing "Laravel
+ *  Framework …") still fails here. */
+function foundationDerivationFailure(project: FoundryProjectRow, foundation: FoundryFoundation, checkoutPath: string): string | null {
+  const state = foundationCommitState(project.repo_path, foundation);
+  if (!state.current) {
+    return `The project repo ${project.repo_path} has no "FOUNDATION scaffold/adopt: ${foundation.stack}" commit, so no checkout can be verified against it. Relaunch the project to (re)establish the foundation commit.`;
+  }
+  const headProbe = spawnSync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: checkoutPath, encoding: 'utf8', timeout: 30_000 });
+  const head = headProbe.status === 0 ? String(headProbe.stdout ?? '').trim() : '';
+  if (!head) {
+    return `${checkoutPath} is not a git checkout with a HEAD commit. Workers must work in a worktree branched from the project base ref, never a bare directory.`;
+  }
+  const probe = spawnSync('git', ['merge-base', '--is-ancestor', state.current.sha, head], {
+    cwd: checkoutPath,
+    encoding: 'utf8',
+    timeout: 30_000,
+  });
+  if (probe.status === 0) return null;
+  return `Checkout HEAD ${head} does not descend from the server-installed foundation commit ${state.current.sha} (${state.current.subject}). A hand-built or re-initialised skeleton is not accepted even when the checks pass — branch from the project base ref.`;
 }
 
 function findFoundationGatedCheckout(nodeId: number): {
@@ -1704,6 +1768,22 @@ export function runFoundryFoundationFinishGate(
       ok: false,
       gated: true,
       result: foundationFailureText(gated.foundation, gated.checkoutPath, results),
+    };
+  }
+  const derivation = foundationDerivationFailure(gated.project, gated.foundation, gated.checkoutPath);
+  if (derivation) {
+    return {
+      ok: false,
+      gated: true,
+      result: [
+        'FOUNDATION CHECK FAILED',
+        `Stack: ${gated.foundation.stack}`,
+        `Checkout: ${gated.checkoutPath}`,
+        `Node: ${gated.label}`,
+        '',
+        'FOUNDATION DERIVATION FAILED',
+        derivation,
+      ].join('\n'),
     };
   }
   return { ok: true, gated: true };
@@ -2067,6 +2147,19 @@ function foundryConflictText(node: HopperNodeRow): string {
 function autoDecisionSpec(node: HopperNodeRow, label: string): string {
   const base = node.spec?.trim() || `# ${node.title}`;
   const conflict = foundryConflictText(node);
+  if (/^FOUNDATION (?:CHECK|SCAFFOLD) FAILED/m.test(conflict)) {
+    return [
+      base,
+      '',
+      '## AUTO-RETRY (JARVIS policy) — foundation gate rejected the previous finish',
+      '',
+      `Node ${node.id} (${node.title}) reported done, but the server-side Foundation Gate refused it:`,
+      '',
+      conflict,
+      '',
+      `Scope: ${label}. The framework skeleton is server-installed and the checks above are DB-owned; you cannot edit them away. Work in the worktree branched from the project base ref (it already contains the FOUNDATION commit), never re-initialise or hand-build framework files, make the real checks pass, then finish this same Hopper node. If the toolchain is genuinely missing, finish blocked describing exactly what is missing.`,
+    ].join('\n');
+  }
   return [
     base,
     '',

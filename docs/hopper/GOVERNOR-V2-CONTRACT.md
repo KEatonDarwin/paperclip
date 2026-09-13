@@ -23,6 +23,13 @@ The implementation must:
 - Preserve current Foundry auto-retry and Spawn-Tree grouping fixes.
 - Add hardening for the parent-id deadlock and Codex finish-POST gap.
 
+## As-Built Operator Doc
+
+This file is the reconciliation contract and review checklist. The as-built
+operator guide lives at `docs/hopper/GOVERNOR.md` and should be kept current
+with runtime defaults, API shape, recovery behavior, verification commands, and
+rollback notes.
+
 ## Current Live Anchors
 
 The current branch already has the correct per-node dispatch seam. `dispatchTick()` walks ready leaves and calls `governorCheck(node.adapter ?? WORKER_ADAPTER)` before each claim in `darwin-assistant/src/hopper-engine.ts:613-623`.

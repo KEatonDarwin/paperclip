@@ -322,6 +322,7 @@ const GOVERNOR_SETTING_SPECS: Record<string, { type: 'number' } | { type: 'enum'
   // devin-jobs.ts, not by hopper-governor.ts. Listed here only so the same
   // GET/PATCH /hopper-engine/settings surface can read and save them.
   devin_max_concurrent: { type: 'number' },
+  devin_acu_pool: { type: 'number' },
   gov_devin_acu_ceiling: { type: 'number' },
   devin_job_max_acu: { type: 'number' },
 };

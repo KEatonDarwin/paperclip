@@ -1714,9 +1714,20 @@ export function createApiV1Router(): Router {
       return;
     }
     const body = (req.body ?? {}) as {
-      outcome?: unknown; result?: unknown; question?: unknown;
+      outcome?: unknown; result?: unknown; question?: unknown; worker_thread_ext?: unknown;
       children?: Array<{ title: string; spec?: string; depends_on_prev?: boolean }>;
     };
+    // Optional attempt pin (governor-v2): a caller that knows which worker
+    // thread it is reporting FOR (the spawn reconciler recovering a finish, a
+    // late worker POST) may pass worker_thread_ext. If the node has since been
+    // re-leased to a different attempt, refuse — a stale attempt must never
+    // complete the node out from under the live one.
+    if (body.worker_thread_ext !== undefined) {
+      if (typeof body.worker_thread_ext !== 'string' || body.worker_thread_ext !== node.worker_thread_ext) {
+        sendError(res, 409, 'hopper_node_attempt_mismatch', `node ${id} is now leased to ${node.worker_thread_ext ?? '(none)'}, not ${String(body.worker_thread_ext)}`);
+        return;
+      }
+    }
     const outcome = body.outcome;
     if (outcome !== 'done' && outcome !== 'split' && outcome !== 'blocked_question' && outcome !== 'blocked') {
       sendError(res, 400, 'invalid_request', "outcome must be one of done|split|blocked_question|blocked");
@@ -1799,11 +1810,13 @@ export function createApiV1Router(): Router {
         updates[key] = value;
       } else {
         const n = typeof value === 'number' ? value : parseFloat(String(value));
-        if (!Number.isFinite(n) || n < 0) {
-          sendError(res, 400, 'invalid_setting', `${key} must be a non-negative number`);
+        // Governor reads these back with parseInt — store integers so what the
+        // panel shows is exactly what the gate compares (50.9 → 50, never 5e1).
+        if (!Number.isFinite(n) || n < 0 || n > 100_000) {
+          sendError(res, 400, 'invalid_setting', `${key} must be a non-negative integer (0–100000)`);
           return;
         }
-        updates[key] = String(n);
+        updates[key] = String(Math.trunc(n));
       }
     }
     if (!Object.keys(updates).length) {

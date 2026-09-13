@@ -322,6 +322,49 @@ setGovernorSettings();
 }
 
 // ---------------------------------------------------------------------------
+
+// Fake cockpit API for reconciler runs: thread descriptors from a Map, finish
+// POSTs routed into the REAL finishHopperNode so the engine's guards apply.
+async function startFakeCockpit(descriptors) {
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    const send = (status, body) => {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(`${JSON.stringify(body)}\n`);
+    };
+    if (req.method === 'GET' && url.pathname.startsWith('/api/v1/threads/')) {
+      const ext = decodeURIComponent(url.pathname.slice('/api/v1/threads/'.length));
+      send(200, descriptors.get(ext) ?? { running: false, turn_count: 0, updated_at: new Date().toISOString() });
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/v1/notifications') {
+      req.resume();
+      send(200, { ok: true });
+      return;
+    }
+    const finishMatch = /^\/api\/v1\/hopper-nodes\/(\d+)\/finish$/.exec(url.pathname);
+    if (req.method === 'POST' && finishMatch) {
+      let raw = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        try {
+          const payload = JSON.parse(raw || '{}');
+          const node = hopperEngine.finishHopperNode(Number(finishMatch[1]), payload.outcome, payload);
+          send(200, { node });
+        } catch (err) {
+          send(500, { error: err instanceof Error ? err.message : String(err) });
+        }
+      });
+      return;
+    }
+    send(404, { error: 'not found' });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  return { server, port };
+}
+
 // 6) Existing reconciler recovers a running node from committed-work evidence.
 // ---------------------------------------------------------------------------
 resetHopperState();
@@ -361,42 +404,7 @@ setGovernorSettings();
     latest_summary: `Worker committed ${sha} on branch hopper/sim-recovery in ${workRepo} but the final finish POST failed.`,
   });
 
-  const server = http.createServer((req, res) => {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-    const send = (status, body) => {
-      res.writeHead(status, { 'Content-Type': 'application/json' });
-      res.end(`${JSON.stringify(body)}\n`);
-    };
-    if (req.method === 'GET' && url.pathname.startsWith('/api/v1/threads/')) {
-      const ext = decodeURIComponent(url.pathname.slice('/api/v1/threads/'.length));
-      send(200, descriptors.get(ext) ?? { running: false, turn_count: 0, updated_at: new Date().toISOString() });
-      return;
-    }
-    if (req.method === 'POST' && url.pathname === '/api/v1/notifications') {
-      req.resume();
-      send(200, { ok: true });
-      return;
-    }
-    const finishMatch = /^\/api\/v1\/hopper-nodes\/(\d+)\/finish$/.exec(url.pathname);
-    if (req.method === 'POST' && finishMatch) {
-      let raw = '';
-      req.setEncoding('utf8');
-      req.on('data', (chunk) => { raw += chunk; });
-      req.on('end', () => {
-        try {
-          const payload = JSON.parse(raw || '{}');
-          const node = hopperEngine.finishHopperNode(Number(finishMatch[1]), payload.outcome, payload);
-          send(200, { node });
-        } catch (err) {
-          send(500, { error: err instanceof Error ? err.message : String(err) });
-        }
-      });
-      return;
-    }
-    send(404, { error: 'not found' });
-  });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const port = server.address().port;
+  const { server, port } = await startFakeCockpit(descriptors);
   const reconciler = await runProcess('python3', ['scripts/jarvis-spawn-reconcile.py'], {
     cwd: repoRoot,
     env: {
@@ -421,6 +429,64 @@ setGovernorSettings();
     assert.match(reconciler.stdout, /recovered node .* from commit evidence/);
   });
   fs.rmSync(workRepo, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 7) Stale-attempt guard: a ledger row from an EXPIRED attempt must never finish
+//    a node that has since been re-leased to a new worker thread — even when
+//    the old worker's text carries a perfectly well-formed finish JSON.
+// ---------------------------------------------------------------------------
+resetHopperState();
+setKevinActive(false);
+setUsage({ claude5h: 10, weekly: 0, codex: 20, auggie: 20 });
+setGovernorSettings();
+{
+  const treeId = await createActiveTree('governor-v2: stale attempt guard', [
+    { title: 'stale attempt node', spec: 'Do the thing, then finish.', adapter: 'claude', model: 'claude-sonnet-5' },
+  ]);
+  const first = nodeByTitle(treeId, 'stale attempt node');
+  assert.equal(first.status, 'running', 'stale-attempt setup failed: node did not dispatch');
+  const oldExt = first.worker_thread_ext;
+  // Expire the lease and tick: the engine reroutes + re-claims under a NEW ext.
+  sqliteDb.prepare(`UPDATE hopper_nodes SET lease_expires_at = datetime('now', '-1 minute') WHERE id = ?`).run(first.id);
+  await flushDispatch('sim_stale_attempt');
+  const released = hopperEngine.getHopperNode(first.id);
+  assert.notEqual(released.worker_thread_ext, oldExt, 'stale-attempt setup failed: node was not re-leased');
+  // Keep the OLD attempt's ledger row 'running' (as it would be if that worker died quietly).
+  sqliteDb.prepare(`UPDATE spawn_tasks SET status = 'running' WHERE thread_ext = ?`).run(oldExt);
+
+  const descriptors = new Map();
+  descriptors.set(oldExt, {
+    running: false,
+    turn_count: 1,
+    updated_at: new Date().toISOString(),
+    latest_summary: 'Finished. Payload: {"outcome":"done","result":"stale attempt claims victory"}',
+  });
+  descriptors.set(released.worker_thread_ext, { running: true, turn_count: 1, updated_at: new Date().toISOString() });
+  const { server, port } = await startFakeCockpit(descriptors);
+  const reconciler = await runProcess('python3', ['scripts/jarvis-spawn-reconcile.py'], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      JARVIS_DB_PATH: DB_PATH,
+      JARVIS_COCKPIT_ENV: fakeCockpitEnv,
+      JARVIS_COCKPIT_API_BASE: `http://127.0.0.1:${port}/api/v1`,
+      PYTHONUNBUFFERED: '1',
+    },
+    encoding: 'utf8',
+  });
+  await new Promise((resolve) => server.close(resolve));
+  const after = hopperEngine.getHopperNode(first.id);
+  const oldSpawn = sqliteDb.prepare(`SELECT * FROM spawn_tasks WHERE thread_ext = ?`).get(oldExt);
+  check('7', 'stale-attempt ledger row cannot finish a re-leased node (attempt pin)', () => {
+    const debug = `\nSTDOUT:\n${reconciler.stdout}\nSTDERR:\n${reconciler.stderr}\nnode=${JSON.stringify(after, null, 2)}`;
+    assert.equal(reconciler.status, 0, `reconciler failed${debug}`);
+    assert.equal(after.status, 'running', `node must still be running under the live attempt${debug}`);
+    assert.equal(after.worker_thread_ext, released.worker_thread_ext, debug);
+    assert.doesNotMatch(after.result ?? '', /stale attempt claims victory/);
+    assert.match(reconciler.stdout, /stale attempt .* no recovery/);
+    assert.equal(oldSpawn.status, 'done', 'old ledger row should still be reconciled to done');
+  });
 }
 
 const failed = results.filter((r) => !r.pass);

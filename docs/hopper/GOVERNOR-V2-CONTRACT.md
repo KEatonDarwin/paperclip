@@ -191,6 +191,9 @@ Reconciler recovery:
   - Action: if no JSON exists but commit evidence is strong, finish the node as `done` with a result that includes the recovered commit sha(s), worker thread ext, and an explicit reconciler note.
   - If evidence is incomplete, do not mark done. Leave normal lease recovery in place and add a precise `spawn_tasks.error` note so Mission Control shows why it was not recovered.
 - Non-destructive rule: the reconciler never edits repos, never rolls back, never fabricates commits, and never finishes a node without either valid payload JSON or commit evidence on the node branch.
+- Attempt pin (added by the adversarial review, node #158): a ledger row is evidence for ONE attempt. The reconciler only recovers when `hopper_nodes.worker_thread_ext` still equals the row's `thread_ext`; if the node has expired its lease and been re-leased to a new worker, the stale row is reconciled to `done` with a log line and touches nothing. Every recovery POST carries `worker_thread_ext`, and `POST /hopper-nodes/:id/finish` returns `409 hopper_node_attempt_mismatch` when that field is present and does not match the node's current lease — so neither the reconciler nor a late worker POST can complete a node out from under the live attempt. Sim check 7 covers this.
+- Template guard: the worker prompt's own finish-contract examples are valid JSON (`{"outcome":"done","result":"<what you did …>"}`); payload replay rejects placeholder-shaped results/questions so a worker that merely restates the contract is never "recovered" with a template.
+- Deferral is live, not terminal: when the commit-evidence window (lease expiry − 5m) has not opened yet, the ledger row KEEPS its prior status (`HOPPER_FINISH_RECOVERY_PENDING:` note) so the next 5-minute tick re-evaluates it. Marking it `done` at that point would make the deferral permanent, because the reconciler only revisits `running`/`stuck` rows.
 
 Spawn ledger details:
 

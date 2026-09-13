@@ -19,6 +19,7 @@ HOPPER_EXT = re.compile(r"^cockpit:hopper-node-(\d+)-")
 OUTCOMES = ("done", "split", "blocked_question", "blocked")
 RECOVERY_MARKER = "[recovered from spawn ledger]"
 RECOVERY_ERROR_PREFIX = "HOPPER_FINISH_RECOVERY:"
+RECOVERY_DEFER_PREFIX = "HOPPER_FINISH_RECOVERY_PENDING:"  # keep the ledger row live; re-evaluate next tick
 
 def key():
     for line in open(ENV):
@@ -100,11 +101,27 @@ def find_payload(text):
                         obj = json.loads(text[start:i + 1])
                     except Exception:
                         obj = None
-                    if isinstance(obj, dict) and obj.get("outcome") in OUTCOMES:
+                    if isinstance(obj, dict) and obj.get("outcome") in OUTCOMES and not is_template_payload(obj):
                         if obj["outcome"] != "split" or (isinstance(obj.get("children"), list) and obj["children"]):
                             found = obj
                     break
     return found
+
+def is_template_payload(obj):
+    """The worker prompt's finish-contract EXAMPLES are themselves valid JSON
+    ({"outcome":"done","result":"<what you did + ...>"}). A worker that restates
+    the contract in its final message must not get 'recovered' with a template."""
+    for k in ("result", "question"):
+        v = obj.get(k)
+        if isinstance(v, str):
+            t = v.strip()
+            if not t or (t.startswith("<") and t.endswith(">")) or "<PAYLOAD>" in t:
+                return True
+    if obj.get("outcome") in ("done", "blocked") and not isinstance(obj.get("result"), str):
+        return True
+    if obj.get("outcome") == "blocked_question" and not isinstance(obj.get("question"), str):
+        return True
+    return False
 
 def append_recovery_marker(payload):
     recovered = json.loads(json.dumps(payload))
@@ -267,15 +284,24 @@ def recover_hopper_finish(c, row, ext, label, descriptor, now):
     node = hopper_node_for_spawn(c, row, ext)
     if not node or node["status"] != "running":
         return None
+    # Attempt pin: this spawn row is evidence for ONE attempt. If the node has
+    # since expired its lease and been re-leased to a different worker thread,
+    # this row's text/commits must never finish the node out from under the
+    # live attempt (the engine's finish route only checks status=running, so
+    # without this pin a stale attempt could complete a re-attempted node).
+    if node["worker_thread_ext"] != ext:
+        log(f"  {label}: node {node['id']} is now leased to {node['worker_thread_ext']}; stale attempt {ext} — no recovery")
+        return None
     text = worker_text(c, ext, descriptor)
     payload = find_payload(text)
     if payload:
         recovered = append_recovery_marker(payload)
+        recovered["worker_thread_ext"] = ext
         api_post(f"/hopper-nodes/{node['id']}/finish", recovered)
         log(f"  {label}: recovered finish JSON for node {node['id']} (outcome={recovered['outcome']})")
         return None
     if not recovery_window_open(node, now):
-        return f"{RECOVERY_ERROR_PREFIX} no finish JSON yet; commit-evidence recovery waits until node {node['id']} is within {RECOVERY_GRACE_MINUTES}m of lease expiry"
+        return f"{RECOVERY_DEFER_PREFIX} no finish JSON yet; commit-evidence recovery waits until node {node['id']} is within {RECOVERY_GRACE_MINUTES}m of lease expiry"
     evidence, reason = commit_evidence(node, row, text)
     if not evidence:
         return f"{RECOVERY_ERROR_PREFIX} {reason}"
@@ -287,7 +313,8 @@ def recover_hopper_finish(c, row, ext, label, descriptor, now):
         "",
         RECOVERY_MARKER,
     ]
-    api_post(f"/hopper-nodes/{node['id']}/finish", {"outcome": "done", "result": "\n".join(lines)})
+    api_post(f"/hopper-nodes/{node['id']}/finish",
+             {"outcome": "done", "result": "\n".join(lines), "worker_thread_ext": ext})
     log(f"  {label}: recovered node {node['id']} from commit evidence ({len(evidence)} commit(s))")
     return None
 
@@ -322,6 +349,12 @@ def main():
                         if recovery_note:
                             error = recovery_note
                             log(f"  {row['label']}: {recovery_note}")
+                            if recovery_note.startswith(RECOVERY_DEFER_PREFIX):
+                                # Deferred (lease not near expiry yet): keep the
+                                # ledger row live so the next tick re-evaluates.
+                                # Marking it done here would make the deferral
+                                # permanent — the query only revisits running/stuck.
+                                new_status = prev
                     except Exception as e:
                         error = f"{RECOVERY_ERROR_PREFIX} finish recovery failed: {e}"
                         log(f"  {row['label']}: {error}")

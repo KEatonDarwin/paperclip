@@ -47,6 +47,7 @@ Finish by POSTing to hopper node {{node_id}} with one outcome:
 - split: only if it genuinely needs more than one worker.
 - blocked_question: ONLY when the contract is silent AND the choice changes user-visible behavior with no sane default.
 - blocked: missing access or a broken dependency, stated precisely.
+If the finish POST fails, retry the same exact payload up to three times with a few seconds between attempts. If it still fails, print the exact JSON payload as your final assistant message so the reconciler can recover it; never claim success unless the POST succeeds.
 `,
   test: `# FOUNDRY TEST - {{project}} / {{key}}
 
@@ -85,6 +86,7 @@ Finish by POSTing to hopper node {{node_id}} with one outcome:
 - done: verdict and evidence.
 - blocked: missing/impossible contract, missing access, or broken dependency.
 - blocked_question: ONLY when the contract is silent AND the choice changes user-visible behavior with no sane default.
+If the finish POST fails, retry the same exact payload up to three times with a few seconds between attempts. If it still fails, print the exact JSON payload as your final assistant message so the reconciler can recover it; never claim success unless the POST succeeds.
 `,
   doc: `# FOUNDRY DOC - {{project}} / {{key}}
 
@@ -99,6 +101,7 @@ cd {{worktrees}}/{{project}}-{{key}}
 
 Fill What it does, Interface, How to run, How to test, Evidence, Limitations, and Depends on.
 Commit and push. Finish by POSTing to hopper node {{node_id}} with the docs commit sha.
+If the finish POST fails, retry the same exact payload up to three times with a few seconds between attempts. If it still fails, print the exact JSON payload as your final assistant message so the reconciler can recover it; never claim success unless the POST succeeds.
 `,
   'integrate-merge': `# FOUNDRY INTEGRATE MERGE - {{project}}
 
@@ -132,6 +135,7 @@ Finish by POSTing to hopper node {{node_id}} with one outcome:
 - done: integration commit sha and green test evidence.
 - blocked: missing/impossible contract, missing access, or broken dependency.
 - blocked_question: ONLY when the contract is silent AND the choice changes user-visible behavior with no sane default.
+If the finish POST fails, retry the same exact payload up to three times with a few seconds between attempts. If it still fails, print the exact JSON payload as your final assistant message so the reconciler can recover it; never claim success unless the POST succeeds.
 `,
   'integrate-review': `# FOUNDRY INTEGRATE REVIEW - {{project}}
 
@@ -150,6 +154,7 @@ Acceptance:
 GUARD: review only; no production systems, no API keys, no merges to main.
 Foundation reality (framework apps): the FOUNDATION scaffold/adopt commit must be an ancestor of this branch; block on any hand-rolled framework entrypoint (fake artisan/manage.py/binstubs, re-implemented test runners) and on foundry.json.foundation drifting from the DB-owned spec.
 Finish by POSTing to hopper node {{node_id}} with verdict, seams tested, and risks.
+If the finish POST fails, retry the same exact payload up to three times with a few seconds between attempts. If it still fails, print the exact JSON payload as your final assistant message so the reconciler can recover it; never claim success unless the POST succeeds.
 `,
   'integrate-docs': `# FOUNDRY INTEGRATE DOCS - {{project}}
 
@@ -164,6 +169,7 @@ for m in {{modules}}; do cat modules/$m/README.md; done
 
 GUARD: touch only README.md and ARCHITECTURE.md. No production systems, no API keys, no merges to main.
 Finish by POSTing to hopper node {{node_id}} with the docs commit sha.
+If the finish POST fails, retry the same exact payload up to three times with a few seconds between attempts. If it still fails, print the exact JSON payload as your final assistant message so the reconciler can recover it; never claim success unless the POST succeeds.
 `,
 };
 

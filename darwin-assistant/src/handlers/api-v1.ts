@@ -1,4 +1,5 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { statSync, readFileSync } from 'node:fs';
 import { displayContentFromRawOutput, parseTurnSteps } from '../turn-steps.js';
@@ -66,6 +67,20 @@ import {
   composeHopperSeed,
   type HopperStatus,
 } from '../hopper.js';
+import {
+  INTEL_LANES,
+  createIntelRun,
+  getActiveIntelRun,
+  getIntelRun,
+  isIntelLane,
+  isIntelRunStatus,
+  isIntelVerdict,
+  listIntelItems,
+  listIntelRuns,
+  promoteIntelItem,
+  updateIntelRunStatus,
+  type IntelLane,
+} from '../intel-desk.js';
 import {
   listMonitors,
   getMonitor,
@@ -384,6 +399,48 @@ function notificationActionsFromBody(value: unknown): NotificationAction[] {
           : undefined,
     } satisfies NotificationAction];
   });
+}
+
+function parseIntelLanes(value: unknown): { lanes: IntelLane[]; error?: string } {
+  if (value === undefined || value === null) return { lanes: INTEL_LANES };
+  if (!Array.isArray(value) || !value.length) {
+    return { lanes: [], error: 'lanes must be a non-empty array when provided' };
+  }
+  const lanes: IntelLane[] = [];
+  for (const lane of value) {
+    if (!isIntelLane(lane)) {
+      return { lanes: [], error: `invalid intel lane: ${String(lane)}` };
+    }
+    if (!lanes.includes(lane)) lanes.push(lane);
+  }
+  return { lanes };
+}
+
+function spawnIntelRunner(runId: number, lanes: IntelLane[]): void {
+  const env: NodeJS.ProcessEnv = { ...process.env, TZ: process.env.TZ ?? 'America/Chicago' };
+  delete env.ANTHROPIC_API_KEY;
+  delete env.OPENAI_API_KEY;
+
+  const npxBin = process.env.INTEL_DESK_NPX_BIN ?? '/usr/bin/npx';
+  const scriptPath = process.env.INTEL_DESK_RUNNER_SCRIPT ?? 'scripts/intel-pull.ts';
+  const lanesArg = lanes.length === INTEL_LANES.length ? 'all' : lanes.join(',');
+  const child = spawn(
+    npxBin,
+    ['tsx', scriptPath, '--run-id', String(runId), '--lanes', lanesArg],
+    {
+      cwd: process.env.INTEL_DESK_RUNNER_CWD ?? process.cwd(),
+      detached: true,
+      env,
+      stdio: 'ignore',
+    },
+  );
+  child.on('error', (err) => {
+    updateIntelRunStatus(runId, 'failed', {
+      error: err instanceof Error ? err.message : String(err),
+      summary: 'Intel Desk runner failed to launch',
+    });
+  });
+  child.unref();
 }
 
 function threadDescriptor(conv: ConversationRow, req: Request): Record<string, unknown> {
@@ -1390,6 +1447,92 @@ export function createApiV1Router(): Router {
       return;
     }
     res.status(202).json(result);
+  });
+
+  // == Intel Desk ============================================================
+  // Daily stack-aware intel pull. This is a global cockpit page, not scoped to
+  // one thread. The runner writes rows; the page listens for intel_run/item SSE.
+
+  router.get('/intel/runs', (req: AuthedRequest, res) => {
+    const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit ?? '20'), 10) || 20));
+    const rawStatus = typeof req.query.status === 'string' ? req.query.status : undefined;
+    if (rawStatus !== undefined && !isIntelRunStatus(rawStatus)) {
+      sendError(res, 400, 'invalid_request', 'status must be queued, running, done, or failed');
+      return;
+    }
+    res.json({ runs: listIntelRuns({ status: rawStatus, limit }) });
+  });
+
+  router.get('/intel/runs/:id/items', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id) || id < 1) {
+      sendError(res, 400, 'invalid_request', 'run id must be a positive integer');
+      return;
+    }
+    if (!getIntelRun(id)) {
+      sendError(res, 404, 'intel_run_not_found', 'intel run not found');
+      return;
+    }
+
+    const rawLane = typeof req.query.lane === 'string' ? req.query.lane : undefined;
+    const rawVerdict = typeof req.query.verdict === 'string' ? req.query.verdict : undefined;
+    if (rawLane !== undefined && !isIntelLane(rawLane)) {
+      sendError(res, 400, 'invalid_request', 'lane must be providers, harvest, tooling, stack, or social');
+      return;
+    }
+    if (rawVerdict !== undefined && !isIntelVerdict(rawVerdict)) {
+      sendError(res, 400, 'invalid_request', 'verdict must be act, watch, or fyi');
+      return;
+    }
+    res.json({
+      items: listIntelItems({
+        run_id: id,
+        lane: rawLane,
+        verdict: rawVerdict,
+      }),
+    });
+  });
+
+  router.post('/intel/run', (req: AuthedRequest, res) => {
+    const active = getActiveIntelRun();
+    if (active) {
+      res.status(409).json({ run: active });
+      return;
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const parsed = parseIntelLanes(body.lanes);
+    if (parsed.error) {
+      sendError(res, 400, 'invalid_request', parsed.error);
+      return;
+    }
+
+    const run = createIntelRun();
+    try {
+      spawnIntelRunner(run.id, parsed.lanes);
+      res.status(202).json({ run });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const failed = updateIntelRunStatus(run.id, 'failed', {
+        error: message,
+        summary: 'Intel Desk runner failed to launch',
+      }) ?? run;
+      sendError(res, 500, 'intel_runner_launch_failed', message, { run: failed });
+    }
+  });
+
+  router.post('/intel/items/:id/promote', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id) || id < 1) {
+      sendError(res, 400, 'invalid_request', 'item id must be a positive integer');
+      return;
+    }
+    const promoted = promoteIntelItem(id);
+    if (!promoted) {
+      sendError(res, 404, 'intel_item_not_found', 'intel item not found');
+      return;
+    }
+    res.json(promoted);
   });
 
   // == Foundry ===============================================================
@@ -3763,6 +3906,7 @@ export function createApiV1Router(): Router {
       'quick_capture', 'thread_summary', 'notification',
       'dispatch', 'dispatch_cue', 'hopper_item', 'hopper_node', 'smart_todo',
       'monitor', 'monitor_run', 'foundry_project', 'foundry_module',
+      'intel_run', 'intel_item',
     ]);
 
     res.writeHead(200, {

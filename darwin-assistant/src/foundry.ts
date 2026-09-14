@@ -227,6 +227,7 @@ export interface FoundryRunSlotRow {
   port: number;
   project_id: string | null;
   pid: number | null;
+  pid_starttime: string | null;
   run_command: string | null;
   log_path: string | null;
   started_at: string | null;
@@ -435,6 +436,7 @@ sqliteDb.exec(`
     port           INTEGER NOT NULL,
     project_id     TEXT REFERENCES foundry_projects(id) ON DELETE SET NULL,
     pid            INTEGER,
+    pid_starttime  TEXT,
     run_command    TEXT,
     log_path       TEXT,
     started_at     TEXT,
@@ -450,6 +452,10 @@ sqliteDb.exec(`
 
 for (const col of ['last_error TEXT', 'origin_thread_ext TEXT']) {
   try { sqliteDb.exec(`ALTER TABLE foundry_projects ADD COLUMN ${col}`); } catch {}
+}
+
+for (const col of ['pid_starttime TEXT']) {
+  try { sqliteDb.exec(`ALTER TABLE foundry_run_slots ADD COLUMN ${col}`); } catch {}
 }
 
 const getProjectStmt = sqliteDb.prepare<[string], FoundryProjectRow>(`SELECT * FROM foundry_projects WHERE id = ?`);
@@ -567,6 +573,15 @@ const setProjectReadyStmt = sqliteDb.prepare<[string]>(`
   WHERE id = ?
     AND status <> 'launched'
 `);
+const setProjectReadyAfterStopStmt = sqliteDb.prepare<[string]>(`
+  UPDATE foundry_projects
+  SET status = 'ready',
+      preview_url = NULL,
+      last_error = NULL,
+      updated_at = datetime('now')
+  WHERE id = ?
+    AND status = 'launched'
+`);
 const setProjectLaunchedStmt = sqliteDb.prepare<[string | null, string]>(`
   UPDATE foundry_projects
   SET status = 'launched',
@@ -647,10 +662,11 @@ const clearFreeRunSlotStmt = sqliteDb.prepare<[number]>(`
       updated_at = datetime('now')
   WHERE slot_no = ?
 `);
-const setRunSlotRunningStmt = sqliteDb.prepare<[string, number, string, string, number]>(`
+const setRunSlotRunningStmt = sqliteDb.prepare<[string, number, string | null, string, string, number]>(`
   UPDATE foundry_run_slots
   SET project_id = ?,
       pid = ?,
+      pid_starttime = ?,
       run_command = ?,
       log_path = ?,
       started_at = datetime('now'),
@@ -662,6 +678,7 @@ const setRunSlotRunningStmt = sqliteDb.prepare<[string, number, string, string, 
 const setRunSlotStoppedStmt = sqliteDb.prepare<[number]>(`
   UPDATE foundry_run_slots
   SET pid = NULL,
+      pid_starttime = NULL,
       status = 'stopped',
       last_health_at = NULL,
       updated_at = datetime('now')
@@ -670,16 +687,36 @@ const setRunSlotStoppedStmt = sqliteDb.prepare<[number]>(`
 const setRunSlotDeadStmt = sqliteDb.prepare<[number]>(`
   UPDATE foundry_run_slots
   SET pid = NULL,
+      pid_starttime = NULL,
       status = 'dead',
       last_health_at = NULL,
       updated_at = datetime('now')
   WHERE slot_no = ?
+`);
+const setRunSlotDeadIfSamePidStmt = sqliteDb.prepare<[number, number]>(`
+  UPDATE foundry_run_slots
+  SET pid = NULL,
+      pid_starttime = NULL,
+      status = 'dead',
+      last_health_at = NULL,
+      updated_at = datetime('now')
+  WHERE slot_no = ?
+    AND status = 'running'
+    AND pid = ?
 `);
 const setRunSlotHealthStmt = sqliteDb.prepare<[number]>(`
   UPDATE foundry_run_slots
   SET last_health_at = datetime('now'),
       updated_at = datetime('now')
   WHERE slot_no = ?
+`);
+const setRunSlotHealthIfSamePidStmt = sqliteDb.prepare<[number, number]>(`
+  UPDATE foundry_run_slots
+  SET last_health_at = datetime('now'),
+      updated_at = datetime('now')
+  WHERE slot_no = ?
+    AND status = 'running'
+    AND pid = ?
 `);
 
 export class FoundryError extends Error {
@@ -1401,6 +1438,16 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+function processGroupAlive(pid: number | null | undefined): boolean {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
   try {
     process.kill(-pid, signal);
@@ -1416,13 +1463,142 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
+function readProcStarttime(pid: number | null | undefined): string | null {
+  if (!pid || pid <= 0) return null;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const close = stat.lastIndexOf(')');
+    if (close === -1) return null;
+    const parts = stat.slice(close + 1).trim().split(/\s+/);
+    return parts[19] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function procEnvHasSlot(pid: number, slotNo: number): boolean {
+  try {
+    const env = fs.readFileSync(`/proc/${pid}/environ`);
+    return env.includes(Buffer.from(`FOUNDRY_SLOT=${slotNo}`));
+  } catch {
+    // Missing /proc row or EPERM means "not a Foundry child we are allowed to
+    // trust." This is what keeps a recycled/root-owned pid from being killed.
+    return false;
+  }
+}
+
+function slotLeaderMatchesIdentity(slot: Pick<FoundryRunSlotRow, 'slot_no' | 'pid' | 'pid_starttime'>): boolean {
+  if (!slot.pid || !pidAlive(slot.pid)) return false;
+  if (!procEnvHasSlot(slot.pid, slot.slot_no)) return false;
+  const currentStarttime = readProcStarttime(slot.pid);
+  return !slot.pid_starttime || currentStarttime === slot.pid_starttime;
+}
+
+const PORT_AVAILABILITY_SCRIPT = `
+const net = require('node:net');
+const port = Number(process.argv[1]);
+const server = net.createServer();
+const timer = setTimeout(() => {
+  console.error('timeout');
+  process.exit(4);
+}, 1200);
+server.once('error', (err) => {
+  clearTimeout(timer);
+  console.error(err && (err.code || err.message) || 'listen_failed');
+  process.exit(err && err.code === 'EADDRINUSE' ? 2 : 3);
+});
+server.listen({ host: '127.0.0.1', port, exclusive: true }, () => {
+  server.close(() => {
+    clearTimeout(timer);
+    process.exit(0);
+  });
+});
+`;
+
+function portAvailableSync(port: number): { available: boolean; reason?: string } {
+  const result = spawnSync(process.execPath, ['-e', PORT_AVAILABILITY_SCRIPT, String(port)], {
+    encoding: 'utf8',
+    timeout: 2_000,
+  });
+  if (result.status === 0) return { available: true };
+  const reason = (result.stderr || result.stdout || result.error?.message || `exit ${result.status ?? result.signal ?? 'unknown'}`).trim();
+  return { available: false, reason };
+}
+
+function portBoundSync(port: number): boolean {
+  const check = portAvailableSync(port);
+  return !check.available && /\bEADDRINUSE\b/.test(check.reason ?? '');
+}
+
+function slotHasLiveOccupant(slot: FoundryRunSlotRow): boolean {
+  if (slot.status !== 'running') return false;
+  if (slotLeaderMatchesIdentity(slot)) return true;
+  if (!slot.pid && portBoundSync(slot.port)) return true;
+  if (slot.pid && !pidAlive(slot.pid) && portBoundSync(slot.port)) return true;
+  return false;
+}
+
+function emitProjectForRunSlot(slot: FoundryRunSlotRow | FoundryRunSlotListRow): void {
+  if (!slot.project_id) return;
+  const project = getProjectStmt.get(slot.project_id);
+  if (project) emitProject('updated', project, projectModulesStmt.all(project.id));
+}
+
+function markRunSlotDeadIfUnchanged(slot: FoundryRunSlotRow | FoundryRunSlotListRow, host?: string | null): void {
+  if (slot.pid) {
+    const info = setRunSlotDeadIfSamePidStmt.run(slot.slot_no, slot.pid);
+    if (info.changes < 1) return;
+  } else {
+    const current = getRunSlotStmt.get(slot.slot_no);
+    if (!current || current.status !== 'running' || current.pid !== null) return;
+    setRunSlotDeadStmt.run(slot.slot_no);
+  }
+  emitRunSlot(slot.slot_no, host);
+  emitProjectForRunSlot(slot);
+}
+
+function markProjectReadyAfterSlotStop(slot: FoundryRunSlotRow | FoundryRunSlotListRow): void {
+  if (!slot.project_id) return;
+  const info = setProjectReadyAfterStopStmt.run(slot.project_id);
+  if (info.changes < 1) return;
+  const project = getProjectStmt.get(slot.project_id);
+  if (project) emitProject('updated', project, projectModulesStmt.all(project.id));
+}
+
+function waitForPortFree(port: number, timeoutMs: number): boolean {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!portBoundSync(port)) return true;
+    sleepSync(75);
+  }
+  return !portBoundSync(port);
+}
+
+function logTail(logPath: string | null | undefined, bytes = 4_000): string {
+  if (!logPath) return '';
+  try {
+    const stat = fs.statSync(logPath);
+    const fd = fs.openSync(logPath, 'r');
+    try {
+      const len = Math.min(bytes, stat.size);
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, Math.max(0, stat.size - len));
+      return buf.toString('utf8').trim();
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return '';
+  }
+}
+
 export function listRunSlots(host?: string | null): FoundryRunSlotResponse[] {
   ensureRunSlots();
   return listRunSlotsStmt.all().map((row) => serializeRunSlot(row, host));
 }
 
 function slotOccupants(host?: string | null): FoundryRunSlotResponse[] {
-  return listRunSlots(host).filter((slot) => slot.status === 'running' && pidAlive(slot.pid));
+  return listRunSlots(host).filter((slot) => slotHasLiveOccupant(slot));
 }
 
 export function stopRunSlot(slotNo: number, opts: { host?: string | null; emit?: boolean } = {}): FoundryRunSlotResponse {
@@ -1431,15 +1607,31 @@ export function stopRunSlot(slotNo: number, opts: { host?: string | null; emit?:
   const row = getRunSlotStmt.get(slotNo) ?? null;
   if (!row) throw new FoundryError(404, 'foundry_slot_not_found', 'foundry run slot not found');
   if (row.status === 'running') {
-    if (pidAlive(row.pid)) {
+    const leaderAlive = pidAlive(row.pid);
+    const leaderIsOurs = slotLeaderMatchesIdentity(row);
+    const groupIsAlive = processGroupAlive(row.pid);
+    if (leaderAlive && !leaderIsOurs) {
+      markRunSlotDeadIfUnchanged(row, opts.host);
+      const updated = getRunSlotWithProjectStmt.get(slotNo);
+      if (!updated) throw new FoundryError(404, 'foundry_slot_not_found', 'foundry run slot not found');
+      return serializeRunSlot(updated, opts.host);
+    }
+    if (row.pid && (leaderIsOurs || groupIsAlive)) {
       signalProcessGroup(row.pid!, 'SIGTERM');
-      for (let i = 0; i < 8 && pidAlive(row.pid); i += 1) sleepSync(150);
-      if (pidAlive(row.pid)) {
+      if (!waitForPortFree(row.port, 1_200)) {
         signalProcessGroup(row.pid!, 'SIGKILL');
-        for (let i = 0; i < 4 && pidAlive(row.pid); i += 1) sleepSync(100);
+        if (!waitForPortFree(row.port, 1_200)) {
+          throw new FoundryError(409, 'foundry_slot_still_bound', `Foundry run slot ${slotNo} still has port ${row.port} bound after stop`, {
+            slot: serializeRunSlot(getRunSlotWithProjectStmt.get(slotNo) ?? { ...row, project_name: null }, opts.host),
+          });
+        }
       }
     }
+    if (portBoundSync(row.port)) {
+      throw new FoundryError(409, 'foundry_slot_still_bound', `Foundry run slot ${slotNo} still has port ${row.port} bound`);
+    }
     setRunSlotStoppedStmt.run(slotNo);
+    markProjectReadyAfterSlotStop(row);
     if (opts.emit !== false) emitRunSlot(slotNo, opts.host);
   }
   const updated = getRunSlotWithProjectStmt.get(slotNo);
@@ -1457,13 +1649,8 @@ export function reconcileRunSlotsAtBoot(host?: string | null): void {
       }
       continue;
     }
-    if (slot.status === 'running' && !pidAlive(slot.pid)) {
-      setRunSlotDeadStmt.run(slot.slot_no);
-      emitRunSlot(slot.slot_no, host);
-      if (slot.project_id) {
-        const project = getProjectStmt.get(slot.project_id);
-        if (project) emitProject('updated', project, projectModulesStmt.all(project.id));
-      }
+    if (slot.status === 'running' && !slotHasLiveOccupant(slot)) {
+      markRunSlotDeadIfUnchanged(slot, host);
     }
   }
 }
@@ -1479,7 +1666,7 @@ function allocateRunSlot(opts: GoProjectOptions): FoundryRunSlotListRow {
   if (requested != null) {
     const target = slots.find((slot) => slot.slot_no === requested) ?? null;
     if (!target) throw new FoundryError(400, 'foundry_invalid_slot', 'slot_no must be 1, 2, or 3');
-    if (target.status === 'running' && pidAlive(target.pid)) {
+    if (slotHasLiveOccupant(target)) {
       if (!opts.replace) {
         throw new FoundryError(409, 'foundry_slot_occupied', `Foundry run slot ${requested} is already running`, {
           slot: serializeRunSlot(target, opts.host),
@@ -1492,7 +1679,7 @@ function allocateRunSlot(opts: GoProjectOptions): FoundryRunSlotListRow {
     return refreshed;
   }
 
-  const free = slots.find((slot) => slot.status !== 'running' || !pidAlive(slot.pid));
+  const free = slots.find((slot) => !slotHasLiveOccupant(slot));
   if (!free) {
     throw new FoundryError(409, 'foundry_slots_full', 'all Foundry run slots are busy', {
       slots: slotOccupants(opts.host).map((slot) => ({
@@ -1507,12 +1694,24 @@ function allocateRunSlot(opts: GoProjectOptions): FoundryRunSlotListRow {
   return free;
 }
 
+function preflightRunSlotPort(slot: FoundryRunSlotListRow, opts: GoProjectOptions): void {
+  const check = portAvailableSync(slot.port);
+  if (check.available) return;
+  const heldBySlot = listRunSlotsStmt.all().find((candidate) => candidate.slot_no !== slot.slot_no && candidate.port === slot.port) ?? null;
+  throw new FoundryError(409, 'foundry_port_busy', `Foundry run slot ${slot.slot_no} port ${slot.port} is already bound`, {
+    slot: serializeRunSlot(slot, opts.host),
+    held_by_slot: heldBySlot ? serializeRunSlot(heldBySlot, opts.host) : null,
+    reason: check.reason ?? 'port is not available',
+  });
+}
+
 async function probePort(port: number): Promise<boolean> {
   for (const pathPart of ['/health', '/']) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 1_000);
     try {
-      await fetch(`http://127.0.0.1:${port}${pathPart}`, { signal: controller.signal });
+      const res = await fetch(`http://127.0.0.1:${port}${pathPart}`, { method: 'HEAD', signal: controller.signal });
+      res.body?.cancel();
       clearTimeout(timeout);
       return true;
     } catch {
@@ -1540,17 +1739,16 @@ export async function runSlotHealthTick(host?: string | null): Promise<void> {
     ensureRunSlots();
     for (const slot of listRunSlotsStmt.all()) {
       if (slot.status !== 'running') continue;
-      if (!pidAlive(slot.pid)) {
-        setRunSlotDeadStmt.run(slot.slot_no);
-        emitRunSlot(slot.slot_no, host);
-        if (slot.project_id) {
-          const project = getProjectStmt.get(slot.project_id);
-          if (project) emitProject('updated', project, projectModulesStmt.all(project.id));
-        }
-        continue;
-      }
-      if (await probePort(slot.port)) {
-        setRunSlotHealthStmt.run(slot.slot_no);
+      const observedPid = slot.pid;
+      const hadLiveOccupant = slotHasLiveOccupant(slot);
+      const portHealthy = await probePort(slot.port);
+      const current = getRunSlotStmt.get(slot.slot_no);
+      if (!current || current.status !== 'running' || current.pid !== observedPid) continue;
+      if (portHealthy) {
+        if (observedPid) setRunSlotHealthIfSamePidStmt.run(slot.slot_no, observedPid);
+        else setRunSlotHealthStmt.run(slot.slot_no);
+      } else if (!hadLiveOccupant) {
+        markRunSlotDeadIfUnchanged(slot, host);
       }
     }
   } finally {
@@ -2713,11 +2911,23 @@ export function startFoundry(): void {
 export function goProject(id: string, opts: GoProjectOptions = {}): GoProjectResult {
   const project = getProjectStmt.get(id) ?? null;
   if (!project) throw new FoundryError(404, 'foundry_project_not_found', 'foundry project not found');
-  if (project.status !== 'ready') throw new FoundryError(409, 'foundry_project_not_ready', 'project must be ready before GO');
+  if (project.status !== 'ready' && project.status !== 'launched') {
+    throw new FoundryError(409, 'foundry_project_not_ready', 'project must be ready before GO');
+  }
   const blueprint = loadBlueprint(project);
   const runCommand = project.run_command?.trim() || blueprint?.run?.command?.trim() || '';
   if (!runCommand) throw new FoundryError(400, 'foundry_missing_run_command', 'project has no run.command');
-  const slot = allocateRunSlot(opts);
+  let goOpts = opts;
+  const ownLiveSlot = listRunSlotsStmt.all().find((slot) => slot.project_id === id && slotHasLiveOccupant(slot)) ?? null;
+  if (ownLiveSlot && opts.slot_no == null) {
+    goOpts = { ...opts, slot_no: ownLiveSlot.slot_no, replace: true };
+  } else if (ownLiveSlot && Number(opts.slot_no) !== ownLiveSlot.slot_no) {
+    throw new FoundryError(409, 'foundry_project_already_running', 'project is already running in a Foundry run slot', {
+      slot: serializeRunSlot(ownLiveSlot, opts.host),
+    });
+  }
+  const slot = allocateRunSlot(goOpts);
+  preflightRunSlotPort(slot, goOpts);
   const effectiveCommand = runCommand.replaceAll('{{port}}', String(slot.port));
   const logDir = path.join(project.repo_path, '.foundry');
   fs.mkdirSync(logDir, { recursive: true });
@@ -2728,6 +2938,7 @@ export function goProject(id: string, opts: GoProjectOptions = {}): GoProjectRes
   childEnv.PORT = String(slot.port);
   childEnv.FOUNDRY_SLOT = String(slot.slot_no);
   let childPid: number | null = null;
+  let childStarttime: string | null = null;
   try {
     const out = fs.openSync(logPath, 'a');
     try {
@@ -2740,6 +2951,7 @@ export function goProject(id: string, opts: GoProjectOptions = {}): GoProjectRes
       });
       if (!child.pid) throw new Error('spawn did not return a child pid');
       childPid = child.pid;
+      childStarttime = readProcStarttime(child.pid);
       child.unref();
     } finally {
       fs.closeSync(out);
@@ -2748,7 +2960,13 @@ export function goProject(id: string, opts: GoProjectOptions = {}): GoProjectRes
     throw new FoundryError(500, 'foundry_go_failed', err instanceof Error ? err.message : String(err));
   }
   if (!childPid) throw new FoundryError(500, 'foundry_go_failed', 'spawn did not return a child pid');
-  setRunSlotRunningStmt.run(project.id, childPid, effectiveCommand, logPath, slot.slot_no);
+  sleepSync(500);
+  if (!pidAlive(childPid) && !processGroupAlive(childPid) && !portBoundSync(slot.port)) {
+    throw new FoundryError(500, 'foundry_go_failed', `run.command exited before binding port ${slot.port}`, {
+      log_tail: logTail(logPath),
+    });
+  }
+  setRunSlotRunningStmt.run(project.id, childPid, childStarttime, effectiveCommand, logPath, slot.slot_no);
   const previewUrl = runSlotPreviewUrl(slot.port, opts.host);
   const blueprintPreviewUrl = blueprint?.run?.preview_url?.trim() || null;
   setProjectLaunchedStmt.run(previewUrl, id);

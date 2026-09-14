@@ -598,8 +598,61 @@ export function buildToolsBlock(): string {
   ].join('\n');
 }
 
-export function buildInitialPrompt(userMessage: string): string {
-  return [buildSystemPrompt(), buildToolsBlock(), '---', `Human: ${userMessage}`, 'Assistant:'].join('\n\n');
+export const CONTINUITY_BOOT_FILE = '/home/kevin/obsidian/paperclip-wiki/skills/jarvis-continuity/SKILL.md';
+export const CONTINUITY_BOOT_HEADER = '## JARVIS Continuity (auto-loaded, first turn)';
+
+let continuityBootReadWarned = false;
+
+export function loadContinuityBootBlock(): string | null {
+  let body: string;
+  try {
+    body = readFileSync(CONTINUITY_BOOT_FILE, 'utf-8').trim();
+  } catch (err) {
+    if (!continuityBootReadWarned) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[agent] Continuity boot file unavailable (${CONTINUITY_BOOT_FILE}); skipping first-turn injection: ${message}`);
+      continuityBootReadWarned = true;
+    }
+    return null;
+  }
+
+  if (!body) return null;
+  return [
+    CONTINUITY_BOOT_HEADER,
+    `_Source: ${CONTINUITY_BOOT_FILE}. Injected once at conversation start so fresh JARVIS threads inherit the continuity contract. It is not repeated on later turns._`,
+    '',
+    body,
+  ].join('\n');
+}
+
+export function shouldInjectContinuityBoot(externalId: string, turns: TurnRow[]): boolean {
+  if (externalId.startsWith('quick:')) return false;
+  if (externalId.startsWith('cockpit:hopper-node-')) return false;
+  return !turns.some((turn) => turn.role === 'assistant');
+}
+
+export function buildInitialPrompt(userMessage: string, opts?: { continuityBootBlock?: string | null }): string {
+  const parts = [buildSystemPrompt(), buildToolsBlock()];
+  if (opts?.continuityBootBlock) parts.push(opts.continuityBootBlock);
+  parts.push('---', `Human: ${userMessage}`, 'Assistant:');
+  return parts.join('\n\n');
+}
+
+export function buildPromptForNewSession(
+  turns: TurnRow[],
+  userMessage: string,
+  externalId: string,
+  adapterId: string = 'claude',
+  model: string | null = null,
+  opts?: { aggressive?: boolean },
+): string {
+  const continuityBootBlock = shouldInjectContinuityBoot(externalId, turns)
+    ? loadContinuityBootBlock()
+    : null;
+
+  return turns.length > 1
+    ? buildContinuationPrompt(turns, userMessage, adapterId, model, { ...opts, continuityBootBlock })
+    : buildInitialPrompt(userMessage, { continuityBootBlock });
 }
 
 export function adapterFromModel(model: string | null | undefined): string | null {
@@ -768,7 +821,7 @@ export function buildContinuationPrompt(
   userMessage: string,
   adapterId: string = 'claude',
   model: string | null = null,
-  opts?: { aggressive?: boolean },
+  opts?: { aggressive?: boolean; continuityBootBlock?: string | null },
 ): string {
   const priorTurns = turns.length && turns[turns.length - 1]?.role === 'user'
     ? turns.slice(0, -1)
@@ -814,6 +867,7 @@ export function buildContinuationPrompt(
   return [
     systemPrompt,
     toolsBlock,
+    ...(opts?.continuityBootBlock ? [opts.continuityBootBlock] : []),
     '---',
     'You are continuing an existing JARVIS conversation after the backing adapter session changed or was reset.',
     'Treat the transcript below as prior context from the same thread and continue naturally from the final human message.',
@@ -1318,7 +1372,7 @@ async function runConversationTurn(
     contextWindowTokensFor(adapter.id, runtime.model) <= 128_000 ? 12_000 : undefined;
   let stdinContent = perTurnContextPrefix + (sessionId
     ? `<memory_refresh>\n${loadMemoryBlock(resumeMemoryMaxChars)}\n</memory_refresh>\n\n${modelInput}`
-    : (turns.length > 1 ? buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model) : buildInitialPrompt(modelInput)));
+    : buildPromptForNewSession(turns, modelInput, conv.external_id, adapter.id, runtime.model));
 
   // DAR-756: only one aggressive-compaction retry per turn — if the destination
   // model still overflows after that, stop retrying and degrade to a friendly

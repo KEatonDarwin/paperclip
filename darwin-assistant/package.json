@@ -11,6 +11,7 @@
     "build:run": "tsc && node dist/index.js",
     "foundry:sim": "node scripts/foundry-sim.mjs",
     "governor-v2:sim": "JARVIS_DB_PATH=/tmp/governor-v2-sim.db node scripts/governor-v2-sim.mjs",
+    "continuity:test": "node scripts/continuity-injection-test.mjs",
     "spawn-monitor:test": "node scripts/spawn-monitor-test.mjs"
   },
   "dependencies": {

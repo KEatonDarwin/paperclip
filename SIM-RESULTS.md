@@ -13,7 +13,7 @@ live `jarvis.db`.
 ```
 cd darwin-assistant
 npm run build            # tsc, clean
-npm run finishline:sim   # Scenarios A, B, D — new script
+npm run finishline:sim   # Scenarios A, B, D, E — new script
 npm run continuity:test  # Scenario C — pre-existing script from the BUILD task
 ```
 
@@ -116,6 +116,23 @@ worker):
 
 1 check (D-1) passed.
 
+## Scenario E — retry dedupe + ancestor-aware continuation audits
+
+Added after adversarial review #184, which found that a retried SHORTFALL
+audit could plant duplicate continuation trees and that a continuation audit
+could judge only its own gap-closing node instead of the whole ancestor chain.
+
+The sim now proves both review fixes:
+
+1. A parent tree can have only one open continuation. A second
+   `POST /hopper-trees` with the same `continuation_of` is rejected with
+   `409 finishline_continuation_exists` and returns the existing tree id.
+2. A continuation tree's `FINISH-LINE AUDIT` spec includes the ancestor tree's
+   delivered node digest, so the audit judges cumulative delivery against the
+   original ask rather than re-flagging work already completed by the parent.
+
+Both checks (E-1..E-2) passed.
+
 ## Scenario C — first-turn continuity injection
 
 Ran the existing `scripts/continuity-injection-test.mjs` (built by the
@@ -145,9 +162,10 @@ Output: `ALL CHECKS PASSED`.
 | A — FULL verdict | A-1..A-5 (5) | 5/5 PASS |
 | B — SHORTFALL + continuation | B-1..B-4 (4) | 4/4 PASS |
 | D — depth cap at plant time | D-1 (1) | 1/1 PASS |
+| E — continuation dedupe + ancestor digest | E-1..E-2 (2) | 2/2 PASS |
 | C — first-turn continuity injection | 4 assertions in `continuity-injection-test.mjs` | ALL CHECKS PASSED |
 
-**10/10** `finishline-sim.mjs` checks passed. **ALL CHECKS PASSED** on the
+**12/12** `finishline-sim.mjs` checks passed. **ALL CHECKS PASSED** on the
 continuity injection test. `tsc` clean. `git diff --check` clean.
 
 ## Cleanup

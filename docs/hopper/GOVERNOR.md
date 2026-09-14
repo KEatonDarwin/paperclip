@@ -1,6 +1,8 @@
 # Hopper Governor
 
-As built on branch `hopper/governor-v2` during the 2026-09-12/13 overnight run.
+As built on branch `hopper/governor-v2` during the 2026-09-12/13 overnight run,
+with manual provider overrides added on branch `hopper/gov-overrides` on
+2026-09-14.
 This is the operator-facing companion to `docs/hopper/GOVERNOR-V2-CONTRACT.md`.
 
 The governor is the Hopper Engine's claim-time throttle. It does not interrupt
@@ -15,6 +17,9 @@ running workers. Every new claim passes through `dispatchTick()` in
 - Settings-KV knobs: governor settings are read uncached from the `settings`
   table with env/default fallbacks, so cockpit changes take effect on the next
   dispatch tick without a restart.
+- Manual provider overrides: each provider has a cockpit toggle for `auto`,
+  `on`, and `off`. These are Kevin's explicit override levers for when the
+  machine's normal budget logic is too conservative or he wants a pool paused.
 - Claude while active: Claude workers can run while Kevin is active only when
   the Claude 5h window is below `gov_kevin_active_claude_max_5h`.
 - Pool ceilings: Codex and Auggie now have their own usage-file stale checks
@@ -33,6 +38,18 @@ running workers. Every new claim passes through `dispatchTick()` in
   complete a re-leased node.
 
 ## Provider Rules
+
+Manual override keys are evaluated first, before `HOPPER_GOV_ENABLED` and
+before every usage, ceiling, and Kevin-active gate:
+
+| Override value | Reason | Meaning |
+| --- | --- | --- |
+| `auto` | normal governor reason | Default. The provider follows the normal governor logic below. |
+| `on` | `override_on` | Force the provider open for new claims, bypassing Kevin-active, ceilings, and usage-staleness. Kevin is accepting the meter risk for that pool. |
+| `off` | `override_off` | Hold all new claims for that provider. Running workers are not interrupted. |
+
+Overrides are per-provider and isolated. For example, `gov_override_auggie=off`
+does not affect Claude, Codex, or Devin.
 
 Provider classification lives in `providerFor(adapter)`:
 
@@ -60,7 +77,13 @@ active-window non-Claude concurrency cap.
 ## Settings and Defaults
 
 All `gov_*` keys are settings-KV rows read by `hopper-governor.ts`. The cockpit
-editor is `/settings/governor` on branch `hopper/governor-v2-ui`.
+editor is `/settings/governor` on branch `hopper/gov-overrides-ui`.
+
+Budget/ceiling keys below use env/default fallbacks. Manual override keys are
+the deliberate exception: they are KV-only, exact-match reads with no env
+fallback, no trimming, and no case-folding. Only literal `on` and `off` activate
+an override; unset, `auto`, `ON`, `on `, and any other hand-edited variant all
+read as `auto`. This keeps the UI and governor from disagreeing.
 
 | Setting key | Env fallback(s) | Default | Meaning |
 | --- | --- | ---: | --- |
@@ -71,6 +94,10 @@ editor is `/settings/governor` on branch `hopper/governor-v2-ui`.
 | `gov_codex_ceiling` | `GOV_CODEX_CEILING`, `HOPPER_GOV_CODEX_CEILING` | `90` | Codex usage ceiling. |
 | `gov_auggie_ceiling` | `GOV_AUGGIE_CEILING`, `HOPPER_GOV_AUGGIE_CEILING` | `85` | Auggie credit-burn ceiling. |
 | `gov_concurrency_cap` | `GOV_CONCURRENCY_CAP`, `HOPPER_DAYTIME_MAX_WORKERS` | `2` | Max non-Claude workers claimed while Kevin is active. |
+| `gov_override_claude` | none, KV-only | `auto` | `auto` follows normal Claude gates; `on` forces Claude open; `off` holds new Claude claims. |
+| `gov_override_codex` | none, KV-only | `auto` | `auto` follows normal Codex gates; `on` forces Codex open; `off` holds new Codex claims. |
+| `gov_override_auggie` | none, KV-only | `auto` | `auto` follows normal Auggie gates; `on` forces Auggie open; `off` holds new Auggie claims. |
+| `gov_override_devin` | none, KV-only | `auto` | `auto` follows normal Devin behavior; `on` forces Devin open; `off` holds new Devin claims. |
 
 Environment-only governor knobs:
 
@@ -109,8 +136,9 @@ Spawn reconciler recovery constants in `scripts/jarvis-spawn-reconcile.py`:
 - Returns the back-compatible top-level verdict for Claude, or for `?adapter=`
   when supplied.
 - Also returns `providers.claude`, `providers.codex`, `providers.auggie`, and
-  `providers.devin` with each lane's allow/hold reason, detail, usage, and
-  effective config.
+  `providers.devin` with each lane's allow/hold reason, `override`, detail,
+  usage, and effective config. Manual overrides surface as `override_on` or
+  `override_off`.
 
 `GET /api/v1/hopper-engine/settings`
 
@@ -121,7 +149,8 @@ Spawn reconciler recovery constants in `scripts/jarvis-spawn-reconcile.py`:
 `PATCH /api/v1/hopper-engine/settings`
 
 - Admin-scoped.
-- Accepts only the `gov_*` keys listed above.
+- Accepts only the `gov_*` keys listed above, including the four manual
+  override keys.
 - Numeric values are parsed, bounded to `0..100000`, truncated to integers, and
   stored as integer strings so the panel and the gate compare the same value.
 - Triggers `dispatchTick('governor_settings_changed')`.
@@ -157,9 +186,11 @@ Every recovery finish POST includes `worker_thread_ext`; the finish route return
 Backend simulation:
 
 ```bash
-cd /home/kevin/paperclip-worktrees/governor-v2/darwin-assistant
+cd /home/kevin/paperclip-worktrees/gov-overrides/darwin-assistant
 npm run build
 npm run governor-v2:sim
+npm run gov-overrides:sim
+node scripts/gov-overrides-review.mjs
 ```
 
 The simulation uses a scratch SQLite DB and scratch usage files. It verifies:
@@ -176,29 +207,31 @@ The simulation uses a scratch SQLite DB and scratch usage files. It verifies:
 Frontend validation:
 
 ```bash
-cd /home/kevin/worktrees/governor-v2-ui
+cd /home/kevin/worktrees/gov-overrides-ui
 NODE_ENV=production SERVER_PRESET=node-server NITRO_PRESET=node-server bun run build
 ```
 
-The panel lives at `/settings/governor`, and Spawn Tree links its governor pill
-to that page. Do not use a bare `bun run build` for cockpit validation; without
-the explicit preset it can emit a Cloudflare-module bundle, which is not the
-systemd-serving shape.
+The panel lives at `/settings/governor`. Manual override controls are the
+three-state segmented buttons near the top of that page. The Provider Usage
+widget shows compact `Override on` / `Paused` pills for any non-`auto` provider.
+Do not use a bare `bun run build` for cockpit validation; without the explicit
+preset it can emit a Cloudflare-module bundle, which is not the systemd-serving
+shape.
 
 ## Rollback
 
 No merge or deploy is part of this branch. Rollback before deployment is simply
 not deploying:
 
-- Backend branch: `hopper/governor-v2`.
-- Cockpit branch: `hopper/governor-v2-ui`.
+- Backend branch: `hopper/gov-overrides`.
+- Cockpit branch: `hopper/gov-overrides-ui`.
 
 After deployment, rollback is to return the live checkouts to the currently live
 branches/commits that these worktrees were based on and restart through the
 normal JARVIS-owned deploy path:
 
-- Backend base studied by review: `52854bbd6b507d7cd2f677892ddd56d1fccd5ef1`.
-- UI base studied by review: `6b781e3`.
+- Backend base studied by review: `6b94550f0`.
+- UI base studied by review: `095835c`.
 
 Do not merge to main from the worker. JARVIS deploys reviewed branches and keeps
 the final rollback call outside the leaf worker path.

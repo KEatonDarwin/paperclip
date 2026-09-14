@@ -70,7 +70,7 @@ Superseded or unsafe to port:
 
 ## Settings-KV Schema
 
-All governor knobs must be read via `getSetting()` with env fallback. Reads are deliberately uncached so the cockpit settings panel can take effect live; `getSetting()` is a direct prepared `SELECT` at `darwin-assistant/src/conversation-db.ts:842-844`.
+Budget and ceiling governor knobs must be read via `getSetting()` with env fallback. Reads are deliberately uncached so the cockpit settings panel can take effect live; `getSetting()` is a direct prepared `SELECT` at `darwin-assistant/src/conversation-db.ts:842-844`.
 
 Create a helper in `darwin-assistant/src/hopper-governor.ts`, similar to Foundry's `getFoundrySetting()` at `darwin-assistant/src/foundry-settings.ts:14-23`:
 
@@ -84,6 +84,11 @@ function getGovernorSetting(name: string): string | null {
 }
 ```
 
+Manual provider override keys are the explicit exception to that helper: read
+`gov_override_{claude,codex,auggie,devin}` from settings-KV directly with no env
+fallback, no trim, and no case-folding. Only exact `on` and exact `off` count;
+unset, `auto`, padded values, and case variants all mean normal `auto` behavior.
+
 Required keys:
 
 | Setting key | Env fallback | Type | Default | Meaning |
@@ -95,6 +100,10 @@ Required keys:
 | `gov_codex_ceiling` | `GOV_CODEX_CEILING` | number percent | `90` | Codex plan ceiling. Also accept `HOPPER_GOV_CODEX_CEILING` from the donor branch. |
 | `gov_auggie_ceiling` | `GOV_AUGGIE_CEILING` | number percent | `85` | Auggie credit burn ceiling. Default must stop new Auggie claims at or above 85 percent burned because Augment is already around 80 percent tonight. Also accept `HOPPER_GOV_AUGGIE_CEILING` from the donor branch. |
 | `gov_concurrency_cap` | `GOV_CONCURRENCY_CAP` | integer workers | `2` | Max non-Claude workers to claim while Kevin is active. This ports old `HOPPER_DAYTIME_MAX_WORKERS` behavior from `hopper/provider-daytime:darwin-assistant/src/hopper-engine.ts:65-74`; accept the old env var as a fallback. |
+| `gov_override_claude` | none; KV-only | enum `auto`, `on`, or `off` | `auto` | Manual Claude override. `auto` follows normal gates; exact `on` forces new Claude claims open; exact `off` holds new Claude claims. |
+| `gov_override_codex` | none; KV-only | enum `auto`, `on`, or `off` | `auto` | Manual Codex override. `auto` follows normal gates; exact `on` forces new Codex claims open; exact `off` holds new Codex claims. |
+| `gov_override_auggie` | none; KV-only | enum `auto`, `on`, or `off` | `auto` | Manual Auggie override. `auto` follows normal gates; exact `on` forces new Auggie claims open; exact `off` holds new Auggie claims. |
+| `gov_override_devin` | none; KV-only | enum `auto`, `on`, or `off` | `auto` | Manual Devin override. `auto` follows normal behavior; exact `on` forces new Devin claims open; exact `off` holds new Devin claims. |
 
 Keep existing non-governor env defaults:
 
@@ -104,9 +113,22 @@ Keep existing non-governor env defaults:
 - `CLAUDE_USAGE_FILE`, `CODEX_USAGE_FILE`, and `AUGGIE_USAGE_FILE` keep their current file defaults.
 - `HOPPER_ENGINE_SLOTS`, `HOPPER_ENGINE_LEASE_MIN`, `HOPPER_WORKER_ADAPTER`, and `hopper_worker_model` stay in the engine layer.
 
-The `config` object returned in every governor verdict must report the effective values above, including which values came from KV/env/default if cheap to include. The API must not require a restart for KV changes.
+The `config` object returned in every governor verdict must report the effective budget/ceiling values above, including which values came from KV/env/default if cheap to include. The verdict itself must also report `override: auto|on|off`. The API must not require a restart for KV changes.
 
 ## Governor Behavior
+
+Manual provider overrides run before every other gate, including
+`HOPPER_GOV_ENABLED`:
+
+- `auto`: no override. Continue through the normal provider-specific logic.
+- `on`: allow new claims for that provider with reason `override_on`, bypassing
+  Kevin-active, 5h/weekly/provider ceilings, and usage-file staleness. This is a
+  true manual "go" lever, and Kevin is accepting the meter risk for that pool.
+- `off`: hold new claims for that provider with reason `override_off`. Running
+  workers are never interrupted.
+
+Overrides are per-provider and isolated; `gov_override_auggie=off` must not hold
+Claude, Codex, or Devin.
 
 Provider lanes:
 
@@ -142,8 +164,10 @@ Dispatch:
 `GET /api/v1/hopper-engine/governor` must return:
 
 - A back-compatible top-level verdict for Claude by default, or for the requested `?adapter=` if present.
-- `providers.claude`, `providers.codex`, `providers.auggie`, and `providers.devin`, each with `allow`, `reason`, `detail`, `provider_usage` or `five_hour`/`weekly`, and `config`.
+- `providers.claude`, `providers.codex`, `providers.auggie`, and `providers.devin`, each with `allow`, `reason`, `override`, `detail`, `provider_usage` or `five_hour`/`weekly`, and `config`.
 - `config` with effective values for every required settings key.
+
+The reason enum must include `override_on` and `override_off`.
 
 Current route is top-level Claude only at `darwin-assistant/src/handlers/api-v1.ts:1748-1751`. The donor branch already has the correct shape at `hopper/provider-daytime:darwin-assistant/src/handlers/api-v1.ts:1323-1329`; port that shape, not the old `/hopper-engine/daytime` toggle as the primary interface.
 
@@ -151,6 +175,7 @@ Settings mutation should live under a small explicit route rather than overloadi
 
 - `GET /api/v1/hopper-engine/settings` returns the effective config and raw KV values.
 - `PATCH /api/v1/hopper-engine/settings` accepts only the required keys, validates numbers/enums, writes settings-KV, and triggers `dispatchTick('governor_settings_changed')`.
+- Override values must be validated exactly as `auto`, `on`, or `off`; invalid values return 400 and must not persist.
 - Writes require admin scope, matching the global settings route at `darwin-assistant/src/handlers/api-v1.ts:3853-3872`.
 
 ## Engine Hardening 1: Parent-ID Deadlock
@@ -230,8 +255,11 @@ Do not ship only the old Daytime Engine toggle.
 Governor v2 cockpit work should add a settings surface reachable from Spawn-Tree/Mission Control or Settings:
 
 - Editable fields for `gov_kevin_active_claude_max_5h`, `gov_5h_ceiling`, `gov_weekly_ceiling`, `gov_weekly_mode`, `gov_codex_ceiling`, `gov_auggie_ceiling`, and `gov_concurrency_cap`.
+- Three-state controls for `gov_override_claude`, `gov_override_codex`, `gov_override_auggie`, and `gov_override_devin`: `auto` = governor logic decides, `on` = force open despite Kevin-active/ceilings/staleness, `off` = hold new workers on that provider.
 - Read-only per-pool state from `GET /hopper-engine/governor`: allow/hold reason, current usage percent, stale status, and effective ceiling.
-- The provider usage widget can link into this panel and show a compact hold/open badge, but the canonical editor should be the settings panel.
+- The provider usage widget can link into this panel and show compact override
+  pills for non-`auto` providers, but the canonical editor should be the
+  settings panel.
 
 UI donor branch useful anchors:
 
@@ -248,6 +276,10 @@ Backend:
 - With Auggie usage at `85`, `governorCheck('auggie')` holds with `provider_ceiling` by default.
 - With Codex meter stale, `governorCheck('codex')` holds with `usage_stale` without holding Claude or Auggie.
 - `GET /hopper-engine/governor` includes top-level verdict and `providers.{claude,codex,auggie,devin}` with effective config values.
+- Default/unset override state reports `override: "auto"` with no behavioral drift from the pre-override governor.
+- Setting `gov_override_claude=on` allows Claude with reason `override_on` even while Kevin is active and Claude usage is above normal ceilings.
+- Setting `gov_override_auggie=off` holds only Auggie with reason `override_off`; other providers remain governed by their own settings.
+- Invalid override values such as `ON`, `on `, or `maybe` do not activate an override. The PATCH route rejects invalid values; hand-edited KV variants read as `auto`.
 - Chain-planted trees have no initial `parent_id` values and dispatch the first dependency node.
 - Split-created children still have `parent_id` and still bubble completion.
 - Reconciler can replay a valid finish JSON from a completed worker thread.
@@ -256,6 +288,7 @@ Backend:
 Frontend:
 
 - The settings panel loads raw/effective governor values.
+- Manual provider overrides render as `Auto`, `On`, or `Off`, normalizing unset or hand-edited non-literals to `Auto` just like the governor.
 - Invalid settings are rejected visibly.
 - Saving settings updates the panel and subsequent governor API reads without a JARVIS restart.
 - Spawn-Tree still renders current Mission Control data; do not regress the current `/spawn-monitor` aggregate route.

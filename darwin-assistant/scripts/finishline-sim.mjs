@@ -86,6 +86,38 @@ async function checkAsync(id, description, fn) {
 const scenarioForTree = new Map(); // treeId -> 'A' | 'B'
 const dispatchedNodeIds = new Set();
 
+function buildSimHandoff(treeId, topic, { backfilled = 'no', report = 'outbox/finishline-sim.md' } = {}) {
+  return [
+    `# ${topic} handoff`,
+    '',
+    `Tree: \`${treeId}\``,
+    'Status: final',
+    `Backfilled: ${backfilled}`,
+    '',
+    '## What was built',
+    '',
+    '- Simulated tree deliverable completed.',
+    '',
+    '## Branches & how to install',
+    '',
+    '| Order | Repo | Branch | Head | Notes |',
+    '| --- | --- | --- | --- | --- |',
+    '| 1 | `KEatonDarwin/paperclip` | `hopper/finish-line-gate` | `sim` | Scratch simulation only; no install step. |',
+    '',
+    '## How to use it',
+    '',
+    '1. Open the finished tree and read the handoff card.',
+    '',
+    '## Next steps / deferred',
+    '',
+    '- None.',
+    '',
+    '## Full report',
+    '',
+    `- Full report: \`${report}\``,
+  ].join('\n');
+}
+
 async function fakeProcessMessage(prompt) {
   const nodeMatch = /node #(\d+)/.exec(prompt);
   const nodeId = nodeMatch ? Number(nodeMatch[1]) : null;
@@ -97,6 +129,11 @@ async function fakeProcessMessage(prompt) {
     const scenario = scenarioForTree.get(treeId);
 
     if (scenario === 'A') {
+      const tree = hopperEngine.getHopperTree(treeId);
+      await httpPost(`/api/v1/hopper-trees/${treeId}/handoff`, {
+        handoff: buildSimHandoff(treeId, tree?.topic ?? 'sim-scenario-A'),
+        force: false,
+      });
       await httpFinish(nodeId, {
         outcome: 'done',
         result: JSON.stringify({
@@ -188,6 +225,19 @@ const httpGet = (p) => httpFetch(p);
 const httpPost = (p, json) => httpFetch(p, { method: 'POST', body: JSON.stringify(json ?? {}) });
 const httpFinish = (nodeId, payload) => httpFetch(`/api/v1/hopper-nodes/${nodeId}/finish`, { method: 'POST', body: JSON.stringify(payload) });
 
+async function expectHttpError(expectedStatus, expectedCode, fn) {
+  let rejected = null;
+  try {
+    await fn();
+  } catch (err) {
+    rejected = err;
+  }
+  assert.ok(rejected, `expected HTTP ${expectedStatus} ${expectedCode}`);
+  assert.equal(rejected.status, expectedStatus);
+  assert.equal(rejected.body?.error?.code, expectedCode);
+  return rejected;
+}
+
 async function waitFor(fn, { timeoutMs = 15_000, intervalMs = 150, label = 'condition' } = {}) {
   const start = Date.now();
   let lastErr;
@@ -223,6 +273,65 @@ await waitFor(
   { timeoutMs: 10_000, label: 'server up' },
 );
 console.log('[finishline-sim] scratch server is up');
+
+// ===========================================================================
+// SCENARIO H — handoff route validation. This drives the real API route against
+// a scratch sqlite DB, without touching the live service or live jarvis.db.
+// ===========================================================================
+let handoffTree;
+await checkAsync('H-1', 'plant a draft tree for handoff route validation', async () => {
+  const created = await httpPost('/api/v1/hopper-trees', {
+    topic: 'sim-scenario-H: handoff route validation',
+    original_ask: 'Validate handoff writes.',
+    nodes: [{ title: 'validation node' }],
+  });
+  handoffTree = created.tree;
+});
+
+await checkAsync('H-2', 'handoff route rejects empty markdown with invalid_handoff', async () => {
+  await expectHttpError(400, 'invalid_handoff', () =>
+    httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, { handoff: '   ' }),
+  );
+});
+
+await checkAsync('H-3', 'handoff route rejects missing required section headings', async () => {
+  await expectHttpError(400, 'invalid_handoff', () =>
+    httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, { handoff: '# bad handoff\n\n## What was built\n\n- partial' }),
+  );
+});
+
+await checkAsync('H-4', 'handoff route rejects absolute /home/kevin full-report paths', async () => {
+  await expectHttpError(400, 'invalid_handoff', () =>
+    httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, {
+      handoff: buildSimHandoff(handoffTree.id, handoffTree.topic, { report: '/home/kevin/outbox/bad.md' }),
+    }),
+  );
+});
+
+await checkAsync('H-5', 'handoff route accepts a valid card and GET detail returns it', async () => {
+  const handoff = buildSimHandoff(handoffTree.id, handoffTree.topic);
+  const posted = await httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, { handoff });
+  assert.equal(posted.tree.handoff, handoff);
+  const detail = await httpGet(`/api/v1/hopper-trees/${handoffTree.id}`);
+  assert.equal(detail.tree.handoff, handoff);
+});
+
+await checkAsync('H-6', 'tree list exposes has_handoff without the full markdown card', async () => {
+  const list = await httpGet('/api/v1/hopper-trees');
+  const listed = list.trees.find((t) => t.id === handoffTree.id);
+  assert.ok(listed, 'expected the handoff test tree in the list payload');
+  assert.equal(listed.has_handoff, true);
+  assert.equal(Object.prototype.hasOwnProperty.call(listed, 'handoff'), false);
+});
+
+await checkAsync('H-7', 'handoff route rejects overwrites unless force=true', async () => {
+  await expectHttpError(409, 'handoff_exists', () =>
+    httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, { handoff: buildSimHandoff(handoffTree.id, handoffTree.topic) }),
+  );
+  const replacement = buildSimHandoff(handoffTree.id, handoffTree.topic, { report: 'outbox/finishline-sim-replaced.md' });
+  const replaced = await httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, { handoff: replacement, force: true });
+  assert.equal(replaced.tree.handoff, replacement);
+});
 
 // ===========================================================================
 // SCENARIO A — original_ask set, one trivial node, audit verdict FULL.
@@ -279,6 +388,7 @@ await checkAsync('A-4', 'FULL verdict finishes the audit node and completes the 
   assert.equal(audit.status, 'done');
   const verdict = JSON.parse(audit.result);
   assert.equal(verdict.finishline_verdict, 'FULL');
+  assert.ok(t.tree.handoff?.includes('## What was built'), 'FULL verdict should persist a handoff before finishing');
 });
 
 check('A-5', 'a success notification with the FULL verdict exists', () => {

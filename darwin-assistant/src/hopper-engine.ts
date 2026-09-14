@@ -39,6 +39,7 @@ export interface HopperTreeRow {
   original_ask: string | null;
   deferred_scope: string | null;
   continuation_of: string | null;
+  handoff: string | null;
   status: 'draft' | 'active' | 'done' | 'archived';
   created_at: string;
   updated_at: string;
@@ -183,7 +184,7 @@ sqliteDb.exec(`
 // ROUTER (phase 1, 2026-09-07): per-node model/adapter chosen by the PLANNER at
 // decomposition time — the tree-breakdown conversation IS the router brain, so
 // there's no separate scoring service. Additive columns; null = default loadout.
-for (const col of ['original_ask TEXT', 'deferred_scope TEXT', 'continuation_of TEXT']) {
+for (const col of ['original_ask TEXT', 'deferred_scope TEXT', 'continuation_of TEXT', 'handoff TEXT']) {
   try {
     sqliteDb.exec(`ALTER TABLE hopper_trees ADD COLUMN ${col}`);
   } catch {
@@ -202,6 +203,9 @@ for (const col of ['adapter TEXT', 'model TEXT', 'foundry_auto_retries INTEGER N
 const getTreeStmt = sqliteDb.prepare<[string], HopperTreeRow>(`SELECT * FROM hopper_trees WHERE id = ?`);
 const listTreesStmt = sqliteDb.prepare<[], HopperTreeRow>(`SELECT * FROM hopper_trees ORDER BY created_at DESC LIMIT 100`);
 const listAllTreesStmt = sqliteDb.prepare<[], HopperTreeRow>(`SELECT * FROM hopper_trees ORDER BY created_at DESC`);
+const setTreeHandoffStmt = sqliteDb.prepare<[string, string]>(
+  `UPDATE hopper_trees SET handoff = ?, updated_at = datetime('now') WHERE id = ?`,
+);
 const getNodeStmt = sqliteDb.prepare<[number], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE id = ?`);
 const treeNodesStmt = sqliteDb.prepare<[string], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE tree_id = ? ORDER BY id`);
 const childrenStmt = sqliteDb.prepare<[number], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE parent_id = ? ORDER BY id`);
@@ -420,6 +424,56 @@ function boundedText(value: string | null | undefined, limit = TEXT_FIELD_LIMIT)
   return trimmed.slice(0, limit);
 }
 
+const REQUIRED_HANDOFF_HEADINGS = [
+  '## What was built',
+  '## Branches & how to install',
+  '## How to use it',
+  '## Next steps / deferred',
+  '## Full report',
+];
+
+export type HandoffValidation =
+  | { ok: true; handoff: string }
+  | { ok: false; message: string };
+
+export function validateHopperTreeHandoff(value: unknown): HandoffValidation {
+  if (typeof value !== 'string') {
+    return { ok: false, message: 'handoff is required and must be a non-empty markdown string' };
+  }
+  const handoff = boundedText(value);
+  if (!handoff) {
+    return { ok: false, message: 'handoff is required and must be a non-empty markdown string' };
+  }
+
+  let cursor = -1;
+  for (const heading of REQUIRED_HANDOFF_HEADINGS) {
+    const idx = handoff.indexOf(heading);
+    if (idx === -1) return { ok: false, message: `handoff is missing required section: ${heading}` };
+    if (idx < cursor) return { ok: false, message: `handoff sections must appear in the required order: ${heading}` };
+    cursor = idx;
+  }
+
+  const fullReport = handoff.slice(handoff.indexOf('## Full report'));
+  if (/\/home\/kevin\//.test(fullReport)) {
+    return { ok: false, message: 'Full report must use a wiki-relative path, not an absolute /home/kevin path' };
+  }
+  return { ok: true, handoff };
+}
+
+export function setHopperTreeHandoff(
+  treeId: string,
+  handoff: string,
+  opts: { force?: boolean } = {},
+): HopperTreeRow | null {
+  const tree = getTreeStmt.get(treeId);
+  if (!tree) return null;
+  if (tree.handoff?.trim() && !opts.force) return tree;
+  const normalized = boundedText(handoff);
+  if (!normalized) return tree;
+  setTreeHandoffStmt.run(normalized, treeId);
+  return getTreeStmt.get(treeId) ?? null;
+}
+
 function finishLineAuditModel(): string {
   return getSetting('finishline_audit_model')?.trim() || FINISHLINE_DEFAULT_MODEL;
 }
@@ -570,6 +624,25 @@ function composeFinishLineAuditSpec(tree: HopperTreeRow, nodes: HopperNodeRow[])
     '- Never touch production, merge to main, send external messages, or use API keys.',
     '',
     depthRule,
+    '',
+    'Handoff card required before any FULL verdict:',
+    '1. Read JARVIS_COCKPIT_KEY from /home/kevin/paperclip/jarvis-command-center/.env.',
+    '2. Identify the docs/push node outbox report path from the settled node inventory. It must be wiki-relative, like `outbox/<file>.md`; never use `/home/kevin/...` in the Full report section.',
+    '3. Synthesize a short markdown handoff card in exactly this section order:',
+    '   # <Tree topic> handoff',
+    '   Tree: `<tree-id>`',
+    '   Status: final',
+    '   Backfilled: no',
+    '   ## What was built',
+    '   ## Branches & how to install',
+    '   ## How to use it',
+    '   ## Next steps / deferred',
+    '   ## Full report',
+    '4. The Branches table must use columns: Order, Repo, Branch, Head, Notes. Include every branch/manual artifact Kevin needs to pull, deploy, review, or intentionally ignore.',
+    '5. POST the card to /api/v1/hopper-trees/:treeId/handoff with JSON `{ "handoff": "<markdown>", "force": false }` and bearer auth.',
+    '6. If the handoff POST fails, retry the exact POST up to three times.',
+    '7. If the handoff still cannot be persisted, do NOT return a FULL verdict. Finish this audit node with outcome=blocked and a precise result explaining the handoff write failure.',
+    '8. Only after the handoff POST succeeds may you finish this audit node with finishline_verdict FULL.',
     '',
     'Finish result:',
     'If FULL or if SHORTFALL with a continuation planted, finish this audit node with outcome=done. Put a single JSON object in result:',

@@ -125,6 +125,8 @@ import {
   getHopperHistory,
   nextContinuationDepth,
   findOpenContinuationOf,
+  setHopperTreeHandoff,
+  validateHopperTreeHandoff,
   type NewNodeInput,
 } from '../hopper-engine.js';
 import { governorStatus, governorStatusAll } from '../hopper-governor.js';
@@ -1824,7 +1826,12 @@ export function createApiV1Router(): Router {
   // worker threads; workers report back through /hopper-nodes/:id/finish.
 
   router.get('/hopper-trees', (_req: AuthedRequest, res) => {
-    res.json({ trees: listHopperTrees() });
+    res.json({
+      trees: listHopperTrees().map((tree) => {
+        const { handoff: _handoff, ...summary } = tree;
+        return { ...summary, has_handoff: Boolean(tree.handoff?.trim()) };
+      }),
+    });
   });
 
   router.post('/hopper-trees', (req: AuthedRequest, res) => {
@@ -1884,6 +1891,28 @@ export function createApiV1Router(): Router {
       return;
     }
     res.json({ tree, nodes: listTreeNodes(tree.id) });
+  });
+
+  router.post('/hopper-trees/:treeId/handoff', (req: AuthedRequest, res) => {
+    const treeId = paramString(req.params.treeId);
+    const tree = getHopperTree(treeId);
+    if (!tree) {
+      sendError(res, 404, 'hopper_tree_not_found', 'hopper tree not found');
+      return;
+    }
+    const body = (req.body ?? {}) as { handoff?: unknown; force?: unknown };
+    const validated = validateHopperTreeHandoff(body.handoff);
+    if (!validated.ok) {
+      sendError(res, 400, 'invalid_handoff', validated.message);
+      return;
+    }
+    const force = body.force === true;
+    if (tree.handoff?.trim() && !force) {
+      sendError(res, 409, 'handoff_exists', 'hopper tree already has a handoff; pass force=true to replace it');
+      return;
+    }
+    const updated = setHopperTreeHandoff(treeId, validated.handoff, { force });
+    res.json({ tree: updated });
   });
 
   // Kevin's "yep that looks good" — the ONE human gate. Nothing below `agreed`

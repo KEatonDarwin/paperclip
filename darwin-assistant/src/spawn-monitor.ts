@@ -79,6 +79,7 @@ export interface SpawnMonitorTreeSummary {
   topic: string;
   status: HopperTreeRow['status'];
   origin_thread_ext: string | null;
+  has_handoff: boolean;
   created_at: string;
   updated_at: string;
   counts: SpawnMonitorNodeCounts;
@@ -252,6 +253,7 @@ function summarizeTree(tree: HopperTreeRow, treeNodes: HopperNodeRow[]): SpawnMo
     topic: tree.topic,
     status: tree.status,
     origin_thread_ext: tree.origin_thread_ext,
+    has_handoff: Boolean(tree.handoff?.trim()),
     created_at: tree.created_at,
     updated_at: tree.updated_at,
     counts: nodeCounts(treeNodes),

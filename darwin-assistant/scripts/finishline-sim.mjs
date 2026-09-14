@@ -1,0 +1,396 @@
+#!/usr/bin/env node
+// FINISH-LINE GATE LIFECYCLE SIMULATION — drives the real engine + real HTTP API
+// (hopper-engine.ts + handlers/api-v1.ts + ui-server.ts) against a scratch DB and
+// a scratch UI port. No model calls: a fake worker stands in for spawned Hopper
+// workers, exactly like scripts/foundry-sim.mjs. Never touches the live service
+// or the live jarvis.db. Permanent regression script: `npm run finishline:sim`.
+//
+//   node scripts/finishline-sim.mjs
+//
+// (run `npm run build` first — this drives the compiled dist/, not tsx.)
+
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ---------------------------------------------------------------------------
+// GUARDS — must run before any dist/ module is imported (conversation-db.js
+// reads JARVIS_DB_PATH at import time and opens the sqlite handle immediately).
+// ---------------------------------------------------------------------------
+const LIVE_DB = path.resolve('/home/kevin/paperclip/darwin-assistant/jarvis.db');
+const DB_PATH = path.resolve(process.env.JARVIS_DB_PATH || `/tmp/finishline-sim-${process.pid}.db`);
+if (DB_PATH === LIVE_DB) {
+  console.error(`FATAL: refusing to run against the live jarvis.db (${LIVE_DB}). Use a /tmp scratch path.`);
+  process.exit(1);
+}
+fs.rmSync(DB_PATH, { force: true });
+process.env.JARVIS_DB_PATH = DB_PATH;
+console.log(`[finishline-sim] scratch DB: ${DB_PATH}`);
+
+const UI_PORT = parseInt(process.env.JARVIS_UI_PORT || '39221', 10);
+if (UI_PORT === 3201) {
+  console.error('FATAL: refusing to bind the live UI port 3201. Pick a throwaway port.');
+  process.exit(1);
+}
+process.env.JARVIS_UI_PORT = String(UI_PORT);
+console.log(`[finishline-sim] scratch UI port: ${UI_PORT}`);
+
+// No governor gating for this mechanics-only test; no Slack (index.ts is never
+// imported, so Slack never boots regardless); no foundry start (non-foundry
+// trees short-circuit the foundation gate with {ok:true, gated:false}).
+process.env.HOPPER_GOV_ENABLED = '0';
+process.env.HOPPER_ENGINE_SLOTS = process.env.HOPPER_ENGINE_SLOTS || '4';
+
+const BASE_URL = `http://127.0.0.1:${UI_PORT}`;
+
+// Dynamic imports ONLY after the guards pass.
+const distDir = path.join(__dirname, '..', 'dist');
+const hopperEngine = await import(path.join(distDir, 'hopper-engine.js'));
+const uiServer = await import(path.join(distDir, 'ui-server.js'));
+const apiKeys = await import(path.join(distDir, 'api-keys.js'));
+const convDb = await import(path.join(distDir, 'conversation-db.js'));
+
+const { sqliteDb } = convDb;
+
+// ---------------------------------------------------------------------------
+// Results table
+// ---------------------------------------------------------------------------
+const results = [];
+function check(id, description, fn) {
+  try {
+    fn();
+    results.push({ id, description, pass: true });
+  } catch (err) {
+    results.push({ id, description, pass: false, error: err instanceof Error ? err.message : String(err) });
+  }
+}
+async function checkAsync(id, description, fn) {
+  try {
+    await fn();
+    results.push({ id, description, pass: true });
+  } catch (err) {
+    results.push({ id, description, pass: false, error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fake worker — no model calls. Mirrors what a real spawned worker does:
+//   - a normal leaf node just reports done immediately.
+//   - a FINISH-LINE AUDIT node runs the scenario-specific verdict logic that a
+//     real audit worker would run, via the SAME public HTTP API a real worker
+//     uses (POST /hopper-trees[+/agree], POST /hopper-nodes/:id/finish).
+// ---------------------------------------------------------------------------
+const scenarioForTree = new Map(); // treeId -> 'A' | 'B'
+const dispatchedNodeIds = new Set();
+
+async function fakeProcessMessage(prompt) {
+  const nodeMatch = /node #(\d+)/.exec(prompt);
+  const nodeId = nodeMatch ? Number(nodeMatch[1]) : null;
+  if (nodeId != null) dispatchedNodeIds.add(nodeId);
+
+  if (prompt.includes('FINISH-LINE AUDIT')) {
+    const treeMatch = /\(tree (tree-[0-9a-f-]+)\)/.exec(prompt);
+    const treeId = treeMatch ? treeMatch[1] : null;
+    const scenario = scenarioForTree.get(treeId);
+
+    if (scenario === 'A') {
+      await httpFinish(nodeId, {
+        outcome: 'done',
+        result: JSON.stringify({
+          finishline_verdict: 'FULL',
+          summary: 'Sim scenario A: the trivial node satisfied the original ask.',
+          gaps: [],
+          continuation_tree_id: null,
+          continuation_nodes: [],
+        }),
+      });
+    } else if (scenario === 'B') {
+      const cont = await httpPost('/api/v1/hopper-trees', {
+        topic: `continuation: sim-scenario-B - close the intentional gap`,
+        origin_thread: 'cockpit:finishline-sim-origin',
+        original_ask: 'Sim scenario B original ask: build the trivial thing AND close the intentional gap.',
+        continuation_of: treeId,
+        deferred_scope: `Continuation auto-planted by finish-line audit for tree ${treeId}. Shortfall: sim gap was never closed by the parent tree.`,
+        nodes: [
+          { title: 'Close the sim gap', spec: 'Trivial continuation node for sim scenario B.', depends_on_indexes: [], adapter: 'claude', model: 'claude-sonnet-5' },
+        ],
+      });
+      const newTreeId = cont.tree.id;
+      // The continuation tree carries the same original_ask, so once ITS leaf
+      // settles the finish-line gate fires again on it too (by design — see
+      // FINISHLINE-DESIGN.md's "Continuation tree inherits the same
+      // original_ask"). Register it so the fake worker closes that second
+      // audit cleanly (FULL) instead of hitting the untracked-tree guard.
+      scenarioForTree.set(newTreeId, 'A');
+      await httpPost(`/api/v1/hopper-trees/${newTreeId}/agree`, {});
+      await httpFinish(nodeId, {
+        outcome: 'done',
+        result: JSON.stringify({
+          finishline_verdict: 'SHORTFALL',
+          summary: 'Sim scenario B: intentional gap found, continuation planted and agreed.',
+          gaps: ['sim gap was never closed'],
+          continuation_tree_id: newTreeId,
+          continuation_nodes: ['Close the sim gap'],
+        }),
+      });
+    } else {
+      // Depth-cap probe trees (see check D-*) never reach a real audit worker —
+      // they are built and torn down purely at the HTTP-plant layer. If one
+      // ever does get here, fail loudly rather than silently no-op.
+      throw new Error(`fakeProcessMessage saw an audit node for unknown/untracked tree ${treeId}`);
+    }
+    return 'FAKE_AUDIT_WORKER_OK — no model call made.';
+  }
+
+  if (nodeId != null) {
+    await httpFinish(nodeId, { outcome: 'done', result: 'Sim leaf node complete — no model call made.' });
+  }
+  return 'FAKE_WORKER_OK — no model call made.';
+}
+
+hopperEngine.startHopperEngine(fakeProcessMessage);
+uiServer.startUiServer();
+
+// ---------------------------------------------------------------------------
+// HTTP helpers — real network calls against the scratch server, exactly like
+// a real caller (a planner chat, a worker's curl finish) would make.
+// ---------------------------------------------------------------------------
+const { plaintext: API_KEY } = apiKeys.mintApiKey('finishline-sim', 'cockpit');
+
+async function httpFetch(pathAndQuery, init = {}) {
+  const res = await fetch(`${BASE_URL}${pathAndQuery}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${API_KEY}`,
+      'Content-Type': 'application/json',
+      ...(init.headers ?? {}),
+    },
+  });
+  const text = await res.text();
+  let body;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = text;
+  }
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status} ${pathAndQuery}: ${typeof body === 'string' ? body : JSON.stringify(body)}`);
+    err.status = res.status;
+    err.body = body;
+    throw err;
+  }
+  return body;
+}
+const httpGet = (p) => httpFetch(p);
+const httpPost = (p, json) => httpFetch(p, { method: 'POST', body: JSON.stringify(json ?? {}) });
+const httpFinish = (nodeId, payload) => httpFetch(`/api/v1/hopper-nodes/${nodeId}/finish`, { method: 'POST', body: JSON.stringify(payload) });
+
+async function waitFor(fn, { timeoutMs = 15_000, intervalMs = 150, label = 'condition' } = {}) {
+  const start = Date.now();
+  let lastErr;
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const v = await fn();
+      if (v) return v;
+    } catch (err) {
+      lastErr = err;
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error(`waitFor(${label}) timed out after ${timeoutMs}ms${lastErr ? `; last error: ${lastErr.message}` : ''}`);
+}
+
+function notificationCount(titleLike) {
+  return sqliteDb
+    .prepare(`SELECT COUNT(*) AS n FROM notifications WHERE source = 'hopper-engine' AND title LIKE ?`)
+    .get(titleLike).n;
+}
+
+// Wait for the scratch HTTP server to actually accept connections before
+// hitting it — app.listen()'s callback fires async relative to our import.
+await waitFor(
+  async () => {
+    try {
+      await httpGet('/api/v1/hopper-trees');
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  { timeoutMs: 10_000, label: 'server up' },
+);
+console.log('[finishline-sim] scratch server is up');
+
+// ===========================================================================
+// SCENARIO A — original_ask set, one trivial node, audit verdict FULL.
+// ===========================================================================
+let treeA;
+await checkAsync('A-1', 'plant tree A via POST /hopper-trees with original_ask', async () => {
+  const created = await httpPost('/api/v1/hopper-trees', {
+    topic: 'sim-scenario-A: trivial task',
+    origin_thread: 'cockpit:finishline-sim-origin-A',
+    original_ask: 'Sim scenario A original ask: do the one trivial thing.',
+    nodes: [{ title: 'Do the trivial thing', spec: 'Trivial sim node for scenario A.' }],
+  });
+  assert.equal(created.tree.status, 'draft');
+  assert.equal(created.tree.original_ask, 'Sim scenario A original ask: do the one trivial thing.');
+  treeA = created.tree;
+  scenarioForTree.set(treeA.id, 'A');
+});
+
+await checkAsync('A-2', 'agree tree A → dispatch claims + fake worker finishes the leaf', async () => {
+  await httpPost(`/api/v1/hopper-trees/${treeA.id}/agree`, {});
+  const got = await waitFor(
+    async () => {
+      const t = await httpGet(`/api/v1/hopper-trees/${treeA.id}`);
+      const leaf = t.nodes.find((n) => !n.title.startsWith('FINISH-LINE AUDIT'));
+      return leaf?.status === 'done' ? t : null;
+    },
+    { label: 'A leaf done' },
+  );
+  assert.equal(got.nodes.filter((n) => n.title !== 'FINISH-LINE AUDIT').length, 1);
+});
+
+await checkAsync('A-3', 'server auto-appends a FINISH-LINE AUDIT node once the leaf settles', async () => {
+  const t = await waitFor(
+    async () => {
+      const t = await httpGet(`/api/v1/hopper-trees/${treeA.id}`);
+      return t.nodes.some((n) => n.title === 'FINISH-LINE AUDIT') ? t : null;
+    },
+    { label: 'A audit node appended' },
+  );
+  const audit = t.nodes.find((n) => n.title === 'FINISH-LINE AUDIT');
+  assert.ok(audit, 'audit node should exist');
+  assert.equal(audit.parent_id, null, 'audit node must be flat (no parent_id) — leaf-only dispatcher rule');
+});
+
+await checkAsync('A-4', 'FULL verdict finishes the audit node and completes the tree', async () => {
+  const t = await waitFor(
+    async () => {
+      const t = await httpGet(`/api/v1/hopper-trees/${treeA.id}`);
+      return t.tree.status === 'done' ? t : null;
+    },
+    { label: 'A tree done' },
+  );
+  const audit = t.nodes.find((n) => n.title === 'FINISH-LINE AUDIT');
+  assert.equal(audit.status, 'done');
+  const verdict = JSON.parse(audit.result);
+  assert.equal(verdict.finishline_verdict, 'FULL');
+});
+
+check('A-5', 'a success notification with the FULL verdict exists', () => {
+  assert.ok(notificationCount('🏁 finish-line: FULL%') >= 1, 'expected a "🏁 finish-line: FULL" notification row');
+});
+
+// ===========================================================================
+// SCENARIO B — SHORTFALL verdict plants + agrees a continuation tree.
+// ===========================================================================
+let treeB;
+await checkAsync('B-1', 'plant tree B via POST /hopper-trees with original_ask', async () => {
+  const created = await httpPost('/api/v1/hopper-trees', {
+    topic: 'sim-scenario-B: trivial task with an intentional gap',
+    origin_thread: 'cockpit:finishline-sim-origin-B',
+    original_ask: 'Sim scenario B original ask: build the trivial thing AND close the intentional gap.',
+    nodes: [{ title: 'Do the trivial thing (scenario B)', spec: 'Trivial sim node for scenario B; deliberately leaves a gap.' }],
+  });
+  treeB = created.tree;
+  scenarioForTree.set(treeB.id, 'B');
+});
+
+await checkAsync('B-2', 'agree tree B → leaf finishes → audit appended → SHORTFALL plants + agrees a continuation', async () => {
+  await httpPost(`/api/v1/hopper-trees/${treeB.id}/agree`, {});
+  const t = await waitFor(
+    async () => {
+      const t = await httpGet(`/api/v1/hopper-trees/${treeB.id}`);
+      return t.tree.status === 'done' ? t : null;
+    },
+    { timeoutMs: 20_000, label: 'B tree done' },
+  );
+  const audit = t.nodes.find((n) => n.title === 'FINISH-LINE AUDIT');
+  assert.equal(audit.status, 'done');
+  const verdict = JSON.parse(audit.result);
+  assert.equal(verdict.finishline_verdict, 'SHORTFALL');
+  assert.ok(verdict.continuation_tree_id, 'SHORTFALL verdict should record the continuation tree id');
+  treeB.continuationTreeId = verdict.continuation_tree_id;
+});
+
+await checkAsync('B-3', 'continuation tree exists, carries original_ask, and records continuation_of as the depth marker', async () => {
+  const cont = await httpGet(`/api/v1/hopper-trees/${treeB.continuationTreeId}`);
+  assert.equal(cont.tree.continuation_of, treeB.id, 'continuation_of should link back to the parent tree (the depth marker)');
+  assert.equal(cont.tree.original_ask, 'Sim scenario B original ask: build the trivial thing AND close the intentional gap.', 'original_ask must carry over unchanged');
+  assert.ok(['active', 'done'].includes(cont.tree.status), 'continuation was agreed by the audit worker, so it should be active or (if its own lifecycle already ran) done');
+  const contLeaves = cont.nodes.filter((n) => n.title !== 'FINISH-LINE AUDIT');
+  assert.equal(contLeaves.length, 1);
+  assert.equal(contLeaves[0].title, 'Close the sim gap');
+});
+
+check('B-4', 'a warning notification with the SHORTFALL verdict + continuation id exists', () => {
+  assert.ok(notificationCount('⚠️ finish-line: SHORTFALL%') >= 1, 'expected a "⚠️ finish-line: SHORTFALL" notification row');
+});
+
+// ===========================================================================
+// SCENARIO D (bonus, cheap) — depth cap is enforced at plant time, not just
+// described in the audit prompt. Chains continuation_of links directly via
+// the same public API scenario B used, without needing another live audit.
+// ===========================================================================
+await checkAsync('D-1', 'depth 1 and depth 2 continuations plant fine; depth 3 is rejected with 409 finishline_depth_cap', async () => {
+  const root = await httpPost('/api/v1/hopper-trees', {
+    topic: 'sim-scenario-D: depth cap probe root',
+    original_ask: 'Depth cap probe.',
+    nodes: [{ title: 'root node' }],
+  });
+  const depth1 = await httpPost('/api/v1/hopper-trees', {
+    topic: 'continuation: depth cap probe - depth 1',
+    original_ask: 'Depth cap probe.',
+    continuation_of: root.tree.id,
+    nodes: [{ title: 'depth1 node' }],
+  });
+  assert.equal(depth1.tree.continuation_of, root.tree.id);
+  const depth2 = await httpPost('/api/v1/hopper-trees', {
+    topic: 'continuation: depth cap probe - depth 2',
+    original_ask: 'Depth cap probe.',
+    continuation_of: depth1.tree.id,
+    nodes: [{ title: 'depth2 node' }],
+  });
+  assert.equal(depth2.tree.continuation_of, depth1.tree.id);
+  let rejected = null;
+  try {
+    await httpPost('/api/v1/hopper-trees', {
+      topic: 'continuation: depth cap probe - depth 3',
+      original_ask: 'Depth cap probe.',
+      continuation_of: depth2.tree.id,
+      nodes: [{ title: 'depth3 node' }],
+    });
+  } catch (err) {
+    rejected = err;
+  }
+  assert.ok(rejected, 'depth-3 continuation should have been rejected');
+  assert.equal(rejected.status, 409);
+  assert.equal(rejected.body?.error?.code, 'finishline_depth_cap');
+});
+
+// ===========================================================================
+// Report
+// ===========================================================================
+console.log('\n=== FINISH-LINE SIM RESULTS ===');
+let failCount = 0;
+for (const r of results) {
+  if (r.pass) {
+    console.log(`  [PASS] ${r.id}: ${r.description}`);
+  } else {
+    failCount++;
+    console.log(`  [FAIL] ${r.id}: ${r.description}\n         ${r.error}`);
+  }
+}
+console.log(`\n${results.length - failCount}/${results.length} checks passed.`);
+
+if (failCount > 0) {
+  process.exitCode = 1;
+}
+
+// Best-effort clean shutdown of the scratch HTTP listener so the process can
+// exit instead of hanging on an open socket.
+process.exit(process.exitCode ?? 0);

@@ -305,6 +305,10 @@ const GOVERNOR_SETTING_SPECS: Record<string, { type: 'number' } | { type: 'enum'
   gov_codex_ceiling: { type: 'number' },
   gov_auggie_ceiling: { type: 'number' },
   gov_concurrency_cap: { type: 'number' },
+  gov_override_claude: { type: 'enum', values: ['auto', 'on', 'off'] },
+  gov_override_codex: { type: 'enum', values: ['auto', 'on', 'off'] },
+  gov_override_auggie: { type: 'enum', values: ['auto', 'on', 'off'] },
+  gov_override_devin: { type: 'enum', values: ['auto', 'on', 'off'] },
 };
 const GOVERNOR_SETTING_KEYS = Object.keys(GOVERNOR_SETTING_SPECS);
 

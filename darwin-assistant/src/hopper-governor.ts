@@ -75,6 +75,13 @@ function weeklyModeSetting(): 'soft' | 'hard' {
   return raw === 'hard' ? 'hard' : 'soft';
 }
 
+export type GovernorOverride = 'auto' | 'on' | 'off';
+
+function overrideSetting(provider: GovernorProvider): GovernorOverride {
+  const raw = getGovernorSetting(`override_${provider}`)?.toLowerCase();
+  return raw === 'on' || raw === 'off' ? raw : 'auto';
+}
+
 // Defaults per docs/hopper/GOVERNOR-V2-CONTRACT.md §Settings-KV Schema.
 function kevinActiveClaudeMax5h(): number {
   return numSetting('kevin_active_claude_max_5h', 50);
@@ -128,6 +135,8 @@ export interface GovernorVerdict {
   reason:
     | 'ok'
     | 'disabled'
+    | 'override_on'
+    | 'override_off'
     | 'five_hour_ceiling'
     | 'weekly_ceiling'
     | 'usage_stale'
@@ -135,6 +144,7 @@ export interface GovernorVerdict {
     | 'provider_ceiling';
   detail: string;
   provider: GovernorProvider;
+  override: GovernorOverride;
   five_hour?: number | null;
   weekly?: number | null;
   provider_usage?: number | null;
@@ -281,9 +291,32 @@ export function governorStatusAll(): Record<GovernorProvider, GovernorVerdict> {
 
 function evaluate(provider: GovernorProvider): GovernorVerdict {
   const CONFIG = currentConfig();
+  const override = overrideSetting(provider);
+
+  if (override === 'on') {
+    return {
+      allow: true,
+      reason: 'override_on',
+      detail: `gov_override_${provider}=on — manual override allows new ${provider} dispatches`,
+      provider,
+      override,
+      config: CONFIG,
+    };
+  }
+
+  if (override === 'off') {
+    return {
+      allow: false,
+      reason: 'override_off',
+      detail: `gov_override_${provider}=off — manual override holds new ${provider} dispatches`,
+      provider,
+      override,
+      config: CONFIG,
+    };
+  }
 
   if (!ENABLED) {
-    return { allow: true, reason: 'disabled', detail: 'governor disabled via HOPPER_GOV_ENABLED=0', provider, config: CONFIG };
+    return { allow: true, reason: 'disabled', detail: 'governor disabled via HOPPER_GOV_ENABLED=0', provider, override, config: CONFIG };
   }
 
   if (provider !== 'claude') {
@@ -306,6 +339,7 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
         reason: 'usage_stale',
         detail: `${provider} usage snapshot ${staleMinutes == null ? 'unreadable' : `${Math.round(staleMinutes)}m stale`}`,
         provider,
+        override,
         provider_usage: used,
         config: CONFIG,
       };
@@ -322,6 +356,7 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
         reason: 'provider_ceiling',
         detail: `${provider} usage ${used}% ≥ ${ceiling}%`,
         provider,
+        override,
         provider_usage: used,
         config: CONFIG,
       };
@@ -331,6 +366,7 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
       reason: 'ok',
       detail: `${provider} usage ${used ?? '?'}% (ceiling ${ceiling}%), clear to dispatch — Claude ceilings do not apply`,
       provider,
+      override,
       provider_usage: used,
       config: CONFIG,
     };
@@ -353,6 +389,7 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
       reason: 'usage_stale',
       detail: `usage snapshot ${staleMinutes == null ? 'unreadable' : `${Math.round(staleMinutes)}m stale`}`,
       provider,
+      override,
       five_hour: fiveHour,
       weekly,
       config: CONFIG,
@@ -375,6 +412,7 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
         reason: 'weekly_ceiling',
         detail: `weekly ${weekly}% ≥ ${WEEKLY_CEILING}%`,
         provider,
+        override,
         five_hour: fiveHour,
         weekly,
         config: CONFIG,
@@ -388,6 +426,7 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
       reason: 'five_hour_ceiling',
       detail: `5h window ${fiveHour}% ≥ ${FIVE_HOUR_CEILING}% — sleeping until the window resets`,
       provider,
+      override,
       five_hour: fiveHour,
       weekly,
       config: CONFIG,
@@ -408,6 +447,7 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
           ? `Kevin active within the last ${IDLE_MINUTES}m and 5h utilization is unknown — never waive on an unknown reading`
           : `Kevin active within the last ${IDLE_MINUTES}m and 5h ${fiveHour}% ≥ waiver threshold ${maxActive}% — his subscription, his turn`,
         provider,
+        override,
         five_hour: fiveHour,
         weekly,
         config: CONFIG,
@@ -420,6 +460,7 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
     reason: 'ok',
     detail: `5h ${fiveHour ?? '?'}% / weekly ${weekly ?? '?'}% — clear to dispatch`,
     provider,
+    override,
     five_hour: fiveHour,
     weekly,
     config: CONFIG,

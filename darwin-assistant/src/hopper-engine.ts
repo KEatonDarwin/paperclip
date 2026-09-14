@@ -36,6 +36,9 @@ export interface HopperTreeRow {
   id: string;
   topic: string;
   origin_thread_ext: string | null;
+  original_ask: string | null;
+  deferred_scope: string | null;
+  continuation_of: string | null;
   status: 'draft' | 'active' | 'done' | 'archived';
   created_at: string;
   updated_at: string;
@@ -59,6 +62,7 @@ export interface HopperNodeRow {
   adapter: string | null;
   model: string | null;
   foundry_auto_retries: number;
+  is_finishline: number;
   created_at: string;
   updated_at: string;
 }
@@ -66,6 +70,9 @@ export interface HopperNodeRow {
 const MAX_SLOTS = Math.max(1, parseInt(process.env.HOPPER_ENGINE_SLOTS ?? '2', 10) || 2);
 const LEASE_MINUTES = Math.max(5, parseInt(process.env.HOPPER_ENGINE_LEASE_MIN ?? '30', 10) || 30);
 const MAX_ATTEMPTS = 2;
+const FINISHLINE_TITLE = 'FINISH-LINE AUDIT';
+const FINISHLINE_DEFAULT_MODEL = 'claude-sonnet-5';
+const TEXT_FIELD_LIMIT = 20_000;
 // Default worker loadout when a node has no planner-assigned model. Settings-KV
 // key wins over env so it's changeable live (no restart); unset both = inherit
 // the global model — which is exactly the "workers on Fable" trap, so keep one.
@@ -175,7 +182,15 @@ sqliteDb.exec(`
 // ROUTER (phase 1, 2026-09-07): per-node model/adapter chosen by the PLANNER at
 // decomposition time — the tree-breakdown conversation IS the router brain, so
 // there's no separate scoring service. Additive columns; null = default loadout.
-for (const col of ['adapter TEXT', 'model TEXT', 'foundry_auto_retries INTEGER NOT NULL DEFAULT 0']) {
+for (const col of ['original_ask TEXT', 'deferred_scope TEXT', 'continuation_of TEXT']) {
+  try {
+    sqliteDb.exec(`ALTER TABLE hopper_trees ADD COLUMN ${col}`);
+  } catch {
+    /* column already exists */
+  }
+}
+
+for (const col of ['adapter TEXT', 'model TEXT', 'foundry_auto_retries INTEGER NOT NULL DEFAULT 0', 'is_finishline INTEGER NOT NULL DEFAULT 0']) {
   try {
     sqliteDb.exec(`ALTER TABLE hopper_nodes ADD COLUMN ${col}`);
   } catch {
@@ -246,6 +261,10 @@ const claimStmt = sqliteDb.prepare<[string, string, number]>(`
 
 const expiredLeasesStmt = sqliteDb.prepare<[], HopperNodeRow>(`
   SELECT * FROM hopper_nodes WHERE status = 'running' AND lease_expires_at < datetime('now')
+`);
+const insertFinishLineNode = sqliteDb.prepare<[string, string, string, string | null, string]>(`
+  INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, status, depends_on, priority, adapter, model, is_finishline)
+  VALUES (?, NULL, ?, ?, 'pending', ?, 1000, 'claude', ?, 1)
 `);
 
 function emitNode(action: HopperNodeEvent['action'], node: HopperNodeRow): void {
@@ -374,15 +393,244 @@ export interface NewNodeInput {
   model?: string | null;             // null → hopper_worker_model setting/env default
 }
 
+export interface CreateHopperTreeOptions {
+  originalAsk?: string | null;
+  deferredScope?: string | null;
+  continuationOf?: string | null;
+}
+
+interface FinishLineVerdict {
+  finishline_verdict?: unknown;
+  summary?: unknown;
+  gaps?: unknown;
+  continuation_tree_id?: unknown;
+  continuation_nodes?: unknown;
+}
+
+function boundedText(value: string | null | undefined, limit = TEXT_FIELD_LIMIT): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  return trimmed.slice(0, limit);
+}
+
+function finishLineAuditModel(): string {
+  return getSetting('finishline_audit_model')?.trim() || FINISHLINE_DEFAULT_MODEL;
+}
+
+function isFinishLineNode(node: HopperNodeRow): boolean {
+  return node.is_finishline === 1 || node.title.startsWith(FINISHLINE_TITLE);
+}
+
+function continuationDepth(tree: HopperTreeRow, seen = new Set<string>()): number {
+  if (!tree.continuation_of || seen.has(tree.id)) return 0;
+  seen.add(tree.id);
+  const parent = getTreeStmt.get(tree.continuation_of);
+  if (!parent) return 1;
+  return 1 + continuationDepth(parent, seen);
+}
+
+export function nextContinuationDepth(parentTreeId: string): number | null {
+  const parent = getHopperTree(parentTreeId);
+  if (!parent) return null;
+  return continuationDepth(parent) + 1;
+}
+
+function shouldAppendFinishLineAudit(tree: HopperTreeRow, nodes: HopperNodeRow[]): boolean {
+  return Boolean(tree.original_ask?.trim())
+    && nodes.length > 0
+    && nodes.every((n) => n.status === 'done' || n.status === 'split')
+    && !nodes.some(isFinishLineNode);
+}
+
+function resultExcerpt(result: string | null | undefined, limit = 900): string {
+  const text = result?.trim();
+  if (!text) return '(no result text)';
+  return text.length > limit ? `${text.slice(0, limit)}...` : text;
+}
+
+function compactNodeDigest(nodes: HopperNodeRow[]): string {
+  return nodes
+    .filter((n) => !isFinishLineNode(n))
+    .map((n) => {
+      const loadout = `${n.adapter ?? WORKER_ADAPTER}/${n.model ?? defaultWorkerModel() ?? 'default'}`;
+      return `- #${n.id} ${n.title} [${n.status}, ${loadout}]: ${resultExcerpt(n.result).replace(/\n+/g, ' ')}`;
+    })
+    .join('\n') || '- (no non-audit nodes recorded)';
+}
+
+function composeFinishLineAuditSpec(tree: HopperTreeRow, nodes: HopperNodeRow[]): string {
+  const depth = continuationDepth(tree);
+  const origin = tree.origin_thread_ext ?? '(none recorded)';
+  const depthRule = depth >= 2
+    ? [
+        'Continuation depth cap:',
+        `This tree is already continuation depth ${depth}. If your verdict is SHORTFALL, do NOT plant another continuation tree.`,
+        'Instead, finish this audit node with outcome=blocked_question and ask Kevin the single narrow question needed to continue, listing the gaps cold.',
+      ].join('\n')
+    : [
+        'Continuation API, only if SHORTFALL:',
+        '1. Read JARVIS_COCKPIT_KEY from /home/kevin/paperclip/jarvis-command-center/.env.',
+        '2. POST /api/v1/hopper-trees with JSON:',
+        '   {',
+        '     "topic": "continuation: <original tree topic> - <gap summary>",',
+        `     "origin_thread": ${JSON.stringify(origin === '(none recorded)' ? null : origin)},`,
+        `     "origin_thread_ext": ${JSON.stringify(origin === '(none recorded)' ? null : origin)},`,
+        '     "original_ask": <the original ask below>,',
+        `     "continuation_of": ${JSON.stringify(tree.id)},`,
+        `     "deferred_scope": "Continuation auto-planted by finish-line audit for tree ${tree.id}. Shortfall: <summary>",`,
+        '     "nodes": [',
+        '       {',
+        '         "title": "<concrete gap-closing task>",',
+        '         "spec": "<self-contained spec with guardrails and done-check>",',
+        '         "depends_on_indexes": [],',
+        '         "adapter": "claude",',
+        '         "model": "claude-sonnet-5"',
+        '       }',
+        '     ]',
+        '   }',
+        '3. POST /api/v1/hopper-trees/:newTreeId/agree.',
+      ].join('\n');
+
+  return [
+    `You are the FINISH-LINE AUDIT for Hopper tree ${tree.id}.`,
+    '',
+    'Purpose:',
+    "Compare what the tree actually delivered against Kevin's original ask. Do not rubber-stamp green just because every worker node reported done.",
+    '',
+    'Original ask:',
+    tree.original_ask ?? '(none recorded)',
+    '',
+    'Explicit deferred/narrowed scope, if any:',
+    tree.deferred_scope ?? '(none recorded)',
+    '',
+    'Settled node inventory:',
+    compactNodeDigest(nodes),
+    '',
+    'Rules:',
+    '- Verdict FULL only if the completed tree satisfies the original ask, or every missing piece is explicitly named in deferred_scope and that deferral is visible enough that Kevin would not wake up surprised.',
+    '- Verdict SHORTFALL if meaningful requested scope remains undone, hidden, ambiguous, or only mentioned in an outbox/doc that no system will consume.',
+    '- NEVER verdict FULL when deferred_scope is non-empty and unaddressed.',
+    '- If SHORTFALL and the continuation depth cap has not been reached, you must plant and agree a continuation Hopper tree through the local API before finishing this audit node.',
+    '- The continuation tree must be narrow, concrete, and cover only the missing scope. Use original_ask as the source of truth and include the shortfall summary in the continuation topic/specs.',
+    '- Never touch production, merge to main, send external messages, or use API keys.',
+    '',
+    depthRule,
+    '',
+    'Finish result:',
+    'If FULL or if SHORTFALL with a continuation planted, finish this audit node with outcome=done. Put a single JSON object in result:',
+    '{',
+    '  "finishline_verdict": "FULL" | "SHORTFALL",',
+    '  "summary": "<one or two sentences>",',
+    '  "gaps": ["..."],',
+    '  "continuation_tree_id": "<tree-id or null>",',
+    '  "continuation_nodes": ["<titles planted, if any>"]',
+    '}',
+    '',
+    'If the depth cap is reached and verdict is SHORTFALL, use outcome=blocked_question instead of outcome=done.',
+  ].join('\n');
+}
+
+function appendFinishLineAuditNode(tree: HopperTreeRow, nodes: HopperNodeRow[]): HopperNodeRow | null {
+  const info = insertFinishLineNode.run(
+    tree.id,
+    FINISHLINE_TITLE,
+    composeFinishLineAuditSpec(tree, nodes),
+    null,
+    finishLineAuditModel(),
+  );
+  const created = getNodeStmt.get(Number(info.lastInsertRowid)) ?? null;
+  if (created) emitNode('created', created);
+  return created;
+}
+
+function finishLineVerdictFor(nodes: HopperNodeRow[]): FinishLineVerdict | null {
+  const audit = nodes.find(isFinishLineNode);
+  if (!audit?.result) return null;
+  try {
+    return JSON.parse(audit.result) as FinishLineVerdict;
+  } catch {
+    return null;
+  }
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string' && !!v.trim()) : [];
+}
+
+function finishLineSummary(verdict: FinishLineVerdict | null): string {
+  return typeof verdict?.summary === 'string' && verdict.summary.trim() ? verdict.summary.trim() : 'Finish-line audit completed.';
+}
+
+function notifyTreeComplete(tree: HopperTreeRow, nodes: HopperNodeRow[]): void {
+  if (!tree.original_ask?.trim()) {
+    createNotification({
+      severity: 'success',
+      title: `🌳 Hopper tree complete: ${tree.topic.slice(0, 120)}`,
+      body: `All ${nodes.length} tasks are done. Tree ${tree.id}.`,
+      source: 'hopper-engine',
+    });
+    return;
+  }
+
+  const verdict = finishLineVerdictFor(nodes);
+  const summary = finishLineSummary(verdict);
+  const normalized = verdict?.finishline_verdict === 'FULL' || verdict?.finishline_verdict === 'SHORTFALL'
+    ? verdict.finishline_verdict
+    : null;
+  if (normalized === 'FULL') {
+    createNotification({
+      severity: 'success',
+      title: '🏁 finish-line: FULL',
+      body: `Tree ${tree.id} satisfied the original ask. ${summary}`,
+      source: 'hopper-engine',
+    });
+    return;
+  }
+  if (normalized === 'SHORTFALL') {
+    const continuationTreeId =
+      typeof verdict?.continuation_tree_id === 'string' && verdict.continuation_tree_id.trim()
+        ? verdict.continuation_tree_id.trim()
+        : 'not reported';
+    const gaps = stringList(verdict?.gaps).join('; ');
+    createNotification({
+      severity: 'warning',
+      title: `⚠️ finish-line: SHORTFALL — planted ${continuationTreeId}`,
+      body: `Tree ${tree.id} completed its scoped work, but the audit found gaps${gaps ? `: ${gaps}` : ''}. ${summary}`,
+      source: 'hopper-engine',
+    });
+    return;
+  }
+
+  const audit = nodes.find(isFinishLineNode);
+  createNotification({
+    severity: 'warning',
+    title: '⚠️ finish-line audit completed with unreadable verdict',
+    body: `Tree ${tree.id} has an original ask, but its finish-line result was not parseable. Result excerpt: ${resultExcerpt(audit?.result, 1200)}`,
+    source: 'hopper-engine',
+  });
+}
+
 /** Create a tree + its draft nodes in one shot (the breakdown chat calls this). */
-export function createHopperTree(topic: string, originThreadExt: string | null, nodes: NewNodeInput[]): {
+export function createHopperTree(
+  topic: string,
+  originThreadExt: string | null,
+  nodes: NewNodeInput[],
+  opts: CreateHopperTreeOptions = {},
+): {
   tree: HopperTreeRow;
   nodes: HopperNodeRow[];
 } {
   const treeId = `tree-${randomUUID().slice(0, 8)}`;
   sqliteDb
-    .prepare(`INSERT INTO hopper_trees (id, topic, origin_thread_ext) VALUES (?, ?, ?)`)
-    .run(treeId, topic.slice(0, 300), originThreadExt);
+    .prepare(`INSERT INTO hopper_trees (id, topic, origin_thread_ext, original_ask, deferred_scope, continuation_of) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(
+      treeId,
+      topic.slice(0, 300),
+      boundedText(originThreadExt, 500),
+      boundedText(opts.originalAsk),
+      boundedText(opts.deferredScope),
+      boundedText(opts.continuationOf, 80),
+    );
   const ids: number[] = [];
   const insert = sqliteDb.prepare(
     `INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, priority, adapter, model) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -576,13 +824,13 @@ function maybeFinishTree(treeId: string): void {
   if (!tree || tree.status !== 'active') return;
   const nodes = listTreeNodes(treeId);
   if (nodes.length && nodes.every((n) => n.status === 'done' || n.status === 'split')) {
+    if (shouldAppendFinishLineAudit(tree, nodes)) {
+      appendFinishLineAuditNode(tree, nodes);
+      queueMicrotask(() => void dispatchTick('finishline_audit_appended'));
+      return;
+    }
     sqliteDb.prepare(`UPDATE hopper_trees SET status = 'done', updated_at = datetime('now') WHERE id = ?`).run(treeId);
-    createNotification({
-      severity: 'success',
-      title: `🌳 Hopper tree complete: ${tree.topic.slice(0, 120)}`,
-      body: `All ${nodes.length} tasks are done. Tree ${treeId}.`,
-      source: 'hopper-engine',
-    });
+    notifyTreeComplete(tree, nodes);
   }
 }
 
@@ -619,7 +867,9 @@ export function finishHopperNode(
     if (latest?.status === 'blocked_question' && !isFoundryTree(tree)) {
       createNotification({
         severity: 'warning',
-        title: `❓ Hopper worker needs your call: ${node.title.slice(0, 100)}`,
+        title: isFinishLineNode(node)
+          ? `⚠️ finish-line: SHORTFALL needs your call`
+          : `❓ Hopper worker needs your call: ${node.title.slice(0, 100)}`,
         body: `${payload.question ?? ''}\n\n(Answer from any JARVIS chat: "answer hopper node ${id}: <your answer>" — a fresh worker resumes with it.)`,
         source: 'hopper-engine',
       });

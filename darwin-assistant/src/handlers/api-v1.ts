@@ -123,6 +123,7 @@ import {
   retryHopperNode,
   dispatchTick,
   getHopperHistory,
+  nextContinuationDepth,
   type NewNodeInput,
 } from '../hopper-engine.js';
 import { governorStatus, governorStatusAll } from '../hopper-governor.js';
@@ -1826,15 +1827,41 @@ export function createApiV1Router(): Router {
   });
 
   router.post('/hopper-trees', (req: AuthedRequest, res) => {
-    const body = (req.body ?? {}) as { topic?: unknown; origin_thread?: unknown; nodes?: unknown };
+    const body = (req.body ?? {}) as {
+      topic?: unknown;
+      origin_thread?: unknown;
+      origin_thread_ext?: unknown;
+      original_ask?: unknown;
+      deferred_scope?: unknown;
+      continuation_of?: unknown;
+      nodes?: unknown;
+    };
     const topic = typeof body.topic === 'string' ? body.topic.trim() : '';
     const nodes = Array.isArray(body.nodes) ? (body.nodes as NewNodeInput[]) : [];
     if (!topic || !nodes.length || nodes.some((n) => typeof n?.title !== 'string' || !n.title.trim())) {
       sendError(res, 400, 'invalid_request', 'topic and a non-empty nodes array (each with a title) are required');
       return;
     }
-    const origin = typeof body.origin_thread === 'string' && body.origin_thread.trim() ? body.origin_thread.trim() : null;
-    const created = createHopperTree(topic, origin, nodes);
+    const originSource = typeof body.origin_thread_ext === 'string' ? body.origin_thread_ext : body.origin_thread;
+    const origin = typeof originSource === 'string' && originSource.trim() ? originSource.trim() : null;
+    const continuationOf =
+      typeof body.continuation_of === 'string' && body.continuation_of.trim() ? body.continuation_of.trim() : null;
+    if (continuationOf) {
+      const depth = nextContinuationDepth(continuationOf);
+      if (depth == null) {
+        sendError(res, 400, 'invalid_request', 'continuation_of must reference an existing hopper tree');
+        return;
+      }
+      if (depth > 2) {
+        sendError(res, 409, 'finishline_depth_cap', 'finish-line continuations are capped at depth 2');
+        return;
+      }
+    }
+    const created = createHopperTree(topic, origin, nodes, {
+      originalAsk: typeof body.original_ask === 'string' ? body.original_ask : null,
+      deferredScope: typeof body.deferred_scope === 'string' ? body.deferred_scope : null,
+      continuationOf,
+    });
     res.status(201).json(created);
   });
 

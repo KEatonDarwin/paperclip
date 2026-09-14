@@ -127,3 +127,28 @@ together as: **identity-verified process group + port-bound liveness + preflight
 port check + async stop that waits for the port.** Re-run both
 `npm run runslots:sim` and `scripts/runslots-review-attacks.mjs` (expect zero
 `[BUG]` lines) and this review flips to PASS.
+
+## 2026-09-14 · RESOLUTIONS — node #212 remediation
+
+Fix commits:
+
+- Backend: `459358ea6392089e421db0186f2f7592ce65877d` (`fix(foundry): harden run slot lifecycle`)
+- Cockpit: `8b0a497a62781e8d7b6ba85efdbb332b7d80b8aa` (`fix(foundry): surface relaunch and preview hosts`)
+
+Finding map:
+
+- **R-1 GO-once:** fixed in backend `459358ea`. `goProject` now accepts `ready` or `launched`; a launched project with no live slot can GO again, and Stop moves a launched project back to `ready` with `preview_url` cleared. A launched project that is already live relaunches by replacing its own slot by default.
+- **R-2 pid identity:** fixed in backend `459358ea`. Run slots now record `pid_starttime`; liveness/stop checks verify `/proc/<pid>/environ` contains `FOUNDRY_SLOT=<slot>` and compare starttime when available before trusting a pid. Reused or EPERM pids are treated as not ours and are never signaled.
+- **R-3 health-tick race:** fixed in backend `459358ea`. Dead/health updates are conditional on the observed pid and the health tick re-reads the row after awaits, so a stale snapshot cannot null or mark dead a replacement occupant.
+- **R-4 preview host:** fixed in cockpit `8b0a497`. The cockpit proxy forwards the browser host as `x-forwarded-host`; the backend's existing `FOUNDRY_PREVIEW_HOST` env override remains the explicit deployment escape hatch.
+- **R-5 preflight port check:** fixed in backend `459358ea`. GO checks slot port availability before spawning and returns `409 foundry_port_busy` instead of launching into a squatted port; a child that exits before binding any port returns `500 foundry_go_failed` with a log tail.
+- **R-6 daemonizing run.command:** fixed in backend `459358ea`. Slot liveness now treats a held port as live even when the shell pid has exited, and allocation will not reclaim a running slot while its port is held.
+- **R-7 blocking Stop:** partially remediated in backend `459358ea`; full async export conversion deferred. `stopRunSlot` remains synchronous to preserve the existing API and direct script contract, but it no longer waits for an unreaped shell pid. It sends SIGTERM/SIGKILL to the process group and waits for the port to free, which reduced the repro from ~1600ms to 51ms in `runslots-review-attacks.mjs` and 83ms in the lifecycle sim. A full async `stopRunSlot` migration can be a later cleanup because this path no longer blocks the event loop at the review-failing scale.
+- **Minor probe body leak:** fixed in backend `459358ea` by switching HTTP probes to `HEAD` and cancelling any response body.
+
+Verification:
+
+- `npm run build` in `darwin-assistant` passed.
+- `node scripts/runslots-review-attacks.mjs` printed zero `[BUG]` lines.
+- `npm run runslots:sim` passed 18/18 checks.
+- `npm run build` in the cockpit worktree passed. `npx tsc --noEmit` still reports pre-existing unrelated route/type errors; none are in `src/lib/cockpit-proxy.ts` or `src/routes/foundry.tsx`.

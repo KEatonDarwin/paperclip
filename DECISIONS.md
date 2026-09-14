@@ -152,3 +152,59 @@ Verification:
 - `node scripts/runslots-review-attacks.mjs` printed zero `[BUG]` lines.
 - `npm run runslots:sim` passed 18/18 checks.
 - `npm run build` in the cockpit worktree passed. `npx tsc --noEmit` still reports pre-existing unrelated route/type errors; none are in `src/lib/cockpit-proxy.ts` or `src/routes/foundry.tsx`.
+
+## 2026-09-14 · Re-review (node #190, attempt 2) — VERDICT: PASS with fixes
+
+Reviewed `hopper/foundry-runslots` @ `880718f29` + `hopper/foundry-runslots-ui` @ `8b0a497`.
+Attack script (`node scripts/runslots-review-attacks.mjs`): **zero `[BUG]`** on
+D/B/C/E/G as delivered. Sim 18/18. `tsc` green (backend); cockpit `tsc` shows the
+same 10 pre-existing errors as base `095835c`, none in touched files; eslint on the
+four touched cockpit files has 0 new issues (63 prettier errors in `cockpit-api.ts`
+are byte-identical to base). Cockpit production build passes with `node-server` preset.
+
+**R-1..R-4 — verified fixed in code, not just by the summary.** R-1: GO accepts
+`launched`, Stop returns the project to `ready`, own-live-slot relaunches in place,
+UI gates Relaunch on "no running slot". R-2: `/proc/<pid>/environ` `FOUNDRY_SLOT=<n>`
++ starttime compared before trusting or signalling a leader; EPERM → not ours. R-3:
+dead/health updates are `WHERE pid = <observed>` and the tick re-reads after every
+await. R-4: `cockpit-proxy.ts` forwards the browser `host` as `x-forwarded-host`;
+backend strips the port and builds `http://<host>:<slot port>`.
+**R-5/R-6/R-7 deferrals:** R-7's remaining sync `stopRunSlot` is accepted — measured
+59–81ms on a well-behaved server, ~1.4s only when the occupant ignores SIGTERM
+(SIGKILL escalation confirmed, port freed). Not a blocker; async conversion stays a
+later cleanup.
+
+**New findings from the re-review's own probes (all fixed in `3e65dfa26`):**
+
+- **R-8 · The R-5 "child exits early → 500" branch was unreachable.** `goProject`
+  blocks the loop in `sleepSync(500)`, so an instantly-dead `sh` is an unreaped
+  zombie and `kill(pid, 0)` still succeeds → GO returned `launched:true` for a
+  command that died in <10ms; slot showed `running` until the 10s tick.
+  *Fix:* `pidAlive`/`processGroupAlive` read `/proc/<pid>/stat` state and treat
+  `Z`/`X` as dead. Attack H now gets `500 foundry_go_failed` with the log tail.
+- **R-9 · Stop still signalled an unverified process group.** With the leader dead,
+  `kill(-pid, 0)` succeeding was taken as "our group" — but a recycled pid can be the
+  pgid of an unrelated orphaned group (leader gone, members alive). Reproduced
+  (attack J): Stop SIGTERMed an unrelated `sleep`. *Fix:* the group is only signalled
+  if a live member carries `FOUNDRY_SLOT=<n>` in its environ.
+- **R-10 · Port-held liveness had no identity, and a daemonized occupant could never
+  be stopped.** A squatter on our port made the board show the old project as
+  `running`; a `setsid`/double-fork `run.command` left the slot stuck at
+  `409 foundry_slot_still_bound` forever (Stop and replace-GO both refused).
+  *Fix:* `/proc/net/tcp{,6}` LISTEN inode → `/proc/<pid>/fd` owner lookup, gated
+  on the same `FOUNDRY_SLOT` marker. Live only if the holder is ours; Stop kills a
+  verified holder by pid (attack K: freed in 76ms); an unrelated holder means the
+  slot is `dead` and preflight keeps GO off the port. Tick cost with a daemonized
+  occupant measured 14–49ms at ~100 processes.
+- Minor from the first review: `deleteProject` now stops the project's running slot.
+
+**Residual (documented, accepted):** GO blocks the loop ~530ms (preflight spawn +
+500ms settle); a child that fails *after* 500ms is reported launched and flips to
+`dead` on the next tick — best-effort by design. Per-slot logs still append without
+rotation. Two slots can briefly name the same project (a `dead` one and its
+relaunch) until the dead slot is reclaimed — cosmetic.
+
+**Decision: PASS.** I would let Kevin press GO tomorrow. Deploy notes: the
+`pid_starttime` column is added via `ALTER TABLE` on first boot (idempotent);
+`FOUNDRY_PREVIEW_HOST` remains an optional override now that the proxy forwards
+the host. Re-verify after merge with `npm run runslots:sim` and the attack script.

@@ -1,5 +1,6 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { getConversation, getOrCreateConversation, setThreadModelOverride, sqliteDb } from './conversation-db.js';
 import { getFoundrySetting } from './foundry-settings.js';
@@ -219,6 +220,44 @@ export interface FoundryProjectWithModulesResponse {
   integration: FoundryIntegrationResponse;
 }
 
+export type FoundryRunSlotStatus = 'free' | 'running' | 'dead' | 'stopped';
+
+export interface FoundryRunSlotRow {
+  slot_no: number;
+  port: number;
+  project_id: string | null;
+  pid: number | null;
+  run_command: string | null;
+  log_path: string | null;
+  started_at: string | null;
+  status: FoundryRunSlotStatus;
+  last_health_at: string | null;
+  updated_at: string;
+}
+
+interface FoundryRunSlotListRow extends FoundryRunSlotRow {
+  project_name: string | null;
+}
+
+export interface FoundryRunSlotResponse extends FoundryRunSlotRow {
+  project_name: string | null;
+  preview_url: string | null;
+}
+
+export interface GoProjectOptions {
+  slot_no?: number | null;
+  replace?: boolean;
+  host?: string | null;
+}
+
+export interface GoProjectResult {
+  project: FoundryProjectResponse;
+  launched: true;
+  preview_url: string | null;
+  slot: FoundryRunSlotResponse;
+  blueprint_preview_url: string | null;
+}
+
 interface BlueprintModule {
   key: string;
   name: string;
@@ -390,6 +429,23 @@ sqliteDb.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_foundry_modules_project_stage
     ON foundry_modules(project_id, stage);
+
+  CREATE TABLE IF NOT EXISTS foundry_run_slots (
+    slot_no        INTEGER PRIMARY KEY CHECK (slot_no BETWEEN 1 AND 3),
+    port           INTEGER NOT NULL,
+    project_id     TEXT REFERENCES foundry_projects(id) ON DELETE SET NULL,
+    pid            INTEGER,
+    run_command    TEXT,
+    log_path       TEXT,
+    started_at     TEXT,
+    status         TEXT NOT NULL DEFAULT 'free'
+                   CHECK (status IN ('free','running','dead','stopped')),
+    last_health_at TEXT,
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_foundry_run_slots_project
+    ON foundry_run_slots(project_id);
 `);
 
 for (const col of ['last_error TEXT', 'origin_thread_ext TEXT']) {
@@ -542,6 +598,88 @@ const setModuleIntegratedStmt = sqliteDb.prepare<[number]>(`
   SET stage = 'integrated',
       updated_at = datetime('now')
   WHERE id = ?
+`);
+const getRunSlotStmt = sqliteDb.prepare<[number], FoundryRunSlotRow>(`
+  SELECT * FROM foundry_run_slots WHERE slot_no = ?
+`);
+const listRunSlotsStmt = sqliteDb.prepare<[], FoundryRunSlotListRow>(`
+  SELECT s.*, p.name AS project_name
+  FROM foundry_run_slots s
+  LEFT JOIN foundry_projects p ON p.id = s.project_id
+  ORDER BY s.slot_no
+`);
+const getRunSlotWithProjectStmt = sqliteDb.prepare<[number], FoundryRunSlotListRow>(`
+  SELECT s.*, p.name AS project_name
+  FROM foundry_run_slots s
+  LEFT JOIN foundry_projects p ON p.id = s.project_id
+  WHERE s.slot_no = ?
+`);
+const upsertRunSlotStmt = sqliteDb.prepare<[number, number]>(`
+  INSERT INTO foundry_run_slots (slot_no, port)
+  VALUES (?, ?)
+  ON CONFLICT(slot_no) DO UPDATE SET
+    port = CASE
+      WHEN foundry_run_slots.status = 'running' AND foundry_run_slots.pid IS NOT NULL
+        THEN foundry_run_slots.port
+      ELSE excluded.port
+    END,
+    updated_at = CASE
+      WHEN (
+        CASE
+          WHEN foundry_run_slots.status = 'running' AND foundry_run_slots.pid IS NOT NULL
+            THEN foundry_run_slots.port
+          ELSE excluded.port
+        END
+      ) <> foundry_run_slots.port
+        THEN datetime('now')
+      ELSE foundry_run_slots.updated_at
+    END
+`);
+const clearFreeRunSlotStmt = sqliteDb.prepare<[number]>(`
+  UPDATE foundry_run_slots
+  SET project_id = NULL,
+      pid = NULL,
+      run_command = NULL,
+      log_path = NULL,
+      started_at = NULL,
+      status = 'free',
+      last_health_at = NULL,
+      updated_at = datetime('now')
+  WHERE slot_no = ?
+`);
+const setRunSlotRunningStmt = sqliteDb.prepare<[string, number, string, string, number]>(`
+  UPDATE foundry_run_slots
+  SET project_id = ?,
+      pid = ?,
+      run_command = ?,
+      log_path = ?,
+      started_at = datetime('now'),
+      status = 'running',
+      last_health_at = NULL,
+      updated_at = datetime('now')
+  WHERE slot_no = ?
+`);
+const setRunSlotStoppedStmt = sqliteDb.prepare<[number]>(`
+  UPDATE foundry_run_slots
+  SET pid = NULL,
+      status = 'stopped',
+      last_health_at = NULL,
+      updated_at = datetime('now')
+  WHERE slot_no = ?
+`);
+const setRunSlotDeadStmt = sqliteDb.prepare<[number]>(`
+  UPDATE foundry_run_slots
+  SET pid = NULL,
+      status = 'dead',
+      last_health_at = NULL,
+      updated_at = datetime('now')
+  WHERE slot_no = ?
+`);
+const setRunSlotHealthStmt = sqliteDb.prepare<[number]>(`
+  UPDATE foundry_run_slots
+  SET last_health_at = datetime('now'),
+      updated_at = datetime('now')
+  WHERE slot_no = ?
 `);
 
 export class FoundryError extends Error {
@@ -1187,6 +1325,237 @@ function emitProject(action: 'created' | 'updated' | 'deleted', project: Foundry
 
 function emitModule(action: 'created' | 'updated' | 'deleted', module: FoundryModuleRow): void {
   sseBus.emit('sse', { type: 'foundry_module', action, project_id: module.project_id, module: serializeFoundryModule(module) });
+}
+
+const DEFAULT_RUN_PORTS: [number, number, number] = [4310, 4311, 4312];
+let runSlotHealthRunning = false;
+let warnedRunPortsRaw: string | null = null;
+
+export function configuredRunPorts(): [number, number, number] {
+  const raw = process.env.FOUNDRY_RUN_PORTS?.trim();
+  if (!raw) return DEFAULT_RUN_PORTS;
+  const parts = raw.split(',').map((part) => part.trim()).filter(Boolean);
+  const ports = parts.map((part) => Number(part));
+  const valid = ports.length === 3
+    && ports.every((port) => Number.isInteger(port) && port > 0 && port <= 65535)
+    && new Set(ports).size === 3;
+  if (!valid) {
+    if (warnedRunPortsRaw !== raw) {
+      warnedRunPortsRaw = raw;
+      console.warn(`[foundry] invalid FOUNDRY_RUN_PORTS=${JSON.stringify(raw)}; using ${DEFAULT_RUN_PORTS.join(',')}`);
+    }
+    return DEFAULT_RUN_PORTS;
+  }
+  return ports as [number, number, number];
+}
+
+function validSlotNo(slotNo: number): boolean {
+  return Number.isInteger(slotNo) && slotNo >= 1 && slotNo <= 3;
+}
+
+export function ensureRunSlots(): void {
+  const ports = configuredRunPorts();
+  for (let i = 0; i < 3; i += 1) {
+    upsertRunSlotStmt.run(i + 1, ports[i]);
+  }
+}
+
+function normalizePreviewHost(host?: string | null): string {
+  const raw = (host?.trim() || process.env.FOUNDRY_PREVIEW_HOST?.trim() || 'localhost').split(',')[0]?.trim() || 'localhost';
+  const withProtocol = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+  try {
+    return new URL(withProtocol).hostname || 'localhost';
+  } catch {
+    return raw.replace(/^https?:\/\//i, '').split('/')[0]?.split(':')[0] || 'localhost';
+  }
+}
+
+function runSlotPreviewUrl(port: number, host?: string | null): string {
+  return `http://${normalizePreviewHost(host)}:${port}`;
+}
+
+function serializeRunSlot(row: FoundryRunSlotListRow, host?: string | null): FoundryRunSlotResponse {
+  return {
+    ...row,
+    preview_url: runSlotPreviewUrl(row.port, host),
+  };
+}
+
+function emitRunSlot(slotNo: number, host?: string | null): void {
+  const row = getRunSlotWithProjectStmt.get(slotNo);
+  if (!row) return;
+  sseBus.emit('sse', { type: 'foundry_run_slot', action: 'updated', slot: serializeRunSlot(row, host) });
+}
+
+function pidAlive(pid: number | null | undefined): boolean {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') return;
+    try {
+      process.kill(pid, signal);
+    } catch (inner) {
+      const innerCode = (inner as NodeJS.ErrnoException).code;
+      if (innerCode !== 'ESRCH') throw inner;
+    }
+  }
+}
+
+export function listRunSlots(host?: string | null): FoundryRunSlotResponse[] {
+  ensureRunSlots();
+  return listRunSlotsStmt.all().map((row) => serializeRunSlot(row, host));
+}
+
+function slotOccupants(host?: string | null): FoundryRunSlotResponse[] {
+  return listRunSlots(host).filter((slot) => slot.status === 'running' && pidAlive(slot.pid));
+}
+
+export function stopRunSlot(slotNo: number, opts: { host?: string | null; emit?: boolean } = {}): FoundryRunSlotResponse {
+  ensureRunSlots();
+  if (!validSlotNo(slotNo)) throw new FoundryError(400, 'foundry_invalid_slot', 'slot_no must be 1, 2, or 3');
+  const row = getRunSlotStmt.get(slotNo) ?? null;
+  if (!row) throw new FoundryError(404, 'foundry_slot_not_found', 'foundry run slot not found');
+  if (row.status === 'running') {
+    if (pidAlive(row.pid)) {
+      signalProcessGroup(row.pid!, 'SIGTERM');
+      for (let i = 0; i < 8 && pidAlive(row.pid); i += 1) sleepSync(150);
+      if (pidAlive(row.pid)) {
+        signalProcessGroup(row.pid!, 'SIGKILL');
+        for (let i = 0; i < 4 && pidAlive(row.pid); i += 1) sleepSync(100);
+      }
+    }
+    setRunSlotStoppedStmt.run(slotNo);
+    if (opts.emit !== false) emitRunSlot(slotNo, opts.host);
+  }
+  const updated = getRunSlotWithProjectStmt.get(slotNo);
+  if (!updated) throw new FoundryError(404, 'foundry_slot_not_found', 'foundry run slot not found');
+  return serializeRunSlot(updated, opts.host);
+}
+
+export function reconcileRunSlotsAtBoot(host?: string | null): void {
+  ensureRunSlots();
+  for (const slot of listRunSlotsStmt.all()) {
+    if (slot.status === 'free') {
+      if (slot.project_id || slot.pid || slot.run_command || slot.log_path || slot.started_at || slot.last_health_at) {
+        clearFreeRunSlotStmt.run(slot.slot_no);
+        emitRunSlot(slot.slot_no, host);
+      }
+      continue;
+    }
+    if (slot.status === 'running' && !pidAlive(slot.pid)) {
+      setRunSlotDeadStmt.run(slot.slot_no);
+      emitRunSlot(slot.slot_no, host);
+      if (slot.project_id) {
+        const project = getProjectStmt.get(slot.project_id);
+        if (project) emitProject('updated', project, projectModulesStmt.all(project.id));
+      }
+    }
+  }
+}
+
+function allocateRunSlot(opts: GoProjectOptions): FoundryRunSlotListRow {
+  ensureRunSlots();
+  reconcileRunSlotsAtBoot(opts.host);
+  const requested = opts.slot_no == null ? null : Number(opts.slot_no);
+  if (requested != null && !validSlotNo(requested)) {
+    throw new FoundryError(400, 'foundry_invalid_slot', 'slot_no must be 1, 2, or 3');
+  }
+  const slots = listRunSlotsStmt.all();
+  if (requested != null) {
+    const target = slots.find((slot) => slot.slot_no === requested) ?? null;
+    if (!target) throw new FoundryError(400, 'foundry_invalid_slot', 'slot_no must be 1, 2, or 3');
+    if (target.status === 'running' && pidAlive(target.pid)) {
+      if (!opts.replace) {
+        throw new FoundryError(409, 'foundry_slot_occupied', `Foundry run slot ${requested} is already running`, {
+          slot: serializeRunSlot(target, opts.host),
+        });
+      }
+      stopRunSlot(requested, { host: opts.host });
+    }
+    const refreshed = getRunSlotWithProjectStmt.get(requested);
+    if (!refreshed) throw new FoundryError(400, 'foundry_invalid_slot', 'slot_no must be 1, 2, or 3');
+    return refreshed;
+  }
+
+  const free = slots.find((slot) => slot.status !== 'running' || !pidAlive(slot.pid));
+  if (!free) {
+    throw new FoundryError(409, 'foundry_slots_full', 'all Foundry run slots are busy', {
+      slots: slotOccupants(opts.host).map((slot) => ({
+        slot_no: slot.slot_no,
+        project_id: slot.project_id,
+        project_name: slot.project_name,
+        port: slot.port,
+        pid: slot.pid,
+      })),
+    });
+  }
+  return free;
+}
+
+async function probePort(port: number): Promise<boolean> {
+  for (const pathPart of ['/health', '/']) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1_000);
+    try {
+      await fetch(`http://127.0.0.1:${port}${pathPart}`, { signal: controller.signal });
+      clearTimeout(timeout);
+      return true;
+    } catch {
+      clearTimeout(timeout);
+    }
+  }
+  return new Promise((resolve) => {
+    const socket = net.connect({ host: '127.0.0.1', port });
+    const done = (ok: boolean) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(1_000);
+    socket.once('connect', () => done(true));
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => done(false));
+  });
+}
+
+export async function runSlotHealthTick(host?: string | null): Promise<void> {
+  if (runSlotHealthRunning) return;
+  runSlotHealthRunning = true;
+  try {
+    ensureRunSlots();
+    for (const slot of listRunSlotsStmt.all()) {
+      if (slot.status !== 'running') continue;
+      if (!pidAlive(slot.pid)) {
+        setRunSlotDeadStmt.run(slot.slot_no);
+        emitRunSlot(slot.slot_no, host);
+        if (slot.project_id) {
+          const project = getProjectStmt.get(slot.project_id);
+          if (project) emitProject('updated', project, projectModulesStmt.all(project.id));
+        }
+        continue;
+      }
+      if (await probePort(slot.port)) {
+        setRunSlotHealthStmt.run(slot.slot_no);
+      }
+    }
+  } finally {
+    runSlotHealthRunning = false;
+  }
 }
 
 export function listProjects(status: FoundryProjectStatus | 'all' = 'all'): FoundryProjectResponse[] {
@@ -2331,33 +2700,46 @@ let foundryStarted = false;
 export function startFoundry(): void {
   if (foundryStarted) return;
   foundryStarted = true;
+  ensureRunSlots();
+  reconcileRunSlotsAtBoot();
+  const healthTimer = setInterval(() => {
+    runSlotHealthTick().catch((err) => console.error('[foundry] run-slot health tick failed', err));
+  }, 10_000);
+  healthTimer.unref?.();
   sseBus.on('sse', handleFoundrySse);
-  console.log('[foundry] lifecycle listener started');
+  console.log('[foundry] lifecycle listener and run-slot sweeper started');
 }
 
-export function goProject(id: string): { project: FoundryProjectResponse; launched: true; preview_url: string | null } {
+export function goProject(id: string, opts: GoProjectOptions = {}): GoProjectResult {
   const project = getProjectStmt.get(id) ?? null;
   if (!project) throw new FoundryError(404, 'foundry_project_not_found', 'foundry project not found');
   if (project.status !== 'ready') throw new FoundryError(409, 'foundry_project_not_ready', 'project must be ready before GO');
   const blueprint = loadBlueprint(project);
   const runCommand = project.run_command?.trim() || blueprint?.run?.command?.trim() || '';
   if (!runCommand) throw new FoundryError(400, 'foundry_missing_run_command', 'project has no run.command');
+  const slot = allocateRunSlot(opts);
+  const effectiveCommand = runCommand.replaceAll('{{port}}', String(slot.port));
   const logDir = path.join(project.repo_path, '.foundry');
   fs.mkdirSync(logDir, { recursive: true });
-  const logPath = path.join(logDir, 'run.log');
+  const logPath = path.join(logDir, `run-slot-${slot.slot_no}.log`);
   const childEnv = { ...process.env };
   delete childEnv.ANTHROPIC_API_KEY;
   delete childEnv.OPENAI_API_KEY;
+  childEnv.PORT = String(slot.port);
+  childEnv.FOUNDRY_SLOT = String(slot.slot_no);
+  let childPid: number | null = null;
   try {
     const out = fs.openSync(logPath, 'a');
     try {
-      const child = spawn(runCommand, {
+      const child = spawn(effectiveCommand, {
         cwd: project.repo_path,
         shell: true,
         detached: true,
         stdio: ['ignore', out, out],
         env: childEnv,
       });
+      if (!child.pid) throw new Error('spawn did not return a child pid');
+      childPid = child.pid;
       child.unref();
     } finally {
       fs.closeSync(out);
@@ -2365,7 +2747,10 @@ export function goProject(id: string): { project: FoundryProjectResponse; launch
   } catch (err) {
     throw new FoundryError(500, 'foundry_go_failed', err instanceof Error ? err.message : String(err));
   }
-  const previewUrl = blueprint?.run?.preview_url?.trim() || null;
+  if (!childPid) throw new FoundryError(500, 'foundry_go_failed', 'spawn did not return a child pid');
+  setRunSlotRunningStmt.run(project.id, childPid, effectiveCommand, logPath, slot.slot_no);
+  const previewUrl = runSlotPreviewUrl(slot.port, opts.host);
+  const blueprintPreviewUrl = blueprint?.run?.preview_url?.trim() || null;
   setProjectLaunchedStmt.run(previewUrl, id);
   const launched = getProjectStmt.get(id);
   if (!launched) throw new FoundryError(404, 'foundry_project_not_found', 'foundry project not found');
@@ -2374,7 +2759,16 @@ export function goProject(id: string): { project: FoundryProjectResponse; launch
     setPreviewLink(conversation.id, previewUrl, launched.name);
   }
   emitProject('updated', launched, projectModulesStmt.all(id));
-  return { project: serializeFoundryProject(launched, projectModulesStmt.all(id)), launched: true, preview_url: previewUrl };
+  emitRunSlot(slot.slot_no, opts.host);
+  const launchedSlot = getRunSlotWithProjectStmt.get(slot.slot_no);
+  if (!launchedSlot) throw new FoundryError(500, 'foundry_go_failed', 'launched slot could not be loaded');
+  return {
+    project: serializeFoundryProject(launched, projectModulesStmt.all(id)),
+    launched: true,
+    preview_url: previewUrl,
+    slot: serializeRunSlot(launchedSlot, opts.host),
+    blueprint_preview_url: blueprintPreviewUrl,
+  };
 }
 
 export function retryModule(projectId: string, key: string, stage?: string | null): {

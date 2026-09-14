@@ -100,12 +100,14 @@ import {
   goProject as goFoundryProject,
   isProjectStatus,
   launchProject as launchFoundryProject,
+  listRunSlots as listFoundryRunSlots,
   listProjects as listFoundryProjects,
   markProjectPlanning,
   retryIntegration as retryFoundryIntegration,
   retryModule as retryFoundryModule,
   runFoundryFoundationFinishGate,
   setBlueprint as setFoundryBlueprint,
+  stopRunSlot as stopFoundryRunSlot,
   buildFoundryAdvisor,
 } from '../foundry.js';
 import { planProject as runFoundryPlanner } from '../foundry-planner.js';
@@ -339,6 +341,24 @@ function headerString(value: string | string[] | undefined): string | undefined 
   if (typeof value === 'string') return value;
   if (Array.isArray(value)) return value[0];
   return undefined;
+}
+
+function stripPortHost(value: string | undefined): string | null {
+  const raw = value?.split(',')[0]?.trim();
+  if (!raw) return null;
+  const withProtocol = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+  try {
+    return new URL(withProtocol).hostname || null;
+  } catch {
+    return raw.replace(/^https?:\/\//i, '').split('/')[0]?.split(':')[0] || null;
+  }
+}
+
+function foundryPreviewHost(req: Request): string {
+  return process.env.FOUNDRY_PREVIEW_HOST?.trim()
+    || stripPortHost(headerString(req.headers['x-forwarded-host']))
+    || stripPortHost(headerString(req.headers.host))
+    || 'localhost';
 }
 
 function sendError(res: Response, status: number, code: string, message: string, extra?: Record<string, unknown>): void {
@@ -1554,6 +1574,22 @@ export function createApiV1Router(): Router {
   // route skeletons, and SSE contracts. Launch/GO/retry get real lifecycle
   // behavior in the follow-up backend node.
 
+  router.get('/foundry/run-slots', (req: AuthedRequest, res) => {
+    try {
+      res.json({ slots: listFoundryRunSlots(foundryPreviewHost(req)) });
+    } catch (err) {
+      sendCaughtFoundryError(res, err);
+    }
+  });
+
+  router.post('/foundry/run-slots/:slot_no/stop', (req: AuthedRequest, res) => {
+    try {
+      res.json({ slot: stopFoundryRunSlot(Number(paramString(req.params.slot_no)), { host: foundryPreviewHost(req) }) });
+    } catch (err) {
+      sendCaughtFoundryError(res, err);
+    }
+  });
+
   router.get('/foundry/projects', (req: AuthedRequest, res) => {
     const rawStatus = typeof req.query.status === 'string' ? req.query.status : 'all';
     if (rawStatus !== 'all' && !isProjectStatus(rawStatus)) {
@@ -1667,8 +1703,14 @@ export function createApiV1Router(): Router {
   });
 
   router.post('/foundry/projects/:id/go', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const rawSlot = Object.prototype.hasOwnProperty.call(body, 'slot_no') ? body.slot_no : body.slotNo;
     try {
-      res.status(202).json(goFoundryProject(paramString(req.params.id)));
+      res.status(202).json(goFoundryProject(paramString(req.params.id), {
+        slot_no: rawSlot == null ? null : Number(rawSlot),
+        replace: body.replace === true,
+        host: foundryPreviewHost(req),
+      }));
     } catch (err) {
       sendCaughtFoundryError(res, err);
     }
@@ -3918,7 +3960,7 @@ export function createApiV1Router(): Router {
       'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
       'quick_capture', 'thread_summary', 'notification',
       'dispatch', 'dispatch_cue', 'hopper_item', 'hopper_node', 'smart_todo',
-      'monitor', 'monitor_run', 'foundry_project', 'foundry_module',
+      'monitor', 'monitor_run', 'foundry_project', 'foundry_module', 'foundry_run_slot',
       'intel_run', 'intel_item',
     ]);
 

@@ -77,8 +77,13 @@ function weeklyModeSetting(): 'soft' | 'hard' {
 
 export type GovernorOverride = 'auto' | 'on' | 'off';
 
+// Settings-KV ONLY — deliberately no env fallback, no trim, no case-folding:
+// the panel reads `raw` KV-only and compares exactly, so an env-sourced,
+// case-variant, or padded value would let the governor run override_on while
+// the UI shows Auto/nothing. Anything but the two literal strings the PATCH
+// route accepts reads as 'auto' (= no override).
 function overrideSetting(provider: GovernorProvider): GovernorOverride {
-  const raw = getGovernorSetting(`override_${provider}`)?.toLowerCase();
+  const raw = getSetting(`gov_override_${provider}`);
   return raw === 'on' || raw === 'off' ? raw : 'auto';
 }
 

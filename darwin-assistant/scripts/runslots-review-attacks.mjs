@@ -1,7 +1,7 @@
 // ADVERSARIAL REVIEW PROBES (node #190) for Foundry GO v2 run slots.
 // Drives dist/foundry.js directly against a scratch DB + scratch ports
 // 48410-48412 (never the live jarvis.db or 4310-4312). Each block is one
-// attack from DECISIONS.md; a [BUG] line means the attack landed. Re-run
+// attack from DECISIONS.md (D..G = first review, H..K = re-review); a [BUG] line means the attack landed. Re-run
 // after fixing: `npm run build && node scripts/runslots-review-attacks.mjs`.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -151,6 +151,68 @@ function finding(id, verdict, detail) { report.push({ id, verdict, detail }); co
   const s2 = slots().find((x) => x.slot_no === r.slot.slot_no);
   finding('G-daemonize', s2.status !== 'running' && bound ? 'BUG' : 'OK', `run.command that backgrounds itself: port bound=${bound}, slot status before tick='${s.status}' after tick='${s2.status}' — pid-only liveness marks a live server dead; slot becomes reclaimable while the port is held (blueprint run.command is model-generated, so '&'/nohup/pm2 shapes are plausible)`);
   try { execSync(`pkill -f "^python3 .*http.server ${r.slot.port}"`, { stdio: 'ignore' }); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// H — (re-review) run.command exits immediately. The GO path runs synchronously,
+// so the dead child is an unreaped zombie; a bare kill(pid,0) still succeeds.
+// Expect 500 foundry_go_failed with a log tail, never launched=true.
+// ---------------------------------------------------------------------------
+{
+  const p = seed('echo "boom: missing module" >&2; exit 1');
+  try {
+    const r = foundry.goProject(p, { host: '127.0.0.1' });
+    finding('H-early-exit', 'BUG', `run.command exited in <10ms yet GO returned launched=${r.launched} slot=${r.slot.slot_no} status='${r.slot.status}' pid=${r.slot.pid} (zombie read as alive)`);
+    try { foundry.stopRunSlot(r.slot.slot_no, { host: '127.0.0.1' }); } catch {}
+  } catch (e) {
+    finding('H-early-exit', e.code === 'foundry_go_failed' ? 'OK' : 'BUG', `GO -> ${e.status} ${e.code}; log_tail=${JSON.stringify(e.detail?.log_tail ?? e.details?.log_tail ?? '')}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// J — (re-review) recorded pid = dead leader of an UNRELATED orphaned group
+// (pid recycled as a pgid) while the port is squatted. Stop must not signal
+// that group; reconcile must not call the squatter "our occupant".
+// ---------------------------------------------------------------------------
+{
+  const sq = spawn('python3', ['-m', 'http.server', '48412', '--bind', '127.0.0.1'], { detached: true, stdio: 'ignore' }); sq.unref();
+  const grp = spawn('sh', ['-c', 'sleep 300 & exit 0'], { detached: true, stdio: 'ignore' }); grp.unref();
+  await sleep(600);
+  const leaderPid = grp.pid;
+  const members = () => { try { return execSync(`ps -o pid=,comm= -g ${leaderPid}`).toString(); } catch { return ''; } };
+  const before = members();
+  sqliteDb.prepare(`UPDATE foundry_run_slots SET status='running', pid=?, pid_starttime=NULL, project_id='atk-1', run_command='x', started_at=datetime('now','-1 day') WHERE slot_no=3`).run(leaderPid);
+  foundry.reconcileRunSlotsAtBoot('127.0.0.1');
+  const s3 = slots().find((s) => s.slot_no === 3);
+  let err = null;
+  try { foundry.stopRunSlot(3, { host: '127.0.0.1' }); } catch (e) { err = e; }
+  await sleep(200);
+  const after = members();
+  const killedUnrelated = before.includes('sleep') && !after.includes('sleep');
+  finding('J-orphan-group-collision', (killedUnrelated || s3.status === 'running') ? 'BUG' : 'OK', `reconcile -> slot 3 '${s3.status}'; Stop -> ${err ? err.code : 'ok'}; unrelated 'sleep' survived=${!killedUnrelated}`);
+  try { process.kill(sq.pid, 'SIGKILL'); } catch {}
+  try { process.kill(-leaderPid, 'SIGKILL'); } catch {}
+  await sleep(100);
+  try { foundry.stopRunSlot(3, { host: '127.0.0.1' }); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// K — (re-review) setsid/double-fork daemon: our process group vanishes but the
+// port is held by a verifiably-ours process. Tick must keep it running; Stop
+// must find the holder via /proc/net/tcp and free the port (no stuck 409).
+// ---------------------------------------------------------------------------
+{
+  const p = seed('setsid python3 -m http.server {{port}} --bind 127.0.0.1 >/dev/null 2>&1 < /dev/null & exit 0');
+  const r = foundry.goProject(p, { host: '127.0.0.1' });
+  await sleep(800);
+  await foundry.runSlotHealthTick('127.0.0.1');
+  const s = slots().find((x) => x.slot_no === r.slot.slot_no);
+  let err = null;
+  try { foundry.stopRunSlot(r.slot.slot_no, { host: '127.0.0.1' }); } catch (e) { err = e; }
+  const bound = await portBound(r.slot.port);
+  const s2 = slots().find((x) => x.slot_no === r.slot.slot_no);
+  finding('K-setsid-daemon', (s.status === 'running' && !err && !bound && s2.status === 'stopped') ? 'OK' : 'BUG', `after tick '${s.status}'; Stop -> ${err ? err.code : 'ok'}; port bound after=${bound}; slot '${s2.status}'`);
+  try { execSync(`pkill -f "http.server ${r.slot.port}"`, { stdio: 'ignore' }); } catch {}
 }
 
 console.log('\n=== SUMMARY ===');

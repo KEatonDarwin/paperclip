@@ -1424,28 +1424,74 @@ function emitRunSlot(slotNo: number, host?: string | null): void {
   sseBus.emit('sse', { type: 'foundry_run_slot', action: 'updated', slot: serializeRunSlot(row, host) });
 }
 
+/** Parsed /proc/<pid>/stat: state letter, parent pgid, and starttime (jiffies). */
+function readProcStat(pid: number | null | undefined): { state: string; pgid: number; starttime: string } | null {
+  if (!pid || pid <= 0) return null;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const close = stat.lastIndexOf(')');
+    if (close === -1) return null;
+    const parts = stat.slice(close + 1).trim().split(/\s+/);
+    // parts[0] = state (field 3), parts[2] = pgrp (field 5), parts[19] = starttime (field 22)
+    return { state: parts[0] ?? '', pgid: Number(parts[2] ?? 0), starttime: parts[19] ?? '' };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True only for a process that is alive AND not a zombie. `kill(pid, 0)`
+ * alone succeeds on an exited-but-unreaped child, and the GO/Stop paths run
+ * synchronously (the loop can't reap), so a child that died 5ms ago would
+ * otherwise read as "running" until the next tick.
+ */
 function pidAlive(pid: number | null | undefined): boolean {
   if (!pid || pid <= 0) return false;
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
     return false;
   }
+  const stat = readProcStat(pid);
+  if (!stat) return true; // no /proc row readable (EPERM) — kill(0) said it exists; identity checks decide ownership
+  return stat.state !== 'Z' && stat.state !== 'X';
+}
+
+/** Live (non-zombie) pids whose process group is `pgid`. /proc scan; use on Stop/GO, not per tick. */
+function liveGroupMembers(pgid: number | null | undefined): number[] {
+  if (!pgid || pgid <= 0) return [];
+  const members: number[] = [];
+  let entries: string[] = [];
+  try { entries = fs.readdirSync('/proc'); } catch { return members; }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    const stat = readProcStat(pid);
+    if (!stat || stat.pgid !== pgid) continue;
+    if (stat.state === 'Z' || stat.state === 'X') continue;
+    members.push(pid);
+  }
+  return members;
 }
 
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+/** A process group counts as alive only if it has a live (non-zombie) member. */
 function processGroupAlive(pid: number | null | undefined): boolean {
   if (!pid || pid <= 0) return false;
   try {
     process.kill(-pid, 0);
-    return true;
   } catch {
     return false;
   }
+  return liveGroupMembers(pid).length > 0;
+}
+
+/** True if a live member of process group `pgid` carries our FOUNDRY_SLOT=<slotNo> marker. */
+function processGroupIsOurs(pgid: number | null | undefined, slotNo: number): boolean {
+  return liveGroupMembers(pgid).some((pid) => procEnvHasSlot(pid, slotNo));
 }
 
 function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
@@ -1464,16 +1510,53 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
 }
 
 function readProcStarttime(pid: number | null | undefined): string | null {
-  if (!pid || pid <= 0) return null;
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const close = stat.lastIndexOf(')');
-    if (close === -1) return null;
-    const parts = stat.slice(close + 1).trim().split(/\s+/);
-    return parts[19] ?? null;
-  } catch {
-    return null;
+  return readProcStat(pid)?.starttime || null;
+}
+
+/**
+ * Pids that hold a LISTEN socket on `port` (any local address), resolved via
+ * /proc/net/tcp{,6} inode -> /proc/<pid>/fd. Only processes whose fd table we
+ * can read (same user) are found — which is exactly the set that could be ours.
+ */
+function portOwnerPids(port: number): number[] {
+  const inodes = new Set<string>();
+  const hexPort = port.toString(16).toUpperCase().padStart(4, '0');
+  for (const table of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    let text = '';
+    try { text = fs.readFileSync(table, 'utf8'); } catch { continue; }
+    for (const line of text.split('\n').slice(1)) {
+      const cols = line.trim().split(/\s+/);
+      if (cols.length < 10) continue;
+      const local = cols[1] ?? '';
+      const state = cols[3];
+      if (state !== '0A') continue; // LISTEN
+      if (!local.endsWith(`:${hexPort}`)) continue;
+      inodes.add(cols[9] ?? '');
+    }
   }
+  inodes.delete('');
+  if (inodes.size === 0) return [];
+  const owners: number[] = [];
+  let entries: string[] = [];
+  try { entries = fs.readdirSync('/proc'); } catch { return owners; }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    let fds: string[] = [];
+    try { fds = fs.readdirSync(`/proc/${pid}/fd`); } catch { continue; }
+    for (const fd of fds) {
+      let target = '';
+      try { target = fs.readlinkSync(`/proc/${pid}/fd/${fd}`); } catch { continue; }
+      const m = /^socket:\[(\d+)\]$/.exec(target);
+      if (m && inodes.has(m[1]!)) { owners.push(pid); break; }
+    }
+  }
+  return owners;
+}
+
+/** True if the port is held by a process carrying our FOUNDRY_SLOT=<slotNo> marker. */
+function portHeldByOurSlot(port: number, slotNo: number): boolean {
+  return portOwnerPids(port).some((pid) => procEnvHasSlot(pid, slotNo));
 }
 
 function procEnvHasSlot(pid: number, slotNo: number): boolean {
@@ -1533,8 +1616,10 @@ function portBoundSync(port: number): boolean {
 function slotHasLiveOccupant(slot: FoundryRunSlotRow): boolean {
   if (slot.status !== 'running') return false;
   if (slotLeaderMatchesIdentity(slot)) return true;
-  if (!slot.pid && portBoundSync(slot.port)) return true;
-  if (slot.pid && !pidAlive(slot.pid) && portBoundSync(slot.port)) return true;
+  // Leader gone (daemonized / backgrounded run.command): the slot is live only
+  // if the port is held by a process that is verifiably ours. A squatter on our
+  // port is NOT an occupant — the slot reads dead and preflight 409s any GO.
+  if (!slot.pid || !pidAlive(slot.pid)) return portHeldByOurSlot(slot.port, slot.slot_no);
   return false;
 }
 
@@ -1609,26 +1694,45 @@ export function stopRunSlot(slotNo: number, opts: { host?: string | null; emit?:
   if (row.status === 'running') {
     const leaderAlive = pidAlive(row.pid);
     const leaderIsOurs = slotLeaderMatchesIdentity(row);
-    const groupIsAlive = processGroupAlive(row.pid);
+    // Never signal a group we can't prove is ours: a dead leader's pid can be
+    // recycled as the pgid of an unrelated orphaned group.
+    const groupIsOurs = row.pid ? (leaderIsOurs || processGroupIsOurs(row.pid, slotNo)) : false;
     if (leaderAlive && !leaderIsOurs) {
       markRunSlotDeadIfUnchanged(row, opts.host);
       const updated = getRunSlotWithProjectStmt.get(slotNo);
       if (!updated) throw new FoundryError(404, 'foundry_slot_not_found', 'foundry run slot not found');
       return serializeRunSlot(updated, opts.host);
     }
-    if (row.pid && (leaderIsOurs || groupIsAlive)) {
+    if (row.pid && groupIsOurs) {
       signalProcessGroup(row.pid!, 'SIGTERM');
       if (!waitForPortFree(row.port, 1_200)) {
         signalProcessGroup(row.pid!, 'SIGKILL');
-        if (!waitForPortFree(row.port, 1_200)) {
-          throw new FoundryError(409, 'foundry_slot_still_bound', `Foundry run slot ${slotNo} still has port ${row.port} bound after stop`, {
-            slot: serializeRunSlot(getRunSlotWithProjectStmt.get(slotNo) ?? { ...row, project_name: null }, opts.host),
-          });
-        }
+        waitForPortFree(row.port, 1_200);
       }
     }
     if (portBoundSync(row.port)) {
-      throw new FoundryError(409, 'foundry_slot_still_bound', `Foundry run slot ${slotNo} still has port ${row.port} bound`);
+      // Group is gone (or never ours) but the port is still held. If the holder
+      // is verifiably ours (setsid/double-fork daemon), kill it by pid; if it
+      // is a squatter, the slot's process is dead and the slot is reclaimable
+      // — preflight keeps GO off the squatted port.
+      const owners = portOwnerPids(row.port).filter((pid) => procEnvHasSlot(pid, slotNo));
+      if (owners.length > 0) {
+        for (const pid of owners) { try { process.kill(pid, 'SIGTERM'); } catch {} }
+        if (!waitForPortFree(row.port, 1_200)) {
+          for (const pid of owners) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+          if (!waitForPortFree(row.port, 1_200)) {
+            throw new FoundryError(409, 'foundry_slot_still_bound', `Foundry run slot ${slotNo} still has port ${row.port} bound after stop`, {
+              slot: serializeRunSlot(getRunSlotWithProjectStmt.get(slotNo) ?? { ...row, project_name: null }, opts.host),
+              owner_pids: owners,
+            });
+          }
+        }
+      } else if (!portHeldByOurSlot(row.port, slotNo)) {
+        markRunSlotDeadIfUnchanged(row, opts.host);
+        const updated = getRunSlotWithProjectStmt.get(slotNo);
+        if (!updated) throw new FoundryError(404, 'foundry_slot_not_found', 'foundry run slot not found');
+        return serializeRunSlot(updated, opts.host);
+      }
     }
     setRunSlotStoppedStmt.run(slotNo);
     markProjectReadyAfterSlotStop(row);
@@ -1883,6 +1987,11 @@ export function markProjectPlannerFailed(id: string, message: string): FoundryPr
 export function deleteProject(id: string): FoundryProjectResponse | null {
   const row = getProjectStmt.get(id) ?? null;
   if (!row) return null;
+  // Don't leave a nameless running slot behind (project_id would SET NULL).
+  for (const slot of listRunSlotsStmt.all()) {
+    if (slot.project_id !== id || slot.status !== 'running') continue;
+    try { stopRunSlot(slot.slot_no); } catch (err) { console.warn(`[foundry] could not stop run slot ${slot.slot_no} on project delete`, err); }
+  }
   const modules = projectModulesStmt.all(id);
   deleteProjectStmt.run(id);
   for (const mod of modules) emitModule('deleted', mod);
@@ -2961,6 +3070,8 @@ export function goProject(id: string, opts: GoProjectOptions = {}): GoProjectRes
   }
   if (!childPid) throw new FoundryError(500, 'foundry_go_failed', 'spawn did not return a child pid');
   sleepSync(500);
+  // pidAlive/processGroupAlive are zombie-aware: the loop is blocked here, so an
+  // already-exited child is unreaped and a bare kill(pid, 0) would still succeed.
   if (!pidAlive(childPid) && !processGroupAlive(childPid) && !portBoundSync(slot.port)) {
     throw new FoundryError(500, 'foundry_go_failed', `run.command exited before binding port ${slot.port}`, {
       log_tail: logTail(logPath),

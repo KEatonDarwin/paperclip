@@ -1,0 +1,129 @@
+# DECISIONS.md — Foundry GO v2 run slots (tree-b3ccebd3)
+
+## 2026-09-14 · Adversarial review (node #190) — VERDICT: FAIL, not GO-ready
+
+Reviewed `hopper/foundry-runslots` @ `1092bfe6d` (darwin-assistant) and
+`hopper/foundry-runslots-ui` @ `4d6f4c1` (cockpit). The lifecycle sim
+(`npm run runslots:sim`) re-ran clean, 18/18, and `tsc` is green in both repos
+(cockpit `tsc` errors are all pre-existing in other routes; `prettier` noise in
+`cockpit-api.ts` is pre-existing on the base commit; the one eslint warning in
+`foundry.tsx` predates this branch). The code is well-structured and the happy
+path is real. It fails the review on **what happens the second time** — relaunch,
+restart, and concurrency — which is exactly what "reusable slots with real
+lifecycle" is supposed to buy.
+
+Reproduction script (committed): `darwin-assistant/scripts/runslots-review-attacks.mjs`
+— `npm run build && node scripts/runslots-review-attacks.mjs`. Scratch DB +
+scratch ports 48410-48412 only. Every finding below prints as a `[BUG]` line.
+
+### Blocking (must fix before Kevin presses GO)
+
+**R-1 · A project can be GO'd exactly once, ever. Stop bricks it.**
+`goProject` requires `status === 'ready'` and sets `launched`; nothing ever
+returns a project to `ready` (`setProjectReadyStmt` has `AND status <> 'launched'`)
+and the UI only renders GO for `ready`. So: GO → Stop (or crash, or reboot) →
+GO again = `409 foundry_project_not_ready`. Reproduced (attack D). The slot is
+reusable; the project is not. That defeats the feature.
+*Fix:* allow GO when `status IN ('ready','launched')`. If the project already
+occupies a live slot, either 409 `foundry_project_already_running` with the slot
+in `detail`, or (better) replace its own slot by default. UI: `canGo = ready ||
+(launched && no running slot for this project)`, label it "Relaunch".
+
+**R-2 · pid liveness has no identity check → after a reboot the board shows
+ghosts and Stop can kill an unrelated process.** `pidAlive` is `kill(pid,0)`
+only. Reproduced (attack C): a recorded pid now owned by an unrelated `sleep`
+→ boot reconcile leaves the slot `running` with the old project name, and Stop
+sends SIGTERM/SIGKILL to that unrelated process group. After a pi reboot every
+recorded pid is stale and low pids get reused fast (jarvis, cockpit, paperclip,
+postgres all live on this box). If the reused pid belongs to root, `kill` throws
+EPERM → Stop 500s forever and the slot can never be cleared.
+*Fix:* record identity at spawn and verify it before trusting a pid: read
+`/proc/<pid>/environ` for `FOUNDRY_SLOT=<n>` (the env is already set on the
+child — cheapest, unambiguous), and/or record `/proc/<pid>/stat` starttime at
+spawn and compare. Any mismatch ⇒ treat as dead. Also treat EPERM as "not ours".
+
+**R-3 · Health tick works from a stale snapshot; a replace-GO during a tick
+marks the NEW occupant dead and NULLs its pid.** `runSlotHealthTick` reads all
+rows, then `await`s `probePort` per slot (up to ~2s each for a port that accepts
+but doesn't speak HTTP). A GO+replace in that window swaps the pid; the tick then
+sees the old pid dead and runs `setRunSlotDeadStmt` on the slot — the live new
+process is now pid-less, unstoppable from the UI, and the slot is reclaimable so
+the next GO collides on the port. Reproduced (attack B).
+*Fix:* make the dead-mark conditional: `UPDATE … SET status='dead', pid=NULL WHERE
+slot_no=? AND pid=? AND status='running'` (compare against the pid the tick
+observed), and re-read the row after each `await` before acting.
+
+**R-4 · Through the real cockpit proxy every preview link is `http://localhost:<port>`.**
+`foundryPreviewHost` falls back to `x-forwarded-host` / `host`, but
+`src/lib/cockpit-proxy.ts` forwards neither — the backend always sees
+`Host: localhost:3201`. Kevin opens the cockpit from his laptop at
+`192.168.1.52:8080`, clicks Open, and hits his laptop's localhost:4310. The
+thread link-bar preview gets the same wrong URL. Not hit by the sim because it
+calls `:3201` directly.
+*Fix:* either set `FOUNDRY_PREVIEW_HOST=192.168.1.52` in darwin-assistant `.env`
+at deploy (document it in the deploy step — it is currently the *only* working
+path), or one line in `cockpit-proxy.ts`: `headers.set("x-forwarded-host",
+request.headers.get("host") ?? "")`. Do the proxy fix; keep the env var as
+override.
+
+### Should fix (board lies / self-inflicted collisions)
+
+**R-5 · No preflight port check; a bound port yields a 202 "launched" and a
+running slot that points at someone else's server.** Reproduced (attack E):
+port already bound → child dies with EADDRINUSE, GO still returns `launched:true`
++ preview URL, slot shows `running` until the 10s tick, and the preview link
+opens the squatter. This is also the failure mode R-3 and R-6 cascade into.
+*Fix:* before spawn, try `net.createServer().listen(port,'127.0.0.1')` and
+close it; on EADDRINUSE → `409 foundry_port_busy` (with whether the port is
+held by one of *our* dead-marked slots). After spawn, wait ~500ms and if the
+pid is already gone, return `500 foundry_go_failed` with the log tail instead
+of "launched".
+
+**R-6 · pid-only liveness marks a daemonizing/backgrounding run.command dead
+while its server holds the port.** Reproduced (attack G): `nohup … &` → shell
+exits, slot flips to `dead`, port still bound, slot reclaimable → next GO
+collides. `run.command` is planner-generated, so `&`/nohup/pm2 shapes will
+appear. (SIM-RESULTS F-2 is the same class from the other direction.)
+*Fix:* liveness = process-group alive (`kill(-pgid, 0)`) OR port bound. If the
+pid is gone but the port answers, mark the slot `running` with pid=NULL and a
+`note`, or `orphaned` — never `dead`/reclaimable while the port is held.
+Combine with R-5's preflight so allocation can never land on a held port.
+
+**R-7 · `stopRunSlot` blocks the whole JARVIS event loop ~1.6s on every Stop
+and every replace-GO (SIM-RESULTS F-1, confirmed again: 1604-1606ms).**
+`Atomics.wait` on the main thread means the killed child can never be reaped
+during the loop, so `pidAlive` never observes the death and the loop always
+maxes out; meanwhile every SSE stream and chat turn stalls. Fixing it naively
+(async wait, exit early when the *leader* pid dies) would open a real orphan
+hole: `sh -c` dies on the first SIGTERM while a slow-draining/SIGTERM-ignoring
+child survives and the SIGKILL escalation is skipped. Today's always-max-out
+loop accidentally guarantees the group SIGKILL.
+*Fix:* make `stopRunSlot` async; poll `kill(-pgid, 0)` (any member alive) with
+`await setTimeout`; escalate to group SIGKILL if the *group* is still alive;
+then wait for the port to actually free before reporting `stopped`.
+
+### Minor / notes
+
+- `probePort` never consumes or cancels the fetch body → slow socket leak,
+  one per running slot per 10s. Add `res.body?.cancel()` or use `HEAD`.
+- `foundry_run_slots.project_id … ON DELETE SET NULL` with `foreign_keys=ON`:
+  deleting a project leaves a nameless running slot and never stops the
+  process. Stop the slot on project delete.
+- Per-slot log files append forever with no rotation (`.foundry/run-slot-N.log`).
+- UI is sound: SSE merge is idempotent, picker/confirm flow matches server
+  semantics, 409s are handled honestly. Health line only ever shows
+  "pending"/"N ago" — after R-6 lands, surface "port not answering" explicitly.
+- Sim (`runslots-sim.mjs`) is good and stays; add the attack script's cases
+  to it once fixed so the regression is permanent.
+
+### Decision
+
+**Blocked, not merged.** R-1 through R-4 are each individually enough to refuse
+"press GO tomorrow": one-shot GO (R-1) makes the feature not do its job, R-2 can
+kill an unrelated process on Kevin's box after a reboot, R-3 loses a live
+process under ordinary use, R-4 makes every link wrong for the real viewer.
+R-5/R-6/R-7 are the same design gap (pid ≠ port ownership) and should be fixed
+together as: **identity-verified process group + port-bound liveness + preflight
+port check + async stop that waits for the port.** Re-run both
+`npm run runslots:sim` and `scripts/runslots-review-attacks.mjs` (expect zero
+`[BUG]` lines) and this review flips to PASS.

@@ -124,6 +124,7 @@ import {
   dispatchTick,
   getHopperHistory,
   nextContinuationDepth,
+  findOpenContinuationOf,
   type NewNodeInput,
 } from '../hopper-engine.js';
 import { governorStatus, governorStatusAll } from '../hopper-governor.js';
@@ -1854,6 +1855,17 @@ export function createApiV1Router(): Router {
       }
       if (depth > 2) {
         sendError(res, 409, 'finishline_depth_cap', 'finish-line continuations are capped at depth 2');
+        return;
+      }
+      const existing = findOpenContinuationOf(continuationOf);
+      if (existing) {
+        sendError(
+          res,
+          409,
+          'finishline_continuation_exists',
+          `an open continuation of ${continuationOf} already exists — reuse it instead of planting another`,
+          { existing_tree_id: existing.id },
+        );
         return;
       }
     }

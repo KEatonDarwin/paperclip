@@ -373,6 +373,55 @@ await checkAsync('D-1', 'depth 1 and depth 2 continuations plant fine; depth 3 i
 });
 
 // ===========================================================================
+// SCENARIO E (review #184) — one open continuation per parent. A retried audit
+// worker (lease expired after it planted) must NOT plant a sibling duplicate;
+// the API answers 409 finishline_continuation_exists with the existing id.
+// Also: a continuation's audit spec must carry the ancestor chain's digest so
+// it judges cumulative delivery, not this tree alone (the spurious-cascade bug).
+// ===========================================================================
+await checkAsync('E-1', 'a second open continuation of the same parent is rejected with 409 finishline_continuation_exists (existing id returned)', async () => {
+  const root = await httpPost('/api/v1/hopper-trees', {
+    topic: 'sim-scenario-E: dedupe probe root',
+    original_ask: 'Dedupe probe.',
+    nodes: [{ title: 'root node' }],
+  });
+  const first = await httpPost('/api/v1/hopper-trees', {
+    topic: 'continuation: dedupe probe - first',
+    original_ask: 'Dedupe probe.',
+    continuation_of: root.tree.id,
+    nodes: [{ title: 'first cont node' }],
+  });
+  let rejected = null;
+  try {
+    await httpPost('/api/v1/hopper-trees', {
+      topic: 'continuation: dedupe probe - duplicate',
+      original_ask: 'Dedupe probe.',
+      continuation_of: root.tree.id,
+      nodes: [{ title: 'dup cont node' }],
+    });
+  } catch (err) {
+    rejected = err;
+  }
+  assert.ok(rejected, 'duplicate continuation should have been rejected');
+  assert.equal(rejected.status, 409);
+  assert.equal(rejected.body?.error?.code, 'finishline_continuation_exists');
+  assert.equal(rejected.body?.error?.existing_tree_id, first.tree.id);
+});
+
+await checkAsync('E-2', "a continuation tree's FINISH-LINE AUDIT spec includes the ancestor tree's node digest", async () => {
+  const contTrees = hopperEngine.listHopperTrees().filter((t) => t.continuation_of && t.status !== 'draft');
+  assert.ok(contTrees.length >= 1, 'expected at least one agreed continuation tree from scenario B');
+  const audits = contTrees.flatMap((t) => hopperEngine.listTreeNodes(t.id).filter((n) => n.is_finishline === 1));
+  assert.ok(audits.length >= 1, 'expected the scenario-B continuation to have received its own audit node');
+  const withAncestors = audits.filter((a) => /Ancestor trees in this continuation chain/.test(a.spec ?? ''));
+  assert.equal(withAncestors.length, audits.length, 'every continuation audit spec must carry the ancestor chain block');
+  for (const a of withAncestors) {
+    const parentId = hopperEngine.getHopperTree(a.tree_id)?.continuation_of;
+    assert.ok(parentId && a.spec.includes(`Tree ${parentId}`), `audit spec for ${a.tree_id} must name its parent tree ${parentId}`);
+  }
+});
+
+// ===========================================================================
 // Report
 // ===========================================================================
 console.log('\n=== FINISH-LINE SIM RESULTS ===');

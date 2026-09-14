@@ -72,6 +72,7 @@ const LEASE_MINUTES = Math.max(5, parseInt(process.env.HOPPER_ENGINE_LEASE_MIN ?
 const MAX_ATTEMPTS = 2;
 const FINISHLINE_TITLE = 'FINISH-LINE AUDIT';
 const FINISHLINE_DEFAULT_MODEL = 'claude-sonnet-5';
+const FINISHLINE_DEFAULT_ADAPTER = 'claude';
 const TEXT_FIELD_LIMIT = 20_000;
 // Default worker loadout when a node has no planner-assigned model. Settings-KV
 // key wins over env so it's changeable live (no restart); unset both = inherit
@@ -262,9 +263,15 @@ const claimStmt = sqliteDb.prepare<[string, string, number]>(`
 const expiredLeasesStmt = sqliteDb.prepare<[], HopperNodeRow>(`
   SELECT * FROM hopper_nodes WHERE status = 'running' AND lease_expires_at < datetime('now')
 `);
-const insertFinishLineNode = sqliteDb.prepare<[string, string, string, string | null, string]>(`
+const insertFinishLineNode = sqliteDb.prepare<[string, string, string, string | null, string, string]>(`
   INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, status, depends_on, priority, adapter, model, is_finishline)
-  VALUES (?, NULL, ?, ?, 'pending', ?, 1000, 'claude', ?, 1)
+  VALUES (?, NULL, ?, ?, 'pending', ?, 1000, ?, ?, 1)
+`);
+// Review #184: one open continuation per parent. An audit worker that planted a
+// continuation and then lost its lease is retried — without this, the retry
+// plants a second sibling continuation doing the same gap work twice.
+const openContinuationOfStmt = sqliteDb.prepare<[string], HopperTreeRow>(`
+  SELECT * FROM hopper_trees WHERE continuation_of = ? AND status IN ('draft', 'active') ORDER BY created_at ASC LIMIT 1
 `);
 
 function emitNode(action: HopperNodeEvent['action'], node: HopperNodeRow): void {
@@ -417,6 +424,28 @@ function finishLineAuditModel(): string {
   return getSetting('finishline_audit_model')?.trim() || FINISHLINE_DEFAULT_MODEL;
 }
 
+function finishLineAuditAdapter(): string {
+  return getSetting('finishline_audit_adapter')?.trim() || FINISHLINE_DEFAULT_ADAPTER;
+}
+
+/** The open (draft/active) continuation already planted for a parent tree, if any. */
+export function findOpenContinuationOf(parentTreeId: string): HopperTreeRow | null {
+  return openContinuationOfStmt.get(parentTreeId) ?? null;
+}
+
+/** Root-first chain of ancestor trees this continuation descends from (cycle-safe). */
+function continuationAncestors(tree: HopperTreeRow): HopperTreeRow[] {
+  const chain: HopperTreeRow[] = [];
+  const seen = new Set<string>([tree.id]);
+  let cursor = tree.continuation_of ? getTreeStmt.get(tree.continuation_of) ?? null : null;
+  while (cursor && !seen.has(cursor.id)) {
+    seen.add(cursor.id);
+    chain.unshift(cursor);
+    cursor = cursor.continuation_of ? getTreeStmt.get(cursor.continuation_of) ?? null : null;
+  }
+  return chain;
+}
+
 function isFinishLineNode(node: HopperNodeRow): boolean {
   return node.is_finishline === 1 || node.title.startsWith(FINISHLINE_TITLE);
 }
@@ -489,7 +518,29 @@ function composeFinishLineAuditSpec(tree: HopperTreeRow, nodes: HopperNodeRow[])
         '     ]',
         '   }',
         '3. POST /api/v1/hopper-trees/:newTreeId/agree.',
+        '4. If step 2 returns 409 finishline_continuation_exists, a previous attempt of this audit already planted the continuation — reuse the tree id from that response in your result and plant nothing else.',
       ].join('\n');
+
+  // Review #184: a continuation's audit must judge the CUMULATIVE delivery of
+  // the whole chain, not this tree alone — otherwise every real SHORTFALL
+  // cascades into spurious continuations (the depth-1 audit sees only the
+  // gap-closing node against the full original ask and re-flags the parent's
+  // finished work as missing).
+  const ancestors = continuationAncestors(tree);
+  const ancestorBlock = ancestors.length
+    ? [
+        '',
+        `Ancestor trees in this continuation chain (root first). This tree is continuation depth ${depth}; it was planted to close a shortfall, so judge the ask against EVERYTHING delivered across the chain, not this tree alone:`,
+        ...ancestors.flatMap((a) => {
+          const aNodes = listTreeNodes(a.id);
+          const aVerdict = finishLineVerdictFor(aNodes);
+          const verdictLine = aVerdict
+            ? `  prior audit verdict: ${String(aVerdict.finishline_verdict ?? '?')} — ${finishLineSummary(aVerdict)}${stringList(aVerdict.gaps).length ? ` (gaps: ${stringList(aVerdict.gaps).join('; ')})` : ''}`
+            : '  prior audit verdict: (none recorded)';
+          return [`Tree ${a.id} — ${a.topic}`, compactNodeDigest(aNodes), verdictLine];
+        }),
+      ]
+    : [];
 
   return [
     `You are the FINISH-LINE AUDIT for Hopper tree ${tree.id}.`,
@@ -502,14 +553,18 @@ function composeFinishLineAuditSpec(tree: HopperTreeRow, nodes: HopperNodeRow[])
     '',
     'Explicit deferred/narrowed scope, if any:',
     tree.deferred_scope ?? '(none recorded)',
+    ...(ancestors.length
+      ? ['(For a continuation tree, deferred_scope records the shortfall this tree was planted to close — it is NOT a new deferral. Treat it as addressed if the chain below now covers it.)']
+      : []),
     '',
-    'Settled node inventory:',
+    'Settled node inventory (this tree):',
     compactNodeDigest(nodes),
+    ...ancestorBlock,
     '',
     'Rules:',
     '- Verdict FULL only if the completed tree satisfies the original ask, or every missing piece is explicitly named in deferred_scope and that deferral is visible enough that Kevin would not wake up surprised.',
     '- Verdict SHORTFALL if meaningful requested scope remains undone, hidden, ambiguous, or only mentioned in an outbox/doc that no system will consume.',
-    '- NEVER verdict FULL when deferred_scope is non-empty and unaddressed.',
+    '- NEVER verdict FULL when deferred_scope names a deferral that is still unaddressed (a continuation\'s own shortfall note counts as addressed once the chain covers it).',
     '- If SHORTFALL and the continuation depth cap has not been reached, you must plant and agree a continuation Hopper tree through the local API before finishing this audit node.',
     '- The continuation tree must be narrow, concrete, and cover only the missing scope. Use original_ask as the source of truth and include the shortfall summary in the continuation topic/specs.',
     '- Never touch production, merge to main, send external messages, or use API keys.',
@@ -536,6 +591,7 @@ function appendFinishLineAuditNode(tree: HopperTreeRow, nodes: HopperNodeRow[]):
     FINISHLINE_TITLE,
     composeFinishLineAuditSpec(tree, nodes),
     null,
+    finishLineAuditAdapter(),
     finishLineAuditModel(),
   );
   const created = getNodeStmt.get(Number(info.lastInsertRowid)) ?? null;
@@ -543,14 +599,30 @@ function appendFinishLineAuditNode(tree: HopperTreeRow, nodes: HopperNodeRow[]):
   return created;
 }
 
+/** Parse the audit's verdict JSON; tolerates code fences / prose around the object. */
+function parseFinishLineVerdict(raw: string | null | undefined): FinishLineVerdict | null {
+  const text = raw?.trim();
+  if (!text) return null;
+  const candidates = [text];
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) candidates.push(fenced[1].trim());
+  const first = text.indexOf('{');
+  const last = text.lastIndexOf('}');
+  if (first !== -1 && last > first) candidates.push(text.slice(first, last + 1));
+  for (const c of candidates) {
+    try {
+      const parsed = JSON.parse(c) as unknown;
+      if (parsed && typeof parsed === 'object' && 'finishline_verdict' in parsed) return parsed as FinishLineVerdict;
+    } catch {
+      /* try next candidate */
+    }
+  }
+  return null;
+}
+
 function finishLineVerdictFor(nodes: HopperNodeRow[]): FinishLineVerdict | null {
   const audit = nodes.find(isFinishLineNode);
-  if (!audit?.result) return null;
-  try {
-    return JSON.parse(audit.result) as FinishLineVerdict;
-  } catch {
-    return null;
-  }
+  return parseFinishLineVerdict(audit?.result);
 }
 
 function stringList(value: unknown): string[] {

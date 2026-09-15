@@ -195,3 +195,123 @@ dry-run with `JARVIS_DB_PATH` pointed at a copy, as done here.
 Repro artifacts: `/tmp/handoff-probe.mjs` (route + FULL-without-handoff probes),
 `/tmp/handoff-pw.mjs` (Playwright drawer/XSS/nav), `/tmp/handoff-drawer.png`,
 `/tmp/handoff-after-close.png`, `/tmp/handoff-backfill-scratch.db` (post-apply).
+
+## 2026-09-14 — Smart Unblocker adversarial review (node #223, tree-e8e8750a) — BLOCKED
+
+Branch `hopper/smart-unblocker` @ `c7054d74f`, reviewed against `docs/hopper/UNBLOCKER.md`
+and Kevin's ask ("do it only when we have the power to do so"). The shipped
+`npm run unblocker:sim` is 6/6 green, but it only exercises the happy shapes.
+Adversarial probes (`darwin-assistant/scripts/unblocker-adversarial-sim.mjs`,
+run with `JARVIS_DB_PATH=/tmp/unblocker-adv.db node scripts/unblocker-adversarial-sim.mjs`
+after `npm run build`) reproduce **5 findings, 5/10 probes fail**. Verdict: BLOCKED —
+findings 1–3 must be fixed before deploy; 4–5 should ride along.
+
+1. **UNBOUNDED RECURSION (HIGH — the exact failure the ask forbids).** The
+   one-pass fuse is `UNIQUE(node_id)`, but every FIX node planted by
+   `appendHopperRemediationNodes` is a *new* node id with no marker. When a
+   FIX node finishes `blocked`, `maybeTriggerSmartUnblocker(fixId)` sees no
+   pass, the juice gate is open, and it spawns another Opus unblocker — which
+   plants FIX-of-FIX nodes, which can block, and so on. Probe R1: original
+   blocks → 5 successive FIX-blocks → **6 high-tier unblocker spawns, 6 pass
+   rows, tree grows a nested FIX chain**. The only thing that stops it is the
+   5h window filling up, i.e. the cascade burns Kevin's high-thought window
+   until the juice gate closes — the opposite of "only when we have the
+   power". No depth guard exists anywhere.
+   **Fix:** persist provenance on planted nodes (add
+   `remediation_of INTEGER` to `hopper_nodes`, set it in
+   `appendHopperRemediationNodes`; don't rely on the `FIX:` title). In
+   `maybeTriggerSmartUnblocker`, if `node.remediation_of` is set, do NOT
+   spawn: mark the *root* node's pass `needs_kevin`, fire the needs-Kevin
+   bell (body = FIX node result), leave the FIX node blocked. Walk
+   `remediation_of` to the root so FIX-of-FIX (if a manual remediation ever
+   nests) still resolves to the single original pass. Add R1 as a permanent
+   sim check (`spawns === 1` after any number of FIX-blocks).
+
+2. **FIX-LEAF MODEL DENYLIST MISSES THE REAL FABLE 5.1 ID (MEDIUM-HIGH).**
+   `FORBIDDEN_FIX_MODELS` / the route's `forbiddenModels` are
+   `{'claude-fable-5','fable-5.1','gpt-6-astra'}`. The claude adapter's id
+   for Fable 5.1 is **`claude-fable-5-1`** (`src/agent.ts:239`), which is
+   accepted. Probe R2: `POST /remediate` with `model:'claude-fable-5-1'` →
+   planted (fix node 8, model=claude-fable-5-1). Kevin's ask explicitly
+   excluded Fable 5.1 and the router rubric says frontier variants of ANY
+   pool are never leaf work; a denylist of three strings cannot honor "a
+   newly appeared frontier model" either. **Fix:** invert to an allowlist
+   for FIX leaves — per-pool Standard/Heavy tiers from
+   `skills/jarvis-router/SKILL.md` (`claude-haiku-4-5-20251001`,
+   `claude-sonnet-5`, `claude-opus-5`, codex `gpt-5.5`, auggie `opus4.8`/
+   `sonnet4.6`-class), reject everything else with `invalid_fix_model`; at
+   minimum add `claude-fable-5-1` and the `UNBLOCKER_MODEL_ALLOWLIST`'s
+   own frontier entries. Keep the check in the engine helper (not just the
+   route) so internal callers can't bypass it.
+
+3. **NO CONCURRENCY CAP — N BLOCKS = N PARALLEL OPUS WORKERS (MEDIUM).**
+   The unblocker is spawned directly from `finishHopperNode`, bypassing
+   `dispatchTick`'s slot/governor loop, so it neither consumes a hopper slot
+   nor counts against any concurrency limit. Probe R3: five leaves block in
+   the same tick (the realistic "missing toolchain" shape under the
+   Foundation Gate anti-shim rule, where every module of a project blocks
+   on the same thing) → **5 Opus unblockers spawned simultaneously**, each
+   planting its own FIX chain for the same root cause. **Fix:** a settings-KV
+   `unblocker_max_concurrent` (default 1) checked against
+   `hopper_unblock_passes WHERE status='running'`; over the cap → write the
+   pass as `waiting_for_juice` (see #5) instead of spawning. Optionally
+   dedupe per tree: if a tree already has a running pass, hold siblings
+   until it settles.
+
+4. **A TRANSIENT SPAWN FAILURE BURNS THE FUSE PERMANENTLY (MEDIUM).**
+   `spawnSmartUnblockerWorker` catches the `processMessage` throw (adapter
+   busy / CLI error) and calls `markUnblockPassFailedStmt` — status
+   `failed` with `worker_ext` set, which `maybeTriggerSmartUnblocker` treats
+   as "pass used". Probe R4: one thrown spawn → pass `failed`, node stays
+   `blocked`, nothing ever retries; the next block on that node goes to
+   `needs_kevin`. Contract: "Do not mark the one-pass fuse as used unless
+   the worker was actually claimed" — a worker that never ran was not a
+   pass. **Fix:** on spawn throw, reset the row to `waiting_for_juice` with
+   `worker_ext=NULL` (keep `result` = the error for visibility) so the
+   sweep (#5) can retry; only burn the fuse once `processMessage` has
+   actually started the turn. Compare `spawnWorker`, which releases the
+   claim on spawn failure for ordinary nodes.
+
+5. **JUICE-CLOSED BLOCKS ARE NEVER REVISITED — `waiting_for_juice` IS DEAD
+   CODE (MEDIUM, functional gap).** When the gate fails,
+   `maybeTriggerSmartUnblocker` only logs and returns: no marker row is
+   written, and nothing sweeps. `claimWaitingUnblockPassStmt` can never
+   match because no code path ever inserts `status='waiting_for_juice'`.
+   Probe R5: block at 5h=80% → 0 markers; drop to 10% and run two
+   `dispatchTick`s → 0 spawns. The contract makes the sweep a "may", but
+   without it the feature silently no-ops for every node that blocks while
+   the 5h window is ≥60% — which is most of an active build night. Kevin's
+   framing was "when we have the power to do so", not "only if we happened
+   to have it at the instant of the block". **Fix:** on gate-fail insert
+   (or upsert) the pass as `waiting_for_juice` with the gate reason in
+   `result`; add a sweep in `dispatchTick` (it already runs every 60s and on
+   every finish) that re-evaluates `waiting_for_juice` rows whose node is
+   still `blocked` and claims them via the existing
+   `claimWaitingUnblockPassStmt` — that stmt is the right shape, it just
+   has no producer.
+
+Passed probes (no change needed): stale usage file holds (R6); `unblocker_model`
+= sonnet / gpt-6-astra falls back to `claude-opus-5` (R7a, sim 4); `opus4.8`
+with Auggie ≥ ceiling falls back to claude/opus-5 (R7b); re-pended original
+blocking again → `needs_kevin` + one bell, no second spawn (R8, sim 2);
+`blocked_question` never triggers and the remediate helper refuses
+`blocked_question` nodes (R9, sim 5); exact-threshold hold (sim 3).
+Foundry coexistence checked by reading: foundry's `handleFoundrySse` is a
+synchronous `sseBus` listener, so its Contract-Resolution retry runs inside
+`setNode()` *before* `maybeTriggerSmartUnblocker` reads the row — the node
+is already `pending` and the unblocker correctly declines; when foundry's
+own retry is exhausted (`foundry_auto_retries>0`) the unblocker takes over,
+matching the contract's ordering.
+
+Not scored, noted: (a) the worker playbook's "never restart / never deploy"
+rails are prompt-only — the unblocker thread is a full JARVIS persona with
+`cockpit_deploy`, `intake_deploy`, `shim_deploy_*` mounted; same posture as
+every hopper worker today, but a high-tier worker told to "unstick" things is
+the one most likely to reach for a restart. Worth a server-side denylist of
+those tools for `cockpit:unblocker-*` / `cockpit:hopper-node-*` threads as a
+follow-up. (b) The finish-line "FULL without handoff" auto-block also fires the
+unblocker; that block is a handoff-card-missing condition, remediable, so
+acceptable. (c) `gov_override_*` (branch `hopper/gov-overrides`) is not on
+this branch; when merged, `override=on` bypasses ceilings but
+`unblockerGate` still reads `five_hour` independently, so the 60% cap holds —
+re-run this sim after that merge.

@@ -459,21 +459,60 @@ function handoffTextHash(text: string): string {
   return createHash('sha256').update(text.trim().replace(/\s+/g, ' ')).digest('hex').slice(0, 16);
 }
 
+interface MarkdownHeading {
+  text: string;
+  offset: number;
+  lineStart: number;
+  lineEnd: number;
+}
+
+function markdownHeadingsOutsideFences(markdown: string): MarkdownHeading[] {
+  const headings: MarkdownHeading[] = [];
+  let inFence = false;
+  let offset = 0;
+  const lines = markdown.match(/[^\r\n]*(?:\r?\n|$)/g) ?? [];
+  for (const segment of lines) {
+    if (!segment) continue;
+    const line = segment.replace(/\r?\n$/, '');
+    const lineLength = line.length;
+    if (/^\s*(```|~~~)/.test(line)) {
+      inFence = !inFence;
+    } else if (!inFence) {
+      const match = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+      if (match) {
+        headings.push({
+          text: `${match[1]} ${match[2].trim()}`,
+          offset,
+          lineStart: offset,
+          lineEnd: offset + lineLength,
+        });
+      }
+    }
+    offset += segment.length;
+  }
+  return headings;
+}
+
 function handoffSectionBody(handoff: string, heading: string): string | null {
-  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const match = handoff.match(new RegExp(`^${escaped}\\s*$`, 'm'));
-  if (!match || match.index == null) return null;
-  const start = match.index + match[0].length;
-  const rest = handoff.slice(start);
-  const next = rest.search(/^##\s+/m);
-  return (next === -1 ? rest : rest.slice(0, next)).trim();
+  const headings = markdownHeadingsOutsideFences(handoff);
+  const currentIndex = headings.findIndex((h) => h.text === heading);
+  if (currentIndex === -1) return null;
+  const current = headings[currentIndex];
+  const next = headings.find((h, idx) => idx > currentIndex && h.text.startsWith('## '));
+  return handoff.slice(current.lineEnd, next?.lineStart).trim();
 }
 
 function parseHumanRunthroughItems(handoff: string): HandoffChecklistItem[] {
   const body = handoffSectionBody(handoff, '## Human runthrough');
   if (!body) return [];
   const items: HandoffChecklistItem[] = [];
+  let inFence = false;
   for (const line of body.split(/\r?\n/)) {
+    if (/^\s*(```|~~~)/.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
     const match = line.match(/^\s*[-*]\s+\[[ xX]\]\s+(.+?)\s*$/);
     if (!match) continue;
     const text = match[1].trim();
@@ -582,10 +621,10 @@ export function validateHopperTreeHandoff(value: unknown): HandoffValidation {
     return { ok: false, message: 'handoff is required and must be a non-empty markdown string' };
   }
 
+  const headings = markdownHeadingsOutsideFences(handoff);
   let cursor = -1;
   for (const heading of REQUIRED_HANDOFF_HEADINGS) {
-    const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const idx = handoff.search(new RegExp(`^${escaped}\\s*$`, 'm'));
+    const idx = headings.find((h) => h.text === heading)?.offset ?? -1;
     if (idx === -1) return { ok: false, message: `handoff is missing required section: ${heading}` };
     if (idx < cursor) return { ok: false, message: `handoff sections must appear in the required order: ${heading}` };
     cursor = idx;

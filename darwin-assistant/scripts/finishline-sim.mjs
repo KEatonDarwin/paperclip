@@ -385,6 +385,38 @@ await checkAsync('H-4d', 'handoff route requires line-anchored required headings
   );
 });
 
+await checkAsync('H-4e', 'handoff route ignores required headings inside fenced code blocks', async () => {
+  await expectHttpError(400, 'invalid_handoff', () =>
+    httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, {
+      handoff: [
+        '# fake handoff',
+        '',
+        '```md',
+        '## What was built',
+        '## Branches & how to install',
+        '## How to use it',
+        '## Human runthrough',
+        '## Next steps / deferred',
+        '## Full report',
+        '```',
+        '',
+        '- [ ] This is also inside the wrong section.',
+      ].join('\n'),
+    }),
+  );
+});
+
+await checkAsync('H-4f', 'handoff route ignores Human runthrough task items inside fenced code blocks', async () => {
+  await expectHttpError(400, 'invalid_handoff', () =>
+    httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, {
+      handoff: buildSimHandoff(handoffTree.id, handoffTree.topic).replace(
+        '- [ ] Open the finished tree detail, expect this handoff card to be visible.\n- [ ] Try the scratch success path, expect the simulated deliverable to be marked complete.\n- [ ] Check the scratch missing-handoff failure path, expect the FULL verdict to be rejected.',
+        '```md\n- [ ] Fenced task examples must not count.\n```',
+      ),
+    }),
+  );
+});
+
 await checkAsync('H-5', 'handoff route accepts a valid card and GET detail returns it', async () => {
   const handoff = buildSimHandoff(handoffTree.id, handoffTree.topic);
   const posted = await httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, { handoff });

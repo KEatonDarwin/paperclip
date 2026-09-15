@@ -121,6 +121,7 @@ import {
   finishHopperNode,
   answerHopperNode,
   retryHopperNode,
+  appendHopperRemediationNodes,
   dispatchTick,
   getHopperHistory,
   nextContinuationDepth,
@@ -128,6 +129,7 @@ import {
   setHopperTreeHandoff,
   validateHopperTreeHandoff,
   FINISHLINE_FULL_MISSING_HANDOFF_RESULT,
+  type AppendHopperNodeInput,
   type NewNodeInput,
 } from '../hopper-engine.js';
 import { governorStatus, governorStatusAll } from '../hopper-governor.js';
@@ -2114,6 +2116,61 @@ export function createApiV1Router(): Router {
       return;
     }
     res.json({ node: retryHopperNode(id) });
+  });
+
+  // Smart Unblocker helper: append flat FIX nodes to this tree and re-pend the
+  // original blocked node behind the final FIX. This is the safe lever the
+  // high-tier unblocker worker uses instead of writing SQLite by hand.
+  router.post('/hopper-nodes/:id/remediate', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const node = getHopperNode(id);
+    if (!node) {
+      sendError(res, 404, 'hopper_node_not_found', 'hopper node not found');
+      return;
+    }
+    if (node.status !== 'blocked') {
+      sendError(res, 409, 'hopper_node_not_blocked', `node is ${node.status}, not blocked`);
+      return;
+    }
+    const body = (req.body ?? {}) as { nodes?: unknown; fix_nodes?: unknown };
+    const rawNodes = Array.isArray(body.nodes) ? body.nodes : Array.isArray(body.fix_nodes) ? body.fix_nodes : null;
+    if (!rawNodes?.length) {
+      sendError(res, 400, 'invalid_request', 'nodes must be a non-empty array');
+      return;
+    }
+
+    const forbiddenModels = new Set(['claude-fable-5', 'fable-5.1', 'gpt-6-astra']);
+    const fixes: AppendHopperNodeInput[] = [];
+    for (const raw of rawNodes.slice(0, 12)) {
+      const item = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+      const title = typeof item.title === 'string' ? item.title.trim() : '';
+      const spec = typeof item.spec === 'string' ? item.spec.trim() : '';
+      const adapter = typeof item.adapter === 'string' ? item.adapter.trim() : '';
+      const model = typeof item.model === 'string' ? item.model.trim() : '';
+      const dependsOn = Array.isArray(item.depends_on)
+        ? item.depends_on.filter((v): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0)
+        : undefined;
+      if (!title || !spec || !adapter || !model) {
+        sendError(res, 400, 'invalid_request', 'each FIX node needs title, spec, adapter, and model');
+        return;
+      }
+      if (forbiddenModels.has(model)) {
+        sendError(res, 400, 'invalid_fix_model', `${model} is not allowed for FIX leaf nodes`);
+        return;
+      }
+      fixes.push({ title, spec, adapter, model, depends_on: dependsOn });
+    }
+
+    try {
+      const result = appendHopperRemediationNodes(id, fixes);
+      if (!result) {
+        sendError(res, 409, 'hopper_remediation_not_applied', 'node could not be remediated in its current state');
+        return;
+      }
+      res.status(201).json(result);
+    } catch (err) {
+      sendError(res, 400, 'hopper_remediation_failed', err instanceof Error ? err.message : String(err));
+    }
   });
 
   router.post('/hopper-trees/:id/archive', (req: AuthedRequest, res) => {

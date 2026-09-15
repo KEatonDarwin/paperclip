@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import './spawn-tasks.js'; // side-effect: guarantees the spawn_tasks DDL ran before we prepare against it
 import { sqliteDb, getOrCreateConversation, renameConversation, setThreadModelOverride, getSetting } from './conversation-db.js';
 import { sseBus, type HopperNodeEvent } from './sse-bus.js';
@@ -75,6 +78,7 @@ const FINISHLINE_TITLE = 'FINISH-LINE AUDIT';
 const FINISHLINE_DEFAULT_MODEL = 'claude-sonnet-5';
 const FINISHLINE_DEFAULT_ADAPTER = 'claude';
 const TEXT_FIELD_LIMIT = 20_000;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Default worker loadout when a node has no planner-assigned model. Settings-KV
 // key wins over env so it's changeable live (no restart); unset both = inherit
 // the global model — which is exactly the "workers on Fable" trap, so keep one.
@@ -123,6 +127,51 @@ const CROSS_PROVIDER_RETRY_LADDER: Partial<Record<GovernorProvider, WorkerLoadou
   ],
   devin: [CLAUDE_FALLBACK],
 };
+
+export const UNBLOCKER_MODEL_ALLOWLIST = [
+  'claude-opus-5',
+  'claude-fable-5',
+  'opus4.8',
+] as const;
+const UNBLOCKER_DEFAULT_MODEL = 'claude-opus-5';
+type UnblockerModel = (typeof UNBLOCKER_MODEL_ALLOWLIST)[number];
+
+interface UnblockerLoadout extends WorkerLoadout {
+  adapter: 'claude' | 'auggie';
+  model: UnblockerModel;
+  configuredModel: UnblockerModel;
+}
+
+interface HopperUnblockPassRow {
+  id: number;
+  node_id: number;
+  tree_id: string;
+  worker_ext: string | null;
+  worker_thread_ext: string | null;
+  adapter: string;
+  model: string;
+  status: 'waiting_for_juice' | 'running' | 'done' | 'needs_kevin' | 'failed';
+  blocked_result: string | null;
+  result: string | null;
+  nudge_id: string | null;
+  spawned_at: string;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+}
+
+export interface AppendHopperNodeInput {
+  title: string;
+  spec: string;
+  depends_on?: number[];
+  adapter: string;
+  model: string;
+}
+
+export interface HopperRemediationResult {
+  blocked_node: HopperNodeRow;
+  fix_nodes: HopperNodeRow[];
+}
 
 function loadoutLabel(loadout: WorkerLoadout): string {
   return `${loadout.adapter ?? WORKER_ADAPTER}/${loadout.model ?? defaultWorkerModel() ?? 'default'}`;
@@ -195,6 +244,51 @@ for (const col of ['original_ask TEXT', 'deferred_scope TEXT', 'continuation_of 
 for (const col of ['adapter TEXT', 'model TEXT', 'foundry_auto_retries INTEGER NOT NULL DEFAULT 0', 'is_finishline INTEGER NOT NULL DEFAULT 0']) {
   try {
     sqliteDb.exec(`ALTER TABLE hopper_nodes ADD COLUMN ${col}`);
+  } catch {
+    /* column already exists */
+  }
+}
+
+sqliteDb.exec(`
+  CREATE TABLE IF NOT EXISTS hopper_unblock_passes (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id           INTEGER NOT NULL UNIQUE,
+    tree_id           TEXT NOT NULL,
+    worker_ext        TEXT,
+    worker_thread_ext TEXT,
+    adapter           TEXT NOT NULL,
+    model             TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'running'
+                      CHECK (status IN ('waiting_for_juice','running','done','needs_kevin','failed')),
+    blocked_result    TEXT,
+    result            TEXT,
+    nudge_id          TEXT,
+    spawned_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at       TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_hopper_unblock_passes_tree ON hopper_unblock_passes(tree_id);
+`);
+
+for (const col of [
+  'tree_id TEXT',
+  'worker_ext TEXT',
+  'worker_thread_ext TEXT',
+  'adapter TEXT',
+  'model TEXT',
+  'status TEXT',
+  'blocked_result TEXT',
+  'result TEXT',
+  'nudge_id TEXT',
+  'spawned_at TEXT',
+  'created_at TEXT',
+  'updated_at TEXT',
+  'finished_at TEXT',
+]) {
+  try {
+    sqliteDb.exec(`ALTER TABLE hopper_unblock_passes ADD COLUMN ${col}`);
   } catch {
     /* column already exists */
   }
@@ -276,6 +370,34 @@ const insertFinishLineNode = sqliteDb.prepare<[string, string, string, string | 
 // plants a second sibling continuation doing the same gap work twice.
 const openContinuationOfStmt = sqliteDb.prepare<[string], HopperTreeRow>(`
   SELECT * FROM hopper_trees WHERE continuation_of = ? AND status IN ('draft', 'active') ORDER BY created_at ASC LIMIT 1
+`);
+const getUnblockPassStmt = sqliteDb.prepare<[number], HopperUnblockPassRow>(
+  `SELECT * FROM hopper_unblock_passes WHERE node_id = ?`,
+);
+const insertUnblockPassStmt = sqliteDb.prepare<[number, string, string, string, string, string, string | null]>(`
+  INSERT INTO hopper_unblock_passes (node_id, tree_id, worker_ext, worker_thread_ext, adapter, model, status, blocked_result)
+  VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
+`);
+const claimWaitingUnblockPassStmt = sqliteDb.prepare<[string, string, string, string, string | null, number]>(`
+  UPDATE hopper_unblock_passes
+  SET worker_ext = ?, worker_thread_ext = ?, adapter = ?, model = ?, status = 'running',
+      blocked_result = COALESCE(?, blocked_result),
+      spawned_at = COALESCE(spawned_at, datetime('now')),
+      updated_at = datetime('now')
+  WHERE node_id = ? AND worker_ext IS NULL AND status = 'waiting_for_juice'
+`);
+const markUnblockPassNeedsKevinStmt = sqliteDb.prepare<[string | null, number]>(`
+  UPDATE hopper_unblock_passes
+  SET status = 'needs_kevin', result = COALESCE(?, result), updated_at = datetime('now')
+  WHERE node_id = ?
+`);
+const setUnblockPassNudgeStmt = sqliteDb.prepare<[string, number]>(`
+  UPDATE hopper_unblock_passes SET nudge_id = ?, updated_at = datetime('now') WHERE node_id = ?
+`);
+const markUnblockPassFailedStmt = sqliteDb.prepare<[string, number]>(`
+  UPDATE hopper_unblock_passes
+  SET status = 'failed', result = ?, updated_at = datetime('now'), finished_at = datetime('now')
+  WHERE node_id = ?
 `);
 
 function emitNode(action: HopperNodeEvent['action'], node: HopperNodeRow): void {
@@ -540,6 +662,358 @@ function compactNodeDigest(nodes: HopperNodeRow[]): string {
       return `- #${n.id} ${n.title} [${n.status}, ${loadout}]: ${resultExcerpt(n.result).replace(/\n+/g, ' ')}`;
     })
     .join('\n') || '- (no non-audit nodes recorded)';
+}
+
+function intSetting(key: string, fallback: number): number {
+  const raw = getSetting(key)?.trim();
+  const n = raw != null ? parseInt(raw, 10) : NaN;
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function smartUnblockerEnabled(): boolean {
+  return getSetting('unblocker_enabled')?.trim().toLowerCase() !== 'off';
+}
+
+function smartUnblockerMax5h(): number {
+  return intSetting('unblocker_max_5h', 60);
+}
+
+function normalizeUnblockerModel(): UnblockerModel {
+  const raw = getSetting('unblocker_model')?.trim();
+  return UNBLOCKER_MODEL_ALLOWLIST.includes(raw as UnblockerModel)
+    ? (raw as UnblockerModel)
+    : UNBLOCKER_DEFAULT_MODEL;
+}
+
+function resolveUnblockerLoadout(): UnblockerLoadout {
+  const configuredModel = normalizeUnblockerModel();
+  if (configuredModel === 'opus4.8') {
+    const auggie = governorStatus('auggie');
+    if (auggie.allow) {
+      return { adapter: 'auggie', model: 'opus4.8', configuredModel };
+    }
+    return { adapter: 'claude', model: UNBLOCKER_DEFAULT_MODEL, configuredModel };
+  }
+  return { adapter: 'claude', model: configuredModel, configuredModel };
+}
+
+function unblockerGate(): { ok: true; loadout: UnblockerLoadout } | { ok: false; reason: string } {
+  if (!smartUnblockerEnabled()) return { ok: false, reason: 'unblocker_enabled=off' };
+  if (!processMessageRef) return { ok: false, reason: 'hopper engine has no processMessage hook yet' };
+
+  const claude = governorStatus('claude');
+  if (!claude.allow) return { ok: false, reason: `claude governor held: ${claude.reason} (${claude.detail})` };
+
+  const max5h = smartUnblockerMax5h();
+  if (typeof claude.five_hour !== 'number' || !Number.isFinite(claude.five_hour)) {
+    return { ok: false, reason: 'claude 5h usage is unknown' };
+  }
+  if (claude.five_hour >= max5h) {
+    return { ok: false, reason: `claude 5h ${claude.five_hour}% >= unblocker_max_5h ${max5h}%` };
+  }
+
+  const loadout = resolveUnblockerLoadout();
+  const selected = governorStatus(loadout.adapter);
+  if (!selected.allow) {
+    return { ok: false, reason: `${loadout.adapter} governor held: ${selected.reason} (${selected.detail})` };
+  }
+  return { ok: true, loadout };
+}
+
+function interpolateUnblockerPlaybook(node: HopperNodeRow, tree: HopperTreeRow): string {
+  const fallback = [
+    `You are a Smart Unblocker worker for Hopper node ${node.id} in tree ${tree.id}.`,
+    'Your job is to unstick ONE red-blocked node, then stop.',
+    '',
+    'If the fix is inside JARVIS\'s standing autonomy bar, insert the smallest useful FIX node or nodes into the SAME tree, keep FIX nodes flat with depends_on only, re-pend the original blocked node behind the new FIX node ids, and finish with a concise remediation summary.',
+    'If the fix genuinely requires Kevin, do not plant speculative work; finish with the exact decision needed.',
+  ].join('\n');
+  try {
+    const contractPath = path.resolve(__dirname, '..', '..', 'docs', 'hopper', 'UNBLOCKER.md');
+    const raw = readFileSync(contractPath, 'utf8');
+    const fenceStart = '```md\nYou are a Smart Unblocker worker';
+    const start = raw.indexOf(fenceStart);
+    if (start === -1) return fallback;
+    const bodyStart = raw.indexOf('\n', start);
+    const end = raw.indexOf('\n```', bodyStart + 1);
+    if (bodyStart === -1 || end === -1) return fallback;
+    return raw
+      .slice(bodyStart + 1, end)
+      .replaceAll('<node_id>', String(node.id))
+      .replaceAll('<tree_id>', tree.id);
+  } catch {
+    return fallback;
+  }
+}
+
+function compactTreeRows(treeId: string): string {
+  return listTreeNodes(treeId)
+    .map((n) => `- #${n.id} ${n.title} [${n.status}] deps=${n.depends_on ?? '[]'} worker=${n.worker_thread_ext ?? '(none)'}`)
+    .join('\n');
+}
+
+function composeSmartUnblockerPrompt(
+  node: HopperNodeRow,
+  tree: HopperTreeRow,
+  loadout: UnblockerLoadout,
+  workerExt: string,
+): string {
+  const playbook = interpolateUnblockerPlaybook(node, tree);
+  return [
+    'You are a SPAWNED SMART-UNBLOCKER WORKER — an ephemeral high-thought JARVIS instance born to unstick ONE red-blocked Hopper node and stop. Nobody will reply to this thread.',
+    '',
+    '**Guardrails (hard):** no touching live production systems/databases, no merging to main, no external sends (Slack/email/PRs) under Kevin\'s identity, no new spend, and NO API KEYS for model calls — subscription CLI binaries only. Never restart `jarvis.service`.',
+    '',
+    `**Unblocker thread:** ${workerExt}`,
+    `**Selected loadout:** ${loadout.adapter}/${loadout.model}${loadout.configuredModel !== loadout.model ? ` (configured ${loadout.configuredModel} fell back)` : ''}`,
+    '',
+    '**Contract Playbook (from docs/hopper/UNBLOCKER.md, ids interpolated):**',
+    playbook,
+    '',
+    '**Current blocked node snapshot:**',
+    '```json',
+    JSON.stringify(node, null, 2),
+    '```',
+    '',
+    '**Tree context snapshot:**',
+    `Tree ${tree.id}: ${tree.topic}`,
+    `Origin thread: ${tree.origin_thread_ext ?? '(none recorded)'}`,
+    compactTreeRows(tree.id),
+    '',
+    '**Safe remediation API available to you:**',
+    `POST /api/v1/hopper-nodes/${node.id}/remediate`,
+    'Body:',
+    '```json',
+    JSON.stringify({
+      nodes: [
+        {
+          title: 'FIX: <short remediation task>',
+          spec: '<self-contained fix spec with done-checks>',
+          adapter: 'claude',
+          model: 'claude-sonnet-5',
+        },
+      ],
+    }, null, 2),
+    '```',
+    'This helper inserts flat FIX nodes, extends this blocked node behind the final FIX node, appends the prior blocked result to the spec, and clears runtime fields. Use it instead of writing SQLite by hand.',
+    '',
+    'When you are done, reply in this thread with only the concise summary of what you planted or the single Kevin decision needed. The spawn-task reconciler tracks this one-shot thread.',
+  ].join('\n');
+}
+
+const spawnUnblockerTaskInsert = sqliteDb.prepare<
+  [string, number, string | null, string, string, string, string, number]
+>(`
+  INSERT OR IGNORE INTO spawn_tasks
+    (thread_ext, conversation_id, parent_thread_ext, label, task_prompt, model, status, hopper_tree_id, hopper_node_id)
+  VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)
+`);
+
+async function spawnSmartUnblockerWorker(
+  node: HopperNodeRow,
+  tree: HopperTreeRow,
+  loadout: UnblockerLoadout,
+  workerExt: string,
+): Promise<void> {
+  if (!processMessageRef) return;
+  const conv = getOrCreateConversation(workerExt);
+  renameConversation(conv.id, `unblocker #${node.id}: ${node.title.slice(0, 80)}`);
+  setThreadModelOverride(conv.id, loadout.adapter, loadout.model);
+  const prompt = composeSmartUnblockerPrompt(node, tree, loadout, workerExt);
+  spawnUnblockerTaskInsert.run(
+    workerExt,
+    conv.id,
+    tree.origin_thread_ext,
+    `unblocker #${node.id}: ${node.title.slice(0, 80)}`,
+    prompt.slice(0, 2000),
+    loadout.model,
+    tree.id,
+    node.id,
+  );
+  try {
+    await processMessageRef(prompt, workerExt, `turn:${conv.id}:0`);
+  } catch (err) {
+    const detail = err instanceof Error ? err.stack ?? err.message : String(err);
+    console.error(`[hopper-unblocker] spawn failed for node ${node.id}:`, err);
+    markUnblockPassFailedStmt.run(detail.slice(0, 4000), node.id);
+    createNotification({
+      severity: 'error',
+      title: `Hopper unblocker failed to start: ${node.title.slice(0, 100)}`,
+      body: `${detail.slice(0, 1200)}\nNode ${node.id}, tree ${node.tree_id}.`,
+      source: 'hopper-unblocker',
+      link: `/spawn-tree?tree=${encodeURIComponent(tree.id)}&node=${node.id}`,
+    });
+  }
+}
+
+function notifyUnblockerNeedsKevin(node: HopperNodeRow, tree: HopperTreeRow, body: string): void {
+  const notification = createNotification({
+    severity: 'error',
+    source: 'hopper-unblocker',
+    title: `Hopper node still needs Kevin: ${node.title.slice(0, 100)}`,
+    body,
+    link: `/spawn-tree?tree=${encodeURIComponent(tree.id)}&node=${node.id}`,
+  });
+  setUnblockPassNudgeStmt.run(String(notification.id), node.id);
+}
+
+function maybeTriggerSmartUnblocker(nodeId: number): void {
+  const node = getNodeStmt.get(nodeId);
+  if (!node || node.status !== 'blocked') return;
+  const tree = getHopperTree(node.tree_id);
+  if (!tree || tree.status === 'draft' || tree.status === 'archived') return;
+
+  const existing = getUnblockPassStmt.get(node.id) ?? null;
+  if (existing?.worker_ext || existing?.worker_thread_ext) {
+    const body = [
+      `${node.result ?? 'The node blocked again after a Smart Unblocker pass was already claimed.'}`,
+      '',
+      `Smart Unblocker already used its one pass for node ${node.id} (${existing.worker_ext ?? existing.worker_thread_ext}). Kevin needs to decide the next move.`,
+    ].join('\n');
+    markUnblockPassNeedsKevinStmt.run(body, node.id);
+    notifyUnblockerNeedsKevin(node, tree, body);
+    return;
+  }
+
+  const gate = unblockerGate();
+  if (!gate.ok) {
+    console.log(`[hopper-unblocker] hold node ${node.id}: ${gate.reason}`);
+    return;
+  }
+
+  const workerExt = `cockpit:unblocker-${node.id}-${randomUUID().slice(0, 8)}`;
+  if (existing?.status === 'waiting_for_juice') {
+    const claimed = claimWaitingUnblockPassStmt.run(
+      workerExt,
+      workerExt,
+      gate.loadout.adapter,
+      gate.loadout.model,
+      node.result ?? null,
+      node.id,
+    );
+    if (claimed.changes !== 1) return;
+  } else {
+    try {
+      insertUnblockPassStmt.run(
+        node.id,
+        tree.id,
+        workerExt,
+        workerExt,
+        gate.loadout.adapter,
+        gate.loadout.model,
+        node.result ?? null,
+      );
+    } catch {
+      const refreshed = getUnblockPassStmt.get(node.id);
+      if (refreshed?.worker_ext || refreshed?.worker_thread_ext) {
+        maybeTriggerSmartUnblocker(node.id);
+      } else {
+        console.warn(`[hopper-unblocker] could not claim pass for node ${node.id}; marker exists without a worker`);
+      }
+      return;
+    }
+  }
+
+  console.log(`[hopper-unblocker] spawn node ${node.id} → ${workerExt} (${gate.loadout.adapter}/${gate.loadout.model})`);
+  void spawnSmartUnblockerWorker(node, tree, gate.loadout, workerExt);
+}
+
+function parseDependencyIds(value: string | null): number[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((v): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function uniqueIds(ids: number[]): number[] {
+  return [...new Set(ids.filter((v) => Number.isInteger(v) && v > 0))];
+}
+
+function normalizeFixTitle(title: string): string {
+  const trimmed = title.trim();
+  return /^FIX:/i.test(trimmed) ? trimmed.slice(0, 300) : `FIX: ${trimmed}`.slice(0, 300);
+}
+
+const FORBIDDEN_FIX_MODELS = new Set(['claude-fable-5', 'fable-5.1', 'gpt-6-astra']);
+
+export function appendHopperRemediationNodes(
+  blockedNodeId: number,
+  inputs: AppendHopperNodeInput[],
+): HopperRemediationResult | null {
+  const blocked = getNodeStmt.get(blockedNodeId);
+  if (!blocked || blocked.status !== 'blocked' || !inputs.length) return null;
+  const tree = getHopperTree(blocked.tree_id);
+  if (!tree || tree.status !== 'active') return null;
+  if (inputs.some((n) => FORBIDDEN_FIX_MODELS.has(n.model))) {
+    throw new Error('FIX leaf nodes may not use frontier unblocker models');
+  }
+
+  const priorResult = blocked.result ?? '(no blocked result recorded)';
+  const originalDeps = parseDependencyIds(blocked.depends_on);
+  const createdIds = sqliteDb.transaction(() => {
+    const insert = sqliteDb.prepare<[string, string, string, string | null, string, string]>(`
+      INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, status, depends_on, adapter, model)
+      VALUES (?, NULL, ?, ?, 'pending', ?, ?, ?)
+    `);
+    const ids: number[] = [];
+    inputs.slice(0, 12).forEach((input, index) => {
+      const defaultDeps = index === 0 ? originalDeps : [ids[index - 1]];
+      const deps = uniqueIds(input.depends_on?.length ? input.depends_on : defaultDeps);
+      const info = insert.run(
+        blocked.tree_id,
+        normalizeFixTitle(input.title),
+        input.spec.trim(),
+        deps.length ? JSON.stringify(deps) : null,
+        input.adapter.trim(),
+        input.model.trim(),
+      );
+      ids.push(Number(info.lastInsertRowid));
+    });
+
+    const finalFixId = ids[ids.length - 1];
+    const nextDeps = uniqueIds([...originalDeps, finalFixId]);
+    const addendum = [
+      blocked.spec?.trim() ?? '',
+      '',
+      '---',
+      '### Smart Unblocker re-review addendum',
+      `Prior blocked result for node ${blocked.id}:`,
+      priorResult,
+      '',
+      `Inserted FIX node ids: ${ids.join(', ')}`,
+      'Rerun standard: verify the FIX chain resolved the blocker before reporting this node done.',
+    ].join('\n').trim();
+
+    sqliteDb.prepare(`
+      UPDATE hopper_nodes
+      SET status = 'pending',
+          attempts = 0,
+          question = NULL,
+          answer = NULL,
+          result = NULL,
+          worker_thread_ext = NULL,
+          lease_expires_at = NULL,
+          depends_on = ?,
+          spec = ?,
+          updated_at = datetime('now')
+      WHERE id = ? AND status = 'blocked'
+    `).run(nextDeps.length ? JSON.stringify(nextDeps) : null, addendum, blocked.id);
+    return ids;
+  })();
+
+  const fixNodes = createdIds
+    .map((id) => getNodeStmt.get(id))
+    .filter((n): n is HopperNodeRow => !!n);
+  fixNodes.forEach((n) => emitNode('created', n));
+  const updated = getNodeStmt.get(blocked.id) ?? null;
+  if (updated) emitNode('updated', updated);
+  queueMicrotask(() => void dispatchTick('smart_unblocker_remediation'));
+  return updated ? { blocked_node: updated, fix_nodes: fixNodes } : null;
 }
 
 function composeFinishLineAuditSpec(tree: HopperTreeRow, nodes: HopperNodeRow[]): string {
@@ -1002,6 +1476,7 @@ export function finishHopperNode(
           source: 'hopper-engine',
         });
       }
+      maybeTriggerSmartUnblocker(id);
       queueMicrotask(() => void dispatchTick('node_finished'));
       return getNodeStmt.get(id) ?? null;
     }
@@ -1045,6 +1520,7 @@ export function finishHopperNode(
         source: 'hopper-engine',
       });
     }
+    maybeTriggerSmartUnblocker(id);
   }
   queueMicrotask(() => void dispatchTick('node_finished'));
   return getNodeStmt.get(id) ?? null;

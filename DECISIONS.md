@@ -195,3 +195,110 @@ dry-run with `JARVIS_DB_PATH` pointed at a copy, as done here.
 Repro artifacts: `/tmp/handoff-probe.mjs` (route + FULL-without-handoff probes),
 `/tmp/handoff-pw.mjs` (Playwright drawer/XSS/nav), `/tmp/handoff-drawer.png`,
 `/tmp/handoff-after-close.png`, `/tmp/handoff-backfill-scratch.db` (post-apply).
+
+## 2026-09-14 · Re-review (attempt 2) — Tree Handoff Cards (tree-b422a2b3 node #216, opus) — PASS, all six findings resolved
+
+Scope: backend `eacf1e93a` (FIX node #219) on `hopper/finish-line-gate` and
+cockpit `95256bc` (FIX node #220) on `hopper/tree-handoff-ui`, re-probed with
+the attempt-1 harness plus new attacks. Everything ran on scratch sqlite DBs
+(`/tmp/handoff-r2-*.db`, `/tmp/handoff-probe2-*.db`, `/tmp/handoff-bg2.db`;
+the backfill ran against a `.dump`-copy of the live hopper tables opened
+`-readonly`) and throwaway ports 39271/39281/39291/39301/39311. Live jarvis.db,
+jarvis.service and the live cockpit were never written or restarted. Both
+branches are still fast-forwards of the live checkouts (`autogroup/auto-thread-grouping`
+and `jarvis/plugins-panel@095835c`).
+
+### Attempt-1 findings → verdict
+
+1. **FULL-without-handoff (MUST) — RESOLVED, server-side.** `finishHopperNode`
+   parses the verdict for finish-line nodes and, when `FULL` and
+   `tree.handoff` is empty, sets the node `blocked` with result
+   `finishline FULL rejected: no handoff on tree`; the route answers
+   `409 finishline_full_missing_handoff`. Probe P1: tree stays `active`,
+   `handoff: null`, audit node `blocked`, one `error` bell, **no** `🏁 FULL`
+   bell. P1b: after an external handoff write + `POST /hopper-nodes/:id/retry`
+   the audit re-runs and the tree completes `done`. Sim check C-2 mirrors it.
+   `finishline:sim` 25/25.
+2. **Drawer-inside-Link navigation (MUST, UI) — RESOLVED.** `HandoffButton` is a
+   pure trigger; one page-level `HandoffDrawer` lives outside the card grid.
+   Playwright (chromium-1134, vite dev :39311 → scratch API :39301): open from
+   the Completed card → close ✕ / click drawer text / click the
+   `outbox/probe.md` vault link / Escape → URL stays `/spawn-tree` in every
+   case; reopen works; drill-in page drawer opens+closes in place. XSS payload
+   still renders as escaped text (`document.title` untouched), zero page errors.
+3. **Backfill "docs-only" lies (SHOULD) — RESOLVED.** Branch mining now scans
+   all node results + unbackticked `branch X` / `hopper/...` forms. On the 41
+   real done trees: 38 cards name their real branches (`hopper/provider-daytime`,
+   `hopper/provider-aware-governor`, `hopper/finish-line-gate`, …), 3 say
+   `unknown … not recoverable from node results`, **zero** say `docs-only`.
+4. **Absolute paths outside Full report (LOW-MED) — RESOLVED.** Route rejects
+   `/home/kevin/`, `/tmp/`, and `~/` anywhere in the card (P2: `home_in_built`,
+   `tilde_line_start`, `tilde_after_paren`, `tmp` → 400). Backfill sanitizes the
+   wiki + worktree prefixes; 40/40 written cards contain no `/home/kevin`.
+5. **Audit prompt excerpt/URL (MED) — RESOLVED.** Spec step 2 now says
+   `GET /api/v1/hopper-trees/<real id>` for the full docs result; step 5
+   interpolates the real `/api/v1/hopper-trees/<id>/handoff`; no `:treeId` /
+   `{{…}}` placeholders remain (P1f).
+6. **Heading check (LOW) — RESOLVED.** Line-anchored regex; inline-in-one-line
+   fence variant → 400 (H-4d, P2 `heading_inline_fence`); CRLF and trailing
+   spaces still accepted.
+
+### New observations — SHOULD-FIX, none blocking
+
+- **a. The 409 gives the worker no in-attempt recovery path (MED).** Because
+  the node flips to `blocked` before the 409 is sent, a worker that reacts
+  correctly (POSTs the card, re-POSTs finish) gets `409
+  finishline_full_missing_handoff` AGAIN even though the handoff now exists
+  (P1c) — the early `status !== 'running'` return hands back the stale blocked
+  row and the route re-emits the code. Net effect: the tree needs a human
+  retry even after the worker fixed its mistake, and the error text is wrong
+  at that point. Cheapest fix: on FULL-without-handoff answer 409 and leave the
+  node `running` (lease still governs), so the worker can post the card and
+  re-finish; if it never does, normal lease expiry → retry/escalation. If the
+  blocked design is kept, at least make the route say "node already blocked;
+  retry it" when `tree.handoff` is now present.
+- **b. Audit prompt does not handle `409 handoff_exists` (MED, prompt-level).**
+  The retry path after (a) — or any lease-expiry retry that lands after a
+  prior attempt already posted the card — hits `handoff_exists` because step 5
+  sends `force:false`, and steps 6–7 read as "POST failed three times → finish
+  blocked". Add one line to `composeFinishLineAuditSpec`: "a 409
+  `handoff_exists` means a card is already persisted — re-POST with
+  `force: true` to replace it with yours, then proceed to the verdict."
+- **c. Lowercase verdict bypasses the gate (LOW).** `{"finishline_verdict":"full"}`
+  without a handoff → tree `done`, `handoff: null`, only the "unreadable
+  verdict" warning bell (P1d). Same end state as SHORTFALL, not silent, but a
+  one-line `.toUpperCase()` in `parseFinishLineVerdict` closes it.
+- **d. Backfill branch extraction is noisy (LOW-MED).** ~15 of ~90 rows across
+  the 40 cards are not branches (`D/B/C/E/G`, `GET/PUT`, `fail/error`,
+  `Laravel/Orchestra`, `.foundry/run.log`, `origin/main`, …) — any backticked
+  slash token qualifies — and `extractHead` stamps the FIRST sha found in all
+  results on EVERY row, so e.g. `hopper/provider-daytime-ui` shows the backend
+  commit. Rows say "verify … before use", so it is not a silent lie, but Kevin
+  will read `Laravel/Orchestra` as something to pull. Suggest: require a
+  branch-ish prefix (`hopper/ foundry/ clearinghouse/ perclickity/ overwatch/
+  mcp/ autogroup/ feature/ …`) or the word `branch` within ~20 chars, and only
+  emit a Head when exactly one branch was found (else `unknown`).
+- **e. One real tree fails backfill validation (LOW).** `tree-53474979` (Intel
+  sweep #1) mentions `/tmp/claude-usage-live.json`; the sanitizer only strips
+  the wiki/worktree prefixes, so the route's new `/tmp/` rule rejects the card
+  and the run exits 1 (`wrote 40, failed 1`). Not a lie — it's a reported
+  failure — but a generic `/tmp/<x>` → `<x>` (or `` `<x>` ``) rewrite in
+  `sanitizeBackfillText` gets it to 41/41.
+- **f. (unchanged from attempt 1) dry-run still opens `JARVIS_DB_PATH`** via
+  the `hopper-engine.js` import (DDL side effect). Deploy the branch before
+  running the backfill from the live checkout, or point `JARVIS_DB_PATH` at a
+  copy. Re-run is idempotent (409 `handoff_exists` → `wrote 0`).
+
+Verification summary: backend `npm run build` clean, `git diff --check` clean,
+`finishline:sim` 25/25 on `/tmp/handoff-r2-sim.db`:39271; backfill `--apply`
+against the live-copy scratch on :39291 → 40 written / 1 failed (e), re-run 0
+written, node statuses (218 done / 1 pending / 1 running) and tree statuses
+(1 active / 41 done) identical before and after. UI tsc = same 10 pre-existing
+errors as `095835c`, eslint 0 errors (10 pre-existing warnings), prettier
+clean. Repro artifacts: `/tmp/handoff-probe2.mjs`, `/tmp/handoff-pw2.mjs`,
+`/tmp/handoff-r2-drawer.png`, `/tmp/handoff-r2-drillin.png`,
+`/tmp/handoff-r2-live-copy.db` (post-apply).
+
+Verdict: **PASS — deploy-ready.** Items a–e are recommended follow-ups for the
+deployer (a+b+c are ~10 lines in `hopper-engine.ts`; d+e in the backfill
+script) and can ride the deploy commit or a small follow-up tree.

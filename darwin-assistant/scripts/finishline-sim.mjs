@@ -179,6 +179,16 @@ async function fakeProcessMessage(prompt) {
           continuation_nodes: ['Close the sim gap'],
         }),
       });
+    } else if (scenario === 'C2') {
+      // Lowercase verdict must be normalized and hit the SAME gate as 'FULL'
+      // (it used to parse as an unreadable verdict and complete the tree with
+      // no handoff at all — review #216 item c / #233 P2).
+      await expectHttpError(409, 'finishline_full_missing_handoff', () =>
+        httpFinish(nodeId, {
+          outcome: 'done',
+          result: JSON.stringify({ finishline_verdict: 'full', summary: 'Sim scenario C2: lowercase full without a handoff.' }),
+        }),
+      );
     } else if (scenario === 'C') {
       await expectHttpError(409, 'finishline_full_missing_handoff', () =>
         httpFinish(nodeId, {
@@ -452,6 +462,19 @@ await checkAsync('H-5b', 'checklist reparses a force-updated handoff and keeps s
   assert.equal(checklist.checklist.items[1].checked, false, 'changed text item should not inherit unrelated state');
 });
 
+await checkAsync('H-5c', 'GET checklist is read-only for tree.updated_at (card chips poll it); POST toggles do bump it', async () => {
+  const before = sqliteDb.prepare('SELECT updated_at, handoff_checklist FROM hopper_trees WHERE id = ?').get(handoffTree.id);
+  await new Promise((r) => setTimeout(r, 1100));
+  await httpGet(`/api/v1/hopper-trees/${handoffTree.id}/checklist`);
+  await httpGet(`/api/v1/hopper-trees/${handoffTree.id}/checklist`);
+  const afterGet = sqliteDb.prepare('SELECT updated_at, handoff_checklist FROM hopper_trees WHERE id = ?').get(handoffTree.id);
+  assert.equal(afterGet.updated_at, before.updated_at, 'GET /checklist must not bump hopper_trees.updated_at');
+  assert.equal(afterGet.handoff_checklist, before.handoff_checklist, 'GET /checklist must not rewrite an unchanged checklist row');
+  await httpPost(`/api/v1/hopper-trees/${handoffTree.id}/checklist/2`, { checked: true });
+  const afterPost = sqliteDb.prepare('SELECT updated_at FROM hopper_trees WHERE id = ?').get(handoffTree.id);
+  assert.notEqual(afterPost.updated_at, before.updated_at, 'a real toggle is tree activity and should bump updated_at');
+});
+
 await checkAsync('H-6', 'tree list exposes has_handoff without the full markdown card', async () => {
   const list = await httpGet('/api/v1/hopper-trees');
   const listed = list.trees.find((t) => t.id === handoffTree.id);
@@ -561,6 +584,29 @@ await checkAsync('C-2', 'FULL verdict without a handoff is rejected, audit node 
   assert.equal(t.tree.status, 'active');
   assert.equal(t.tree.handoff, null);
   assert.equal(audit.result, 'finishline FULL rejected: missing valid handoff/Human runthrough checklist');
+});
+
+let treeC2;
+await checkAsync('C-3', 'lowercase "full" verdict without a handoff is normalized and rejected the same way (no silent tree completion)', async () => {
+  const created = await httpPost('/api/v1/hopper-trees', {
+    topic: 'sim-scenario-C2: lowercase full verdict',
+    origin_thread: 'cockpit:finishline-sim-origin-C2',
+    original_ask: 'Sim scenario C2 original ask.',
+    nodes: [{ title: 'Do the trivial thing (scenario C2)', spec: 'Trivial sim node for scenario C2.' }],
+  });
+  treeC2 = created.tree;
+  scenarioForTree.set(treeC2.id, 'C2');
+  await httpPost(`/api/v1/hopper-trees/${treeC2.id}/agree`, {});
+  const t = await waitFor(
+    async () => {
+      const t = await httpGet(`/api/v1/hopper-trees/${treeC2.id}`);
+      const audit = t.nodes.find((n) => n.title === 'FINISH-LINE AUDIT');
+      return audit?.status === 'blocked' ? t : null;
+    },
+    { label: 'C2 audit blocked' },
+  );
+  assert.equal(t.tree.status, 'active');
+  assert.equal(t.tree.handoff, null);
 });
 
 // ===========================================================================

@@ -207,8 +207,16 @@ const listAllTreesStmt = sqliteDb.prepare<[], HopperTreeRow>(`SELECT * FROM hopp
 const setTreeHandoffStmt = sqliteDb.prepare<[string, string]>(
   `UPDATE hopper_trees SET handoff = ?, updated_at = datetime('now') WHERE id = ?`,
 );
+// Two statements on purpose: a Kevin action (POST toggle/note) is real tree
+// activity and bumps updated_at; the GET-side merge/normalize must NOT — every
+// finished tree card on /spawn-tree fetches its checklist, and bumping there
+// made all of them read "updated just now" and re-sorted clusters by recency
+// on every page load (review #233, finding 1).
 const setTreeChecklistStmt = sqliteDb.prepare<[string, string]>(
   `UPDATE hopper_trees SET handoff_checklist = ?, updated_at = datetime('now') WHERE id = ?`,
+);
+const setTreeChecklistQuietStmt = sqliteDb.prepare<[string, string]>(
+  `UPDATE hopper_trees SET handoff_checklist = ? WHERE id = ?`,
 );
 const getNodeStmt = sqliteDb.prepare<[number], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE id = ?`);
 const treeNodesStmt = sqliteDb.prepare<[string], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE tree_id = ? ORDER BY id`);
@@ -581,7 +589,11 @@ function mergeChecklistState(handoff: string, previousRaw: string | null | undef
   };
 }
 
-function persistChecklist(treeId: string, checklist: HandoffChecklist): HandoffChecklist {
+function persistChecklist(
+  treeId: string,
+  checklist: HandoffChecklist,
+  opts: { touch?: boolean; previousRaw?: string | null } = {},
+): HandoffChecklist {
   const normalized: HandoffChecklist = {
     items: checklist.items.map((item, idx) => ({
       idx,
@@ -592,7 +604,15 @@ function persistChecklist(treeId: string, checklist: HandoffChecklist): HandoffC
       text_hash: item.text_hash || handoffTextHash(item.text),
     })),
   };
-  setTreeChecklistStmt.run(JSON.stringify(normalized), treeId);
+  const json = JSON.stringify(normalized);
+  if (opts.touch) {
+    setTreeChecklistStmt.run(json, treeId);
+  } else if (json !== (opts.previousRaw ?? null)) {
+    // Read path: only write when the merged shape actually differs from what
+    // is stored (first parse, or the handoff was re-edited), and never bump
+    // updated_at.
+    setTreeChecklistQuietStmt.run(json, treeId);
+  }
   return normalized;
 }
 
@@ -659,7 +679,7 @@ export function getHopperTreeChecklist(treeId: string): HandoffChecklist | null 
   const tree = getTreeStmt.get(treeId);
   if (!tree || !tree.handoff?.trim()) return null;
   const merged = mergeChecklistState(tree.handoff, tree.handoff_checklist);
-  return publicChecklist(persistChecklist(treeId, merged));
+  return publicChecklist(persistChecklist(treeId, merged, { previousRaw: tree.handoff_checklist }));
 }
 
 export function updateHopperTreeChecklistItem(
@@ -675,7 +695,7 @@ export function updateHopperTreeChecklistItem(
   item.checked = patch.checked;
   item.note = patch.note === undefined ? item.note : patch.note?.trim().slice(0, 1000) || null;
   item.checked_at = patch.checked ? item.checked_at ?? new Date().toISOString() : null;
-  return publicChecklist(persistChecklist(treeId, current));
+  return publicChecklist(persistChecklist(treeId, current, { touch: true }));
 }
 
 function finishLineAuditModel(): string {
@@ -891,7 +911,15 @@ function parseFinishLineVerdict(raw: string | null | undefined): FinishLineVerdi
   for (const c of candidates) {
     try {
       const parsed = JSON.parse(c) as unknown;
-      if (parsed && typeof parsed === 'object' && 'finishline_verdict' in parsed) return parsed as FinishLineVerdict;
+      if (parsed && typeof parsed === 'object' && 'finishline_verdict' in parsed) {
+        const verdict = parsed as FinishLineVerdict;
+        // Normalize case so a lowercase "full" cannot slip past the
+        // FULL-requires-handoff gate as an "unreadable" verdict (review #216 c / #233).
+        if (typeof verdict.finishline_verdict === 'string') {
+          verdict.finishline_verdict = verdict.finishline_verdict.trim().toUpperCase();
+        }
+        return verdict;
+      }
     } catch {
       /* try next candidate */
     }

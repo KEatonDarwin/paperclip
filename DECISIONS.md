@@ -302,3 +302,114 @@ clean. Repro artifacts: `/tmp/handoff-probe2.mjs`, `/tmp/handoff-pw2.mjs`,
 Verdict: **PASS — deploy-ready.** Items a–e are recommended follow-ups for the
 deployer (a+b+c are ~10 lines in `hopper-engine.ts`; d+e in the backfill
 script) and can ride the deploy commit or a small follow-up tree.
+
+## 2026-09-15 · Adversarial review — Handoff v2 human-runthrough checklist (tree-333d5062 node #233, opus) — PASS with fixes applied
+
+Scope: `hopper/handoff-checklist` (darwin-assistant, `f0dcbecf0`) + `hopper/handoff-checklist-ui`
+(jarvis-command-center, `36baee1`), reviewed from clean detached worktrees
+(`/tmp/rev233/{backend,ui}`), scratch DBs `/tmp/rev233/probe-*.db`, scratch ports 39233–39244.
+Attack list from the node spec: gate bypass · parser edge cases · state desync after re-edit ·
+endpoint auth · XSS · stale-deploy path · audit-prompt dry-run. Repro artifacts:
+`/tmp/rev233/probe.mjs` (backend, 27 probes), the Playwright probe that became the third
+permanent e2e test, `/tmp/rev233/drawer-fenced-first.png` (finding 2 before the fix),
+`/tmp/rev233/dryrun-card.md` (finding 7).
+
+### Findings
+
+1. **GET `/hopper-trees/:id/checklist` wrote to the tree on every read (MED-HIGH, FIXED).**
+   `getHopperTreeChecklist` always re-persisted the merged checklist through a statement that
+   also set `updated_at = datetime('now')`. The new card chip (`HandoffButton`) fires that GET
+   for **every finished tree with a handoff** on every `/spawn-tree` load (+ react-query
+   window-focus refetch, 30s stale) — probe: 5 stubbed trees → 5 GETs on load; real backend:
+   two GETs 1s apart bumped `updated_at` twice (P1). Net effect after the backfill lands
+   (~41 done trees): every finished card reads "updated just now" forever and
+   `spawn-monitor.ts` cluster recency sort (`recentA/recentB` on `tree.updated_at`) is
+   reshuffled by page views, plus N sqlite writes per view. Fix (`hopper-engine.ts`):
+   `persistChecklist` now takes `{touch, previousRaw}` — the read path writes only when the
+   merged JSON differs from the stored row (first parse / handoff re-edit) and never bumps
+   `updated_at`; the POST toggle/note path still bumps it (a Kevin action is real tree
+   activity). Sim `H-5c` covers both halves; it fails on the unfixed code (30/32) and passes
+   after (32/32).
+2. **Drawer section split was fence-blind while the backend gate is fence-aware (MED, FIXED).**
+   Sim `H-4e` deliberately lets a card quote the template inside a ``` block (including a
+   `## Human runthrough` line). The UI's `splitHumanRunthroughSection` matched the FENCED copy:
+   the interactive widget landed under "What was built", an empty `<pre>` appeared, and
+   Branches / How to use / the REAL runthrough / Next steps / Full report all rendered as one raw
+   code block (screenshot `/tmp/rev233/drawer-fenced-first.png`). Same root cause garbled the
+   stale-deploy markdown fallback (1 disabled GFM checkbox from the template, real items in the
+   `<pre>`). Fix (`spawn-monitor.tsx`): the split skips ```/~~~ fences for both the section
+   heading and the next-`## ` boundary, mirroring `markdownHeadingsOutsideFences`. New e2e
+   "a fenced copy of the heading before the real section does not garble the card" fails on
+   `36baee1`, passes after; suite 3/3.
+3. **Lowercase `"full"` verdict still bypassed the handoff gate (LOW→MED now, FIXED).** Flagged as
+   item (c) in the #216 re-review and not picked up; with the checklist now the whole point of
+   the handoff, `{"finishline_verdict":"full"}` with no handoff → node `done`, tree `done`,
+   `handoff: NULL`, only the "unreadable verdict" bell (P2). Fix: `parseFinishLineVerdict`
+   normalizes the verdict string (`trim().toUpperCase()`), so it hits the same 409 gate. Sim
+   `C-3` (scenario C2) covers it.
+
+### Verified OK (no change needed)
+
+- Auth: unauthenticated GET/POST → 401 (bearer router-wide).
+- XSS: item text/notes render as React text (`{item.text}`, `<Input value>`); `<img onerror>`,
+  `<script>`, `javascript:` links in item text and note → 0 `img`/`script`/`a[href^=javascript]`
+  in the drawer, title untouched (Playwright).
+- Parser: `- [ ]`/`* [ ]`/`- [x]`/`- [X]`, nested (flattened), unicode, trailing spaces, CRLF
+  documents, `## Human runthrough ##`, extra spaces after `##`, 400-item lists (48 KB state
+  row) all parse; `## Human Runthrough` (case) and `### …` are rejected as missing (strict, fine);
+  empty `- [ ]` and fenced items are skipped; `+ [ ]`, `1. [ ]` (GFM-valid) and blockquoted items
+  are NOT counted — acceptable given the prompt mandates `- [ ] …`, noted below.
+- Input hardening: `idx` `abc`/`-1` → 400, out-of-range → 404, `checked:"true"` → 400,
+  `note:42` → 400, 5000-char note → 1000, `note:null` clears; `checked_at` is stable across a
+  note-only edit and cleared on uncheck; 3 parallel POSTs all persist (sync sqlite).
+- Re-edit: same-text items keep state via `text_hash`, changed text resets (sim H-5b).
+- Stale deploy: checklist 404 → plain-markdown section (e2e); old-format card (no section) →
+  `200 {items:[]}` → UI falls back to markdown.
+- Oversize: `boundedText` truncates to 20 000 chars BEFORE validation, so there is no
+  validate-then-truncate gap (a 22 KB card is rejected, not silently cut) — but the error says
+  "missing required section: ## What was built" rather than "too long" (LOW, noted below).
+- Builds: backend `tsc` clean (only the symlinked-node_modules TS2742 artifact), sim 32/32 on
+  scratch; UI `tsc` = same 10 pre-existing errors as base `95256bc`, 0 in changed files,
+  eslint 0 errors on changed files, prettier clean, production build `NITRO_PRESET=node-server`
+  → `.output/nitro.json preset:"node-server"`, checklist code present in
+  `assets/spawn-monitor-*.js`. `bun.lock` diff (-83/+4) only prunes stale optional-peer
+  entries (`esbuild`/`rollup`/`tsx` platform packages that nothing in package.json requires);
+  the deploy script never runs `bun install`, so no deploy impact.
+- Audit-prompt dry run (sonnet, subscription CLI, HTTP disabled, this tree's real node results):
+  produced an 8-item `## Human runthrough` in do-X/expect-Y form covering the drawer, persistence,
+  cross-tab sync, the card chip, two gate failure cases, optimistic rollback and the old-card
+  fallback; `validateHopperTreeHandoff` → `ok:true`. The instruction change produces a usable
+  checklist. (`/tmp/rev233/dryrun-card.md`)
+
+### Should-fix follow-ups (not blocking, not changed here)
+
+- **a. Unreadable / non-FULL audit results still complete the tree with no handoff (MED, design).**
+  A finish-line node finishing `done` with prose (no JSON) or a `SHORTFALL` verdict that plants
+  no continuation → tree `done`, `handoff: NULL`, checklist never exists (P3). The "unreadable
+  verdict" warning bell fires, so it is not silent, but "every finished tree hands Kevin a
+  checklist" is not true for that path. Cheapest closure: treat an unparseable result on a
+  finish-line node as `blocked` (worker protocol violation) instead of `done`, and require
+  `continuation_tree_id` on SHORTFALL before accepting `done`.
+- **b. `idx` is positional (LOW).** A toggle sent against a cached list after a `force:true`
+  handoff re-edit hits whatever now sits at that index (P8: cached idx=1 "beta" toggled "gamma").
+  Accept an optional `text_hash` in the POST body and 409 on mismatch; the UI already has the
+  text. Rare (re-edit while the drawer is open).
+- **c. Duplicate item text loses state on re-edit (LOW).** Two identical items, second one
+  checked, first one removed → the survivor shows unchecked (first-by-hash `shift()`). Prefer the
+  checked/annotated prior on hash collisions.
+- **d. Prompt-level: `- [ ] .` passes the gate (LOW, by design).** Semantic emptiness is not
+  code-gated; the prompt's do-X/expect-Y instruction is the control. Optionally require ≥ 2
+  items or ≥ 15 chars of text per item.
+- **e. Oversize handoff error is misleading (LOW).** Say "handoff exceeds 20 000 characters"
+  when `value.length > TEXT_FIELD_LIMIT` before the section check.
+- **f. Parser scope (LOW).** `1. [ ] …` and `+ [ ] …` are GFM task items the gate does not
+  count; fine while the prompt mandates `- [ ]`, but document it in HANDOFF.md.
+- **g. Still open from #216: (a) blocked-before-409 recovery path and (b) `handoff_exists`
+  handling in the audit prompt** — unchanged on this branch; (b) matters more now that a retried
+  audit on a tree with an existing card gets 409 and the prompt reads that as "finish blocked".
+
+### Verdict
+
+**PASS — deploy-ready with the three fixes above applied on-branch** (`hopper/handoff-checklist`
++ `hopper/handoff-checklist-ui`, this commit and its UI sibling). Re-verified after the fixes:
+sim 32/32 on scratch, e2e 3/3, tsc/eslint/prettier as above.

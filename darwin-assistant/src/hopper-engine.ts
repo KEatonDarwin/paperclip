@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import './spawn-tasks.js'; // side-effect: guarantees the spawn_tasks DDL ran before we prepare against it
 import { sqliteDb, getOrCreateConversation, renameConversation, setThreadModelOverride, getSetting } from './conversation-db.js';
 import { sseBus, type HopperNodeEvent } from './sse-bus.js';
@@ -40,6 +40,7 @@ export interface HopperTreeRow {
   deferred_scope: string | null;
   continuation_of: string | null;
   handoff: string | null;
+  handoff_checklist: string | null;
   status: 'draft' | 'active' | 'done' | 'archived';
   created_at: string;
   updated_at: string;
@@ -184,7 +185,7 @@ sqliteDb.exec(`
 // ROUTER (phase 1, 2026-09-07): per-node model/adapter chosen by the PLANNER at
 // decomposition time — the tree-breakdown conversation IS the router brain, so
 // there's no separate scoring service. Additive columns; null = default loadout.
-for (const col of ['original_ask TEXT', 'deferred_scope TEXT', 'continuation_of TEXT', 'handoff TEXT']) {
+for (const col of ['original_ask TEXT', 'deferred_scope TEXT', 'continuation_of TEXT', 'handoff TEXT', 'handoff_checklist TEXT']) {
   try {
     sqliteDb.exec(`ALTER TABLE hopper_trees ADD COLUMN ${col}`);
   } catch {
@@ -205,6 +206,9 @@ const listTreesStmt = sqliteDb.prepare<[], HopperTreeRow>(`SELECT * FROM hopper_
 const listAllTreesStmt = sqliteDb.prepare<[], HopperTreeRow>(`SELECT * FROM hopper_trees ORDER BY created_at DESC`);
 const setTreeHandoffStmt = sqliteDb.prepare<[string, string]>(
   `UPDATE hopper_trees SET handoff = ?, updated_at = datetime('now') WHERE id = ?`,
+);
+const setTreeChecklistStmt = sqliteDb.prepare<[string, string]>(
+  `UPDATE hopper_trees SET handoff_checklist = ?, updated_at = datetime('now') WHERE id = ?`,
 );
 const getNodeStmt = sqliteDb.prepare<[number], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE id = ?`);
 const treeNodesStmt = sqliteDb.prepare<[string], HopperNodeRow>(`SELECT * FROM hopper_nodes WHERE tree_id = ? ORDER BY id`);
@@ -428,14 +432,146 @@ const REQUIRED_HANDOFF_HEADINGS = [
   '## What was built',
   '## Branches & how to install',
   '## How to use it',
+  '## Human runthrough',
   '## Next steps / deferred',
   '## Full report',
 ];
-export const FINISHLINE_FULL_MISSING_HANDOFF_RESULT = 'finishline FULL rejected: no handoff on tree';
+export const FINISHLINE_FULL_MISSING_HANDOFF_RESULT = 'finishline FULL rejected: missing valid handoff/Human runthrough checklist';
+
+export interface HandoffChecklistItem {
+  idx: number;
+  text: string;
+  checked: boolean;
+  note: string | null;
+  checked_at: string | null;
+  text_hash?: string;
+}
+
+export interface HandoffChecklist {
+  items: HandoffChecklistItem[];
+}
 
 export type HandoffValidation =
   | { ok: true; handoff: string }
   | { ok: false; message: string };
+
+function handoffTextHash(text: string): string {
+  return createHash('sha256').update(text.trim().replace(/\s+/g, ' ')).digest('hex').slice(0, 16);
+}
+
+function handoffSectionBody(handoff: string, heading: string): string | null {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = handoff.match(new RegExp(`^${escaped}\\s*$`, 'm'));
+  if (!match || match.index == null) return null;
+  const start = match.index + match[0].length;
+  const rest = handoff.slice(start);
+  const next = rest.search(/^##\s+/m);
+  return (next === -1 ? rest : rest.slice(0, next)).trim();
+}
+
+function parseHumanRunthroughItems(handoff: string): HandoffChecklistItem[] {
+  const body = handoffSectionBody(handoff, '## Human runthrough');
+  if (!body) return [];
+  const items: HandoffChecklistItem[] = [];
+  for (const line of body.split(/\r?\n/)) {
+    const match = line.match(/^\s*[-*]\s+\[[ xX]\]\s+(.+?)\s*$/);
+    if (!match) continue;
+    const text = match[1].trim();
+    if (!text) continue;
+    items.push({
+      idx: items.length,
+      text,
+      checked: false,
+      note: null,
+      checked_at: null,
+      text_hash: handoffTextHash(text),
+    });
+  }
+  return items;
+}
+
+function normalizeStoredChecklist(raw: string | null | undefined): HandoffChecklistItem[] {
+  if (!raw?.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as { items?: unknown }).items)) return [];
+    return (parsed as { items: unknown[] }).items
+      .map((item): HandoffChecklistItem | null => {
+        if (!item || typeof item !== 'object') return null;
+        const row = item as Partial<HandoffChecklistItem>;
+        const text = typeof row.text === 'string' ? row.text.trim() : '';
+        if (!text) return null;
+        return {
+          idx: Number.isFinite(row.idx) ? Number(row.idx) : 0,
+          text,
+          checked: row.checked === true,
+          note: typeof row.note === 'string' && row.note.trim() ? row.note.trim().slice(0, 1000) : null,
+          checked_at: typeof row.checked_at === 'string' && row.checked_at.trim() ? row.checked_at.trim() : null,
+          text_hash: typeof row.text_hash === 'string' && row.text_hash.trim() ? row.text_hash.trim() : handoffTextHash(text),
+        };
+      })
+      .filter((item): item is HandoffChecklistItem => !!item);
+  } catch {
+    return [];
+  }
+}
+
+function mergeChecklistState(handoff: string, previousRaw: string | null | undefined): HandoffChecklist {
+  const parsed = parseHumanRunthroughItems(handoff);
+  const previous = normalizeStoredChecklist(previousRaw);
+  const byHash = new Map<string, HandoffChecklistItem[]>();
+  for (const item of previous) {
+    const hash = item.text_hash || handoffTextHash(item.text);
+    const list = byHash.get(hash) ?? [];
+    list.push(item);
+    byHash.set(hash, list);
+  }
+  return {
+    items: parsed.map((item, idx) => {
+      const hash = item.text_hash || handoffTextHash(item.text);
+      const prior = byHash.get(hash)?.shift();
+      return {
+        idx,
+        text: item.text,
+        checked: prior?.checked ?? false,
+        note: prior?.note ?? null,
+        checked_at: prior?.checked_at ?? null,
+        text_hash: hash,
+      };
+    }),
+  };
+}
+
+function persistChecklist(treeId: string, checklist: HandoffChecklist): HandoffChecklist {
+  const normalized: HandoffChecklist = {
+    items: checklist.items.map((item, idx) => ({
+      idx,
+      text: item.text,
+      checked: item.checked === true,
+      note: item.note?.trim() || null,
+      checked_at: item.checked_at || null,
+      text_hash: item.text_hash || handoffTextHash(item.text),
+    })),
+  };
+  setTreeChecklistStmt.run(JSON.stringify(normalized), treeId);
+  return normalized;
+}
+
+function publicChecklist(checklist: HandoffChecklist): HandoffChecklist {
+  return {
+    items: checklist.items.map((item, idx) => ({
+      idx,
+      text: item.text,
+      checked: item.checked === true,
+      note: item.note ?? null,
+      checked_at: item.checked_at ?? null,
+    })),
+  };
+}
+
+function validHumanRunthrough(handoff: string | null | undefined): boolean {
+  return typeof handoff === 'string' && parseHumanRunthroughItems(handoff).length > 0;
+}
 
 export function validateHopperTreeHandoff(value: unknown): HandoffValidation {
   if (typeof value !== 'string') {
@@ -453,6 +589,9 @@ export function validateHopperTreeHandoff(value: unknown): HandoffValidation {
     if (idx === -1) return { ok: false, message: `handoff is missing required section: ${heading}` };
     if (idx < cursor) return { ok: false, message: `handoff sections must appear in the required order: ${heading}` };
     cursor = idx;
+  }
+  if (!validHumanRunthrough(handoff)) {
+    return { ok: false, message: 'handoff is missing required Human runthrough checklist task items' };
   }
 
   if (/\/home\/kevin\//.test(handoff) || /\/tmp\//.test(handoff) || /(^|[\s"'`([:])~\//m.test(handoff)) {
@@ -472,7 +611,32 @@ export function setHopperTreeHandoff(
   const normalized = boundedText(handoff);
   if (!normalized) return tree;
   setTreeHandoffStmt.run(normalized, treeId);
-  return getTreeStmt.get(treeId) ?? null;
+  const updated = getTreeStmt.get(treeId) ?? null;
+  if (updated) getHopperTreeChecklist(treeId);
+  return updated;
+}
+
+export function getHopperTreeChecklist(treeId: string): HandoffChecklist | null {
+  const tree = getTreeStmt.get(treeId);
+  if (!tree || !tree.handoff?.trim()) return null;
+  const merged = mergeChecklistState(tree.handoff, tree.handoff_checklist);
+  return publicChecklist(persistChecklist(treeId, merged));
+}
+
+export function updateHopperTreeChecklistItem(
+  treeId: string,
+  idx: number,
+  patch: { checked: boolean; note?: string | null },
+): HandoffChecklist | null {
+  const tree = getTreeStmt.get(treeId);
+  if (!tree || !tree.handoff?.trim()) return null;
+  const current = mergeChecklistState(tree.handoff, tree.handoff_checklist);
+  const item = current.items[idx];
+  if (!item) return null;
+  item.checked = patch.checked;
+  item.note = patch.note === undefined ? item.note : patch.note?.trim().slice(0, 1000) || null;
+  item.checked_at = patch.checked ? item.checked_at ?? new Date().toISOString() : null;
+  return publicChecklist(persistChecklist(treeId, current));
 }
 
 function finishLineAuditModel(): string {
@@ -637,13 +801,15 @@ function composeFinishLineAuditSpec(tree: HopperTreeRow, nodes: HopperNodeRow[])
     '   ## What was built',
     '   ## Branches & how to install',
     '   ## How to use it',
+    '   ## Human runthrough',
     '   ## Next steps / deferred',
     '   ## Full report',
     '4. The Branches table must use columns: Order, Repo, Branch, Head, Notes. Include every branch/manual artifact Kevin needs to pull, deploy, review, or intentionally ignore.',
-    `5. POST the card to /api/v1/hopper-trees/${tree.id}/handoff with JSON \`{ "handoff": "<markdown>", "force": false }\` and bearer auth.`,
-    '6. If the handoff POST fails, retry the exact POST up to three times.',
-    '7. If the handoff still cannot be persisted, do NOT return a FULL verdict. Finish this audit node with outcome=blocked and a precise result explaining the handoff write failure.',
-    '8. Only after the handoff POST succeeds may you finish this audit node with finishline_verdict FULL.',
+    '5. The Human runthrough section must be a markdown task list (`- [ ] ...`). Write concrete operator steps in "do X, expect Y" form. Cover every new user-visible behavior, at least one failure/edge case per major feature, and any required pre-flight/deploy/env state Kevin needs before testing.',
+    `6. POST the card to /api/v1/hopper-trees/${tree.id}/handoff with JSON \`{ "handoff": "<markdown>", "force": false }\` and bearer auth.`,
+    '7. If the handoff POST fails, retry the exact POST up to three times.',
+    '8. If the handoff still cannot be persisted, do NOT return a FULL verdict. Finish this audit node with outcome=blocked and a precise result explaining the handoff write failure.',
+    '9. Only after the handoff POST succeeds may you finish this audit node with finishline_verdict FULL.',
     '',
     'Finish result:',
     'If FULL or if SHORTFALL with a continuation planted, finish this audit node with outcome=done. Put a single JSON object in result:',
@@ -992,7 +1158,7 @@ export function finishHopperNode(
 
   if (outcome === 'done') {
     const verdict = isFinishLineNode(node) ? parseFinishLineVerdict(payload.result) : null;
-    if (verdict?.finishline_verdict === 'FULL' && !tree?.handoff?.trim()) {
+    if (verdict?.finishline_verdict === 'FULL' && !validHumanRunthrough(tree?.handoff)) {
       const latest = setNode(id, { status: 'blocked', result: FINISHLINE_FULL_MISSING_HANDOFF_RESULT, lease_expires_at: null });
       if (latest?.status === 'blocked' && !isFoundryTree(tree)) {
         createNotification({

@@ -108,6 +108,12 @@ function buildSimHandoff(treeId, topic, { backfilled = 'no', report = 'outbox/fi
     '',
     '1. Open the finished tree and read the handoff card.',
     '',
+    '## Human runthrough',
+    '',
+    '- [ ] Open the finished tree detail, expect this handoff card to be visible.',
+    '- [ ] Try the scratch success path, expect the simulated deliverable to be marked complete.',
+    '- [ ] Check the scratch missing-handoff failure path, expect the FULL verdict to be rejected.',
+    '',
     '## Next steps / deferred',
     '',
     '- None.',
@@ -313,6 +319,17 @@ await checkAsync('H-3', 'handoff route rejects missing required section headings
   );
 });
 
+await checkAsync('H-3a', 'handoff route rejects a Human runthrough section with no task items', async () => {
+  await expectHttpError(400, 'invalid_handoff', () =>
+    httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, {
+      handoff: buildSimHandoff(handoffTree.id, handoffTree.topic).replace(
+        '- [ ] Open the finished tree detail, expect this handoff card to be visible.\n- [ ] Try the scratch success path, expect the simulated deliverable to be marked complete.\n- [ ] Check the scratch missing-handoff failure path, expect the FULL verdict to be rejected.',
+        'No checklist here.',
+      ),
+    }),
+  );
+});
+
 await checkAsync('H-4', 'handoff route rejects absolute /home/kevin full-report paths', async () => {
   await expectHttpError(400, 'invalid_handoff', () =>
     httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, {
@@ -374,6 +391,33 @@ await checkAsync('H-5', 'handoff route accepts a valid card and GET detail retur
   assert.equal(posted.tree.handoff, handoff);
   const detail = await httpGet(`/api/v1/hopper-trees/${handoffTree.id}`);
   assert.equal(detail.tree.handoff, handoff);
+});
+
+await checkAsync('H-5a', 'checklist route parses, stores, and updates server-owned check state', async () => {
+  const initial = await httpGet(`/api/v1/hopper-trees/${handoffTree.id}/checklist`);
+  assert.equal(initial.checklist.items.length, 3);
+  assert.equal(initial.checklist.items[0].checked, false);
+  const updated = await httpPost(`/api/v1/hopper-trees/${handoffTree.id}/checklist/0`, {
+    checked: true,
+    note: 'looks good in sim',
+  });
+  assert.equal(updated.checklist.items[0].checked, true);
+  assert.equal(updated.checklist.items[0].note, 'looks good in sim');
+  assert.ok(updated.checklist.items[0].checked_at, 'checking an item should stamp checked_at');
+  const detail = await httpGet(`/api/v1/hopper-trees/${handoffTree.id}/checklist`);
+  assert.equal(detail.checklist.items[0].checked, true);
+});
+
+await checkAsync('H-5b', 'checklist reparses a force-updated handoff and keeps same-text check state', async () => {
+  const replacement = buildSimHandoff(handoffTree.id, handoffTree.topic).replace(
+    '- [ ] Try the scratch success path, expect the simulated deliverable to be marked complete.',
+    '- [ ] Try a renamed scratch success path, expect the simulated deliverable to be marked complete.',
+  );
+  await httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, { handoff: replacement, force: true });
+  const checklist = await httpGet(`/api/v1/hopper-trees/${handoffTree.id}/checklist`);
+  assert.equal(checklist.checklist.items.length, 3);
+  assert.equal(checklist.checklist.items[0].checked, true, 'same text item should keep prior checked state');
+  assert.equal(checklist.checklist.items[1].checked, false, 'changed text item should not inherit unrelated state');
 });
 
 await checkAsync('H-6', 'tree list exposes has_handoff without the full markdown card', async () => {
@@ -484,7 +528,7 @@ await checkAsync('C-2', 'FULL verdict without a handoff is rejected, audit node 
   const audit = t.nodes.find((n) => n.title === 'FINISH-LINE AUDIT');
   assert.equal(t.tree.status, 'active');
   assert.equal(t.tree.handoff, null);
-  assert.equal(audit.result, 'finishline FULL rejected: no handoff on tree');
+  assert.equal(audit.result, 'finishline FULL rejected: missing valid handoff/Human runthrough checklist');
 });
 
 // ===========================================================================

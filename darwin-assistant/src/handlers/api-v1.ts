@@ -126,6 +126,8 @@ import {
   nextContinuationDepth,
   findOpenContinuationOf,
   setHopperTreeHandoff,
+  getHopperTreeChecklist,
+  updateHopperTreeChecklistItem,
   validateHopperTreeHandoff,
   FINISHLINE_FULL_MISSING_HANDOFF_RESULT,
   type NewNodeInput,
@@ -1914,6 +1916,51 @@ export function createApiV1Router(): Router {
     }
     const updated = setHopperTreeHandoff(treeId, validated.handoff, { force });
     res.json({ tree: updated });
+  });
+
+  router.get('/hopper-trees/:treeId/checklist', (req: AuthedRequest, res) => {
+    const treeId = paramString(req.params.treeId);
+    if (!getHopperTree(treeId)) {
+      sendError(res, 404, 'hopper_tree_not_found', 'hopper tree not found');
+      return;
+    }
+    const checklist = getHopperTreeChecklist(treeId);
+    if (!checklist) {
+      sendError(res, 404, 'hopper_checklist_not_found', 'tree has no persisted handoff checklist');
+      return;
+    }
+    res.json({ checklist });
+  });
+
+  router.post('/hopper-trees/:treeId/checklist/:idx', (req: AuthedRequest, res) => {
+    const treeId = paramString(req.params.treeId);
+    if (!getHopperTree(treeId)) {
+      sendError(res, 404, 'hopper_tree_not_found', 'hopper tree not found');
+      return;
+    }
+    const idx = parseInt(String(req.params.idx), 10);
+    if (!Number.isInteger(idx) || idx < 0) {
+      sendError(res, 400, 'invalid_request', 'idx must be a non-negative integer');
+      return;
+    }
+    const body = (req.body ?? {}) as { checked?: unknown; note?: unknown };
+    if (typeof body.checked !== 'boolean') {
+      sendError(res, 400, 'invalid_request', 'checked must be a boolean');
+      return;
+    }
+    if (body.note !== undefined && body.note !== null && typeof body.note !== 'string') {
+      sendError(res, 400, 'invalid_request', 'note must be a string when provided');
+      return;
+    }
+    const checklist = updateHopperTreeChecklistItem(treeId, idx, {
+      checked: body.checked,
+      note: typeof body.note === 'string' ? body.note : body.note === null ? null : undefined,
+    });
+    if (!checklist) {
+      sendError(res, 404, 'hopper_checklist_item_not_found', 'tree handoff checklist item not found');
+      return;
+    }
+    res.json({ checklist });
   });
 
   // Kevin's "yep that looks good" — the ONE human gate. Nothing below `agreed`

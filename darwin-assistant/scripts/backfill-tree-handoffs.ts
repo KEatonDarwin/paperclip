@@ -66,6 +66,16 @@ function resultText(node: NodeRow | null | undefined): string {
   return node?.result?.trim() || '';
 }
 
+function sanitizeBackfillText(text: string): string {
+  return text
+    .replaceAll('/home/kevin/obsidian/paperclip-wiki/', '')
+    .replace(/\/home\/kevin\/paperclip-worktrees\/([^/\s`'")]+)\//g, 'worktree $1: ');
+}
+
+function allResultText(nodes: NodeRow[]): string {
+  return sanitizeBackfillText(nodes.map((n) => resultText(n)).filter(Boolean).join('\n\n'));
+}
+
 function scoreDocsNode(node: NodeRow): number {
   const title = node.title.toLowerCase();
   const result = resultText(node).toLowerCase();
@@ -116,34 +126,49 @@ function looksLikeBranchToken(value: string): boolean {
   return /^[A-Za-z0-9._/-]+$/.test(value);
 }
 
+function cleanBranchToken(value: string): string | null {
+  const branch = value.trim().replace(/[.,;:)]+$/g, '');
+  return looksLikeBranchToken(branch) ? branch : null;
+}
+
 function extractBranchTokens(text: string): string[] {
   const branches = new Set<string>();
   const codeSpanRe = /`([^`]+)`/g;
   let match: RegExpExecArray | null;
   while ((match = codeSpanRe.exec(text))) {
-    const value = match[1].trim();
-    if (looksLikeBranchToken(value)) branches.add(value);
+    const branch = cleanBranchToken(match[1]);
+    if (branch) branches.add(branch);
+  }
+  const namedBranchRe = /\b(?:branch|on)\s+([A-Za-z0-9._-]+\/[A-Za-z0-9._/-]+)/gi;
+  while ((match = namedBranchRe.exec(text))) {
+    const branch = cleanBranchToken(match[1]);
+    if (branch) branches.add(branch);
+  }
+  const hopperBranchRe = /\bhopper\/[\w./-]+/g;
+  while ((match = hopperBranchRe.exec(text))) {
+    const branch = cleanBranchToken(match[0]);
+    if (branch) branches.add(branch);
   }
   return Array.from(branches).slice(0, 8);
 }
 
 function extractHead(text: string): string {
   const match = text.match(/\b(?:head|commit|sha)\s*:?\s*`?([0-9a-f]{7,40})`?/i);
-  return match?.[1]?.slice(0, 12) ?? 'none';
+  return match?.[1]?.slice(0, 12) ?? 'unknown';
 }
 
 function branchTable(text: string): string {
   const existing = extractExistingBranchTable(text);
   if (existing) return existing;
   const branches = extractBranchTokens(text);
+  const head = extractHead(text);
   if (!branches.length) {
     return [
       '| Order | Repo | Branch | Head | Notes |',
       '| --- | --- | --- | --- | --- |',
-      '| 1 | `KEatonDarwin/paperclip` | none | docs-only | No branch details found in historical node results; read the linked report/tree detail. |',
+      `| 1 | unknown | unknown | ${head} | not recoverable from node results - read the full report |`,
     ].join('\n');
   }
-  const head = extractHead(text);
   return [
     '| Order | Repo | Branch | Head | Notes |',
     '| --- | --- | --- | --- | --- |',
@@ -192,9 +217,10 @@ function deferredBullets(text: string): string[] {
   return found.length ? found : ['- None found in historical node results.'];
 }
 
-function buildHandoff(tree: TreeRow, docsNode: NodeRow | null): string {
-  const text = resultText(docsNode);
-  const outboxPath = extractOutboxPath(text);
+function buildHandoff(tree: TreeRow, nodes: NodeRow[], docsNode: NodeRow | null): string {
+  const docsText = sanitizeBackfillText(resultText(docsNode));
+  const allText = allResultText(nodes);
+  const outboxPath = extractOutboxPath(allText);
   return [
     `# ${tree.topic} handoff`,
     '',
@@ -205,11 +231,11 @@ function buildHandoff(tree: TreeRow, docsNode: NodeRow | null): string {
     '',
     '## What was built',
     '',
-    ...summaryBullets(text),
+    ...summaryBullets(docsText),
     '',
     '## Branches & how to install',
     '',
-    branchTable(text),
+    branchTable(allText),
     '',
     '## How to use it',
     '',
@@ -219,7 +245,7 @@ function buildHandoff(tree: TreeRow, docsNode: NodeRow | null): string {
     '## Next steps / deferred',
     '',
     '- _backfilled from node results_; verify against the full report before deploy.',
-    ...deferredBullets(text),
+    ...deferredBullets(docsText),
     '',
     '## Full report',
     '',
@@ -255,8 +281,9 @@ async function main(): Promise<void> {
   for (const tree of trees) {
     const nodes = nodesForTree.all(tree.id);
     const docsNode = findDocsNode(nodes);
-    const handoff = buildHandoff(tree, docsNode);
-    const report = extractOutboxPath(resultText(docsNode)) ?? 'no report path';
+    const allText = allResultText(nodes);
+    const handoff = buildHandoff(tree, nodes, docsNode);
+    const report = extractOutboxPath(allText) ?? 'no report path';
     console.log(`- ${tree.id} ${tree.status} - ${tree.topic} - docs node ${docsNode?.id ?? 'none'} - ${report}`);
     if (!APPLY) continue;
     try {

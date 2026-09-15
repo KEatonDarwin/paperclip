@@ -83,7 +83,7 @@ async function checkAsync(id, description, fn) {
 //     real audit worker would run, via the SAME public HTTP API a real worker
 //     uses (POST /hopper-trees[+/agree], POST /hopper-nodes/:id/finish).
 // ---------------------------------------------------------------------------
-const scenarioForTree = new Map(); // treeId -> 'A' | 'B'
+const scenarioForTree = new Map(); // treeId -> 'A' | 'B' | 'C'
 const dispatchedNodeIds = new Set();
 
 function buildSimHandoff(treeId, topic, { backfilled = 'no', report = 'outbox/finishline-sim.md' } = {}) {
@@ -173,6 +173,19 @@ async function fakeProcessMessage(prompt) {
           continuation_nodes: ['Close the sim gap'],
         }),
       });
+    } else if (scenario === 'C') {
+      await expectHttpError(409, 'finishline_full_missing_handoff', () =>
+        httpFinish(nodeId, {
+          outcome: 'done',
+          result: JSON.stringify({
+            finishline_verdict: 'FULL',
+            summary: 'Sim scenario C: fake audit tried to report FULL without first writing a handoff.',
+            gaps: [],
+            continuation_tree_id: null,
+            continuation_nodes: [],
+          }),
+        }),
+      );
     } else {
       // Depth-cap probe trees (see check D-*) never reach a real audit worker —
       // they are built and torn down purely at the HTTP-plant layer. If one
@@ -308,6 +321,53 @@ await checkAsync('H-4', 'handoff route rejects absolute /home/kevin full-report 
   );
 });
 
+await checkAsync('H-4a', 'handoff route rejects /home/kevin paths outside the Full report section', async () => {
+  await expectHttpError(400, 'invalid_handoff', () =>
+    httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, {
+      handoff: buildSimHandoff(handoffTree.id, handoffTree.topic).replace(
+        '- Simulated tree deliverable completed.',
+        '- Updated /home/kevin/obsidian/paperclip-wiki/skills/example/SKILL.md.',
+      ),
+    }),
+  );
+});
+
+await checkAsync('H-4b', 'handoff route rejects ~/ paths anywhere in the card', async () => {
+  await expectHttpError(400, 'invalid_handoff', () =>
+    httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, {
+      handoff: buildSimHandoff(handoffTree.id, handoffTree.topic).replace(
+        '- Simulated tree deliverable completed.',
+        '- Updated ~/paperclip/scratch.md.',
+      ),
+    }),
+  );
+});
+
+await checkAsync('H-4c', 'handoff route rejects /tmp paths anywhere in the card', async () => {
+  await expectHttpError(400, 'invalid_handoff', () =>
+    httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, {
+      handoff: buildSimHandoff(handoffTree.id, handoffTree.topic).replace(
+        '- Simulated tree deliverable completed.',
+        '- Wrote /tmp/finishline-proof.md.',
+      ),
+    }),
+  );
+});
+
+await checkAsync('H-4d', 'handoff route requires line-anchored required headings', async () => {
+  await expectHttpError(400, 'invalid_handoff', () =>
+    httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, {
+      handoff: [
+        '# fake handoff',
+        '',
+        '```',
+        '## What was built ## Branches & how to install ## How to use it ## Next steps / deferred ## Full report',
+        '```',
+      ].join('\n'),
+    }),
+  );
+});
+
 await checkAsync('H-5', 'handoff route accepts a valid card and GET detail returns it', async () => {
   const handoff = buildSimHandoff(handoffTree.id, handoffTree.topic);
   const posted = await httpPost(`/api/v1/hopper-trees/${handoffTree.id}/handoff`, { handoff });
@@ -393,6 +453,38 @@ await checkAsync('A-4', 'FULL verdict finishes the audit node and completes the 
 
 check('A-5', 'a success notification with the FULL verdict exists', () => {
   assert.ok(notificationCount('🏁 finish-line: FULL%') >= 1, 'expected a "🏁 finish-line: FULL" notification row');
+});
+
+// ===========================================================================
+// SCENARIO C — server-owned gate rejects FULL audit reports when no handoff was
+// persisted first. Mirrors review probe P1.
+// ===========================================================================
+let treeC;
+await checkAsync('C-1', 'plant tree C via POST /hopper-trees with original_ask', async () => {
+  const created = await httpPost('/api/v1/hopper-trees', {
+    topic: 'sim-scenario-C: FULL without handoff must block',
+    origin_thread: 'cockpit:finishline-sim-origin-C',
+    original_ask: 'Sim scenario C original ask: do the one trivial thing, then require a persisted handoff before FULL.',
+    nodes: [{ title: 'Do the trivial thing (scenario C)', spec: 'Trivial sim node for scenario C.' }],
+  });
+  treeC = created.tree;
+  scenarioForTree.set(treeC.id, 'C');
+});
+
+await checkAsync('C-2', 'FULL verdict without a handoff is rejected, audit node blocks, and tree stays active', async () => {
+  await httpPost(`/api/v1/hopper-trees/${treeC.id}/agree`, {});
+  const t = await waitFor(
+    async () => {
+      const t = await httpGet(`/api/v1/hopper-trees/${treeC.id}`);
+      const audit = t.nodes.find((n) => n.title === 'FINISH-LINE AUDIT');
+      return audit?.status === 'blocked' ? t : null;
+    },
+    { label: 'C audit blocked' },
+  );
+  const audit = t.nodes.find((n) => n.title === 'FINISH-LINE AUDIT');
+  assert.equal(t.tree.status, 'active');
+  assert.equal(t.tree.handoff, null);
+  assert.equal(audit.result, 'finishline FULL rejected: no handoff on tree');
 });
 
 // ===========================================================================

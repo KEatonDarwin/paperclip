@@ -431,6 +431,7 @@ const REQUIRED_HANDOFF_HEADINGS = [
   '## Next steps / deferred',
   '## Full report',
 ];
+export const FINISHLINE_FULL_MISSING_HANDOFF_RESULT = 'finishline FULL rejected: no handoff on tree';
 
 export type HandoffValidation =
   | { ok: true; handoff: string }
@@ -447,15 +448,15 @@ export function validateHopperTreeHandoff(value: unknown): HandoffValidation {
 
   let cursor = -1;
   for (const heading of REQUIRED_HANDOFF_HEADINGS) {
-    const idx = handoff.indexOf(heading);
+    const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const idx = handoff.search(new RegExp(`^${escaped}\\s*$`, 'm'));
     if (idx === -1) return { ok: false, message: `handoff is missing required section: ${heading}` };
     if (idx < cursor) return { ok: false, message: `handoff sections must appear in the required order: ${heading}` };
     cursor = idx;
   }
 
-  const fullReport = handoff.slice(handoff.indexOf('## Full report'));
-  if (/\/home\/kevin\//.test(fullReport)) {
-    return { ok: false, message: 'Full report must use a wiki-relative path, not an absolute /home/kevin path' };
+  if (/\/home\/kevin\//.test(handoff) || /\/tmp\//.test(handoff) || /(^|[\s"'`([:])~\//m.test(handoff)) {
+    return { ok: false, message: 'handoff must not include absolute local filesystem paths; use wiki-relative paths instead' };
   }
   return { ok: true, handoff };
 }
@@ -627,7 +628,7 @@ function composeFinishLineAuditSpec(tree: HopperTreeRow, nodes: HopperNodeRow[])
     '',
     'Handoff card required before any FULL verdict:',
     '1. Read JARVIS_COCKPIT_KEY from /home/kevin/paperclip/jarvis-command-center/.env.',
-    '2. Identify the docs/push node outbox report path from the settled node inventory. It must be wiki-relative, like `outbox/<file>.md`; never use `/home/kevin/...` in the Full report section.',
+    `2. GET /api/v1/hopper-trees/${tree.id} with bearer auth and read the docs/push node's full \`result\` (the settled inventory above is only an excerpt). Identify the outbox report path from that full result. It must be wiki-relative, like \`outbox/<file>.md\`; never use \`/home/kevin/...\`, \`~/...\`, or \`/tmp/...\` anywhere in the handoff card.`,
     '3. Synthesize a short markdown handoff card in exactly this section order:',
     '   # <Tree topic> handoff',
     '   Tree: `<tree-id>`',
@@ -639,7 +640,7 @@ function composeFinishLineAuditSpec(tree: HopperTreeRow, nodes: HopperNodeRow[])
     '   ## Next steps / deferred',
     '   ## Full report',
     '4. The Branches table must use columns: Order, Repo, Branch, Head, Notes. Include every branch/manual artifact Kevin needs to pull, deploy, review, or intentionally ignore.',
-    '5. POST the card to /api/v1/hopper-trees/:treeId/handoff with JSON `{ "handoff": "<markdown>", "force": false }` and bearer auth.',
+    `5. POST the card to /api/v1/hopper-trees/${tree.id}/handoff with JSON \`{ "handoff": "<markdown>", "force": false }\` and bearer auth.`,
     '6. If the handoff POST fails, retry the exact POST up to three times.',
     '7. If the handoff still cannot be persisted, do NOT return a FULL verdict. Finish this audit node with outcome=blocked and a precise result explaining the handoff write failure.',
     '8. Only after the handoff POST succeeds may you finish this audit node with finishline_verdict FULL.',
@@ -990,6 +991,20 @@ export function finishHopperNode(
   const tree = getHopperTree(node.tree_id);
 
   if (outcome === 'done') {
+    const verdict = isFinishLineNode(node) ? parseFinishLineVerdict(payload.result) : null;
+    if (verdict?.finishline_verdict === 'FULL' && !tree?.handoff?.trim()) {
+      const latest = setNode(id, { status: 'blocked', result: FINISHLINE_FULL_MISSING_HANDOFF_RESULT, lease_expires_at: null });
+      if (latest?.status === 'blocked' && !isFoundryTree(tree)) {
+        createNotification({
+          severity: 'error',
+          title: `🚧 Hopper task blocked: ${node.title.slice(0, 100)}`,
+          body: `${FINISHLINE_FULL_MISSING_HANDOFF_RESULT}\nNode ${id}, tree ${node.tree_id}.`,
+          source: 'hopper-engine',
+        });
+      }
+      queueMicrotask(() => void dispatchTick('node_finished'));
+      return getNodeStmt.get(id) ?? null;
+    }
     const updated = setNode(id, { status: 'done', result: payload.result ?? '(no result text)', lease_expires_at: null });
     if (updated) settleAncestors(updated);
   } else if (outcome === 'split' && payload.children?.length) {

@@ -127,6 +127,7 @@ import {
   findOpenContinuationOf,
   setHopperTreeHandoff,
   validateHopperTreeHandoff,
+  FINISHLINE_FULL_MISSING_HANDOFF_RESULT,
   type NewNodeInput,
 } from '../hopper-engine.js';
 import { governorStatus, governorStatusAll } from '../hopper-governor.js';
@@ -1973,6 +1974,10 @@ export function createApiV1Router(): Router {
       question: typeof body.question === 'string' ? body.question : undefined,
       children: body.children,
     });
+    if (outcome === 'done' && updated?.status === 'blocked' && updated.result === FINISHLINE_FULL_MISSING_HANDOFF_RESULT) {
+      sendError(res, 409, 'finishline_full_missing_handoff', FINISHLINE_FULL_MISSING_HANDOFF_RESULT);
+      return;
+    }
     res.json({ node: updated });
   });
 

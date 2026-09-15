@@ -2,6 +2,15 @@
 
 This contract defines the Kevin-facing handoff card attached to a completed Hopper tree.
 
+## Implementation status
+
+Tree `tree-333d5062` adds the v2 human-runthrough checklist on top of the finish-line handoff card.
+
+- Backend branch: `hopper/handoff-checklist`, stacked on `hopper/finish-line-gate`.
+- Cockpit branch: `hopper/handoff-checklist-ui`, stacked on `hopper/tree-handoff-ui`.
+- Deploy order: backend first, then cockpit UI. Both parent branches must land first or be deployed in the same stacked order.
+- Review status: adversarial review #233 passed after fixes for quiet checklist GETs, fence-aware drawer splitting, and lowercase FULL verdict normalization.
+
 ## v2 required shape
 
 Every finished Hopper tree with an `original_ask` must persist a handoff card before the finish-line audit may return a `FULL` verdict.
@@ -85,6 +94,18 @@ API:
   - `checked=true` stamps `checked_at` if not already set.
   - `checked=false` clears `checked_at`.
   - Re-parses the current handoff before applying the update so an edited handoff cannot desync the stored checklist.
+
+Read behavior:
+
+- The first read may persist parsed checklist state, but normal GETs must not bump `hopper_trees.updated_at`.
+- Updating a checkbox or note is real human activity and may bump `updated_at`.
+- Re-reading after a handoff edit keeps checked state and notes for unchanged item text.
+
+Cockpit behavior:
+
+- Completed tree cards show a `checked/total` progress chip when a checklist exists.
+- The handoff drawer replaces only the `## Human runthrough` markdown section with the interactive checklist.
+- Markdown headings inside fenced code blocks are ignored when finding the runthrough section, so quoted templates do not garble the drawer.
 
 ## Finish-line gate
 

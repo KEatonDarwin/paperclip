@@ -129,6 +129,7 @@ import {
   setHopperTreeHandoff,
   validateHopperTreeHandoff,
   FINISHLINE_FULL_MISSING_HANDOFF_RESULT,
+  isAllowedFixLeafModel,
   type AppendHopperNodeInput,
   type NewNodeInput,
 } from '../hopper-engine.js';
@@ -2139,7 +2140,6 @@ export function createApiV1Router(): Router {
       return;
     }
 
-    const forbiddenModels = new Set(['claude-fable-5', 'fable-5.1', 'gpt-6-astra']);
     const fixes: AppendHopperNodeInput[] = [];
     for (const raw of rawNodes.slice(0, 12)) {
       const item = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
@@ -2154,7 +2154,9 @@ export function createApiV1Router(): Router {
         sendError(res, 400, 'invalid_request', 'each FIX node needs title, spec, adapter, and model');
         return;
       }
-      if (forbiddenModels.has(model)) {
+      // Shares the engine's allowlist (review #223 finding 2) so this route
+      // and appendHopperRemediationNodes can never drift apart again.
+      if (!isAllowedFixLeafModel(model)) {
         sendError(res, 400, 'invalid_fix_model', `${model} is not allowed for FIX leaf nodes`);
         return;
       }

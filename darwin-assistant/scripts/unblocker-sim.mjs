@@ -218,8 +218,11 @@ setSettings({ unblocker_max_5h: '60' });
   const { node } = await createRunningNode('unblocker: exact threshold hold');
   hopperEngine.finishHopperNode(node.id, 'blocked', { result: 'simulated red block at exact threshold' });
   await new Promise((resolve) => setImmediate(resolve));
-  check('3', 'claude 5h exactly equal to unblocker_max_5h holds without spawning', () => {
-    assert.equal(unblockPasses().length, 0);
+  check('3', 'claude 5h exactly equal to unblocker_max_5h holds without spawning (finding 5: parks a waiting_for_juice marker for the sweep, never spawns)', () => {
+    const passes = unblockPasses();
+    assert.equal(passes.length, 1);
+    assert.equal(passes[0].status, 'waiting_for_juice');
+    assert.equal(passes[0].worker_ext, null);
     assert.equal(unblockerDispatches.length, 0);
     assert.equal(unblockerNotifications().length, 0);
   });

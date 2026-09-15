@@ -67,6 +67,7 @@ export interface HopperNodeRow {
   model: string | null;
   foundry_auto_retries: number;
   is_finishline: number;
+  remediation_of: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -241,7 +242,17 @@ for (const col of ['original_ask TEXT', 'deferred_scope TEXT', 'continuation_of 
   }
 }
 
-for (const col of ['adapter TEXT', 'model TEXT', 'foundry_auto_retries INTEGER NOT NULL DEFAULT 0', 'is_finishline INTEGER NOT NULL DEFAULT 0']) {
+for (const col of [
+  'adapter TEXT',
+  'model TEXT',
+  'foundry_auto_retries INTEGER NOT NULL DEFAULT 0',
+  'is_finishline INTEGER NOT NULL DEFAULT 0',
+  // Review #223 finding 1: FIX nodes planted by a Smart Unblocker pass carry
+  // the id of the ROOT node whose one-pass fuse they belong to (walked flat
+  // at insert time, so FIX-of-FIX still resolves to a single root). A node
+  // with this set must never trigger a fresh unblocker spawn of its own.
+  'remediation_of INTEGER',
+]) {
   try {
     sqliteDb.exec(`ALTER TABLE hopper_nodes ADD COLUMN ${col}`);
   } catch {
@@ -394,11 +405,33 @@ const markUnblockPassNeedsKevinStmt = sqliteDb.prepare<[string | null, number]>(
 const setUnblockPassNudgeStmt = sqliteDb.prepare<[string, number]>(`
   UPDATE hopper_unblock_passes SET nudge_id = ?, updated_at = datetime('now') WHERE node_id = ?
 `);
-const markUnblockPassFailedStmt = sqliteDb.prepare<[string, number]>(`
+// Finding 4: a spawn that never actually started (adapter busy, CLI error) did
+// not consume the one pass — reset the marker so the waiting-for-juice sweep
+// (finding 5) can retry it, instead of permanently burning the fuse.
+const resetUnblockPassToWaitingStmt = sqliteDb.prepare<[string, number]>(`
   UPDATE hopper_unblock_passes
-  SET status = 'failed', result = ?, updated_at = datetime('now'), finished_at = datetime('now')
+  SET status = 'waiting_for_juice', worker_ext = NULL, worker_thread_ext = NULL,
+      result = ?, updated_at = datetime('now')
   WHERE node_id = ?
 `);
+// Finding 5: gate-fail (juice closed) and finding 3: concurrency-capped both
+// park the node here instead of silently doing nothing — `dispatchTick`'s
+// sweep is the only producer that makes `claimWaitingUnblockPassStmt` reachable.
+const insertWaitingForJuiceStmt = sqliteDb.prepare<[number, string, string, string | null]>(`
+  INSERT INTO hopper_unblock_passes (node_id, tree_id, adapter, model, status, blocked_result)
+  VALUES (?, ?, 'claude', ?, 'waiting_for_juice', ?)
+`);
+const updateWaitingForJuiceStmt = sqliteDb.prepare<[string | null, number]>(`
+  UPDATE hopper_unblock_passes
+  SET blocked_result = COALESCE(?, blocked_result), updated_at = datetime('now')
+  WHERE node_id = ? AND status = 'waiting_for_juice' AND worker_ext IS NULL
+`);
+const runningUnblockPassCountStmt = sqliteDb.prepare<[], { n: number }>(
+  `SELECT COUNT(*) AS n FROM hopper_unblock_passes WHERE status = 'running'`,
+);
+const waitingUnblockPassNodeIdsStmt = sqliteDb.prepare<[], { node_id: number }>(
+  `SELECT node_id FROM hopper_unblock_passes WHERE status = 'waiting_for_juice' AND worker_ext IS NULL`,
+);
 
 function emitNode(action: HopperNodeEvent['action'], node: HopperNodeRow): void {
   sseBus.emit('sse', { type: 'hopper_node', action, node } satisfies HopperNodeEvent);
@@ -678,6 +711,16 @@ function smartUnblockerMax5h(): number {
   return intSetting('unblocker_max_5h', 60);
 }
 
+// Finding 3: nothing routed the unblocker through dispatchTick's slot/governor
+// loop, so N simultaneous blocks spawned N parallel Opus workers. Default 1 —
+// a real incident is almost always the same root cause fanning out across
+// every leaf of a module (e.g. the Foundation Gate anti-shim rule tripping on
+// every module of a project at once); one pass diagnoses it for all of them
+// via the needs_kevin escalation once the fuse is spent.
+function unblockerMaxConcurrent(): number {
+  return Math.max(1, intSetting('unblocker_max_concurrent', 1));
+}
+
 function normalizeUnblockerModel(): UnblockerModel {
   const raw = getSetting('unblocker_model')?.trim();
   return UNBLOCKER_MODEL_ALLOWLIST.includes(raw as UnblockerModel)
@@ -835,18 +878,23 @@ async function spawnSmartUnblockerWorker(
   } catch (err) {
     const detail = err instanceof Error ? err.stack ?? err.message : String(err);
     console.error(`[hopper-unblocker] spawn failed for node ${node.id}:`, err);
-    markUnblockPassFailedStmt.run(detail.slice(0, 4000), node.id);
+    // Finding 4: the worker never actually claimed the pass (adapter busy,
+    // CLI error) — that is not a used pass. Reset to waiting_for_juice
+    // (worker_ext cleared) so the sweep in dispatchTick retries it instead of
+    // stranding the node with a permanently burned fuse.
+    resetUnblockPassToWaitingStmt.run(detail.slice(0, 4000), node.id);
     createNotification({
       severity: 'error',
-      title: `Hopper unblocker failed to start: ${node.title.slice(0, 100)}`,
+      title: `Hopper unblocker failed to start (will retry): ${node.title.slice(0, 100)}`,
       body: `${detail.slice(0, 1200)}\nNode ${node.id}, tree ${node.tree_id}.`,
       source: 'hopper-unblocker',
       link: `/spawn-tree?tree=${encodeURIComponent(tree.id)}&node=${node.id}`,
     });
+    queueMicrotask(() => void dispatchTick('unblocker_spawn_failed_retry'));
   }
 }
 
-function notifyUnblockerNeedsKevin(node: HopperNodeRow, tree: HopperTreeRow, body: string): void {
+function notifyUnblockerNeedsKevin(node: HopperNodeRow, tree: HopperTreeRow, body: string, passNodeId: number = node.id): void {
   const notification = createNotification({
     severity: 'error',
     source: 'hopper-unblocker',
@@ -854,7 +902,27 @@ function notifyUnblockerNeedsKevin(node: HopperNodeRow, tree: HopperTreeRow, bod
     body,
     link: `/spawn-tree?tree=${encodeURIComponent(tree.id)}&node=${node.id}`,
   });
-  setUnblockPassNudgeStmt.run(String(notification.id), node.id);
+  setUnblockPassNudgeStmt.run(String(notification.id), passNodeId);
+}
+
+/** Finding 5: park a node whose unblocker attempt couldn't run right now (gate
+ *  closed / concurrency-capped) so `dispatchTick`'s sweep can pick it back up
+ *  the moment capacity/juice reopens, instead of silently no-op'ing forever. */
+function recordWaitingForJuice(node: HopperNodeRow, tree: HopperTreeRow, reason: string): void {
+  const existing = getUnblockPassStmt.get(node.id) ?? null;
+  if (existing) {
+    // Any status other than an unclaimed waiting_for_juice marker means the
+    // fuse is already spent or a worker is already in flight — never clobber it.
+    if (existing.status === 'waiting_for_juice' && !existing.worker_ext) {
+      updateWaitingForJuiceStmt.run(node.result ?? reason, node.id);
+    }
+    return;
+  }
+  try {
+    insertWaitingForJuiceStmt.run(node.id, tree.id, UNBLOCKER_DEFAULT_MODEL, node.result ?? reason);
+  } catch {
+    /* raced with another writer inserting the marker first — it exists now, fine */
+  }
 }
 
 function maybeTriggerSmartUnblocker(nodeId: number): void {
@@ -862,6 +930,21 @@ function maybeTriggerSmartUnblocker(nodeId: number): void {
   if (!node || node.status !== 'blocked') return;
   const tree = getHopperTree(node.tree_id);
   if (!tree || tree.status === 'draft' || tree.status === 'archived') return;
+
+  // Finding 1: a FIX node planted by a prior unblocker pass must never spawn
+  // a fresh unblocker of its own — that is the unbounded-recursion cascade.
+  // Escalate straight to the root pass's needs_kevin instead.
+  if (node.remediation_of) {
+    const rootId = node.remediation_of;
+    const body = [
+      `FIX node #${node.id} (planted to remediate node #${rootId}) blocked again: ${node.result ?? '(no result)'}`,
+      '',
+      `Smart Unblocker already spent its one pass on node ${rootId}. Kevin needs to decide the next move.`,
+    ].join('\n');
+    markUnblockPassNeedsKevinStmt.run(body, rootId);
+    notifyUnblockerNeedsKevin(node, tree, body, rootId);
+    return;
+  }
 
   const existing = getUnblockPassStmt.get(node.id) ?? null;
   if (existing?.worker_ext || existing?.worker_thread_ext) {
@@ -878,6 +961,18 @@ function maybeTriggerSmartUnblocker(nodeId: number): void {
   const gate = unblockerGate();
   if (!gate.ok) {
     console.log(`[hopper-unblocker] hold node ${node.id}: ${gate.reason}`);
+    recordWaitingForJuice(node, tree, gate.reason);
+    return;
+  }
+
+  // Finding 3: route through a concurrency cap instead of spawning one
+  // high-tier worker per simultaneous block — a real incident is usually the
+  // same root cause fanning out across many leaves at once.
+  const runningNow = runningUnblockPassCountStmt.get()?.n ?? 0;
+  const maxConcurrent = unblockerMaxConcurrent();
+  if (runningNow >= maxConcurrent) {
+    console.log(`[hopper-unblocker] hold node ${node.id}: concurrency cap ${runningNow}/${maxConcurrent} reached`);
+    recordWaitingForJuice(node, tree, `concurrency cap ${runningNow}/${maxConcurrent} reached`);
     return;
   }
 
@@ -907,6 +1002,8 @@ function maybeTriggerSmartUnblocker(nodeId: number): void {
       const refreshed = getUnblockPassStmt.get(node.id);
       if (refreshed?.worker_ext || refreshed?.worker_thread_ext) {
         maybeTriggerSmartUnblocker(node.id);
+      } else if (refreshed?.status === 'waiting_for_juice') {
+        maybeTriggerSmartUnblocker(node.id);
       } else {
         console.warn(`[hopper-unblocker] could not claim pass for node ${node.id}; marker exists without a worker`);
       }
@@ -916,6 +1013,15 @@ function maybeTriggerSmartUnblocker(nodeId: number): void {
 
   console.log(`[hopper-unblocker] spawn node ${node.id} → ${workerExt} (${gate.loadout.adapter}/${gate.loadout.model})`);
   void spawnSmartUnblockerWorker(node, tree, gate.loadout, workerExt);
+}
+
+/** Finding 5's producer-side complement: sweep every parked waiting_for_juice
+ *  marker on each dispatch tick and give it another shot at the gate/cap. */
+function sweepWaitingUnblockPasses(): void {
+  for (const row of waitingUnblockPassNodeIdsStmt.all()) {
+    const node = getNodeStmt.get(row.node_id);
+    if (node && node.status === 'blocked') maybeTriggerSmartUnblocker(row.node_id);
+  }
 }
 
 function parseDependencyIds(value: string | null): number[] {
@@ -939,7 +1045,24 @@ function normalizeFixTitle(title: string): string {
   return /^FIX:/i.test(trimmed) ? trimmed.slice(0, 300) : `FIX: ${trimmed}`.slice(0, 300);
 }
 
-const FORBIDDEN_FIX_MODELS = new Set(['claude-fable-5', 'fable-5.1', 'gpt-6-astra']);
+// Review #223 finding 2: a denylist can never keep pace with new frontier
+// model ids (the original list missed `claude-fable-5-1`, the real Fable 5.1
+// id). Inverted to an allowlist of the Standard/Heavy tiers a FIX leaf is
+// actually meant to run on (skills/jarvis-router/SKILL.md); a frontier tier
+// on ANY pool — including one that doesn't exist yet — is rejected by
+// default instead of by name.
+export const FIX_LEAF_MODEL_ALLOWLIST = new Set([
+  'claude-haiku-4-5-20251001',
+  'claude-sonnet-5',
+  'claude-opus-5',
+  'gpt-5.5',
+  'opus4.8',
+  'sonnet4.6',
+  'default', // auggie no-op flag: rides its own configured default, not a frontier escape hatch
+]);
+export function isAllowedFixLeafModel(model: string): boolean {
+  return FIX_LEAF_MODEL_ALLOWLIST.has(model.trim());
+}
 
 export function appendHopperRemediationNodes(
   blockedNodeId: number,
@@ -949,16 +1072,22 @@ export function appendHopperRemediationNodes(
   if (!blocked || blocked.status !== 'blocked' || !inputs.length) return null;
   const tree = getHopperTree(blocked.tree_id);
   if (!tree || tree.status !== 'active') return null;
-  if (inputs.some((n) => FORBIDDEN_FIX_MODELS.has(n.model))) {
-    throw new Error('FIX leaf nodes may not use frontier unblocker models');
+  if (inputs.some((n) => !isAllowedFixLeafModel(n.model))) {
+    throw new Error('FIX leaf nodes may only use allowlisted Standard/Heavy tier models, never a frontier tier');
   }
+
+  // Finding 1: FIX nodes belong to the root node's one-pass fuse. Walk once
+  // at insert time so a FIX-of-FIX (a manual remediation nested by hand)
+  // still resolves flat to the original blocked node, never to an
+  // intermediate FIX node.
+  const remediationRoot = blocked.remediation_of ?? blocked.id;
 
   const priorResult = blocked.result ?? '(no blocked result recorded)';
   const originalDeps = parseDependencyIds(blocked.depends_on);
   const createdIds = sqliteDb.transaction(() => {
-    const insert = sqliteDb.prepare<[string, string, string, string | null, string, string]>(`
-      INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, status, depends_on, adapter, model)
-      VALUES (?, NULL, ?, ?, 'pending', ?, ?, ?)
+    const insert = sqliteDb.prepare<[string, string, string, string | null, string, string, number]>(`
+      INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, status, depends_on, adapter, model, remediation_of)
+      VALUES (?, NULL, ?, ?, 'pending', ?, ?, ?, ?)
     `);
     const ids: number[] = [];
     inputs.slice(0, 12).forEach((input, index) => {
@@ -971,6 +1100,7 @@ export function appendHopperRemediationNodes(
         deps.length ? JSON.stringify(deps) : null,
         input.adapter.trim(),
         input.model.trim(),
+        remediationRoot,
       );
       ids.push(Number(info.lastInsertRowid));
     });
@@ -1593,6 +1723,12 @@ export async function dispatchTick(reason: string): Promise<void> {
         });
       }
     }
+
+    // 1.5) Finding 5: retry any Smart Unblocker pass parked waiting_for_juice
+    //      (gate closed or concurrency-capped last time it was evaluated).
+    //      Runs outside the node-slot machinery — these are direct
+    //      processMessageRef spawns, not hopper leaves.
+    sweepWaitingUnblockPasses();
 
     // 2) Fill free slots with ready leaves (deps satisfied), priority order.
     //    The governor gates every NEW claim per-node by that node's provider so

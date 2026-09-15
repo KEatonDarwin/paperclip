@@ -315,3 +315,86 @@ acceptable. (c) `gov_override_*` (branch `hopper/gov-overrides`) is not on
 this branch; when merged, `override=on` bypasses ceilings but
 `unblockerGate` still reads `five_hour` independently, so the 60% cap holds —
 re-run this sim after that merge.
+
+## 2026-09-15 · Smart Unblocker fix pass (tree-7015c6fe node #235) — all 5 findings resolved
+
+Follow-up to the 2026-09-14 adversarial review above. Branch `hopper/smart-unblocker`,
+worked in the same worktree. All changes in `darwin-assistant/src/hopper-engine.ts`
++ `src/handlers/api-v1.ts` + `scripts/unblocker-sim.mjs`. Verified with
+`npm run build` (clean), `npm run unblocker:sim` (6/6, check 3 updated — see
+below), and `JARVIS_DB_PATH=/tmp/unblocker-adv.db node scripts/unblocker-adversarial-sim.mjs`
+(10/10, was 5/10). `finishline:sim` re-run for cross-check: 25/25, unaffected.
+
+1. **Unbounded recursion — fixed via `remediation_of`.** Added a
+   `remediation_of INTEGER` column to `hopper_nodes`. `appendHopperRemediationNodes`
+   now stamps every FIX node it plants with `blocked.remediation_of ?? blocked.id`
+   (walked once at insert time, so a FIX-of-FIX still resolves flat to the
+   original root). `maybeTriggerSmartUnblocker` checks `node.remediation_of`
+   first: if set, it never spawns — it escalates straight to the root pass's
+   `needs_kevin` (via `markUnblockPassNeedsKevinStmt`/`notifyUnblockerNeedsKevin`,
+   which now takes an explicit `passNodeId` so the nudge lands on the ROOT
+   node's pass row, not the FIX node's nonexistent one). Adversarial R1: 5
+   successive FIX-blocks now produce exactly 1 unblocker spawn (was 6).
+
+2. **Fable 5.1 / frontier-model bypass — inverted denylist to an allowlist.**
+   `FIX_LEAF_MODEL_ALLOWLIST` (exported) replaces `FORBIDDEN_FIX_MODELS` in
+   both `appendHopperRemediationNodes` and the `/hopper-nodes/:id/remediate`
+   route (which now imports `isAllowedFixLeafModel` from the engine instead
+   of keeping its own copy — the two can no longer drift, closing exactly the
+   gap that let `claude-fable-5-1` slip through in the first place). Allowlist
+   = the Standard/Heavy tiers a FIX leaf is meant to run on:
+   `claude-haiku-4-5-20251001`, `claude-sonnet-5`, `claude-opus-5`, `gpt-5.5`,
+   `opus4.8`, `sonnet4.6`, `default` (auggie's no-op flag). A new/unknown
+   frontier id is rejected by default now, not just the three names on the
+   old list. Adversarial R2 passes.
+
+3. **No concurrency cap — added `unblocker_max_concurrent` (default 1).**
+   `maybeTriggerSmartUnblocker` now counts `hopper_unblock_passes WHERE
+   status='running'` before claiming a new pass; at/over the cap it parks the
+   node via `recordWaitingForJuice` (finding 5's mechanism) instead of
+   spawning. Adversarial R3: 5 simultaneous blocks → 1 unblocker (was 5).
+
+4. **Spawn failure burning the fuse — reset to `waiting_for_juice` instead of
+   `failed`.** `spawnSmartUnblockerWorker`'s catch block now calls
+   `resetUnblockPassToWaitingStmt` (worker_ext cleared, status back to
+   `waiting_for_juice`) instead of `markUnblockPassFailedStmt`, and kicks a
+   `dispatchTick` so the retry isn't stranded until the next periodic tick.
+   `markUnblockPassFailedStmt` removed (no longer has a caller). Adversarial
+   R4 passes (pass status is `waiting_for_juice`, never `failed`).
+
+5. **`waiting_for_juice` was dead code — added a producer and a sweep.**
+   `recordWaitingForJuice(node, tree, reason)` upserts a `waiting_for_juice`
+   marker whenever `maybeTriggerSmartUnblocker` can't proceed right now
+   (gate closed OR concurrency-capped), without clobbering a row that's
+   already `running`/`needs_kevin`/etc. `dispatchTick` gained a step 1.5,
+   `sweepWaitingUnblockPasses()`, that re-evaluates every unclaimed
+   `waiting_for_juice` row's still-`blocked` node on every tick (the existing
+   60s timer / every-finish trigger is therefore the retry cadence — no new
+   scheduler). `claimWaitingUnblockPassStmt` (already shipped, previously
+   unreachable) is now reachable. Adversarial R5 passes: 1 marker at hold
+   time, exactly 1 spawn two ticks after juice reopens.
+
+**Contract-behavior change worth flagging explicitly:** finding 5 means a
+node that blocks while the gate is closed (or over the concurrency cap) now
+**always** leaves a `hopper_unblock_passes` row (`waiting_for_juice`), where
+before it left none. `scripts/unblocker-sim.mjs` check 3 ("claude 5h exactly
+equal to unblocker_max_5h") asserted zero rows in that case — updated to
+assert exactly one `waiting_for_juice` row with `worker_ext IS NULL`, still
+zero dispatches/notifications. This is the intended new contract, not a
+regression: it's what makes the sweep in #5 have something to sweep.
+
+Residual notes, not code-fixable / out of scope for this pass:
+
+- `unblocker_max_concurrent` has no settings-UI surface yet (same posture as
+  every other `unblocker_*` KV today — set via `PATCH` to the settings table
+  directly or a future cockpit panel).
+- The concurrency check and the gate check both read `hopper_unblock_passes`
+  without a transaction wrapping the read-then-insert; two `dispatchTick`
+  sweeps racing on the exact same tick could both see `runningNow=0` and both
+  claim. In practice `dispatchTick` has a `ticking` reentrancy guard so this
+  can't happen from the tick path itself; `finishHopperNode`'s direct
+  synchronous call path is single-threaded Node, so it's serialized too. Not
+  reproduced adversarially; noted for completeness.
+- `gov_override_*` (branch `hopper/gov-overrides`, not yet merged here) still
+  needs the same re-run-after-merge caveat the original review noted — none
+  of today's changes touch `unblockerGate`'s governor read.

@@ -15,6 +15,7 @@ import type { SmartTodoNodeRow } from './smart-todos.js';
 import type { MonitorRow, MonitorRunRow } from './monitors.js';
 import type { FoundryModuleResponse, FoundryProjectResponse } from './foundry.js';
 import type { IntelItem, IntelRun } from './intel-desk.js';
+import type { NudgeRow } from './nudges.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -282,6 +283,12 @@ export interface IntelItemEvent {
   item: IntelItem;
 }
 
+export interface NudgeEvent {
+  type: 'nudge';
+  action: 'created' | 'updated' | 'deleted';
+  nudge: NudgeRow;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
@@ -293,7 +300,7 @@ export type SSEEvent =
   | ThreadGroupEvent | NotificationEvent
   | DispatchEvent | DispatchCueEvent | HopperItemEvent | HopperNodeEvent | SmartTodoEvent
   | MonitorEvent | MonitorRunEvent | FoundryProjectEvent | FoundryModuleEvent
-  | IntelRunEvent | IntelItemEvent;
+  | IntelRunEvent | IntelItemEvent | NudgeEvent;
 
 class SSEBus extends EventEmitter {}
 

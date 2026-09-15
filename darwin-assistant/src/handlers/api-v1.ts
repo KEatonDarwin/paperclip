@@ -58,6 +58,20 @@ import {
   type NotificationMeta,
 } from '../notifications.js';
 import {
+  createNudge,
+  deleteNudge,
+  getNudge,
+  isNudgeSource,
+  isNudgeStatus,
+  listNudges,
+  markNudgeDelivered,
+  markNudgeResolved,
+  markNudgesDelivered,
+  nudgeCounts,
+  NUDGE_THREAD_EXTERNAL_ID,
+  type NudgeStatus,
+} from '../nudges.js';
+import {
   listHopperItems,
   getHopperItem,
   createHopperItem,
@@ -291,7 +305,7 @@ import {
 
 const MAX_TEXT_LENGTH = 50_000;
 const UI_PORT = parseInt(process.env.JARVIS_UI_PORT ?? '3201', 10);
-const PROTECTED_THREAD_IDS = new Set(['checkin:notifications']);
+const PROTECTED_THREAD_IDS = new Set(['checkin:notifications', NUDGE_THREAD_EXTERNAL_ID]);
 
 // Governor v2 settings-KV schema (docs/hopper/GOVERNOR-V2-CONTRACT.md
 // §Settings-KV Schema). Single source of truth for GET/PATCH
@@ -366,11 +380,16 @@ function parseJsonSetting<T>(key: string): T | null {
 function notificationMetaFromBody(value: unknown): NotificationMeta | null {
   if (!value || typeof value !== 'object') return null;
   const meta = value as Record<string, unknown>;
+  const kind =
+    meta.kind === 'checkin' || meta.kind === 'needs_kevin'
+      ? meta.kind
+      : undefined;
   return {
-    kind: meta.kind === 'checkin' ? 'checkin' : undefined,
+    kind,
     checkinId: typeof meta.checkinId === 'string' ? meta.checkinId : undefined,
     sourceType: typeof meta.sourceType === 'string' ? meta.sourceType : null,
     sourceId: typeof meta.sourceId === 'string' ? meta.sourceId : null,
+    nudgeId: typeof meta.nudgeId === 'number' && Number.isFinite(meta.nudgeId) ? meta.nudgeId : undefined,
   };
 }
 
@@ -1249,6 +1268,111 @@ export function createApiV1Router(): Router {
       return;
     }
     deleteNotification(id);
+    res.status(204).end();
+  });
+
+  // == JARVIS Nudges ==========================================================
+  // Needs-Kevin surface: one global JARVIS thread plus a pulsing cockpit bubble.
+  // The ordinary bell remains as a compatibility layer; nudges carry the route
+  // metadata that lets Kevin reply in one place and have the answer applied back
+  // to the blocked source workflow.
+
+  router.get('/nudges', (req: AuthedRequest, res) => {
+    const statusRaw = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const status =
+      statusRaw === 'open' || isNudgeStatus(statusRaw)
+        ? statusRaw as NudgeStatus | 'open'
+        : undefined;
+    if (statusRaw && !status) {
+      sendError(res, 400, 'invalid_status', 'status must be pending, delivered, resolved, or open');
+      return;
+    }
+    const limit = Math.max(1, Math.min(500, parseInt(String(req.query.limit ?? '100'), 10) || 100));
+    res.json({ nudges: listNudges(status, limit), ...nudgeCounts() });
+  });
+
+  router.post('/nudges', async (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { source?: unknown; subject_ref?: unknown; context?: unknown };
+    if (!isNudgeSource(body.source)) {
+      sendError(res, 400, 'invalid_source', 'source must be blocked_question, unblocker, finishline_shortfall, commitment, or manual');
+      return;
+    }
+    const subjectRef = typeof body.subject_ref === 'string' ? body.subject_ref.trim() : '';
+    if (!subjectRef) {
+      sendError(res, 400, 'subject_ref_required', 'subject_ref is required');
+      return;
+    }
+    if (body.context !== undefined && (!body.context || typeof body.context !== 'object' || Array.isArray(body.context))) {
+      sendError(res, 400, 'invalid_context', 'context must be an object when provided');
+      return;
+    }
+    try {
+      const result = await createNudge({
+        source: body.source,
+        subject_ref: subjectRef,
+        context: body.context as Record<string, unknown> | undefined,
+      });
+      res.status(result.duplicate ? 200 : 201).json({ ...result, ...nudgeCounts() });
+    } catch (err) {
+      sendError(res, 500, 'nudge_create_failed', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.post('/nudges/delivered', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { ids?: unknown };
+    let ids: number[] | undefined;
+    if (body.ids !== undefined) {
+      if (!Array.isArray(body.ids)) {
+        sendError(res, 400, 'invalid_ids', 'ids must be an array of nudge ids');
+        return;
+      }
+      ids = body.ids
+        .map((id) => Number(id))
+        .filter((id) => Number.isInteger(id) && id > 0);
+    }
+    res.json({ nudges: markNudgesDelivered(ids), ...nudgeCounts() });
+  });
+
+  router.post('/nudges/:id/deliver', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isInteger(id) || id <= 0) {
+      sendError(res, 400, 'invalid_id', 'nudge id must be a positive integer');
+      return;
+    }
+    const nudge = markNudgeDelivered(id);
+    if (!nudge) {
+      sendError(res, 404, 'nudge_not_found', 'nudge not found');
+      return;
+    }
+    res.json({ nudge, ...nudgeCounts() });
+  });
+
+  router.patch('/nudges/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isInteger(id) || id <= 0) {
+      sendError(res, 400, 'invalid_id', 'nudge id must be a positive integer');
+      return;
+    }
+    const body = (req.body ?? {}) as { status?: unknown };
+    if (body.status !== 'resolved') {
+      sendError(res, 400, 'invalid_status', 'PATCH /nudges/:id only supports {"status":"resolved"}');
+      return;
+    }
+    const nudge = markNudgeResolved(id);
+    if (!nudge) {
+      sendError(res, 404, 'nudge_not_found', 'nudge not found');
+      return;
+    }
+    res.json({ nudge, ...nudgeCounts() });
+  });
+
+  router.delete('/nudges/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getNudge(id)) {
+      sendError(res, 404, 'nudge_not_found', 'nudge not found');
+      return;
+    }
+    deleteNudge(id);
     res.status(204).end();
   });
 
@@ -3919,7 +4043,7 @@ export function createApiV1Router(): Router {
       'quick_capture', 'thread_summary', 'notification',
       'dispatch', 'dispatch_cue', 'hopper_item', 'hopper_node', 'smart_todo',
       'monitor', 'monitor_run', 'foundry_project', 'foundry_module',
-      'intel_run', 'intel_item',
+      'intel_run', 'intel_item', 'nudge',
     ]);
 
     res.writeHead(200, {

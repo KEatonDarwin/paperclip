@@ -21,10 +21,11 @@ export interface NotificationAction {
 }
 
 export interface NotificationMeta {
-  kind?: 'checkin';
+  kind?: 'checkin' | 'needs_kevin';
   checkinId?: string;
   sourceType?: string | null;
   sourceId?: string | null;
+  nudgeId?: number;
 }
 
 export interface NotificationRow {

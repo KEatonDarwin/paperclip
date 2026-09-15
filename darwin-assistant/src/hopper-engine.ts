@@ -3,6 +3,7 @@ import './spawn-tasks.js'; // side-effect: guarantees the spawn_tasks DDL ran be
 import { sqliteDb, getOrCreateConversation, renameConversation, setThreadModelOverride, getSetting } from './conversation-db.js';
 import { sseBus, type HopperNodeEvent } from './sse-bus.js';
 import { createNotification } from './notifications.js';
+import { createBlockedQuestionNudge } from './nudges.js';
 import { governorCheck, governorStatus, kevinActive, providerFor, concurrencyCap, type GovernorProvider } from './hopper-governor.js';
 
 // HOPPER ENGINE — the autonomous work-tree executor (designed 2026-09-06 with
@@ -617,11 +618,18 @@ export function finishHopperNode(
     setNode(id, { status: 'blocked_question', question: payload.question ?? '(no question text)', lease_expires_at: null });
     const latest = getNodeStmt.get(id) ?? null;
     if (latest?.status === 'blocked_question' && !isFoundryTree(tree)) {
-      createNotification({
+      const notification = createNotification({
         severity: 'warning',
         title: `❓ Hopper worker needs your call: ${node.title.slice(0, 100)}`,
         body: `${payload.question ?? ''}\n\n(Answer from any JARVIS chat: "answer hopper node ${id}: <your answer>" — a fresh worker resumes with it.)`,
         source: 'hopper-engine',
+      });
+      createBlockedQuestionNudge({
+        nodeId: id,
+        treeId: node.tree_id,
+        title: node.title,
+        question: payload.question ?? '',
+        notificationId: notification.id,
       });
     }
   } else {

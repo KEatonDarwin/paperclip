@@ -398,3 +398,126 @@ Residual notes, not code-fixable / out of scope for this pass:
 - `gov_override_*` (branch `hopper/gov-overrides`, not yet merged here) still
   needs the same re-run-after-merge caveat the original review noted — none
   of today's changes touch `unblockerGate`'s governor read.
+
+## 2026-09-15 · Smart Unblocker adversarial re-review (node #223 re-run, tree-e8e8750a, opus) — BLOCKED, 3 must-fix + 1 should-fix
+
+Branch `hopper/smart-unblocker` @ `afeca0e5d` (the fix pass for the 2026-09-14
+review, tree-7015c6fe node #235), re-attacked against `docs/hopper/UNBLOCKER.md`
+and Kevin's ask ("must NOT cascade unbounded", "only when we have the power to do
+so"). All five original findings hold under re-probe (R1–R9 green, `unblocker:sim`
+6/6). The fix pass introduced two new defects and left one recursion door open.
+Probes R10–R14 appended to `darwin-assistant/scripts/unblocker-adversarial-sim.mjs`
+(`JARVIS_DB_PATH=/tmp/unblocker-adv-223b.db node scripts/unblocker-adversarial-sim.mjs`
+after `npm run build`); result **12/15 — R10, R11, R12 fail**. Scratch sqlite only;
+live jarvis.db and jarvis.service untouched.
+
+### MUST FIX
+
+1. **A pass never leaves `running`, so the new concurrency cap becomes a
+   permanent lockout: the feature works exactly once per DB lifetime (HIGH).**
+   No statement in the engine transitions `hopper_unblock_passes` to `done`
+   (`grep "status = 'done'"` → nothing; nothing runs after
+   `await processMessageRef(...)` in `spawnSmartUnblockerWorker`; the spawn
+   reconciler never touches the table). `runningUnblockPassCountStmt` therefore
+   counts every pass ever spawned, forever. With the default
+   `unblocker_max_concurrent=1`, the FIRST unblocker spawn holds the only slot
+   for the rest of the service's life. Probe R10: tree A blocks → unblocker
+   spawns → FIX planted → FIX done → original done → **tree A = `done`, pass A
+   = `running`**; unrelated tree B blocks with the gate wide open → pass B
+   parked `waiting_for_juice`; 5 sweeps later still 1 spawn. The success path
+   is the lockout path — the better the unblocker works, the sooner it stops
+   working. The only exits from `running` today are `needs_kevin` (a FIX or
+   re-pended node blocking again) and the spawn-fail reset. Contract state
+   flow says `fixable: … pass done`. **Fix:** mark the pass `done`
+   (`finished_at`, `result` = the worker's final text) when
+   `processMessageRef` resolves — and, belt-and-braces, in `sweepWaiting…`/
+   `maybeTrigger…` treat a `running` pass whose node is no longer `blocked`
+   (re-pended/done) or whose worker thread is not running as settled. Add R10
+   as a permanent check (`spawns === 2`).
+
+2. **Recursion via `split`: FIX-node children carry no `remediation_of`, so
+   every split re-arms the unblocker (HIGH — the exact cascade the ask
+   forbids).** `finishHopperNode`'s `split` branch inserts children with
+   `(tree_id, parent_id, title, spec, status, depends_on, adapter, model)` —
+   `remediation_of` is not inherited. A FIX node that finishes `split` (a
+   perfectly legal outcome for a worker whose fix is "too big for one worker")
+   produces unmarked children; a child that blocks passes the finding-1 guard,
+   has no pass row of its own, and spawns a fresh Opus unblocker, which plants
+   FIX nodes for the child, which can split again… Probe R11 (cap raised to 10
+   so #1 doesn't mask it): root block → 1 spawn; FIX→split→child-blocks ×4 →
+   **5 unblocker spawns, `child.remediation_of = null` at every level**. Today
+   #1 accidentally caps this at one (the lockout), so fixing #1 alone makes
+   this live. **Fix:** in the `split` insert, copy `node.remediation_of` onto
+   every child (and do the same anywhere else nodes are derived from an
+   existing node — check `retryHopperNode`/foundry planting for the same
+   pattern). Optionally refuse `split` on a node with `remediation_of` set
+   (a FIX leaf that can't fit one worker is a signal for needs_kevin, not a
+   subtree). Keep R11 as a permanent check.
+
+3. **Spawn-failure retry is an unbounded microtask storm, not "one attempt per
+   tick" (HIGH — event-loop stall + notification flood).** Finding-4's fix
+   resets the pass to `waiting_for_juice` and calls
+   `queueMicrotask(() => dispatchTick('unblocker_spawn_failed_retry'))`. The
+   next tick's sweep re-claims the same row and re-spawns immediately; if the
+   failure is deterministic (model unavailable on the plan, CLI/auth broken,
+   prompt over the window — `processMessage` **rethrows** on any adapter
+   crash, `agent.ts` "Fix C") the cycle is
+   catch → reset → `createNotification` → microtask tick → sweep → claim →
+   spawn → throw, with **no timer between iterations and no attempt cap**.
+   Probe R12 unbounded: the sim wrote **493,299 `Hopper unblocker failed to
+   start` notifications** into the scratch DB and >64 MB of stack traces to
+   stderr before I killed it; the bounded re-run (hook fails 200×) shows 201
+   attempts / 200 error bells inside 9 ticks. In prod each iteration also
+   emits an SSE `notification` event and a `spawn_tasks` row — a broken model
+   id in `unblocker_model` (e.g. `claude-fable-5` on a plan without Fable)
+   would take the cockpit bell and the event loop down within seconds of the
+   first red block. **Fix:** (a) persist an attempt counter on the pass row
+   (`spawn_attempts`), cap at 2–3, then mark the pass `failed` + one bell and
+   stop; (b) drop the `queueMicrotask(dispatchTick)` from the catch — the 60s
+   timer / next finish is the right retry cadence, and add a minimum backoff
+   (`retry_after`) the sweep honors; (c) dedupe the error bell per node.
+   R12 stays as a permanent check (`attempts <= 2`, bounded hook).
+
+### SHOULD FIX
+
+4. **The playbook's "never restart / never deploy" rails are prompt-only for the
+   one worker most likely to reach for them (MEDIUM).** `buildToolsBlock()`
+   takes no thread argument and nothing in `agent.ts`/`tools/` keys on
+   `cockpit:unblocker-*`, so the unblocker thread is a full JARVIS persona
+   with `cockpit_deploy`, `intake_deploy`, `shim_deploy_*` mounted plus a
+   shell (`systemctl restart jarvis.service` is one Bash line). Same posture
+   as every hopper worker today, so not blocking on its own — but this worker
+   is spawned specifically to "unstick" things at Opus tier, and the last two
+   reviews both flagged it. **Fix:** a `WORKER_DENIED_TOOLS` set applied in
+   the tool dispatcher (refuse + log) and stripped from the tools block for
+   `cockpit:unblocker-*` and `cockpit:hopper-node-*` threads; the shell
+   side stays a prompt rail (sandboxing the CLI is out of scope here).
+
+### Held under re-probe (no change needed)
+
+- Recursion via FIX-node blocks (R1) and re-pended-original blocks (R8) → one
+  spawn, `needs_kevin` on the ROOT pass, one bell. R14 adds the by-hand case:
+  FIX planted while the root's pass was only `waiting_for_juice` (gate was
+  closed) → FIX blocks → root pass `needs_kevin`, 0 spawns, 1 bell, no crash.
+- Juice gate: stale usage file holds (R6); `claude 5h == unblocker_max_5h`
+  holds and parks a marker (sim 3); governor hold parks; unknown 5h holds.
+  `gov_override_*` is still not on this branch — the earlier caveat stands.
+- Model allowlist: `unblocker_model` = sonnet / gpt-6-astra / garbage →
+  `claude-opus-5` (R7a, sim 4); `opus4.8` with Auggie frozen → claude/opus-5
+  (R7b); FIX leaves on `claude-fable-5-1` / anything outside
+  `FIX_LEAF_MODEL_ALLOWLIST` rejected in both the engine and the route (R2).
+- `blocked_question` never triggers (sim 5) and `/remediate` refuses it (R9);
+  lease-exhausted blocks neither spawn nor park a marker (R13, per contract).
+- Double-spawn on concurrent finishes: `finishHopperNode` →
+  `maybeTriggerSmartUnblocker` → pass INSERT is synchronous before any yield,
+  and `UNIQUE(node_id)` backs it; the cap check + insert can't interleave from
+  the tick path (`ticking` guard) or the finish path (same synchronous frame).
+
+Nit: every sweep re-logs `[hopper-unblocker] hold node N: …` and bumps
+`updated_at` for each parked row, per tick — with #1 parking everything
+forever that's N log lines + N writes every 60s; goes away with #1 but worth
+a quiet-after-first-log guard regardless.
+
+Repro: `darwin-assistant/scripts/unblocker-adversarial-sim.mjs` R10–R14 (this
+commit). Scratch DBs `/tmp/unblocker-adv-223b.db` (bounded run) — the
+unbounded R12 run's DB was discarded after counting.

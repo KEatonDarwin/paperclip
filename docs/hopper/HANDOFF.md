@@ -311,8 +311,10 @@ Backfill must not:
 - Re-open nodes or trees.
 - Re-run workers.
 - Invent branches or deploy steps that are not present in node results.
-- Store local filesystem paths in the card. Backfill must sanitize wiki,
-  worktree, `/tmp`, and `~/` paths before POSTing through the API.
+- Store local filesystem paths in the card. Backfill should sanitize any
+  recoverable local path before POSTing through the API; if historical node text
+  still contains `/home/kevin/`, `/tmp/`, or `~/`, the API must reject the card
+  rather than write a bad handoff.
 - Overwrite a handoff already written by a finish-line audit unless an operator
   deliberately re-runs it with `force: true`.
 
@@ -363,9 +365,10 @@ implemented:
 - The cockpit renders one page-level handoff drawer outside the finished-tree
   card links. Clicking close, copying text, pressing Escape, or opening the
   outbox link no longer navigates away from `/spawn-tree`.
-- Backfill cards scan all node results for branches and commits, sanitize local
-  paths, and use honest `unknown` rows when old node text does not carry enough
-  information.
+- Backfill cards scan all node results for branches and commits, sanitize
+  recoverable local paths, and use honest `unknown` rows when old node text does
+  not carry enough information. Cards that still contain local-only paths fail
+  validation instead of being stored.
 - Required markdown headings are line-anchored, so a code-fenced or inline
   mention of a heading does not pass validation.
 

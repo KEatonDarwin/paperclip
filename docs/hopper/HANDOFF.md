@@ -183,9 +183,11 @@ Validation:
 
 - `404 hopper_tree_not_found` when the tree id does not exist.
 - `400 invalid_handoff` when `handoff` is empty or missing any required
-  section heading.
-- `400 invalid_handoff` when the `Full report` section contains an absolute
-  `/home/kevin/` path. Use wiki-relative `outbox/<file>.md` links.
+  section heading. Heading checks are line-anchored; a heading mentioned inside
+  prose or a code fence does not satisfy the contract.
+- `400 invalid_handoff` when the card contains local-only filesystem paths such
+  as `/home/kevin/`, `/tmp/`, or `~/` anywhere in the markdown. Use
+  wiki-relative `outbox/<file>.md` links and repository-relative paths instead.
 - `409 handoff_exists` when the tree already has a handoff and `force` is not
   true.
 
@@ -197,6 +199,11 @@ Status rules:
 - The endpoint only writes `hopper_trees.handoff` and updates `updated_at`. It
   must not change tree status, node status, worker leases, branch state, or
   notifications.
+- The worker finish route also enforces the handoff gate for finish-line audit
+  nodes: a `finishline_verdict: "FULL"` result is rejected with
+  `409 finishline_full_missing_handoff` unless the tree already has a persisted
+  handoff card. The tree stays active and the audit node is blocked/retryable;
+  Kevin never gets a green finished-tree bell without a card.
 
 Suggested engine helper:
 
@@ -222,12 +229,16 @@ step before it reports `finishline_verdict: "FULL"`:
 2. Identify the docs/push node's outbox report path from node result text. It
    must be a wiki-relative path like `outbox/<file>.md`.
 3. Synthesize the handoff markdown using the required section order.
-4. POST it to `/api/v1/hopper-trees/:treeId/handoff` with bearer auth.
+4. POST it to `/api/v1/hopper-trees/<actual-tree-id>/handoff` with bearer auth.
 5. If the handoff POST fails, retry up to three times.
-6. If the handoff still cannot be persisted, do not return a `FULL` verdict.
+6. If the endpoint returns `409 handoff_exists`, a previous attempt already
+   wrote a card. Confirm the stored card with `GET
+   /api/v1/hopper-trees/<actual-tree-id>`; if it is stale or incomplete, repeat
+   the POST with `force: true`, then continue.
+7. If the handoff still cannot be persisted, do not return a `FULL` verdict.
    Finish the audit node as `blocked` with a precise result, because Kevin would
    still have no finished-tree handoff.
-7. After the handoff POST succeeds, finish the audit node with the existing
+8. After the handoff POST succeeds, finish the audit node with the existing
    JSON result contract:
 
 ```json
@@ -300,9 +311,23 @@ Backfill must not:
 - Re-open nodes or trees.
 - Re-run workers.
 - Invent branches or deploy steps that are not present in node results.
-- Store absolute local filesystem paths in the card.
+- Store local filesystem paths in the card. Backfill must sanitize wiki,
+  worktree, `/tmp`, and `~/` paths before POSTing through the API.
 - Overwrite a handoff already written by a finish-line audit unless an operator
   deliberately re-runs it with `force: true`.
+
+Branch extraction rules:
+
+- Scan all node results, not only the docs/push node, because historical branch
+  and commit text often appears in build or review nodes.
+- Prefer branch-looking tokens introduced by words like `branch`, `on`, or
+  well-known branch prefixes such as `hopper/`, `foundry/`, `mcp/`,
+  `clearinghouse/`, `feature/`, and `autogroup/`.
+- If the branch or repo cannot be recovered honestly, write `unknown` and point
+  Kevin to the full report or tree detail. Do not use `docs-only` unless the
+  tree truly produced no branch/manual artifact.
+- Only attach a `Head` value when it is recoverable for that row. Otherwise use
+  `unknown`.
 
 ## Cockpit Consumer Notes
 
@@ -319,10 +344,34 @@ The UI can treat `tree.handoff` as the source of truth:
 
 - `hopper_trees.handoff` exists and is returned by `GET /hopper-trees/:id`.
 - `POST /hopper-trees/:id/handoff` validates required headings and rejects
-  absolute `/home/kevin/...` full-report links.
-- Finish-line audit `FULL` verdicts write the handoff before finishing the
-  audit node.
+  local filesystem paths anywhere in the markdown.
+- Finish-line audit `FULL` verdicts cannot complete the tree unless the handoff
+  has already been persisted.
 - Docs/push templates include outbox reports and branch tables in the expected
   shape.
 - A scratch done tree can be backfilled from a docs node result without
   changing tree/node status.
+
+## Review Drift Notes
+
+Re-review for tree `tree-b422a2b3` passed after these contract refinements were
+implemented:
+
+- The handoff gate is now enforced in server code, not just in the audit prompt.
+  A `FULL` finish-line verdict without `hopper_trees.handoff` is rejected with
+  `409 finishline_full_missing_handoff`.
+- The cockpit renders one page-level handoff drawer outside the finished-tree
+  card links. Clicking close, copying text, pressing Escape, or opening the
+  outbox link no longer navigates away from `/spawn-tree`.
+- Backfill cards scan all node results for branches and commits, sanitize local
+  paths, and use honest `unknown` rows when old node text does not carry enough
+  information.
+- Required markdown headings are line-anchored, so a code-fenced or inline
+  mention of a heading does not pass validation.
+
+Known non-blocking follow-ups:
+
+- Let a worker recover in-attempt from `finishline_full_missing_handoff` after
+  it posts the missing card, instead of requiring a node retry.
+- Tighten historical backfill branch extraction further so slash tokens like
+  framework names never appear as branch rows.

@@ -575,3 +575,34 @@ export function jotWorkstream(text: string): { matched: boolean; workstream: Wor
   });
   return { matched: false, workstream: created };
 }
+
+/**
+ * Compose the seed message for a workstream's dedicated discussion thread
+ * (the 💬 Discuss button on /flight-deck). Plain string composition — zero
+ * model calls; the receiving JARVIS turn does the thinking.
+ */
+export function composeWorkstreamDiscussSeed(ws: WorkstreamWithDetails): string {
+  const links =
+    ws.links.map((l) => `- [${l.kind}] ${l.label ?? l.ref} (${l.ref})`).join('\n') || '- (none yet)';
+  const timeline =
+    ws.events
+      .slice(0, 8)
+      .map((e) => `- ${e.created_at} · ${e.actor}: ${e.text}`)
+      .join('\n') || '- (no events yet)';
+  return [
+    `🛩 This thread is the DISCUSSION CHANNEL for Flight Deck workstream #${ws.id} — "${ws.title}".`,
+    '',
+    'Current state:',
+    `- What: ${ws.what ?? '(no description)'}`,
+    `- Turn: ${ws.turn}${ws.next_owner ? ` (next owner: ${ws.next_owner})` : ''}`,
+    `- Next action: ${ws.next_action ?? '(none set)'}`,
+    '',
+    'Links:',
+    links,
+    '',
+    'Recent timeline:',
+    timeline,
+    '',
+    `JARVIS: you own keeping this workstream TRUE on the Flight Deck via the \`workstreams\` tool (workstream_id ${ws.id}). When Kevin corrects the plan here — "not my turn yet", "we missed a step", "change the next action" — apply it immediately: flip the turn, update next_action, log the outcome to the timeline, attach new links. Confirm each change in one short line. Start by greeting Kevin with a one-paragraph read of where this ball stands and what you believe the next step is.`,
+  ].join('\n');
+}

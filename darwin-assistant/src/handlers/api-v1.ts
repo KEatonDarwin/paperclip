@@ -71,6 +71,7 @@ import {
   DETAIL_EVENT_LIMIT,
   attachWorkstreamLink,
   completeWorkstreamStep,
+  composeWorkstreamDiscussSeed,
   createWorkstream,
   deleteWorkstreamLink,
   flipTurn,
@@ -1909,6 +1910,39 @@ export function createApiV1Router(): Router {
     } catch (err) {
       sendError(res, 400, 'invalid_request', err instanceof Error ? err.message : String(err));
     }
+  });
+
+  // -- POST /workstreams/:id/discuss: open (or reuse) the workstream's own
+  // discussion thread. Mirrors the hopper promote 2-step: this creates the
+  // thread + returns seed_text (only on first open); the cockpit then POSTs
+  // the seed through the normal /threads/:ext/messages ingest so the full
+  // JARVIS turn runs on the battle-tested path.
+  router.post('/workstreams/:id/discuss', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const ws = getWorkstream(id, 8);
+    if (!ws) {
+      sendError(res, 404, 'workstream_not_found', 'workstream not found');
+      return;
+    }
+    const externalId = `cockpit:workstream-${id}`;
+    const existing = getConversation(externalId);
+    const conv = getOrCreateConversation(externalId);
+    if (!existing) {
+      renameConversation(conv.id, `🛩 ${ws.title}`.slice(0, 120));
+    }
+    if (!ws.links.some((l) => l.kind === 'thread' && l.ref === externalId)) {
+      attachWorkstreamLink({
+        workstream_id: id,
+        kind: 'thread',
+        ref: externalId,
+        label: '💬 discussion',
+      });
+    }
+    res.json({
+      external_id: externalId,
+      created: !existing,
+      seed_text: existing ? null : composeWorkstreamDiscussSeed(ws),
+    });
   });
 
   router.post('/workstreams/:id/flip', (req: AuthedRequest, res) => {

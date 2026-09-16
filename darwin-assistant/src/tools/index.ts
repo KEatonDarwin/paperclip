@@ -131,6 +131,7 @@ import { logDecision } from './decisions.js';
 import { threadTodos } from './thread-todos-tool.js';
 import { threadLinks } from './thread-links-tool.js';
 import { hopper } from './hopper-tool.js';
+import { workstreams } from './workstreams-tool.js';
 import { smartTodos } from './smart-todos-tool.js';
 import { notifications } from './notifications-tool.js';
 import { intakeDeploy } from './intake-deploy.js';
@@ -198,6 +199,7 @@ export const ALL_TOOLS: ToolDef[] = [
   threadTodos,
   threadLinks,
   hopper,
+  workstreams,
   smartTodos,
   notifications,
   intakeDeploy,

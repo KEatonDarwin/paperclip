@@ -68,6 +68,23 @@ import {
   type HopperStatus,
 } from '../hopper.js';
 import {
+  attachWorkstreamLink,
+  completeWorkstreamStep,
+  createWorkstream,
+  deleteWorkstreamLink,
+  flipTurn,
+  getWorkstream,
+  isWorkstreamActor,
+  isWorkstreamLinkKind,
+  isWorkstreamTurn,
+  jotWorkstream,
+  listWorkstreams,
+  logWorkstreamEvent,
+  updateWorkstream,
+  type WorkstreamActor,
+  type WorkstreamTurn,
+} from '../workstreams.js';
+import {
   INTEL_LANES,
   createIntelRun,
   getActiveIntelRun,
@@ -1709,6 +1726,212 @@ export function createApiV1Router(): Router {
     const out = buildFoundryAdvisor(paramString(req.params.id), paramString(req.params.key));
     if (!out) { res.status(404).json({ error: { code: 'not_found', message: 'project or module not found' } }); return; }
     res.json(out);
+  });
+
+  // == Flight Deck Workstreams ===============================================
+  // Workstreams are Kevin's "balls in the air": a durable object tying together
+  // threads, hopper trees, smart-todo roots, commitments, next action, and whose
+  // turn it is. This is plain state/CRUD; no model calls.
+
+  router.get('/workstreams', (req: AuthedRequest, res) => {
+    const includeDone = req.query.include_done === '1' || req.query.include_done === 'true';
+    res.json({ workstreams: listWorkstreams(includeDone) });
+  });
+
+  router.get('/workstreams/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const workstream = getWorkstream(id);
+    if (!workstream) {
+      sendError(res, 404, 'workstream_not_found', 'workstream not found');
+      return;
+    }
+    res.json({ workstream });
+  });
+
+  router.post('/workstreams', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const title = typeof body.title === 'string' ? body.title.trim() : '';
+    if (!title) {
+      sendError(res, 400, 'invalid_request', 'title is required and must be a non-empty string');
+      return;
+    }
+    const rawTurn = typeof body.turn === 'string' ? body.turn : undefined;
+    if (rawTurn && !isWorkstreamTurn(rawTurn)) {
+      sendError(res, 400, 'invalid_request', 'turn must be one of jarvis, kevin, external, parked, done');
+      return;
+    }
+    const turn = rawTurn ? rawTurn as WorkstreamTurn : undefined;
+    const actor = typeof body.actor === 'string' && isWorkstreamActor(body.actor)
+      ? body.actor as WorkstreamActor
+      : 'system';
+    try {
+      const workstream = createWorkstream({
+        title,
+        what: typeof body.what === 'string' ? body.what : null,
+        turn,
+        next_action: typeof body.next_action === 'string' ? body.next_action : null,
+        next_owner: typeof body.next_owner === 'string' ? body.next_owner : null,
+        smart_todo_root_id: typeof body.smart_todo_root_id === 'number' ? body.smart_todo_root_id : null,
+        group_id: typeof body.group_id === 'number' ? body.group_id : null,
+        sort_order: typeof body.sort_order === 'number' ? body.sort_order : null,
+        actor,
+      });
+      res.status(201).json({ workstream });
+    } catch (err) {
+      sendError(res, 400, 'invalid_request', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.patch('/workstreams/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getWorkstream(id)) {
+      sendError(res, 404, 'workstream_not_found', 'workstream not found');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const rawTurn = typeof body.turn === 'string' ? body.turn : undefined;
+    if (rawTurn && !isWorkstreamTurn(rawTurn)) {
+      sendError(res, 400, 'invalid_request', 'turn must be one of jarvis, kevin, external, parked, done');
+      return;
+    }
+    const turn = rawTurn ? rawTurn as WorkstreamTurn : undefined;
+    const actor = typeof body.actor === 'string' && isWorkstreamActor(body.actor)
+      ? body.actor as WorkstreamActor
+      : 'system';
+    try {
+      const workstream = updateWorkstream(id, {
+        title: typeof body.title === 'string' ? body.title : undefined,
+        what: body.what !== undefined ? (body.what === null ? null : String(body.what)) : undefined,
+        turn,
+        next_action: body.next_action !== undefined ? (body.next_action === null ? null : String(body.next_action)) : undefined,
+        next_owner: body.next_owner !== undefined ? (body.next_owner === null ? null : String(body.next_owner)) : undefined,
+        smart_todo_root_id: body.smart_todo_root_id !== undefined
+          ? (typeof body.smart_todo_root_id === 'number' ? body.smart_todo_root_id : null)
+          : undefined,
+        group_id: body.group_id !== undefined ? (typeof body.group_id === 'number' ? body.group_id : null) : undefined,
+        sort_order: typeof body.sort_order === 'number' ? body.sort_order : undefined,
+        archived: typeof body.archived === 'boolean' ? body.archived : undefined,
+        actor,
+        event_text: typeof body.event_text === 'string' ? body.event_text : null,
+      });
+      res.json({ workstream });
+    } catch (err) {
+      sendError(res, 400, 'invalid_request', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.post('/workstreams/:id/links', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getWorkstream(id)) {
+      sendError(res, 404, 'workstream_not_found', 'workstream not found');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const kind = typeof body.kind === 'string' ? body.kind : '';
+    const ref = typeof body.ref === 'string' ? body.ref.trim() : '';
+    if (!isWorkstreamLinkKind(kind)) {
+      sendError(res, 400, 'invalid_request', 'kind must be one of thread, tree, todo_root, commitment, url');
+      return;
+    }
+    if (!ref) {
+      sendError(res, 400, 'invalid_request', 'ref is required and must be a non-empty string');
+      return;
+    }
+    try {
+      const link = attachWorkstreamLink({
+        workstream_id: id,
+        kind,
+        ref,
+        label: typeof body.label === 'string' ? body.label : null,
+      });
+      res.status(201).json({ link, workstream: getWorkstream(id) });
+    } catch (err) {
+      sendError(res, 400, 'invalid_request', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.delete('/workstreams/:id/links/:linkId', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const linkId = parseInt(String(req.params.linkId), 10);
+    const removed = deleteWorkstreamLink(id, linkId);
+    if (!removed) {
+      sendError(res, 404, 'workstream_link_not_found', 'workstream link not found');
+      return;
+    }
+    res.status(204).end();
+  });
+
+  router.post('/workstreams/:id/events', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!getWorkstream(id)) {
+      sendError(res, 404, 'workstream_not_found', 'workstream not found');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const actor = typeof body.actor === 'string' && isWorkstreamActor(body.actor)
+      ? body.actor
+      : 'system';
+    const text = typeof body.text === 'string' ? body.text.trim() : '';
+    if (!text) {
+      sendError(res, 400, 'invalid_request', 'text is required and must be a non-empty string');
+      return;
+    }
+    try {
+      const event = logWorkstreamEvent(id, actor, text);
+      res.status(201).json({ event, workstream: getWorkstream(id) });
+    } catch (err) {
+      sendError(res, 400, 'invalid_request', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.post('/workstreams/:id/done-step', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const note = typeof body.note === 'string' ? body.note : null;
+    const workstream = completeWorkstreamStep(id, note);
+    if (!workstream) {
+      sendError(res, 404, 'workstream_not_found', 'workstream not found');
+      return;
+    }
+    res.json({ workstream });
+  });
+
+  router.post('/workstreams/jot', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const text = typeof body.text === 'string' ? body.text.trim() : '';
+    if (!text) {
+      sendError(res, 400, 'invalid_request', 'text is required and must be a non-empty string');
+      return;
+    }
+    try {
+      res.status(201).json(jotWorkstream(text));
+    } catch (err) {
+      sendError(res, 400, 'invalid_request', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.post('/workstreams/:id/flip', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const turn = typeof body.turn === 'string' && isWorkstreamTurn(body.turn) ? body.turn : null;
+    if (!turn) {
+      sendError(res, 400, 'invalid_request', 'turn must be one of jarvis, kevin, external, parked, done');
+      return;
+    }
+    const actor = typeof body.actor === 'string' && isWorkstreamActor(body.actor)
+      ? body.actor as WorkstreamActor
+      : 'system';
+    const workstream = flipTurn(id, turn, {
+      actor,
+      text: typeof body.text === 'string' ? body.text : null,
+      next_action: body.next_action !== undefined ? (body.next_action === null ? null : String(body.next_action)) : undefined,
+      next_owner: body.next_owner !== undefined ? (body.next_owner === null ? null : String(body.next_owner)) : undefined,
+    });
+    if (!workstream) {
+      sendError(res, 404, 'workstream_not_found', 'workstream not found');
+      return;
+    }
+    res.json({ workstream });
   });
 
   // == Task Hopper (candidate tasks awaiting Kevin's yes/dismiss) ==============
@@ -3918,7 +4141,7 @@ export function createApiV1Router(): Router {
       'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
       'quick_capture', 'thread_summary', 'notification',
       'dispatch', 'dispatch_cue', 'hopper_item', 'hopper_node', 'smart_todo',
-      'monitor', 'monitor_run', 'foundry_project', 'foundry_module',
+      'workstream', 'monitor', 'monitor_run', 'foundry_project', 'foundry_module',
       'intel_run', 'intel_item',
     ]);
 

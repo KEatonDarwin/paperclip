@@ -12,6 +12,7 @@ import type { DispatchRow, DispatchWorkerRow } from './dispatches.js';
 import type { HopperItemRow } from './hopper.js';
 import type { HopperNodeRow } from './hopper-engine.js';
 import type { SmartTodoNodeRow } from './smart-todos.js';
+import type { WorkstreamWithDetails } from './workstreams.js';
 import type { MonitorRow, MonitorRunRow } from './monitors.js';
 import type { FoundryModuleResponse, FoundryProjectResponse } from './foundry.js';
 import type { IntelItem, IntelRun } from './intel-desk.js';
@@ -234,6 +235,15 @@ export interface SmartTodoEvent {
   node?: SmartTodoNodeRow;
 }
 
+// FLIGHT DECK — Kevin/JARVIS workstreams, the "balls in the air" surface.
+// Global like HopperItemEvent; payload includes links + latest timeline events
+// so clients can patch a card/drawer from one event or simply refetch.
+export interface WorkstreamEvent {
+  type: 'workstream';
+  action: 'created' | 'updated' | 'deleted';
+  workstream: WorkstreamWithDetails;
+}
+
 // HOPPER ENGINE — work-tree node state changes (dispatch/finish/split/etc.).
 // Global like HopperItemEvent; a future tree-view pane renders live off these.
 export interface HopperNodeEvent {
@@ -292,7 +302,7 @@ export type SSEEvent =
   | ThreadReminderEvent | ToolCallEvent | ThreadSummaryEvent
   | ThreadGroupEvent | NotificationEvent
   | DispatchEvent | DispatchCueEvent | HopperItemEvent | HopperNodeEvent | SmartTodoEvent
-  | MonitorEvent | MonitorRunEvent | FoundryProjectEvent | FoundryModuleEvent
+  | WorkstreamEvent | MonitorEvent | MonitorRunEvent | FoundryProjectEvent | FoundryModuleEvent
   | IntelRunEvent | IntelItemEvent;
 
 class SSEBus extends EventEmitter {}

@@ -68,6 +68,7 @@ import {
   type HopperStatus,
 } from '../hopper.js';
 import {
+  DETAIL_EVENT_LIMIT,
   attachWorkstreamLink,
   completeWorkstreamStep,
   createWorkstream,
@@ -1740,7 +1741,7 @@ export function createApiV1Router(): Router {
 
   router.get('/workstreams/:id', (req: AuthedRequest, res) => {
     const id = parseInt(String(req.params.id), 10);
-    const workstream = getWorkstream(id);
+    const workstream = getWorkstream(id, DETAIL_EVENT_LIMIT);
     if (!workstream) {
       sendError(res, 404, 'workstream_not_found', 'workstream not found');
       return;

@@ -97,14 +97,13 @@ add_link "$perclickity_id" thread "cockpit:4d438c70-4c56-4fac-bfef-65594d677bb6"
 add_link "$perclickity_id" thread "cockpit:5904f93e-df2a-4f19-9b9c-7004fa75cbfc" "Review thread"
 add_link "$perclickity_id" tree "tree-4b5433d5" "Clearinghouse tree"
 add_link "$perclickity_id" todo_root "25" "Perclickity todo root"
-add_link "$perclickity_id" todo_root "20" "Clearinghouse todo root"
 
 active_response_id="$(create_workstream \
   "Active Response non-human opens" \
   "kevin" \
   "Eyeball the verification thread and green-light rollout" \
   "13")"
-add_link "$active_response_id" thread "cockpit:2d638a76-48d5-41d1-bb03-41b061e5019b" "Verification thread"
+add_link "$active_response_id" thread "cockpit:2d638a76-48d5-43d1-bb03-41b061e5019b" "Verification thread"
 add_link "$active_response_id" thread "cockpit:monitor-1" "Monitor"
 add_link "$active_response_id" todo_root "13" "Active Response todo root"
 

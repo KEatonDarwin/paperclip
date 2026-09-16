@@ -271,11 +271,16 @@ function assertActor(actor: string): WorkstreamActor {
   return actor as WorkstreamActor;
 }
 
-function rowWithDetails(row: WorkstreamRow): WorkstreamWithDetails {
+// List rows carry a short tail of the timeline (enough to patch a card from
+// one SSE event); the detail GET asks for a deeper slice for the drawer.
+const LIST_EVENT_LIMIT = 5;
+export const DETAIL_EVENT_LIMIT = 100;
+
+function rowWithDetails(row: WorkstreamRow, eventLimit = LIST_EVENT_LIMIT): WorkstreamWithDetails {
   return {
     ...row,
     links: listLinksStmt.all(row.id),
-    events: listRecentEventsStmt.all(row.id, 5),
+    events: listRecentEventsStmt.all(row.id, eventLimit),
   };
 }
 
@@ -301,9 +306,9 @@ export function isWorkstreamActor(value: unknown): value is WorkstreamActor {
   return typeof value === 'string' && VALID_ACTORS.has(value as WorkstreamActor);
 }
 
-export function getWorkstream(id: number): WorkstreamWithDetails | null {
+export function getWorkstream(id: number, eventLimit?: number): WorkstreamWithDetails | null {
   const row = getByIdStmt.get(id);
-  return row ? rowWithDetails(row) : null;
+  return row ? rowWithDetails(row, eventLimit) : null;
 }
 
 export function listWorkstreams(includeDone = false): WorkstreamWithDetails[] {
@@ -521,14 +526,36 @@ export function jotWorkstream(text: string): { matched: boolean; workstream: Wor
   const noteTokens = tokens(note);
   let best: { row: WorkstreamWithDetails; score: number } | null = null;
 
-  for (const row of listWorkstreams(false)) {
-    const candidateText = [row.title, row.what ?? ''].join(' ');
-    const normalizedCandidate = normalize(candidateText);
-    const score = normalizedCandidate.includes(normalizedNote) || normalizedNote.includes(normalizedCandidate)
-      ? 1
-      : jotMatchScore(noteTokens, tokens(candidateText));
-    if (score >= 0.5 && (!best || score > best.score)) {
-      best = { row, score };
+  // `"x".includes("")` is true, so a note that normalizes to nothing (emoji /
+  // punctuation only) would otherwise "match" the first open workstream.
+  // Same for a candidate whose title normalizes to nothing. Such notes just
+  // create a new parked workstream (deterministic, never lost).
+  const SUBSTRING_MIN = 3;
+  const DISTINCTIVE_MIN = 5;
+  if (normalizedNote.length >= SUBSTRING_MIN || noteTokens.length > 0) {
+    const candidates = listWorkstreams(false).map((row) => {
+      const candidateText = [row.title, row.what ?? ''].join(' ');
+      return { row, normalized: normalize(candidateText), tokens: tokens(candidateText) };
+    });
+    // Document frequency across open workstreams: a shared token that only ONE
+    // workstream uses (e.g. "perclickity") is a strong signal even when the
+    // jot is long and chatty ("making perclickity edits from what Mike gave me").
+    const df = new Map<string, number>();
+    for (const c of candidates) for (const t of c.tokens) df.set(t, (df.get(t) ?? 0) + 1);
+
+    for (const c of candidates) {
+      const substringHit =
+        normalizedNote.length >= SUBSTRING_MIN
+        && c.normalized.length >= SUBSTRING_MIN
+        && (c.normalized.includes(normalizedNote) || normalizedNote.includes(c.normalized));
+      const candidateSet = new Set(c.tokens);
+      const distinctiveHit = noteTokens.some(
+        (t) => t.length >= DISTINCTIVE_MIN && candidateSet.has(t) && df.get(t) === 1,
+      );
+      const score = substringHit ? 1 : Math.max(jotMatchScore(noteTokens, c.tokens), distinctiveHit ? 0.6 : 0);
+      if (score >= 0.5 && (!best || score > best.score)) {
+        best = { row: c.row, score };
+      }
     }
   }
 

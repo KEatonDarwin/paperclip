@@ -1320,7 +1320,15 @@ async function runConversationTurn(
   if (adapter.id === 'claude') {
     const selection = selectActiveClaudeAccount(claudeFiveHourCeiling());
     activeClaudeAccount = selection.account;
-    const storedAccount = conv.session_account;
+    // LEGACY-SESSION GUARD (2026-09-17): threads created before multi-Claude have a
+    // NULL session_account but their `claude --resume` id lives in account 'a'
+    // (~/.claude, the pre-multi-claude default). Coalesce to 'a' when a live
+    // session exists so the stickiness guard below protects them from being
+    // routed to another account and hard-failing the resume ("error before JARVIS
+    // replied" — hit cockpit:35b7b447 / conv 1875). New threads always persist
+    // their real account, so this only ever affects pre-multi-claude threads, and
+    // every one of those lives in 'a'. De-mines all legacy threads with no DB write.
+    const storedAccount = conv.session_account || (sessionId ? 'a' : null);
     if (sessionId && storedAccount && activeClaudeAccount && storedAccount !== activeClaudeAccount.key) {
       // STICKINESS (adversarial review, node #296): a live session stays on the
       // account it was created under for as long as that account is still

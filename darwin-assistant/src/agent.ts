@@ -27,6 +27,7 @@ import {
 import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent, type StreamEndEvent, type ToolCallEvent } from './sse-bus.js';
 import { buildGroupChatContext } from './group-chat-context.js';
 import { buildQuickChatContext } from './quick-chat-profiles.js';
+import { buildNudgeReplyContext } from './nudges.js';
 import { dirname } from 'node:path';
 import type { SavedImage } from './image-store.js';
 
@@ -1291,6 +1292,11 @@ async function runConversationTurn(
     ? await buildGroupChatContext(conv.group_id)
     : '';
   const quickChatContextBlock = buildQuickChatContext(conv.external_id);
+  // M-1: in the global nudge thread, splice a server-owned per-turn block of the
+  // open nudges + the reply-loop instructions so the replying model always knows
+  // which nudge Kevin is answering and how to apply + resolve it (works on both
+  // transcript-replay and --resume). Empty string for every other thread.
+  const nudgeReplyContextBlock = buildNudgeReplyContext(conv.external_id);
 
   // DAR-744: hand the model an absolute file path per attached image, mirroring
   // the working vision-critique.ts pattern (local claude CLI reads an image when
@@ -1305,7 +1311,7 @@ async function runConversationTurn(
     ? `<attached_images>\nThe user attached ${images.length} image(s) to this message. Open and look at each one now before responding — absolute paths:\n${images.map((img) => `- ${img.absPath}`).join('\n')}\n</attached_images>\n\n`
     : '';
 
-  const perTurnContextPrefix = threadContextLine + autonomyDialLine + groupContextBlock + quickChatContextBlock + imageBlock;
+  const perTurnContextPrefix = threadContextLine + autonomyDialLine + groupContextBlock + quickChatContextBlock + nudgeReplyContextBlock + imageBlock;
 
   // The resume path re-injects memory on EVERY turn that has a live sessionId
   // (the common case), so an uncapped loadMemoryBlock() here was the dominant

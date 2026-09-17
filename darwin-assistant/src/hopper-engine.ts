@@ -3,7 +3,7 @@ import './spawn-tasks.js'; // side-effect: guarantees the spawn_tasks DDL ran be
 import { sqliteDb, getOrCreateConversation, renameConversation, setThreadModelOverride, getSetting } from './conversation-db.js';
 import { sseBus, type HopperNodeEvent } from './sse-bus.js';
 import { createNotification } from './notifications.js';
-import { createBlockedQuestionNudge } from './nudges.js';
+import { createBlockedQuestionNudge, resolveNudgeBySubject } from './nudges.js';
 import { governorCheck, governorStatus, kevinActive, providerFor, concurrencyCap, type GovernorProvider } from './hopper-governor.js';
 
 // HOPPER ENGINE — the autonomous work-tree executor (designed 2026-09-06 with
@@ -653,6 +653,9 @@ export function answerHopperNode(id: number, answer: string): HopperNodeRow | nu
   const node = getNodeStmt.get(id);
   if (!node || node.status !== 'blocked_question') return node ?? null;
   const updated = setNode(id, { status: 'pending', answer, worker_thread_ext: null });
+  // M-2: answering the source clears the bubble and frees the (source,subject)
+  // slot so a later re-block for this node can raise a fresh nudge.
+  resolveNudgeBySubject('blocked_question', `${node.tree_id}/node-${id}`);
   queueMicrotask(() => void dispatchTick('question_answered'));
   return updated;
 }
@@ -670,6 +673,8 @@ export function retryHopperNode(id: number): HopperNodeRow | null {
     worker_thread_ext: null,
     lease_expires_at: null,
   });
+  // M-2: a retry clears the blocking question, so resolve any open nudge for it.
+  resolveNudgeBySubject('blocked_question', `${node.tree_id}/node-${id}`);
   queueMicrotask(() => void dispatchTick('node_retry'));
   return updated;
 }

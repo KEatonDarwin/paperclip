@@ -179,3 +179,76 @@ after the first quiet fortnight. The UI branch is otherwise sound and needs
 only S-1 (footer strip) and optionally a per-nudge Resolve control. Scratch
 artifacts: `/tmp/nudge-review.db`, `/tmp/nudge-review-server.log`,
 `/tmp/nudge-{1,2,3,4}-*.png`, `/tmp/fake-turn-*.stdin`.
+
+## 2026-09-17 · JARVIS nudge review remediation (Claude B, backend) — M-1..M-4 + S-2/S-3 resolved
+
+Backend fixes for review #228, done in worktree `hopper/jarvis-nudge`
+(`darwin-assistant`). UI-only items (S-1 footer strip, manual Resolve control)
+belong to the UI worker and were not touched here. Build: `npm run build` (tsc)
+clean, 0 errors. Verification: `scripts/nudge-remediate-verify.mjs` (scratch
+`/tmp` DB, fake `claude` bins, canary `ANTHROPIC_API_KEY`) — 18/18 assertions
+pass; plus a separate argv-dump probe for S-3.
+
+- **M-1 (reply loop blind on resume) — DONE.** New server-owned per-turn block.
+  `buildNudgeReplyContext(externalId)` in `src/nudges.ts` renders a
+  `<jarvis_nudges>` block from `listNudges('open')` (id, source, subject_ref,
+  status, created_at, summary, why, answer_route; newest first) plus the
+  NUDGE.md §Reply Loop steps (match latest → call answer_route with `$KEVIN_REPLY`
+  → PATCH `/api/v1/nudges/<id>` resolved → confirm; ambiguous → one clarifying
+  Q). Spliced in `src/agent.ts` `runConversationTurn` into `perTurnContextPrefix`
+  (same slot as `quickChatContextBlock`), gated on
+  `conv.external_id === NUDGE_THREAD_EXTERNAL_ID`. Because it is rebuilt from the
+  DB every turn and lives in the prompt prefix, it is identical on
+  transcript-replay and on `--resume`. Footer left in the DB for audit. Verified:
+  block names `tree-abc/node-77`, its answer_route path, and the resolve step;
+  empty string for non-nudge threads.
+- **M-2 (answering source never resolves nudge) — DONE.** Exported
+  `resolveNudgeBySubject(source, subject_ref)` from `src/nudges.ts` (resolves the
+  open row for that subject via `markNudgeResolved`, emits `updated`). Called from
+  `answerHopperNode()` and `retryHopperNode()` in `src/hopper-engine.ts` with
+  `blocked_question` + `${node.tree_id}/node-${id}` — the exact subject_ref the
+  producer (`createBlockedQuestionNudge`) writes. Verified: resolve drops open
+  count and a re-block for the same subject now creates a FRESH nudge instead of
+  deduping to the stale row. NOTE: the finish-line SHORTFALL, smart-unblocker,
+  and watchdog commitment producers have no wired call sites or answer routes in
+  this codebase yet (only the `createXNudge` helpers exist, unused) — there is no
+  terminal/answered path to hook, so nothing to change there; `resolveNudgeBySubject`
+  is ready for them when they land.
+- **M-3 (auto-hide archives nudge thread → 500 + ghost rows) — DONE.** (a) Added
+  exported `PROTECTED_THREAD_EXTERNAL_IDS` set in `src/conversation-db.ts`;
+  `autoHideStaleThreads()` SELECT now excludes it
+  (`external_id IS NULL OR external_id NOT IN (...)`), and `api-v1.ts`
+  `PROTECTED_THREAD_IDS` now aliases that shared set so routes and sweep can't
+  drift. (b) `ensureNudgeThread()` reactivates an archived nudge thread
+  (`setConversationStatus(id,'active')`) before `getOrCreateConversation`, killing
+  the `UNIQUE constraint failed` 500. (c) `createNudge()` materializes inside the
+  same try as the insert and deletes the just-inserted row on failure, so a failed
+  compose never leaves a ghost open nudge with `turn_id NULL`. Verified: nudge
+  thread stays active through a 14d sweep while an unrelated 15d-idle thread is
+  archived; POST /nudges succeeds and reactivates even after the thread is forced
+  archived.
+- **M-4 (concurrent creates → duplicate turns) — DONE.** In-process
+  `Map<subjectKey, Promise<NudgeRow>>` (`materializeOnce`) coalesces concurrent
+  materializations for one subject, PLUS DB guard
+  `UPDATE nudges SET turn_id=? WHERE id=? AND turn_id IS NULL` — a late writer
+  gets `changes===0` and deletes its orphan turn. Verified: 3 concurrent POSTs vs
+  a 900ms fake composer → exactly 1 new assistant turn, all 3 callers report the
+  same turn_id, 1 open row.
+- **S-2 (parseClaudeJson leaked raw stdout) — DONE.** `parseClaudeJson` now
+  returns `null` on `JSON.parse` failure and on non-string/`is_error` result, so
+  the caller uses the deterministic fallback. Verified: garbage stdout → nudge
+  body is the fallback text, raw junk absent from the message.
+- **S-3 (composer tool/MCP surface) — DONE.** Composer argv now appends
+  `--tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}'` (all three
+  flags confirmed present in this CLI version via `claude --help`), and a
+  `nudge_model` starting with `-` is sanitized to `claude-sonnet-5` before
+  splicing. Verified via argv dump; also re-confirmed `ANTHROPIC_API_KEY` is
+  absent from the child env (canary test).
+- **Low/noted:** added the one-line no-op guard for `POST /nudges/delivered` with
+  an explicitly-empty `ids:[]` (previously fell through to "mark all pending").
+  Other low/noted items (double-bell watchdog, fallback model stamp, context cap,
+  toast position) left as-is.
+
+Verification script kept at `darwin-assistant/scripts/nudge-remediate-verify.mjs`
+(scratch DB only; never opens the live DB). No API keys, no SDK, no service
+restart, no deploy.

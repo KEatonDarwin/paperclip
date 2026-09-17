@@ -13,6 +13,14 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = process.env.JARVIS_DB_PATH ?? path.join(__dirname, '..', 'jarvis.db');
 
+// Single source of truth for cockpit system threads that retention/archive jobs
+// must never hide. The API layer (PATCH/DELETE/group guards) imports this set so
+// the sweep and the routes can never drift apart. (M-3)
+export const PROTECTED_THREAD_EXTERNAL_IDS = new Set<string>([
+  'checkin:notifications',
+  'cockpit:jarvis-nudges',
+]);
+
 const db: DatabaseType = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
@@ -695,15 +703,22 @@ export function ungroupMembers(groupId: number): void {
 export function autoHideStaleThreads(days: number): number {
   if (!days || days <= 0) return 0;
   const cutoff = `-${Math.floor(days)} days`;
+  // M-3(a): protected system threads (nudge thread, check-in/notifications
+  // thread) must never be swept — otherwise the nudge thread gets archived and
+  // every subsequent nudge creation 500s. Guard the SELECT itself, not just the
+  // PATCH/DELETE routes. `external_id IS NULL` rows stay eligible.
+  const protectedIds = [...PROTECTED_THREAD_EXTERNAL_IDS];
+  const placeholders = protectedIds.map(() => '?').join(',');
   const candidates = db
-    .prepare<[string], { id: number }>(
+    .prepare<[string, ...string[]], { id: number }>(
       `SELECT id FROM conversations
         WHERE status = 'active'
           AND updated_at < datetime('now', ?)
           AND group_id IS NULL
+          AND (external_id IS NULL OR external_id NOT IN (${placeholders}))
           AND id NOT IN (SELECT conversation_id FROM thread_todos WHERE status != 'done')`,
     )
-    .all(cutoff);
+    .all(cutoff, ...protectedIds);
   if (candidates.length === 0) return 0;
 
   const markArchived = db.prepare<[number]>(

@@ -291,6 +291,7 @@ import {
   listRunHistory,
   classifyRunOutcome,
   PERSONALITY_STAT_KEYS,
+  PROTECTED_THREAD_EXTERNAL_IDS,
 } from '../conversation-db.js';
 import { query } from '../db.js';
 import { listVaultTree, readVaultFile, searchVault } from '../vault-page.js';
@@ -305,7 +306,9 @@ import {
 
 const MAX_TEXT_LENGTH = 50_000;
 const UI_PORT = parseInt(process.env.JARVIS_UI_PORT ?? '3201', 10);
-const PROTECTED_THREAD_IDS = new Set(['checkin:notifications', NUDGE_THREAD_EXTERNAL_ID]);
+// Shared with the auto-hide sweep (conversation-db) so route guards and the
+// sweep can never drift. NUDGE_THREAD_EXTERNAL_ID is a member of this set. (M-3)
+const PROTECTED_THREAD_IDS = PROTECTED_THREAD_EXTERNAL_IDS;
 
 // Governor v2 settings-KV schema (docs/hopper/GOVERNOR-V2-CONTRACT.md
 // §Settings-KV Schema). Single source of truth for GET/PATCH
@@ -1329,6 +1332,11 @@ export function createApiV1Router(): Router {
       ids = body.ids
         .map((id) => Number(id))
         .filter((id) => Number.isInteger(id) && id > 0);
+      // An explicitly-empty array is a no-op, not "mark every pending delivered".
+      if (ids.length === 0) {
+        res.json({ nudges: [], ...nudgeCounts() });
+        return;
+      }
     }
     res.json({ nudges: markNudgesDelivered(ids), ...nudgeCounts() });
   });

@@ -2,9 +2,11 @@ import { execFile } from 'node:child_process';
 import {
   sqliteDb,
   getOrCreateConversation,
+  getConversation,
   getConversationById,
   getSetting,
   renameConversation,
+  setConversationStatus,
   setThreadDisplay,
   addTurn,
 } from './conversation-db.js';
@@ -86,9 +88,13 @@ const getOpenBySubjectStmt = sqliteDb.prepare<[NudgeSource, string], NudgeRow>(`
   ORDER BY id DESC
   LIMIT 1
 `);
+// M-4: DB-level single-writer guard — only the first materializer to reach this
+// UPDATE wins (turn_id IS NULL). A late concurrent writer gets changes === 0 and
+// discards its (now-orphan) turn instead of overwriting the winner's turn_id.
 const setTurnStmt = sqliteDb.prepare<[number, number]>(`
-  UPDATE nudges SET turn_id = ? WHERE id = ?
+  UPDATE nudges SET turn_id = ? WHERE id = ? AND turn_id IS NULL
 `);
+const deleteTurnStmt = sqliteDb.prepare<[number]>(`DELETE FROM turns WHERE id = ?`);
 const turnIdByIndexStmt = sqliteDb.prepare<[number, number], { id: number }>(`
   SELECT id FROM turns WHERE conversation_id = ? AND turn_index = ?
 `);
@@ -163,7 +169,72 @@ export function getNudge(id: number): NudgeRow | null {
   return getByIdStmt.get(id) ?? null;
 }
 
+// M-1: the reply loop is server-owned. On every turn in the nudge thread we
+// splice a fresh <jarvis_nudges> block (open nudges, newest first) plus the
+// NUDGE.md §Reply Loop instructions into the prompt, so the replying model knows
+// exactly which nudge Kevin is answering and how to apply + resolve it. This
+// works identically on transcript-replay and on --resume, because it is rebuilt
+// from the DB each turn rather than relying on an out-of-band assistant turn
+// that a resumed session never re-sees. The DB footer stays for audit.
+export function buildNudgeReplyContext(externalId: string): string {
+  if (externalId !== NUDGE_THREAD_EXTERNAL_ID) return '';
+  const open = listNudges('open', 50);
+  const lines: string[] = [
+    '<jarvis_nudges>',
+    'You are in the global JARVIS Nudges thread (cockpit:jarvis-nudges). Kevin opens',
+    'this to answer things you flagged as needing him — each one below could not be',
+    'cleared without his call.',
+    '',
+  ];
+  if (open.length === 0) {
+    lines.push('There are no open nudges right now. Respond normally.');
+    lines.push('</jarvis_nudges>');
+    lines.push('');
+    return lines.join('\n');
+  }
+  lines.push('Open nudges (newest first):');
+  for (const n of open) {
+    const ctx = parseNudgeContext(n);
+    const route = normalizeAnswerRoute(ctx.answer_route);
+    const summary = cleanString(ctx.summary, 500) ?? n.subject_ref;
+    const why = cleanString(ctx.why_jarvis_could_not_clear, 1000) ?? DEFAULT_WHY;
+    lines.push(
+      `- nudge #${n.id} [${n.source}] subject=${n.subject_ref} status=${n.status} created=${n.created_at}`,
+      `    summary: ${summary}`,
+      `    why I could not clear it: ${why}`,
+      `    answer_route: ${route.method} ${route.path || '(none)'} body=${JSON.stringify(route.body_template ?? { answer: '$KEVIN_REPLY' })}`,
+    );
+  }
+  lines.push(
+    '',
+    'Reply loop (apply Kevin\'s answer, then resolve):',
+    '1. Match Kevin\'s reply to the most recent open nudge above, unless he names',
+    '   another one by its subject.',
+    '2. Call that nudge\'s answer_route, substituting Kevin\'s reply for the',
+    '   "$KEVIN_REPLY" placeholder in body_template. If answer_route.method is',
+    '   "manual" (or the path is empty), do not call an endpoint — just confirm',
+    '   receipt and, if appropriate, resolve it manually or open a follow-up task.',
+    '3. If the answer route succeeds, PATCH /api/v1/nudges/<id> {"status":"resolved"}.',
+    '4. Add a short first-person confirmation here in this thread.',
+    '5. If the reply is ambiguous, ask one short clarifying question here and do',
+    '   nothing else. If applying the answer fails, leave the nudge delivered, tell',
+    '   Kevin plainly, and do not PATCH it resolved.',
+    '</jarvis_nudges>',
+    '',
+  );
+  return lines.join('\n');
+}
+
 export function ensureNudgeThread() {
+  // M-3(b): if the auto-hide sweep (or anything else) archived the nudge thread,
+  // reactivate the SAME row. Otherwise getOrCreateConversation() falls through to
+  // INSERT and hits `UNIQUE constraint failed: conversations.external_id`, which
+  // is the 500 that leaves ghost open nudges behind. Only reactivate 'archived';
+  // a 'closed' row is intentional and handled by getOrCreateConversation.
+  const prior = getConversation(NUDGE_THREAD_EXTERNAL_ID);
+  if (prior && prior.status === 'archived') {
+    setConversationStatus(prior.id, 'active');
+  }
   const conv = getOrCreateConversation(NUDGE_THREAD_EXTERNAL_ID);
   if (!conv.title) renameConversation(conv.id, NUDGE_THREAD_TITLE);
   if (!conv.headline || !conv.border_color) {
@@ -246,6 +317,10 @@ function nudgePrompt(nudge: NudgeRow, context: NudgeContext): string {
 }
 
 function parseClaudeJson(stdout: string): string | null {
+  // S-2: malformed JSON, an is_error result, or a non-string `result` must fall
+  // through to the deterministic fallback — never surface raw stdout (stream-json
+  // lines, CLI diagnostics) as the visible nudge message. cleanString() already
+  // returns null for a non-string result.
   const trimmed = stdout.trim();
   if (!trimmed) return null;
   try {
@@ -253,7 +328,7 @@ function parseClaudeJson(stdout: string): string | null {
     if (parsed.is_error) return null;
     return cleanString(parsed.result, 4000);
   } catch {
-    return cleanString(trimmed, 4000);
+    return null;
   }
 }
 
@@ -261,10 +336,24 @@ function runComposer(prompt: string, model: string): Promise<string> {
   const bin = process.env.NUDGE_CLAUDE_BIN || process.env.CLAUDE_BIN || 'claude';
   const env = { ...process.env };
   delete env.ANTHROPIC_API_KEY;
+  // S-3: the composer only ever writes prose over untrusted embedded worker text
+  // (hopper question, watchdog detail); it needs no tools and no MCP surface.
+  // Lock both down, and never let a settings/env-supplied model that starts with
+  // '-' be spliced in as its own argv flag (validated by the caller, defended
+  // again here).
+  const safeModel = model.startsWith('-') ? 'claude-sonnet-5' : model;
+  const args = [
+    '-p', prompt,
+    '--model', safeModel,
+    '--output-format', 'json',
+    '--tools', '',
+    '--strict-mcp-config',
+    '--mcp-config', '{"mcpServers":{}}',
+  ];
   return new Promise((resolve, reject) => {
     const child = execFile(
       bin,
-      ['-p', prompt, '--model', model, '--output-format', 'json'],
+      args,
       { env, timeout: 60_000, maxBuffer: 1024 * 1024 },
       (err, stdout, stderr) => {
         const parsed = parseClaudeJson(stdout);
@@ -327,10 +416,34 @@ async function materializeNudge(nudge: NudgeRow): Promise<NudgeRow> {
     model: getSetting('nudge_model')?.trim() || process.env.NUDGE_MODEL || 'claude-sonnet-5',
   });
   const turnId = turnIdByIndexStmt.get(conv.id, turnIndex)?.id ?? turnIndex;
-  setTurnStmt.run(turnId, nudge.id);
+  // M-4: single-writer guard. If a concurrent materializer already claimed the
+  // row (turn_id no longer NULL), our turn is an orphan — delete it so the thread
+  // shows exactly one assistant turn per nudge.
+  const res = setTurnStmt.run(turnId, nudge.id);
+  if (res.changes === 0) deleteTurnStmt.run(turnId);
   const updated = getNudge(nudge.id);
   if (!updated) throw new Error('Failed to load nudge after materializing turn');
   return updated;
+}
+
+// M-4: coalesce concurrent materializations for one subject onto a single
+// in-flight promise so three near-simultaneous POSTs against a slow composer
+// compose once, not three times.
+const inFlightMaterializations = new Map<string, Promise<NudgeRow>>();
+
+function subjectKey(source: NudgeSource, subjectRef: string): string {
+  return `${source} ${subjectRef}`;
+}
+
+function materializeOnce(nudge: NudgeRow): Promise<NudgeRow> {
+  const key = subjectKey(nudge.source, nudge.subject_ref);
+  const existing = inFlightMaterializations.get(key);
+  if (existing) return existing;
+  const p = materializeNudge(nudge).finally(() => {
+    if (inFlightMaterializations.get(key) === p) inFlightMaterializations.delete(key);
+  });
+  inFlightMaterializations.set(key, p);
+  return p;
 }
 
 export async function createNudge(args: CreateNudgeArgs): Promise<{
@@ -345,14 +458,25 @@ export async function createNudge(args: CreateNudgeArgs): Promise<{
   const context = args.context && typeof args.context === 'object' ? args.context : {};
   const existing = getOpenBySubjectStmt.get(args.source, subjectRef);
   if (existing) {
-    const nudge = existing.turn_id == null ? await materializeNudge(existing) : existing;
+    // Heal a ghost (turn_id NULL from a prior failed compose) via the same
+    // in-flight coalescer; otherwise return the existing row untouched.
+    const nudge = existing.turn_id == null ? await materializeOnce(existing) : existing;
     return { nudge, thread_external_id: NUDGE_THREAD_EXTERNAL_ID, duplicate: true };
   }
 
   const info = insertStmt.run(args.source, subjectRef, JSON.stringify(context));
   const inserted = getNudge(Number(info.lastInsertRowid));
   if (!inserted) throw new Error('Failed to load nudge after insert');
-  const nudge = await materializeNudge(inserted);
+  // M-3(c): materialize inside the same try as the insert. If the turn can never
+  // be created (e.g. the thread can't be ensured), delete the just-inserted row
+  // so GET /nudges?status=open never counts a ghost with no message behind it.
+  let nudge: NudgeRow;
+  try {
+    nudge = await materializeOnce(inserted);
+  } catch (err) {
+    if (getNudge(inserted.id)?.turn_id == null) deleteStmt.run(inserted.id);
+    throw err;
+  }
   const notification =
     typeof context.notification_id === 'number'
       ? undefined
@@ -428,6 +552,18 @@ export function markNudgeResolved(id: number): NudgeRow | null {
   const updated = getNudge(id) ?? existing;
   if (updated.status !== existing.status || updated.resolved_at !== existing.resolved_at) emit('updated', updated);
   return updated;
+}
+
+// M-2: resolve the open nudge for a producer subject when the source itself is
+// answered/retried/settled, so answering at the source clears the bubble and a
+// later re-block for the same subject is not deduped against a stale open row.
+// Returns the resolved row (or null when there was no open nudge to resolve).
+export function resolveNudgeBySubject(source: NudgeSource, subjectRef: string): NudgeRow | null {
+  const ref = subjectRef.trim();
+  if (!ref) return null;
+  const open = getOpenBySubjectStmt.get(source, ref);
+  if (!open) return null;
+  return markNudgeResolved(open.id);
 }
 
 export function deleteNudge(id: number): NudgeRow | null {

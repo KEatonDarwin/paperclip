@@ -199,6 +199,12 @@ elif [ "$DRY_RUN" = "1" ]; then
 else
   mkdir -p "$ENV_DIR"
   ENV_FILE="${ENV_DIR}/${KEY}.env"
+  # The template unit hardcodes EnvironmentFile=/home/kevin/.claude-accounts/%i.env
+  # (systemd can't read $HOME). A custom --env-dir needs a matching unit edit.
+  if [ "$ENV_DIR" != "/home/kevin/.claude-accounts" ]; then
+    echo "      WARNING: --env-dir '${ENV_DIR}' differs from the path baked into claude-usage-poll@.service" >&2
+    echo "               (/home/kevin/.claude-accounts). Edit the installed unit's EnvironmentFile= to match." >&2
+  fi
   {
     echo "ACCOUNT_KEY=${KEY}"
     echo "ORG_ID=${ORG_ID}"

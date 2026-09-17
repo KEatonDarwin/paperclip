@@ -1318,13 +1318,29 @@ async function runConversationTurn(
   // adapter check above. Single-account default (config_dir null) never trips this.
   let activeClaudeAccount: ClaudeAccount | null = null;
   if (adapter.id === 'claude') {
-    activeClaudeAccount = selectActiveClaudeAccount(claudeFiveHourCeiling()).account;
+    const selection = selectActiveClaudeAccount(claudeFiveHourCeiling());
+    activeClaudeAccount = selection.account;
     const storedAccount = conv.session_account;
     if (sessionId && storedAccount && activeClaudeAccount && storedAccount !== activeClaudeAccount.key) {
-      console.log(
-        `[agent] Conversation ${conv.id} switching Claude accounts (${storedAccount} -> ${activeClaudeAccount.key}); starting a fresh session (claude session ids are per-account)`,
-      );
-      sessionId = null;
+      // STICKINESS (adversarial review, node #296): a live session stays on the
+      // account it was created under for as long as that account is still
+      // ELIGIBLE (enabled, metered, under the 5h ceiling). Without this, two
+      // accounts hovering near each other in usage would flip the least-used
+      // pick every turn, dropping the native session (and replaying the whole
+      // transcript) each time — the opposite of what native resume buys us.
+      // New threads (no session yet) still spread by least-used, so parallel
+      // throughput across accounts is unaffected. The stored account only loses
+      // the session once it genuinely can't serve (over ceiling / stale /
+      // disabled / removed) — that is the real swap moment.
+      const stored = selection.perAccount.find((e) => e.account.key === storedAccount);
+      if (stored?.eligible) {
+        activeClaudeAccount = stored.account;
+      } else {
+        console.log(
+          `[agent] Conversation ${conv.id} switching Claude accounts (${storedAccount} -> ${activeClaudeAccount.key}); starting a fresh session (claude session ids are per-account)`,
+        );
+        sessionId = null;
+      }
     }
   }
   // Runtime handed to every runClaude call this turn, carrying the resolved

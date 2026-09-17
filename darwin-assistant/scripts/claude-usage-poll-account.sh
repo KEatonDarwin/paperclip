@@ -19,8 +19,16 @@
 set -euo pipefail
 
 ACCOUNT_KEY="${ACCOUNT_KEY:?ACCOUNT_KEY env var is required (e.g. 'b')}"
-ORG_ID="${ORG_ID:?ORG_ID env var is required - see: claude auth status (under that account CLAUDE_CONFIG_DIR)}"
 COOKIE_FILE="${COOKIE_FILE:?COOKIE_FILE env var is required}"
+# ORG_ID is legitimately EMPTY until the account has logged in once (the setup
+# script writes the env file before that can happen, by design — "degrades
+# gracefully"). Treat it like a missing cookie: no-op with exit 0 so the timer
+# instance doesn't sit in `failed` every 60s; one journal line says why.
+ORG_ID="${ORG_ID:-}"
+if [ -z "$ORG_ID" ]; then
+  logger -t "claude-usage-poll-${ACCOUNT_KEY}" "no ORG_ID yet for account '${ACCOUNT_KEY}' — re-run multi-claude-setup.sh after 'claude auth login' (no-op)"
+  exit 0
+fi
 # Mirrors darwin-assistant/src/claude-accounts.ts usageFilePath() EXACTLY:
 # account 'a' keeps the legacy unsuffixed path; every other key gets its own
 # file. (This script should never actually be pointed at 'a' — that account

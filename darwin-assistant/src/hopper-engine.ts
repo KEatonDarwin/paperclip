@@ -232,15 +232,27 @@ function tierOf(loadout: WorkerLoadout): WorkerTier {
   if (provider === 'auggie') return model.includes('opus') ? 'frontier' : 'standard';
   return 'standard'; // devin / unknown → standard
 }
-// (candidate pool, source tier) → the concrete loadout to run there. Matches the
-// tier-equivalence map in RECON.md §3 (codex gpt-5.5↔sonnet-5, gpt-6-astra↔opus-5,
+// (candidate pool, source tier) → the concrete loadout to run there, or null
+// when that pool has NO leaf-eligible loadout at that tier (candidate skipped).
+// Matches the tier-equivalence map in RECON.md §3 (codex gpt-5.5↔sonnet-5,
 // auggie opus4.8↔opus-5, standard↔sonnet-5). Bidirectional so a reordered
 // pool-order can also divert a claude-ceilinged node outward.
-const DIVERSION_LOADOUTS: Record<GovernorProvider, Record<WorkerTier, WorkerLoadout>> = {
+//
+// Review #302 (2026-09-16): codex frontier is deliberately NULL as a TARGET.
+// The router rubric (skills/jarvis-router/SKILL.md, per-pool tier rule after
+// the 2026-09-14 gpt-6-astra burn) makes every pool's frontier variant
+// planner-only — never leaf work. Diverting an opus-5 leaf onto gpt-6-astra
+// would re-create that exact misroute on the most common daytime hold
+// (kevin_active), so a frontier node simply cannot divert onto codex. The
+// inbound direction (gpt-6-astra → opus-5) still works via tierOf(). Devin is
+// null at both tiers: it has no usage meter (ceiling is a constant 100, so it
+// would "clear" every band forever) and its CLI is one-shot-only — an
+// unmetered pool must never be a diversion sink.
+const DIVERSION_LOADOUTS: Record<GovernorProvider, Record<WorkerTier, WorkerLoadout | null>> = {
   claude: { standard: { adapter: 'claude', model: 'claude-sonnet-5' }, frontier: { adapter: 'claude', model: 'claude-opus-5' } },
-  codex: { standard: { adapter: 'codex', model: 'gpt-5.5' }, frontier: { adapter: 'codex', model: 'gpt-6-astra' } },
+  codex: { standard: { adapter: 'codex', model: 'gpt-5.5' }, frontier: null },
   auggie: { standard: { adapter: 'auggie', model: 'default' }, frontier: { adapter: 'auggie', model: 'opus4.8' } },
-  devin: { standard: { adapter: 'devin', model: null }, frontier: { adapter: 'devin', model: null } },
+  devin: { standard: null, frontier: null },
 };
 
 interface DiversionResult {
@@ -267,13 +279,14 @@ function tryDivert(
   const tier = tierOf(current);
   for (const candidate of order) {
     if (candidate === ownProvider) continue; // never "divert" onto the blocked pool
+    const loadout = DIVERSION_LOADOUTS[candidate][tier];
+    if (!loadout) continue; // no leaf-eligible loadout at this tier on that pool (see map)
     let probe = divVerdicts.get(candidate);
     if (probe === undefined) {
       probe = governorCheckDiversionTarget(candidate, ceiling);
       divVerdicts.set(candidate, probe);
     }
     if (!probe.allow) continue; // override_off / stale / weekly-maxed / still over the raised band
-    const loadout = DIVERSION_LOADOUTS[candidate][tier];
     const label = `[DIVERTED ${loadoutLabel(current)}→${loadoutLabel(loadout)}: ${verdict.reason} ${verdict.detail}]`;
     return {
       loadout,
@@ -888,20 +901,18 @@ export async function dispatchTick(reason: string): Promise<void> {
         verdict = governorCheck(adapter);
         verdicts.set(adapter, verdict);
       }
-      let divertPrefix: string | undefined;
+      let diversion: DiversionResult | null = null;
       if (!verdict.allow) {
         // Own pool is held. Try to unstick this genuinely-stuck ready node via
         // cross-pool diversion (one decision per node per tick). No alternate
-        // clears the raised band → hold exactly as before.
-        const diversion = divEnabled ? tryDivert(node, verdict, divOrder, divCeiling, divVerdicts) : null;
+        // clears the raised band → hold exactly as before. The DECISION is made
+        // here; the loadout RESTAMP happens only after a successful claim below
+        // (review #302: a cap-held or claim-raced node must keep its original
+        // planner-assigned pool — mutating it without dispatching silently
+        // re-homes the node and loses the [DIVERTED] audit trail).
+        diversion = divEnabled ? tryDivert(node, verdict, divOrder, divCeiling, divVerdicts) : null;
         if (!diversion) continue;
-        // Restamp the node's stored loadout BEFORE the claim re-reads the row so
-        // `fresh`, spawnWorker, and any later lease-expiry retry all see the
-        // diverted pool (mirrors the retry-reroute restamp above).
-        setNode(node.id, { adapter: diversion.loadout.adapter, model: diversion.loadout.model });
-        console.log(`[hopper-engine] node ${node.id} ${diversion.note}`);
         adapter = diversion.loadout.adapter ?? WORKER_ADAPTER;
-        divertPrefix = diversion.labelPrefix;
       }
       const nonClaude = providerFor(adapter) !== 'claude';
       if (daytime && nonClaude && daytimeRunning >= cap) {
@@ -914,13 +925,20 @@ export async function dispatchTick(reason: string): Promise<void> {
       const ext = `cockpit:hopper-node-${node.id}-${randomUUID().slice(0, 8)}`;
       const claimed = claimStmt.run(ext, `+${LEASE_MINUTES} minutes`, node.id);
       if (claimed.changes !== 1) continue; // raced — someone else claimed it
+      if (diversion) {
+        // Claim succeeded → restamp the node's stored loadout BEFORE the
+        // re-read so `fresh`, spawnWorker, and any later lease-expiry retry all
+        // see the diverted pool (mirrors the retry-reroute restamp above).
+        setNode(node.id, { adapter: diversion.loadout.adapter, model: diversion.loadout.model });
+        console.log(`[hopper-engine] node ${node.id} ${diversion.note}`);
+      }
       const fresh = getNodeStmt.get(node.id)!;
       emitNode('updated', fresh);
       const tree = getHopperTree(node.tree_id)!;
       free -= 1;
       if (nonClaude) daytimeRunning += 1;
       console.log(`[hopper-engine] dispatch node ${node.id} (${reason}) → ${ext}`);
-      void spawnWorker(fresh, tree, divertPrefix);
+      void spawnWorker(fresh, tree, diversion?.labelPrefix);
     }
   } finally {
     ticking = false;

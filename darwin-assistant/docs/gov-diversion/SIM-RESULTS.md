@@ -115,3 +115,10 @@ npm install --include=dev   # only needed once per fresh worktree checkout
 npm run build
 npm run governor-v2:sim
 ```
+
+## Addendum — adversarial review (node #302, 2026-09-16)
+
+Two review fixes landed on the branch (see `REVIEW.md`): (A) diverted loadout is restamped only
+after a successful claim, and (B) codex has no leaf-eligible frontier diversion target
+(`gpt-6-astra` is never a diversion sink; devin excluded as unmetered). Harness extended with
+checks 12a/12b; full run now **21/21**.

@@ -691,6 +691,65 @@ setGovernorSettings({ gov_diversion_enabled: 'false', gov_diversion_pool_order: 
     assert.equal(n.model, 'gpt-5.5');
   });
 }
+// ---------------------------------------------------------------------------
+// 12) Adversarial review (node #302) regressions for the diversion path.
+// ---------------------------------------------------------------------------
+// 12a — a diverted node that the DAYTIME CONCURRENCY CAP then holds must keep
+//       its ORIGINAL planner-assigned loadout: the restamp happens only after a
+//       successful claim. (Pre-fix: the node was silently re-homed to the
+//       alternate pool while still pending, losing the [DIVERTED] audit trail
+//       and never returning to its own pool once it freed up.)
+resetHopperState();
+setKevinActive(true);
+setUsage({ claude5h: 10, weekly: 0, codex: 91, auggie: 20 });
+setGovernorSettings({ gov_diversion_enabled: 'true', gov_diversion_ceiling_5h: '85', gov_diversion_pool_order: 'claude,codex,auggie', gov_concurrency_cap: '1', gov_override_claude: 'off' });
+{
+  const fillerTree = await createActiveTree('gov-diversion review: cap filler', [
+    { title: 'auggie filler', spec: 'occupies the single daytime non-claude slot', adapter: 'auggie', model: 'default' },
+  ]);
+  assert.equal(nodeByTitle(fillerTree, 'auggie filler').status, 'running', '12a setup: filler did not dispatch');
+  const treeId = await createActiveTree('gov-diversion review: cap-held divert', [
+    { title: 'codex stuck under cap', spec: 'would divert to auggie but the cap holds it', adapter: 'codex', model: 'gpt-5.5' },
+  ]);
+  check('12a', 'cap-held diverted node keeps its original loadout (restamp only after a successful claim)', () => {
+    const n = nodeByTitle(treeId, 'codex stuck under cap');
+    assert.equal(n.status, 'pending', 'node must be held by the daytime cap');
+    assert.equal(n.adapter, 'codex', 'adapter must not be restamped without a dispatch');
+    assert.equal(n.model, 'gpt-5.5', 'model must not be restamped without a dispatch');
+    assert.equal(spawnLabelForNode(n.id), '', 'no spawn_tasks row for an undispatched node');
+  });
+  convDb.setSetting('gov_override_claude', 'auto');
+}
+
+// 12b — a FRONTIER claude node held for kevin_active must never divert onto
+//       codex gpt-6-astra (router rubric: every pool's frontier variant is
+//       planner-only, never leaf work — the 2026-09-14 codex burn). Codex has
+//       no leaf-eligible frontier loadout, so with auggie also blocked the node
+//       holds exactly as today; a STANDARD claude node in the same state still
+//       diverts outward to codex/gpt-5.5.
+resetHopperState();
+setKevinActive(true);
+setUsage({ claude5h: 60, weekly: 0, codex: 20, auggie: 91 });
+setGovernorSettings({ gov_diversion_enabled: 'true', gov_diversion_ceiling_5h: '85', gov_diversion_pool_order: 'claude,codex,auggie' });
+{
+  const treeId = await createActiveTree('gov-diversion review: frontier never → gpt-6-astra', [
+    { title: 'opus review node', spec: 'frontier leaf held for kevin_active', adapter: 'claude', model: 'claude-opus-5' },
+    { title: 'sonnet build node', spec: 'standard leaf held for kevin_active', adapter: 'claude', model: 'claude-sonnet-5' },
+  ]);
+  check('12b', 'frontier claude node never diverts onto codex gpt-6-astra (holds); standard node still diverts to gpt-5.5', () => {
+    const f = nodeByTitle(treeId, 'opus review node');
+    assert.equal(f.status, 'pending', 'frontier node must hold (no leaf-eligible codex frontier, auggie blocked)');
+    assert.equal(f.adapter, 'claude');
+    assert.equal(f.model, 'claude-opus-5');
+    assert.equal(spawnLabelForNode(f.id), '');
+    const s = nodeByTitle(treeId, 'sonnet build node');
+    assert.equal(s.status, 'running');
+    assert.equal(s.adapter, 'codex');
+    assert.equal(s.model, 'gpt-5.5');
+    assert.match(spawnLabelForNode(s.id), /^\[DIVERTED claude\/claude-sonnet-5→codex\/gpt-5\.5: kevin_active/);
+  });
+}
+
 
 const failed = results.filter((r) => !r.pass);
 for (const r of results) {

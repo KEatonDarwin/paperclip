@@ -24,6 +24,7 @@ import {
   type TurnRow,
   type TurnMetadata,
 } from './conversation-db.js';
+import { selectActiveClaudeAccount, claudeFiveHourCeiling, type ClaudeAccount } from './claude-accounts.js';
 import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent, type StreamEndEvent, type ToolCallEvent } from './sse-bus.js';
 import { buildGroupChatContext } from './group-chat-context.js';
 import { buildQuickChatContext } from './quick-chat-profiles.js';
@@ -842,6 +843,11 @@ export interface ClaudeResult {
   usage?: ClaudeUsage;
   model?: string;
   rawOutput?: string;
+  // Multi-Claude (tree-44d2ff4a): which Claude account this run was routed to
+  // (the `claude_accounts` key, e.g. 'a'/'b'), or null for non-Claude runs / when
+  // no account could be resolved. Lets the caller persist session_account and lets
+  // the monitor see which subscription the work burned.
+  accountKey?: string | null;
 }
 
 function parseClaudeOutput(stdout: string): ClaudeResult {
@@ -1002,7 +1008,7 @@ export async function runClaude(
   input: string,
   sessionId?: string | null,
   onEvent?: (event: Record<string, unknown>) => void,
-  runtime?: { adapter: AdapterConfig; model: string | null; options?: Record<string, unknown> },
+  runtime?: { adapter: AdapterConfig; model: string | null; options?: Record<string, unknown>; claudeAccount?: ClaudeAccount | null },
   signal?: AbortSignal,
   imageDirs?: string[],
   imagePaths?: string[],
@@ -1014,6 +1020,30 @@ export async function runClaude(
   const options = runtime?.options ?? getActiveOptions();
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
   adapter.envOverrides?.(env);
+
+  // Multi-Claude (tree-44d2ff4a): route this claude run to its active account by
+  // pointing CLAUDE_CONFIG_DIR at that account's isolated login (own OAuth token /
+  // session / usage). The caller (runConversationTurn) resolves the account once
+  // per turn and passes it in so the resume-vs-fresh session decision and the
+  // actual spawn agree on the same account; one-shot callers (briefings, etc.)
+  // that don't know about accounts get a fresh least-used pick here. Only the
+  // `claude` adapter uses accounts. SINGLE-ACCOUNT DEFAULT: the implicit account
+  // 'a' has config_dir null, so env is left completely untouched — byte-identical
+  // to before this feature. ANTHROPIC_API_KEY is still deleted above (no keys).
+  let activeClaudeAccountKey: string | null = null;
+  if (adapter.id === 'claude') {
+    const provided = runtime && 'claudeAccount' in runtime ? (runtime.claudeAccount ?? null) : undefined;
+    const account = provided !== undefined ? provided : selectActiveClaudeAccount(claudeFiveHourCeiling()).account;
+    if (account) {
+      activeClaudeAccountKey = account.key;
+      if (account.config_dir) {
+        env['CLAUDE_CONFIG_DIR'] = account.config_dir;
+        // Log only when a NON-default account is actually used, so the single-
+        // account path stays quiet. Visible to the governor/monitor via the log.
+        console.log(`[agent] claude run routed to account '${account.key}' (CLAUDE_CONFIG_DIR=${account.config_dir})`);
+      }
+    }
+  }
 
   const args = adapter.buildArgs({ sessionId, model, options, imageDirs, imagePaths });
 
@@ -1140,7 +1170,7 @@ export async function runClaude(
         const combined = stderr + '\n' + stdout;
         const unknownSessionRe = adapter.unknownSessionPattern ?? UNKNOWN_SESSION_RE;
         if (sessionId && unknownSessionRe.test(combined)) {
-          resolve({ text: '', sessionId: null });
+          resolve({ text: '', sessionId: null, accountKey: activeClaudeAccountKey });
           return;
         }
         const firstErr = stderr.split('\n').find((l) => l.trim()) ?? `exit code ${code}`;
@@ -1152,6 +1182,9 @@ export async function runClaude(
       // Native session resume: prefer the id captured from the export file over
       // whatever the stdout parser produced (Devin's stdout has none).
       if (exportSessionId) parsed.sessionId = exportSessionId;
+      // Multi-Claude: surface which account this run used so the caller can
+      // persist session_account and the monitor can see it.
+      parsed.accountKey = activeClaudeAccountKey;
       resolve(parsed);
     });
 
@@ -1252,6 +1285,32 @@ async function runConversationTurn(
     );
     sessionId = null;
   }
+
+  // Multi-Claude (tree-44d2ff4a): pick the Claude account this turn runs on
+  // (least-used enabled account under the 5h ceiling). Resolved ONCE here so the
+  // session-drop decision below and the actual spawn (runClaude, via the runtime
+  // it's handed) agree on the same account. Only the `claude` adapter uses
+  // accounts; for everything else this stays null and is ignored downstream.
+  // SESSION CAVEAT: a claude --resume id lives inside its account's config dir, so
+  // it can't resolve under a different account. v0 rule: if this thread's live
+  // session was created under a DIFFERENT account than the one we're about to use,
+  // drop it and start a fresh session (never error). storedAccount null
+  // (legacy/unknown/non-claude) is treated as "no forced drop" — same shape as the
+  // adapter check above. Single-account default (config_dir null) never trips this.
+  let activeClaudeAccount: ClaudeAccount | null = null;
+  if (adapter.id === 'claude') {
+    activeClaudeAccount = selectActiveClaudeAccount(claudeFiveHourCeiling()).account;
+    const storedAccount = conv.session_account;
+    if (sessionId && storedAccount && activeClaudeAccount && storedAccount !== activeClaudeAccount.key) {
+      console.log(
+        `[agent] Conversation ${conv.id} switching Claude accounts (${storedAccount} -> ${activeClaudeAccount.key}); starting a fresh session (claude session ids are per-account)`,
+      );
+      sessionId = null;
+    }
+  }
+  // Runtime handed to every runClaude call this turn, carrying the resolved
+  // account so all calls (initial + expiry/overflow retries) land on the same one.
+  const runClaudeRuntime = { adapter: runtime.adapter, model: runtime.model, options: runtime.options, claudeAccount: activeClaudeAccount };
 
   // DAR-716: rewrite the plan-mode marker (if present) into an explicit
   // instruction for the model. `input` itself stays untouched — it's already
@@ -1359,7 +1418,7 @@ async function runConversationTurn(
     const claudeT0 = Date.now();
     let result: ClaudeResult;
     try {
-      result = await runClaude(stdinContent, sessionId, onStreamEvent, runtime, signal, imageDirs, imagePaths);
+      result = await runClaude(stdinContent, sessionId, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths);
       sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
 
       // Session expired or unknown — retry without resume
@@ -1369,7 +1428,7 @@ async function runConversationTurn(
         stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model);
         accumulatedText = '';
         sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
-        result = await runClaude(stdinContent, null, onStreamEvent, runtime, signal, imageDirs, imagePaths);
+        result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths);
         sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
       }
     } catch (err) {
@@ -1389,7 +1448,7 @@ async function runConversationTurn(
         accumulatedText = '';
         try {
           sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
-          result = await runClaude(stdinContent, null, onStreamEvent, runtime, signal, imageDirs, imagePaths);
+          result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths);
           sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
         } catch (retryErr) {
           sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
@@ -1432,7 +1491,12 @@ async function runConversationTurn(
 
     if (result.sessionId && result.sessionId !== sessionId) {
       sessionId = result.sessionId;
-      updateSessionState(conv.id, sessionId, adapter.id);
+      // Multi-Claude (tree-44d2ff4a): stamp the account this fresh session was
+      // created under so a later account change can drop it. result.accountKey is
+      // the account runClaude actually used (null for non-Claude adapters). A new
+      // session id is only ever produced when we start fresh — including when the
+      // account changed above — so this is the correct point to record it.
+      updateSessionState(conv.id, sessionId, adapter.id, result.accountKey ?? null);
     }
 
     const claudeMeta: TurnMetadata = {

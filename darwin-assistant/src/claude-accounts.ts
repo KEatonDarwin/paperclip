@@ -89,6 +89,23 @@ function staleMinutesCeiling(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 10;
 }
 
+/**
+ * The 5h-window ceiling used to decide account eligibility — mirrors the
+ * governor's `fiveHourCeiling()` exactly (settings-KV `gov_5h_ceiling`, env
+ * `HOPPER_GOV_5H_CEILING`, default 90) so the account selector and the governor
+ * agree on when an account is "full". Read fresh (uncached) so a cockpit PATCH
+ * takes effect on the next spawn, same as every other governor knob. Kept here
+ * (not imported from hopper-governor) to avoid a cross-module dependency — the
+ * governor's copy is private.
+ */
+export function claudeFiveHourCeiling(): number {
+  const kv = getSetting('gov_5h_ceiling')?.trim();
+  const env = process.env.HOPPER_GOV_5H_CEILING?.trim();
+  const raw = kv || env;
+  const n = raw != null ? parseInt(raw, 10) : NaN;
+  return Number.isFinite(n) && n >= 0 ? n : 90;
+}
+
 /** The implicit single account used when nothing is configured. */
 function defaultAccount(): ClaudeAccount {
   return {

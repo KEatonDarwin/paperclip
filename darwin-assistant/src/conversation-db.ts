@@ -123,6 +123,13 @@ for (const col of [
   // null = unlocked. The cockpit gates thread content behind a password prompt
   // whenever this is non-null.
   'password_hash TEXT',
+  // Multi-Claude (tree-44d2ff4a): which Claude account (`claude_accounts` key,
+  // e.g. 'a'/'b') the current live CLI session was created under. Claude session
+  // ids live inside each account's CLAUDE_CONFIG_DIR, so a --resume id can't
+  // cross accounts — when the active account changes between turns we drop the
+  // stale session and start fresh. Null = unknown/legacy or a non-Claude session
+  // (single-account default stays null-safe → byte-identical behavior).
+  'session_account TEXT',
 ]) {
   try { db.exec(`ALTER TABLE conversations ADD COLUMN ${col}`); } catch {}
 }
@@ -159,6 +166,9 @@ export interface ConversationRow {
   border_color: string | null;
   // Per-thread password lock (DAR-785). "salt:hash" when locked, null when open.
   password_hash: string | null;
+  // Multi-Claude (tree-44d2ff4a): the `claude_accounts` key the live session was
+  // created under (null = unknown/legacy or non-Claude). See updateSessionState.
+  session_account: string | null;
 }
 
 /**
@@ -234,6 +244,14 @@ const stmts = {
   updateSessionState: db.prepare<[string | null, string | null, number]>(
     `UPDATE conversations
      SET claude_session_id = ?, session_adapter = ?, updated_at = datetime('now')
+     WHERE id = ?`,
+  ),
+  // Multi-Claude variant that also records the Claude account the session lives
+  // under. Kept separate so the 3-arg callers (clone/fork/checkin) stay
+  // byte-identical and never clobber session_account.
+  updateSessionStateWithAccount: db.prepare<[string | null, string | null, string | null, number]>(
+    `UPDATE conversations
+     SET claude_session_id = ?, session_adapter = ?, session_account = ?, updated_at = datetime('now')
      WHERE id = ?`,
   ),
   touchConversation: db.prepare<[number]>(
@@ -364,8 +382,20 @@ export function getOrCreateConversation(externalId: string, slackChannel?: strin
   return created;
 }
 
-export function updateSessionState(conversationId: number, sessionId: string | null, adapterId: string | null): void {
-  stmts.updateSessionState.run(sessionId, adapterId, conversationId);
+export function updateSessionState(
+  conversationId: number,
+  sessionId: string | null,
+  adapterId: string | null,
+  // Multi-Claude (tree-44d2ff4a): the Claude account key this session lives under.
+  // Omit (undefined) to leave session_account untouched — that keeps the existing
+  // clone/fork/checkin callers byte-identical. Pass null for a non-Claude session.
+  accountKey?: string | null,
+): void {
+  if (accountKey === undefined) {
+    stmts.updateSessionState.run(sessionId, adapterId, conversationId);
+  } else {
+    stmts.updateSessionStateWithAccount.run(sessionId, adapterId, accountKey, conversationId);
+  }
 }
 
 export function touchConversation(conversationId: number): void {

@@ -11,8 +11,10 @@
     "build:run": "tsc && node dist/index.js",
     "foundry:sim": "node scripts/foundry-sim.mjs",
     "governor-v2:sim": "JARVIS_DB_PATH=/tmp/governor-v2-sim.db node scripts/governor-v2-sim.mjs",
+    "governor-multiclaude:sim": "JARVIS_DB_PATH=/tmp/governor-multiclaude-sim.db node scripts/governor-multiclaude-sim.mjs",
     "spawn-monitor:test": "node scripts/spawn-monitor-test.mjs",
-    "claude-accounts:test": "JARVIS_DB_PATH=/tmp/claude-accounts-test.db node scripts/claude-accounts-test.mjs"
+    "claude-accounts:test": "JARVIS_DB_PATH=/tmp/claude-accounts-test.db node scripts/claude-accounts-test.mjs",
+    "claude-adapter-account:test": "JARVIS_DB_PATH=/tmp/claude-adapter-account-test.db node scripts/claude-adapter-account-test.mjs"
   },
   "dependencies": {
     "@slack/bolt": "^4.0.0",

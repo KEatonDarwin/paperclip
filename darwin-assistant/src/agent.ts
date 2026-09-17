@@ -24,7 +24,7 @@ import {
   type TurnRow,
   type TurnMetadata,
 } from './conversation-db.js';
-import { selectActiveClaudeAccount, claudeFiveHourCeiling, type ClaudeAccount } from './claude-accounts.js';
+import { selectActiveClaudeAccount, claudeFiveHourCeiling, listClaudeAccounts, type ClaudeAccount } from './claude-accounts.js';
 import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent, type StreamEndEvent, type ToolCallEvent } from './sse-bus.js';
 import { buildGroupChatContext } from './group-chat-context.js';
 import { buildQuickChatContext } from './quick-chat-profiles.js';
@@ -1004,6 +1004,25 @@ const UNKNOWN_SESSION_RE = /no conversation found with session id|unknown sessio
 // hit the same class of error with their own wording.
 const CONTEXT_OVERFLOW_RE = /ran out of room|context window|context.length.exceeded|maximum context length|prompt is too long|too many tokens/i;
 
+// Multi-Claude (tree-44d2ff4a node #294): matches the claude CLI error surfaced
+// when a subscription window is EXHAUSTED (5h or weekly usage cap) or a
+// rate/quota limit is hit mid-turn. On this signal, a claude turn is rescued by
+// re-running it ONCE on the next Claude account that still has headroom (see the
+// rate-limit rescue branch in runConversationTurn) — the "continue on it"
+// guarantee — before the node ever fails into the hopper engine's model-tier
+// escalation ladder.
+//
+// ⚠️ These patterns cover the KNOWN Claude Code CLI (v2.1.x) usage-limit output
+// shapes + the API 429 error wording (documented in docs/multi-claude/RECON.md
+// §7). The exact live headless string could not be captured without actually
+// burning Kevin's window; the constant is deliberately the single tuning point
+// so a confirmed live string can be folded in with a one-line edit. It is only
+// ever tested against a FAILED run's error message (non-zero exit stderr), never
+// against normal assistant text, so the broad alternates carry no false-positive
+// risk for real replies.
+const RATE_LIMIT_RE =
+  /usage limit reached|reached your usage limit|5-?hour limit reached|weekly limit reached|Claude AI usage limit|rate[ _-]?limit(?:_error)?|too many requests|\b429\b/i;
+
 export async function runClaude(
   input: string,
   sessionId?: string | null,
@@ -1384,6 +1403,11 @@ async function runConversationTurn(
   // message instead of looping.
   let contextOverflowRetried = false;
 
+  // Multi-Claude (tree-44d2ff4a node #294): cap the rate-limit account swap at
+  // ONE per turn/attempt so a wall that follows us across accounts can't loop —
+  // after this the node fails and the hopper engine's model-tier ladder takes over.
+  let accountSwapRetried = false;
+
   for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
     let accumulatedText = '';
     liveStreams.delete(conv.id); // reset the cross-browser buffer each tool-turn
@@ -1464,6 +1488,82 @@ async function runConversationTurn(
           });
           touchConversation(conv.id);
           return friendly;
+        }
+      } else if (
+        adapter.id === 'claude' &&
+        RATE_LIMIT_RE.test(message) &&
+        !accountSwapRetried &&
+        listClaudeAccounts().filter((a) => a.enabled).length > 1
+      ) {
+        // Multi-Claude (tree-44d2ff4a node #294): this claude turn hit the wall
+        // (5h/weekly usage cap or a rate/quota limit) mid-flight. RESCUE it by
+        // re-running ONCE on the next account that still has headroom, EXCLUDING
+        // the one that just failed — the "continue on it" guarantee, before this
+        // node ever fails into the hopper engine's model-tier escalation ladder.
+        // Capped at one swap/turn (accountSwapRetried) so a wall following us
+        // across accounts can't loop. Single-account setups never reach here (the
+        // >1-enabled guard keeps that path byte-identical to before this feature).
+        accountSwapRetried = true;
+        const failedKey = activeClaudeAccount?.key ?? null;
+        const swap = selectActiveClaudeAccount(claudeFiveHourCeiling(), { exclude: failedKey });
+        const nextEntry = swap.account
+          ? swap.perAccount.find((e) => e.account.key === swap.account!.key)
+          : null;
+        // Only rescue onto an account with REAL headroom (an eligible pick, not a
+        // "so we still try" fallback). No such account ⇒ all accounts exhausted ⇒
+        // finish/hold exactly as today.
+        const rescueAccount = swap.account && nextEntry?.eligible ? swap.account : null;
+        if (rescueAccount) {
+          console.log(
+            `[agent] Conversation ${conv.id} hit a Claude usage/rate limit on account '${failedKey ?? 'a'}'; ` +
+              `retrying on account '${rescueAccount.key}' with a fresh session (claude sessions are per-account)`,
+          );
+          // Fresh session on account change — a --resume id only resolves inside
+          // its own CLAUDE_CONFIG_DIR (node #291 rule); context is rebuilt from
+          // the transcript by buildContinuationPrompt.
+          activeClaudeAccount = rescueAccount;
+          runClaudeRuntime.claudeAccount = rescueAccount;
+          sessionId = null;
+          stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model);
+          accumulatedText = '';
+          try {
+            sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
+            result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths);
+            sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
+          } catch (rescueErr) {
+            // The rescue account also walled/failed → all headroom exhausted →
+            // finish/hold as today (node fails; the model-tier ladder runs next).
+            sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
+            const partial = accumulatedText.trim()
+              ? `${accumulatedText}\n\n${INTERRUPTED_SUFFIX}`
+              : INTERRUPTED_MARKER;
+            const rescueDetail = (rescueErr instanceof Error
+              ? `${rescueErr.message}\n\n${rescueErr.stack ?? ''}`
+              : String(rescueErr)).slice(0, 8000);
+            addTurn(conv.id, 'assistant', partial, undefined, undefined, undefined, {
+              timingMs: Date.now() - claudeT0,
+              claudeInput: stdinContent,
+              errorDetail: `${message}\n\n(account-swap rescue on '${rescueAccount.key}' also failed: ${rescueDetail})`,
+            });
+            touchConversation(conv.id);
+            throw rescueErr;
+          }
+        } else {
+          // No other account has headroom → all Claude accounts exhausted →
+          // persist the partial and rethrow exactly like the default error path.
+          const partial = accumulatedText.trim()
+            ? `${accumulatedText}\n\n${INTERRUPTED_SUFFIX}`
+            : INTERRUPTED_MARKER;
+          const errorDetail = (err instanceof Error
+            ? `${err.message}\n\n${err.stack ?? ''}`
+            : String(err)).slice(0, 8000);
+          addTurn(conv.id, 'assistant', partial, undefined, undefined, undefined, {
+            timingMs: Date.now() - claudeT0,
+            claudeInput: stdinContent,
+            errorDetail: `${errorDetail}\n\n(all Claude accounts exhausted — no headroom to rescue onto)`,
+          });
+          touchConversation(conv.id);
+          throw err;
         }
       } else {
         // Fix C (DAR-676): a timed-out or crashed model call must not vanish. Persist

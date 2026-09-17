@@ -175,3 +175,47 @@ unset).
 6. Login is a manual one-time-per-account step (addendum): the setup script
    should print `CLAUDE_CONFIG_DIR=~/.claude-b claude login` for Kevin to run
    himself, not attempt to automate it.
+
+## 7. Rate-limit / window-exhausted detection string (node #294)
+
+Node #294 rescues a claude turn that hits its subscription wall mid-flight by
+re-running it once on the next account with headroom. That requires DETECTING the
+wall from the claude CLI's own failure output.
+
+**How the wall surfaces in our harness:** the Claude Code CLI run in
+`--print - --output-format stream-json` mode exits **non-zero and writes the
+limit to stderr** when a usage window is exhausted. `runClaude` (`src/agent.ts`)
+already funnels that case — `code !== 0 && !stdout.trim()` → `reject(new
+Error(`claude: <first stderr line>`))` — so the detector runs on that thrown
+error message inside `runConversationTurn`'s catch block (NOT against normal
+assistant text, so the alternation carries no false-positive risk for real
+replies).
+
+**⚠️ Honest caveat — the live string was NOT captured.** Triggering a real 5h/
+weekly exhaustion would have burned Kevin's actual subscription window, which is
+off-limits for a build node. So `RATE_LIMIT_RE` (`src/agent.ts`) is built from
+the KNOWN Claude Code CLI (v2.1.266, installed) usage-limit output shapes and the
+Anthropic API 429 error wording, not from a live capture. The regex is the single
+tuning point — when a real wall is observed in the logs, fold the exact string in
+with a one-line edit. Patterns matched (case-insensitive):
+
+- `usage limit reached` / `reached your usage limit`  — the headline limit phrase
+- `5-hour limit reached` / `weekly limit reached`      — the two subscription windows
+- `Claude AI usage limit`                              — older headless banner form
+- `rate_limit` / `rate-limit` / `rate limit`           — API-level rate limiting
+- `too many requests` / `429`                          — HTTP 429 wording/code
+
+**Deliberately NOT matched:** transient server overload (`Overloaded` / HTTP 529)
+— a different account won't clear a global Anthropic overload, and it's a
+retry-later condition, not a per-subscription wall. If overload rescue is ever
+wanted, add it to `RATE_LIMIT_RE` (harmless — a fresh account is just tried once).
+
+**Rescue mechanics (implemented in `runConversationTurn`):** on a match, and only
+when `> 1` Claude account is enabled (single-account path stays byte-identical),
+`selectActiveClaudeAccount(ceiling, { exclude: <failed key> })` picks the next
+account that has REAL headroom (an eligible pick, not a "so we still try"
+fallback). Session id is dropped (per-account session isolation, node #291 rule)
+and context replayed via `buildContinuationPrompt`. Capped at ONE swap per turn
+(`accountSwapRetried`) so a wall that follows across accounts can't loop. No
+headroom anywhere → the turn fails/holds exactly as today, and the node's next
+attempt rides the hopper engine's existing model-tier escalation ladder.

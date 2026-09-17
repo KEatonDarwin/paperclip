@@ -28,7 +28,7 @@
 // before this feature existed.
 
 import { statSync, readFileSync } from 'node:fs';
-import { getSetting } from './conversation-db.js';
+import { getSetting, setSetting } from './conversation-db.js';
 
 /** A single Claude subscription JARVIS can route work to. */
 export interface ClaudeAccount {
@@ -167,6 +167,52 @@ export function listClaudeAccounts(): ClaudeAccount[] {
   return accounts.length > 0 ? accounts : [defaultAccount()];
 }
 
+/** Fields the setup script / cockpit may set when registering an account. Omitted fields keep their prior value (or a sane default when the account is new). */
+export interface ClaudeAccountInput {
+  key: string;
+  label?: string;
+  /** `undefined` = leave as-is; `null` or `''` = explicit CLI default (`~/.claude`). */
+  config_dir?: string | null;
+  cookie_file?: string;
+  /** `undefined` = leave as-is; `null` or `''` = unknown. */
+  org_id?: string | null;
+  enabled?: boolean;
+}
+
+/**
+ * Create-or-update one account in the `claude_accounts` registry (settings-KV).
+ * Starts from `listClaudeAccounts()` — which already synthesizes the implicit
+ * default account 'a' when nothing is stored yet — so seeding a NEW account
+ * (e.g. 'b') for the first time never silently drops 'a'. Returns the full
+ * registry after the write. Idempotent: calling it again with the same input
+ * re-applies the same fields (safe to re-run the setup script).
+ */
+export function upsertClaudeAccount(input: ClaudeAccountInput): ClaudeAccount[] {
+  const key = input.key?.trim();
+  if (!key) throw new Error('claude account key is required');
+  const base = listClaudeAccounts();
+  const idx = base.findIndex((a) => a.key === key);
+  const prior = idx >= 0 ? base[idx] : null;
+
+  const configDir =
+    input.config_dir !== undefined ? (input.config_dir?.trim() || null) : (prior?.config_dir ?? null);
+  const merged: ClaudeAccount = {
+    key,
+    label: input.label?.trim() || prior?.label || `Claude ${key.toUpperCase()}`,
+    config_dir: configDir,
+    cookie_file:
+      input.cookie_file?.trim() ||
+      prior?.cookie_file ||
+      (configDir ? `${configDir.replace(/\/$/, '')}/claude-ai-session-cookie` : '~/.claude/claude-ai-session-cookie'),
+    org_id: input.org_id !== undefined ? (input.org_id?.trim() || null) : (prior?.org_id ?? null),
+    enabled: input.enabled !== undefined ? input.enabled : (prior?.enabled ?? true),
+  };
+
+  const next = idx >= 0 ? base.map((a, i) => (i === idx ? merged : a)) : [...base, merged];
+  setSetting(SETTINGS_KEY, JSON.stringify(next));
+  return next;
+}
+
 /** The usage file for an account: 'a' keeps the legacy path; others get a per-key file. */
 export function usageFilePath(key: string): string {
   const base = USAGE_DIR.replace(/\/$/, '');
@@ -200,6 +246,18 @@ export function readAccountUsage(key: string): AccountUsage {
   }
 }
 
+/** Options for {@link selectActiveClaudeAccount}. */
+export interface SelectAccountOptions {
+  /**
+   * Account key to leave out of selection entirely — used by the rate-limit
+   * rescue (node #294) to pick the "next account that has headroom" after the
+   * account a turn just ran on hit its wall. The excluded account is treated as
+   * ineligible AND dropped from the fallback pool, so it can never be re-picked.
+   * `null`/omitted = no exclusion → byte-identical to the single-arg call.
+   */
+  exclude?: string | null;
+}
+
 /**
  * Picks the account a new Claude worker should run on.
  *
@@ -209,15 +267,24 @@ export function readAccountUsage(key: string): AccountUsage {
  * across accounts (parallel throughput) and also handles the serial swap: once
  * an account crosses the ceiling it stops being eligible and the other wins.
  *
+ * `opts.exclude` removes one account key from consideration (the just-failed
+ * account, for the mid-flight rate-limit rescue). It never appears eligible and
+ * is never the fallback pick — so the rescue always lands on a DIFFERENT
+ * subscription. When only the excluded account exists, `account` comes back
+ * null (all exhausted → caller finishes/holds as today).
+ *
  * Fallback ("so we still try"): if no account is eligible, return the enabled
- * account with the lowest KNOWN five_hour; if none are readable, the first
- * enabled account. Returns account=null only when every account is disabled.
+ * (non-excluded) account with the lowest KNOWN five_hour; if none are readable,
+ * the first enabled (non-excluded) account. Returns account=null only when every
+ * account is disabled/excluded.
  */
-export function selectActiveClaudeAccount(ceiling: number): AccountSelection {
+export function selectActiveClaudeAccount(ceiling: number, opts?: SelectAccountOptions): AccountSelection {
+  const excludeKey = opts?.exclude ?? null;
   const accounts = listClaudeAccounts();
   const perAccount: AccountUsageEntry[] = accounts.map((account) => {
     const usage = readAccountUsage(account.key);
     const eligible =
+      account.key !== excludeKey &&
       account.enabled && !usage.stale && usage.five_hour != null && usage.five_hour < ceiling;
     return { account, usage, eligible };
   });
@@ -237,11 +304,13 @@ export function selectActiveClaudeAccount(ceiling: number): AccountSelection {
   if (account == null) {
     // Fallback: every eligible slot is exhausted/stale. Still hand back something
     // to try — prefer an enabled account with a readable number, else the first
-    // enabled account, else nothing (all disabled).
+    // enabled account, else nothing (all disabled). The excluded key is dropped
+    // from both fallback pools so a rescue never returns to the account that
+    // just hit the wall.
     const enabledReadable = perAccount.filter(
-      (e) => e.account.enabled && e.usage.five_hour != null,
+      (e) => e.account.enabled && e.account.key !== excludeKey && e.usage.five_hour != null,
     );
-    account = pickLowest(enabledReadable) ?? accounts.find((a) => a.enabled) ?? null;
+    account = pickLowest(enabledReadable) ?? accounts.find((a) => a.enabled && a.key !== excludeKey) ?? null;
   }
 
   return { account, allNames: accounts.map((a) => a.key), perAccount };

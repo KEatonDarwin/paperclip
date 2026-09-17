@@ -1,0 +1,54 @@
+#!/bin/bash
+# Multi-claude usage poller — generalized version of ~/.claude/claude-usage-poll.sh
+# for accounts OTHER THAN the default 'a' (tree-44d2ff4a node #293).
+#
+# Account 'a' is UNCHANGED: it keeps its existing standalone script
+# (~/.claude/claude-usage-poll.sh) writing /tmp/claude-usage-live.json, wired
+# to claude-usage-poll.service/.timer exactly as before this feature existed.
+#
+# This script is the ONE poller body every OTHER account's systemd instance
+# runs (see systemd/claude-usage-poll@.service, template-instantiated per
+# account key via `systemctl enable --now claude-usage-poll@<key>.timer`).
+# Per-account config comes from the environment (an EnvironmentFile written by
+# scripts/multi-claude-setup.sh, one per account, at
+# ~/.claude-accounts/<key>.env) — nothing here is account-specific.
+#
+# Polls the authenticated claude.ai usage endpoint (browser sessionKey cookie
+# — a DIFFERENT credential than the CLI's own OAuth token/CLAUDE_CONFIG_DIR
+# login). Does NOT consume any Claude API/subscription usage — plain HTTP GET.
+set -euo pipefail
+
+ACCOUNT_KEY="${ACCOUNT_KEY:?ACCOUNT_KEY env var is required (e.g. 'b')}"
+ORG_ID="${ORG_ID:?ORG_ID env var is required - see: claude auth status (under that account CLAUDE_CONFIG_DIR)}"
+COOKIE_FILE="${COOKIE_FILE:?COOKIE_FILE env var is required}"
+# Mirrors darwin-assistant/src/claude-accounts.ts usageFilePath() EXACTLY:
+# account 'a' keeps the legacy unsuffixed path; every other key gets its own
+# file. (This script should never actually be pointed at 'a' — that account
+# keeps its original standalone poller — but the rule is kept identical here
+# so the two never drift if it ever is.)
+if [ "${ACCOUNT_KEY}" = "a" ]; then
+  DEFAULT_OUT_FILE="/tmp/claude-usage-live.json"
+else
+  DEFAULT_OUT_FILE="/tmp/claude-usage-${ACCOUNT_KEY}-live.json"
+fi
+OUT_FILE="${OUT_FILE:-$DEFAULT_OUT_FILE}"
+
+UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+
+[ -f "$COOKIE_FILE" ] || exit 0
+COOKIE=$(cat "$COOKIE_FILE")
+[ -n "$COOKIE" ] || exit 0
+
+TMP=$(mktemp)
+HTTP_CODE=$(curl -s -o "$TMP" -w "%{http_code}" \
+  "https://claude.ai/api/organizations/${ORG_ID}/usage" \
+  -H "Cookie: sessionKey=${COOKIE}" \
+  -H "User-Agent: ${UA}" \
+  -H "Accept: application/json")
+
+if [ "$HTTP_CODE" = "200" ]; then
+  mv "$TMP" "$OUT_FILE"
+else
+  rm -f "$TMP"
+  logger -t "claude-usage-poll-${ACCOUNT_KEY}" "poll failed with HTTP ${HTTP_CODE} (cookie likely expired) org=${ORG_ID}"
+fi

@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { statSync, readFileSync } from 'node:fs';
 import { displayContentFromRawOutput, parseTurnSteps } from '../turn-steps.js';
 import { isPlanModeMessage } from '../agent.js';
+import { selectActiveClaudeAccount, claudeFiveHourCeiling, upsertClaudeAccount } from '../claude-accounts.js';
 import {
   getOrCreateConversation,
   getConversation,
@@ -4332,6 +4333,65 @@ export function createApiV1Router(): Router {
     setSetting('active_preset', preset.id);
     const info = getActiveAdapterInfo();
     res.json({ ok: true, preset, active_adapter: info.adapter, active_model: info.model });
+  });
+
+  // == Claude accounts (multi-claude, tree-44d2ff4a node #293) ================
+  // GET is the live per-account breakdown (registry + usage + eligibility +
+  // which account a new worker would land on right now) — same data the
+  // governor's claude lane consults. POST is how the setup script (or the
+  // cockpit, later) registers/updates ONE account in the `claude_accounts`
+  // settings-KV registry; admin-scoped since it changes where work routes.
+  // A default single-account setup (nothing ever POSTed here) is unaffected —
+  // `listClaudeAccounts()` synthesizes account 'a' when the setting is unset.
+
+  router.get('/claude-accounts', (_req: AuthedRequest, res) => {
+    const ceiling = claudeFiveHourCeiling();
+    const selection = selectActiveClaudeAccount(ceiling);
+    res.json({
+      active_account: selection.account?.key ?? null,
+      ceiling,
+      accounts: selection.perAccount.map(({ account, usage, eligible }) => ({
+        key: account.key,
+        label: account.label,
+        config_dir: account.config_dir,
+        org_id: account.org_id,
+        enabled: account.enabled,
+        five_hour: usage.five_hour,
+        weekly: usage.weekly,
+        stale: usage.stale,
+        eligible,
+      })),
+    });
+  });
+
+  router.post('/claude-accounts', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Registering a Claude account requires an admin-scoped key');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const key = typeof body.key === 'string' ? body.key.trim() : '';
+    if (!key) {
+      sendError(res, 400, 'invalid_request', 'key is required (e.g. "b")');
+      return;
+    }
+    const strOrNull = (v: unknown): string | null | undefined => {
+      if (v === null) return null;
+      return typeof v === 'string' ? v : undefined;
+    };
+    try {
+      const accounts = upsertClaudeAccount({
+        key,
+        label: typeof body.label === 'string' ? body.label : undefined,
+        config_dir: strOrNull(body.config_dir),
+        cookie_file: typeof body.cookie_file === 'string' ? body.cookie_file : undefined,
+        org_id: strOrNull(body.org_id),
+        enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
+      });
+      res.json({ ok: true, accounts });
+    } catch (err) {
+      sendError(res, 400, 'invalid_request', err instanceof Error ? err.message : String(err));
+    }
   });
 
   // == Settings (DAR-676 — port of the 3201 /settings page) ===================

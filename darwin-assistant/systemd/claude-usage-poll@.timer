@@ -1,0 +1,15 @@
+# MULTI-CLAUDE — fires claude-usage-poll@<key>.service every 60s, one instance
+# per registered account (other than 'a'). Committed here for JARVIS/Kevin to
+# install at setup time. NOT installed by this build. See
+# claude-usage-poll@.service for the template-unit explanation.
+
+[Unit]
+Description=Run claude-usage-poll for account %i every 60s
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

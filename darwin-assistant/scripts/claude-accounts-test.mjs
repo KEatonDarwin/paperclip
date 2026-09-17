@@ -179,6 +179,43 @@ function ok(name) {
   ok('malformed / empty / all-disabled robustness');
 }
 
+// ── TEST 7: exclude — the rate-limit rescue picks the OTHER account (node #294) ──
+{
+  clearUsage();
+  setAccounts([{ key: 'a' }, { key: 'b' }, { key: 'c' }]);
+  writeUsage('a', 10, 20); // least-used → normally selected
+  writeUsage('b', 30, 25); // headroom
+  writeUsage('c', 40, 30); // headroom
+
+  // No exclude: least-used (a) wins, byte-identical to the single-arg call.
+  assert.equal(selectActiveClaudeAccount(90).account.key, 'a', 'no-exclude → least-used a');
+
+  // A just hit the wall → rescue excludes 'a' and lands on the next account with
+  // headroom (least-used among the rest = b).
+  const sel = selectActiveClaudeAccount(90, { exclude: 'a' });
+  assert.equal(sel.account.key, 'b', "exclude 'a' → next-with-headroom (b)");
+  assert.equal(sel.perAccount.find((e) => e.account.key === 'a').eligible, false, 'excluded a is ineligible');
+  assert.equal(sel.perAccount.find((e) => e.account.key === 'b').eligible, true, 'b has real headroom');
+
+  // Only the excluded account has headroom, the other is over ceiling → the
+  // rescue finds NO eligible account (all exhausted → caller finishes/holds).
+  clearUsage();
+  setAccounts([{ key: 'a' }, { key: 'b' }]);
+  writeUsage('a', 20, 20); // healthy, but this is the one that failed
+  writeUsage('b', 96, 40); // over ceiling — no real headroom
+  const sel2 = selectActiveClaudeAccount(90, { exclude: 'a' });
+  const bEntry2 = sel2.account ? sel2.perAccount.find((e) => e.account.key === sel2.account.key) : null;
+  assert.ok(!(sel2.account && bEntry2?.eligible), 'no non-excluded account has headroom → no eligible rescue');
+  assert.notEqual(sel2.account?.key, 'a', 'excluded account is never the fallback pick either');
+
+  // Single account excluded → nothing left to select.
+  clearUsage();
+  deleteSetting('claude_accounts');
+  writeUsage('a', 30, 20);
+  assert.equal(selectActiveClaudeAccount(90, { exclude: 'a' }).account, null, 'only account excluded → null');
+  ok('exclude → rescue picks the other account / null when none left');
+}
+
 deleteSetting('claude_accounts');
 clearUsage();
 fs.rmSync(USAGE_DIR, { recursive: true, force: true });

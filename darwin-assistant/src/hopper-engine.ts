@@ -181,6 +181,48 @@ const DIVERTIBLE_REASONS = new Set<GovernorVerdict['reason']>([
   'kevin_active',
 ]);
 
+export interface DiversionRecord {
+  node_id: number | null;
+  tree_id: string | null;
+  thread_ext: string;
+  status: string;
+  label: string;
+  created_at: string;
+}
+export interface DiversionState {
+  enabled: boolean;
+  ceiling_5h: number;
+  pool_order: GovernorProvider[];
+  divertible_reasons: string[];
+  active: DiversionRecord[];
+  recent: DiversionRecord[];
+}
+
+// Read-only view of the diversion band + recent cross-pool diversions, for
+// GET /hopper-engine/governor. The band is the live settings-KV config; the
+// records come from the durable spawn_tasks ledger — dispatchTick prefixes a
+// diverted attempt's label with `[DIVERTED …]`. `active` = diversions whose
+// worker is still running; `recent` = the last 20 regardless of status. No
+// side effects, so it's safe to call from a status route.
+const divertedTasksStmt = sqliteDb.prepare<[], DiversionRecord>(`
+  SELECT hopper_node_id AS node_id, hopper_tree_id AS tree_id, thread_ext, status, label, created_at
+  FROM spawn_tasks
+  WHERE label LIKE '[DIVERTED%'
+  ORDER BY created_at DESC
+  LIMIT 20
+`);
+export function diversionState(): DiversionState {
+  const recent = divertedTasksStmt.all();
+  return {
+    enabled: diversionEnabled(),
+    ceiling_5h: diversionCeiling5h(),
+    pool_order: diversionPoolOrder(),
+    divertible_reasons: [...DIVERTIBLE_REASONS],
+    active: recent.filter((r) => r.status === 'running'),
+    recent,
+  };
+}
+
 type WorkerTier = 'standard' | 'frontier';
 function tierOf(loadout: WorkerLoadout): WorkerTier {
   const provider = providerFor(loadout.adapter);

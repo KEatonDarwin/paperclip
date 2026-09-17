@@ -123,6 +123,7 @@ import {
   retryHopperNode,
   dispatchTick,
   getHopperHistory,
+  diversionState,
   type NewNodeInput,
 } from '../hopper-engine.js';
 import { governorStatus, governorStatusAll } from '../hopper-governor.js';
@@ -1954,7 +1955,7 @@ export function createApiV1Router(): Router {
   // is visible even while Claude is held (and vice versa).
   router.get('/hopper-engine/governor', (req: AuthedRequest, res) => {
     const adapter = typeof req.query.adapter === 'string' ? req.query.adapter : undefined;
-    res.json({ ...governorStatus(adapter), providers: governorStatusAll() });
+    res.json({ ...governorStatus(adapter), providers: governorStatusAll(), diversion: diversionState() });
   });
 
   // Governor settings-KV — the machine/governor knobs Kevin asked for

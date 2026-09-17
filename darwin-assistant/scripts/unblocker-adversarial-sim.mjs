@@ -71,13 +71,26 @@ reset();
 }
 
 // R3: concurrency — 5 nodes block at once → 5 parallel high-tier unblockers?
+// CONTRACT UPDATE (2026-09-17, finding-1 remediation): the cap governs how many
+// unblockers run CONCURRENTLY, not the lifetime total. Once finding-1 gave a pass
+// a `done` transition, a completed pass frees its slot and the next parked node
+// runs on a later tick — so "5 simultaneous blocks" no longer means "1 spawn
+// ever" (that was only true while a finished pass wrongly held the slot forever).
+// Measure the real invariant: at the instant of the simultaneous burst (before
+// any tick lets the instant fake-worker complete), only ONE spawned and the rest
+// are parked waiting_for_juice. That is the "no N parallel Opus workers" contract.
 reset();
 {
   const { nodes } = await runningTree('adv: fan-out', ['a', 'b', 'c', 'd', 'e']);
   for (const n of nodes) eng.finishHopperNode(n.id, 'blocked', { result: 'missing toolchain: composer' });
+  const spawnedAtBurst = spawns.length;
+  const parkedAtBurst = passes().filter((p) => p.status === 'waiting_for_juice').length;
   await tick('all blocked');
-  check('R3', 'N simultaneous red blocks spawn N concurrent Opus unblockers (no concurrency cap)', () => { assert.ok(spawns.length <= 1, `spawned ${spawns.length} unblockers concurrently`); });
-  console.log(`  [R3 evidence] 5 nodes blocked → ${spawns.length} unblocker workers spawned in the same tick`);
+  check('R3', 'N simultaneous red blocks must NOT spawn N concurrent Opus unblockers — the cap holds all but one', () => {
+    assert.equal(spawnedAtBurst, 1, `spawned ${spawnedAtBurst} unblockers concurrently at the burst (cap=1)`);
+    assert.ok(parkedAtBurst >= 4, `only ${parkedAtBurst}/4 siblings parked waiting_for_juice under the cap`);
+  });
+  console.log(`  [R3 evidence] 5 nodes blocked in one burst → ${spawnedAtBurst} spawned concurrently, ${parkedAtBurst} parked (cap=1); after a tick the instant fake-workers complete and parked nodes run serially → cumulative spawns=${spawns.length}`);
 }
 
 // R4: spawn failure (adapter busy) burns the one-pass fuse permanently

@@ -521,3 +521,100 @@ a quiet-after-first-log guard regardless.
 Repro: `darwin-assistant/scripts/unblocker-adversarial-sim.mjs` R10–R14 (this
 commit). Scratch DBs `/tmp/unblocker-adv-223b.db` (bounded run) — the
 unbounded R12 run's DB was discarded after counting.
+
+## 2026-09-17 · Smart Unblocker re-review remediation (Claude B) — 3 must-fix + 1 should-fix resolved
+
+Follow-up to the 2026-09-15 re-review above (node #223 re-run, BLOCKED 12/15).
+Branch `hopper/smart-unblocker`, same worktree. All engine changes in
+`darwin-assistant/src/hopper-engine.ts`; the tool denylist in
+`darwin-assistant/src/agent.ts`; one contract-changed sim check in
+`darwin-assistant/scripts/unblocker-adversarial-sim.mjs`. Additive/idempotent
+ALTERs mirror the existing `remediation_of` / `hopper_unblock_passes` pattern.
+Verified: `npm run build` clean; `npm run unblocker:sim` 6/6; adversarial sim
+**15/15 (was 12/15)** with R10/R11/R12 now green; `finishline:sim` 25/25
+(unaffected). Scratch DBs only (`/tmp/unblocker-adv-remediated.db`); live
+jarvis.db and jarvis.service never touched. R12 run BOUNDED only (failing hook
+capped at 200; observed attempts=1 — the unbounded 493k-bell variant was never
+run).
+
+1. **MUST-FIX (HIGH) — pass never left `running` → permanent one-shot lockout.**
+   `spawnSmartUnblockerWorker` now captures the worker's final text and calls a
+   new `markUnblockPassDoneStmt` (status→`done`, `finished_at`, `result`, guarded
+   `WHERE status='running'`) the moment `processMessageRef` resolves, releasing
+   the concurrency slot. Belt-and-braces: `reconcileStuckUnblockPasses()`
+   (backed by `reconcileStuckRunningPassesStmt` — a JOIN that finds `running`
+   passes whose node is no longer `blocked`) settles orphaned rows; it runs at
+   the top of `sweepWaitingUnblockPasses()` and just before the concurrency
+   count in `maybeTriggerSmartUnblocker`. Adversarial R10 now passes (tree A
+   done → pass A `done`; unrelated tree B block → 2nd spawn; `spawns===2`).
+   Files: `hopper-engine.ts` ~L411 (stmt), ~L438 (reconcile stmt), ~L940
+   (resolve→done), ~L1055 (reconcile before count), ~L1103 (reconcile helper +
+   sweep).
+
+2. **MUST-FIX (HIGH) — recursion via `split`: FIX children carried no
+   `remediation_of`.** `finishHopperNode`'s `split` insert now includes the
+   `remediation_of` column and copies `node.remediation_of ?? null` onto every
+   child, so a FIX node that splits keeps its whole subtree bound to the ORIGINAL
+   node's one-pass fuse (already flat-walked to the root at plant time). Audited
+   the other node-derivation sites: `appendHopperRemediationNodes` already
+   stamps it; `retryHopperNode` reuses the same node (column preserved by
+   `setNode`); `createHopperTree` (L1386) and the finish-line audit insert
+   (L376) create fresh top-level nodes where `remediation_of=NULL` is correct —
+   neither is derived from a blocked node, so no change. Adversarial R11 now
+   passes (root→FIX→split→child-blocks ×4 → `spawns===1`, `child.remediation_of`
+   non-null [=20] at every level). File: `hopper-engine.ts` ~L1620.
+
+3. **MUST-FIX (HIGH) — spawn-failure retry was an unbounded microtask storm.**
+   (a) Added additive/idempotent columns `spawn_attempts INTEGER NOT NULL
+   DEFAULT 0` and `retry_after TEXT` to `hopper_unblock_passes`. (b) The catch in
+   `spawnSmartUnblockerWorker` now counts the attempt: under the cap
+   (`unblocker_max_spawn_attempts`, default 2) it resets to `waiting_for_juice`
+   with `spawn_attempts+1` and a `retry_after` backoff (`datetime('now', '+N
+   seconds')`, `unblocker_spawn_backoff_seconds` default 60) and fires NO bell;
+   at the cap it calls `markUnblockPassFailedStmt` (status→`failed`) and fires
+   exactly ONE terminal bell, then stops (a `failed` row is never re-swept). (c)
+   Dropped the `queueMicrotask(dispatchTick)` from the catch — the 60s dispatch
+   timer / next finish is the retry cadence. (d) `waitingUnblockPassNodeIdsStmt`
+   now honors the backoff (`AND (retry_after IS NULL OR retry_after <=
+   datetime('now'))`) so the sweep can't re-claim a failing row within its
+   window; error bell deduped to the single terminal `failed` transition.
+   Adversarial R12 now passes BOUNDED (deterministic failure → attempts=1 across
+   9 ticks, 0 storm bells, pass parked `waiting_for_juice` behind its backoff).
+   Files: `hopper-engine.ts` ~L300 (ALTER), ~L162 (row type), ~L411/~L446
+   (stmts), ~L434 (sweep selector), ~L768 (config helpers), ~L937 (catch).
+
+4. **SHOULD-FIX (MEDIUM) — deploy/restart tools were prompt-only for the
+   unblocker persona. DONE (both halves).** Added `WORKER_DENIED_TOOLS`
+   (`cockpit_deploy`, `intake_deploy`, `shim_deploy_switch/approve/reject/status`)
+   and `isDeniedToolThread(externalId)` (matches `cockpit:unblocker-*` and
+   `cockpit:hopper-node-*`) in `agent.ts`. `buildToolsBlock(externalId?)` strips
+   the denied tools from the tools block for those threads (threaded through
+   `buildInitialPrompt` / `buildContinuationPrompt` / `buildPromptForNewSession`
+   via `conv.external_id`), and the tool dispatcher refuses+logs any denied call
+   from such a thread before execution (defence in depth for an internal caller
+   or a hallucinated tool name). The shell rail (`systemctl restart`) stays
+   prompt-only, per the review (CLI sandboxing out of scope). File: `agent.ts`
+   ~L583 (set/helper/buildToolsBlock), ~L654/~L1423/~L1442 (threading),
+   ~L1547 (dispatcher refusal).
+
+**Contract-behavior change flagged (mirrors the prior pass's check-3 note):**
+adversarial check **R3** legitimately changed. Its old assertion `spawns <= 1`
+was only true while finding-1's bug held a finished pass's slot forever; once a
+pass gets a `done` transition, a completed (instant, in the sim) fake worker
+frees the slot and the next parked sibling runs on a later tick. R3 now asserts
+the REAL invariant — at the instant of the simultaneous burst, exactly ONE
+spawned and ≥4 siblings parked `waiting_for_juice` (the cap governs *concurrent*
+workers, not the lifetime total). The evidence line shows cumulative spawns
+climbing after the tick as parked nodes run serially, which is correct.
+
+Residual notes / not closed:
+- The read-then-insert on the concurrency count is still un-transactioned; same
+  reasoning as the prior pass (single-threaded Node + `ticking` guard serialize
+  the two call paths). The new `reconcileStuckUnblockPasses` only ever moves a
+  pass `running→done` when its node left `blocked`, so it can't race a fresh
+  claim into a bad state.
+- `unblocker_max_spawn_attempts` / `unblocker_spawn_backoff_seconds` have no
+  settings-UI surface yet (same posture as every other `unblocker_*` KV).
+- The re-review's log-spam nit (every sweep re-logs each parked row) is largely
+  moot now that finding-1 stops parking everything forever, but the per-tick
+  `console.log` on a still-held row remains — left as-is (cosmetic).

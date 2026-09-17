@@ -580,8 +580,34 @@ export function getActiveRuns(): { conversationId: number; startedAt: number }[]
     .sort((a, b) => a.startedAt - b.startedAt);
 }
 
-export function buildToolsBlock(): string {
-  const defs = ALL_TOOLS.map(
+// #223 should-fix: the Smart Unblocker (`cockpit:unblocker-*`) and hopper leaf
+// (`cockpit:hopper-node-*`) worker threads are full JARVIS personas — they mount
+// the deploy tools and a shell, so the playbook's "never restart / never deploy"
+// rails were prompt-only for the one worker (a high-tier "unstick this" persona)
+// most likely to reach for them. Deny the deploy tools at BOTH surfaces: strip
+// them from the tools block so the model never sees them, and refuse+log in the
+// dispatcher so an internal caller or a hallucinated tool name can't slip past.
+// The shell rail (`systemctl restart`) stays prompt-only — sandboxing the CLI is
+// out of scope here.
+export const WORKER_DENIED_TOOLS: ReadonlySet<string> = new Set([
+  'cockpit_deploy',
+  'intake_deploy',
+  'shim_deploy_switch',
+  'shim_deploy_approve',
+  'shim_deploy_reject',
+  'shim_deploy_status',
+]);
+
+export function isDeniedToolThread(externalId: string | null | undefined): boolean {
+  if (!externalId) return false;
+  return externalId.startsWith('cockpit:unblocker-') || externalId.startsWith('cockpit:hopper-node-');
+}
+
+export function buildToolsBlock(externalId?: string | null): string {
+  const tools = isDeniedToolThread(externalId)
+    ? ALL_TOOLS.filter((t) => !WORKER_DENIED_TOOLS.has(t.name))
+    : ALL_TOOLS;
+  const defs = tools.map(
     (t) =>
       `### ${t.name}\n${t.description}\nParameters: ${JSON.stringify(t.parameters, null, 2)}`,
   ).join('\n\n');
@@ -631,8 +657,8 @@ export function shouldInjectContinuityBoot(externalId: string, turns: TurnRow[])
   return !turns.some((turn) => turn.role === 'assistant');
 }
 
-export function buildInitialPrompt(userMessage: string, opts?: { continuityBootBlock?: string | null }): string {
-  const parts = [buildSystemPrompt(), buildToolsBlock()];
+export function buildInitialPrompt(userMessage: string, opts?: { continuityBootBlock?: string | null; externalId?: string | null }): string {
+  const parts = [buildSystemPrompt(), buildToolsBlock(opts?.externalId)];
   if (opts?.continuityBootBlock) parts.push(opts.continuityBootBlock);
   parts.push('---', `Human: ${userMessage}`, 'Assistant:');
   return parts.join('\n\n');
@@ -651,8 +677,8 @@ export function buildPromptForNewSession(
     : null;
 
   return turns.length > 1
-    ? buildContinuationPrompt(turns, userMessage, adapterId, model, { ...opts, continuityBootBlock })
-    : buildInitialPrompt(userMessage, { continuityBootBlock });
+    ? buildContinuationPrompt(turns, userMessage, adapterId, model, { ...opts, continuityBootBlock, externalId })
+    : buildInitialPrompt(userMessage, { continuityBootBlock, externalId });
 }
 
 export function adapterFromModel(model: string | null | undefined): string | null {
@@ -821,14 +847,14 @@ export function buildContinuationPrompt(
   userMessage: string,
   adapterId: string = 'claude',
   model: string | null = null,
-  opts?: { aggressive?: boolean; continuityBootBlock?: string | null },
+  opts?: { aggressive?: boolean; continuityBootBlock?: string | null; externalId?: string | null },
 ): string {
   const priorTurns = turns.length && turns[turns.length - 1]?.role === 'user'
     ? turns.slice(0, -1)
     : turns;
 
   const systemPrompt = buildSystemPrompt();
-  const toolsBlock = buildToolsBlock();
+  const toolsBlock = buildToolsBlock(opts?.externalId);
 
   const windowTokens = contextWindowTokensFor(adapterId, model);
   const aggressive = opts?.aggressive ?? false;
@@ -1420,7 +1446,7 @@ async function runConversationTurn(
       if (sessionId && !result.text && !result.sessionId) {
         console.log(`[agent] Session ${sessionId} expired, starting fresh`);
         sessionId = null;
-        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model);
+        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { externalId: conv.external_id });
         accumulatedText = '';
         sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
         result = await runClaude(stdinContent, null, onStreamEvent, runtime, signal, imageDirs, imagePaths);
@@ -1439,7 +1465,7 @@ async function runConversationTurn(
         contextOverflowRetried = true;
         console.log(`[agent] Conversation ${conv.id} overflowed ${adapter.id}'s context window; retrying with an aggressively compacted continuation prompt`);
         sessionId = null;
-        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { aggressive: true });
+        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { aggressive: true, externalId: conv.external_id });
         accumulatedText = '';
         try {
           sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
@@ -1535,6 +1561,14 @@ async function runConversationTurn(
       // actually runs. Fed back so the model can recover and just answer.
       toolResult = {
         error: 'Tool execution is disabled — this message is in planning mode. Describe the plan instead of executing it.',
+      };
+    } else if (WORKER_DENIED_TOOLS.has(toolCall.name) && isDeniedToolThread(conv.external_id)) {
+      // #223 should-fix: hard, server-side denial for hopper worker threads —
+      // the deploy/restart tools are human-only. Refuse + log; the model gets a
+      // clear error and is told to report the blocker instead of deploying.
+      console.warn(`[agent] denied tool '${toolCall.name}' for hopper worker thread ${conv.external_id}`);
+      toolResult = {
+        error: `Tool '${toolCall.name}' is not available to hopper worker threads. Deploying/restarting is human-only — report the blocker (finish 'blocked') instead of attempting it.`,
       };
     } else {
       try {

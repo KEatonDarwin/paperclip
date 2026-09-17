@@ -159,6 +159,8 @@ interface HopperUnblockPassRow {
   created_at: string;
   updated_at: string;
   finished_at: string | null;
+  spawn_attempts: number;
+  retry_after: string | null;
 }
 
 export interface AppendHopperNodeInput {
@@ -297,6 +299,14 @@ for (const col of [
   'created_at TEXT',
   'updated_at TEXT',
   'finished_at TEXT',
+  // Review #223 re-run finding 3: bound the spawn-failure retry. `spawn_attempts`
+  // counts how many times a worker turn was actually attempted (and threw) for
+  // this pass; once it hits the cap the pass is marked `failed` with exactly one
+  // bell instead of looping forever. `retry_after` is a backoff timestamp the
+  // waiting-for-juice sweep honors so a deterministic failure can't re-spawn on
+  // every 60s tick with no gap.
+  'spawn_attempts INTEGER NOT NULL DEFAULT 0',
+  'retry_after TEXT',
 ]) {
   try {
     sqliteDb.exec(`ALTER TABLE hopper_unblock_passes ADD COLUMN ${col}`);
@@ -405,13 +415,46 @@ const markUnblockPassNeedsKevinStmt = sqliteDb.prepare<[string | null, number]>(
 const setUnblockPassNudgeStmt = sqliteDb.prepare<[string, number]>(`
   UPDATE hopper_unblock_passes SET nudge_id = ?, updated_at = datetime('now') WHERE node_id = ?
 `);
+// Review #223 re-run finding 1: a pass whose worker turn resolved is DONE — it
+// must release its concurrency slot, or the default cap of 1 becomes a permanent
+// lockout (the feature works exactly once per DB lifetime). Guarded to `running`
+// so a re-pended block that already flipped the pass to needs_kevin isn't
+// clobbered back to done.
+const markUnblockPassDoneStmt = sqliteDb.prepare<[string | null, number]>(`
+  UPDATE hopper_unblock_passes
+  SET status = 'done', result = COALESCE(?, result),
+      finished_at = datetime('now'), updated_at = datetime('now')
+  WHERE node_id = ? AND status = 'running'
+`);
+// Review #223 re-run finding 1 (belt-and-braces): settle a `running` pass whose
+// node is no longer `blocked` (re-pended / done / split) — the worker either
+// finished or the node moved on, so the slot must be freed.
+const reconcileStuckRunningPassesStmt = sqliteDb.prepare<[], { node_id: number }>(`
+  SELECT p.node_id AS node_id
+  FROM hopper_unblock_passes p
+  JOIN hopper_nodes n ON n.id = p.node_id
+  WHERE p.status = 'running' AND n.status != 'blocked'
+`);
 // Finding 4: a spawn that never actually started (adapter busy, CLI error) did
 // not consume the one pass — reset the marker so the waiting-for-juice sweep
-// (finding 5) can retry it, instead of permanently burning the fuse.
-const resetUnblockPassToWaitingStmt = sqliteDb.prepare<[string, number]>(`
+// (finding 5) can retry it, instead of permanently burning the fuse. Review #223
+// re-run finding 3: also bump `spawn_attempts` and set a `retry_after` backoff so
+// the sweep can't re-spawn a deterministically-failing worker on every tick.
+const resetUnblockPassToWaitingStmt = sqliteDb.prepare<[string, number, string, number]>(`
   UPDATE hopper_unblock_passes
   SET status = 'waiting_for_juice', worker_ext = NULL, worker_thread_ext = NULL,
-      result = ?, updated_at = datetime('now')
+      result = ?, spawn_attempts = ?, retry_after = datetime('now', ?),
+      updated_at = datetime('now')
+  WHERE node_id = ?
+`);
+// Review #223 re-run finding 3: the retry is bounded — once spawn_attempts hits
+// the cap the pass is marked `failed` (one terminal bell fired by the caller,
+// then it stops; a `failed` row is not waiting_for_juice so the sweep never
+// re-claims it).
+const markUnblockPassFailedStmt = sqliteDb.prepare<[string, number, number]>(`
+  UPDATE hopper_unblock_passes
+  SET status = 'failed', result = ?, spawn_attempts = ?,
+      finished_at = datetime('now'), updated_at = datetime('now')
   WHERE node_id = ?
 `);
 // Finding 5: gate-fail (juice closed) and finding 3: concurrency-capped both
@@ -430,7 +473,11 @@ const runningUnblockPassCountStmt = sqliteDb.prepare<[], { n: number }>(
   `SELECT COUNT(*) AS n FROM hopper_unblock_passes WHERE status = 'running'`,
 );
 const waitingUnblockPassNodeIdsStmt = sqliteDb.prepare<[], { node_id: number }>(
-  `SELECT node_id FROM hopper_unblock_passes WHERE status = 'waiting_for_juice' AND worker_ext IS NULL`,
+  // Review #223 re-run finding 3: skip rows still inside their spawn-fail backoff
+  // window so a deterministic failure can't be re-claimed on every tick.
+  `SELECT node_id FROM hopper_unblock_passes
+   WHERE status = 'waiting_for_juice' AND worker_ext IS NULL
+     AND (retry_after IS NULL OR retry_after <= datetime('now'))`,
 );
 
 function emitNode(action: HopperNodeEvent['action'], node: HopperNodeRow): void {
@@ -721,6 +768,20 @@ function unblockerMaxConcurrent(): number {
   return Math.max(1, intSetting('unblocker_max_concurrent', 1));
 }
 
+// Review #223 re-run finding 3: cap how many times a spawn may throw before the
+// pass is given up (marked failed + one bell). Default 2 — one retry after the
+// backoff, then stop. Prevents the catch→reset→sweep→spawn→throw storm.
+function unblockerMaxSpawnAttempts(): number {
+  return Math.max(1, intSetting('unblocker_max_spawn_attempts', 2));
+}
+
+// Minimum gap (seconds) before the sweep may re-claim a pass that just failed to
+// spawn — the 60s dispatch timer is the natural cadence, this just guarantees a
+// deterministic failure can't be re-tried within the same burst of ticks.
+function unblockerSpawnBackoffSeconds(): number {
+  return Math.max(1, intSetting('unblocker_spawn_backoff_seconds', 60));
+}
+
 function normalizeUnblockerModel(): UnblockerModel {
   const raw = getSetting('unblocker_model')?.trim();
   return UNBLOCKER_MODEL_ALLOWLIST.includes(raw as UnblockerModel)
@@ -874,23 +935,45 @@ async function spawnSmartUnblockerWorker(
     node.id,
   );
   try {
-    await processMessageRef(prompt, workerExt, `turn:${conv.id}:0`);
+    const finalText = await processMessageRef(prompt, workerExt, `turn:${conv.id}:0`);
+    // Review #223 re-run finding 1: the worker turn resolved — the pass is DONE.
+    // Release its concurrency slot (guarded to `running` so a re-pend that already
+    // flipped it to needs_kevin isn't clobbered). Without this the default cap of
+    // 1 is a permanent lockout after the first successful unblock.
+    markUnblockPassDoneStmt.run((finalText ?? '').slice(0, 4000) || null, node.id);
   } catch (err) {
     const detail = err instanceof Error ? err.stack ?? err.message : String(err);
     console.error(`[hopper-unblocker] spawn failed for node ${node.id}:`, err);
-    // Finding 4: the worker never actually claimed the pass (adapter busy,
-    // CLI error) — that is not a used pass. Reset to waiting_for_juice
-    // (worker_ext cleared) so the sweep in dispatchTick retries it instead of
-    // stranding the node with a permanently burned fuse.
-    resetUnblockPassToWaitingStmt.run(detail.slice(0, 4000), node.id);
-    createNotification({
-      severity: 'error',
-      title: `Hopper unblocker failed to start (will retry): ${node.title.slice(0, 100)}`,
-      body: `${detail.slice(0, 1200)}\nNode ${node.id}, tree ${node.tree_id}.`,
-      source: 'hopper-unblocker',
-      link: `/spawn-tree?tree=${encodeURIComponent(tree.id)}&node=${node.id}`,
-    });
-    queueMicrotask(() => void dispatchTick('unblocker_spawn_failed_retry'));
+    // Review #223 re-run finding 3: bound the retry. A worker that never actually
+    // ran (adapter busy, CLI error, bad model on the plan) did not consume the
+    // one pass — but a DETERMINISTIC failure must not loop forever. Count the
+    // attempt; under the cap we reset to waiting_for_juice with a backoff so the
+    // sweep retries later (no immediate microtask re-spawn); at the cap we mark
+    // the pass `failed` and fire exactly ONE terminal bell, then stop.
+    const prior = getUnblockPassStmt.get(node.id);
+    const attempts = (prior?.spawn_attempts ?? 0) + 1;
+    const cap = unblockerMaxSpawnAttempts();
+    if (attempts >= cap) {
+      markUnblockPassFailedStmt.run(detail.slice(0, 4000), attempts, node.id);
+      createNotification({
+        severity: 'error',
+        title: `Hopper unblocker gave up after ${attempts} attempts: ${node.title.slice(0, 100)}`,
+        body: `${detail.slice(0, 1200)}\nNode ${node.id}, tree ${node.tree_id}. The Smart Unblocker could not start a worker; needs a human.`,
+        source: 'hopper-unblocker',
+        link: `/spawn-tree?tree=${encodeURIComponent(tree.id)}&node=${node.id}`,
+      });
+      return;
+    }
+    // Under the cap: park with a backoff and let the 60s timer / next finish be
+    // the retry cadence. NO queueMicrotask(dispatchTick) — that immediate re-tick
+    // was the microtask storm (finding 3). No bell here — dedupe to the single
+    // terminal bell above so a broken model id can't flood the cockpit.
+    resetUnblockPassToWaitingStmt.run(
+      detail.slice(0, 4000),
+      attempts,
+      `+${unblockerSpawnBackoffSeconds()} seconds`,
+      node.id,
+    );
   }
 }
 
@@ -968,6 +1051,10 @@ function maybeTriggerSmartUnblocker(nodeId: number): void {
   // Finding 3: route through a concurrency cap instead of spawning one
   // high-tier worker per simultaneous block — a real incident is usually the
   // same root cause fanning out across many leaves at once.
+  // Review #223 re-run finding 1 (belt-and-braces): settle any `running` pass
+  // whose node has since moved off `blocked` before counting, so a slot freed by
+  // a finished/re-pended pass is always reflected in the concurrency check.
+  reconcileStuckUnblockPasses();
   const runningNow = runningUnblockPassCountStmt.get()?.n ?? 0;
   const maxConcurrent = unblockerMaxConcurrent();
   if (runningNow >= maxConcurrent) {
@@ -1015,9 +1102,22 @@ function maybeTriggerSmartUnblocker(nodeId: number): void {
   void spawnSmartUnblockerWorker(node, tree, gate.loadout, workerExt);
 }
 
+/** Review #223 re-run finding 1: mark any `running` pass whose node is no longer
+ *  `blocked` as `done`. The worker turn's own resolve handler is the primary
+ *  settler (markUnblockPassDoneStmt); this reconciler is the safety net for a
+ *  worker thread that died without resolving, or a node re-pended/split out from
+ *  under a still-"running" row — either way the concurrency slot must be freed so
+ *  the cap doesn't become a permanent lockout. */
+function reconcileStuckUnblockPasses(): void {
+  for (const row of reconcileStuckRunningPassesStmt.all()) {
+    markUnblockPassDoneStmt.run(null, row.node_id);
+  }
+}
+
 /** Finding 5's producer-side complement: sweep every parked waiting_for_juice
  *  marker on each dispatch tick and give it another shot at the gate/cap. */
 function sweepWaitingUnblockPasses(): void {
+  reconcileStuckUnblockPasses();
   for (const row of waitingUnblockPassNodeIdsStmt.all()) {
     const node = getNodeStmt.get(row.node_id);
     if (node && node.status === 'blocked') maybeTriggerSmartUnblocker(row.node_id);
@@ -1613,14 +1713,20 @@ export function finishHopperNode(
     const updated = setNode(id, { status: 'done', result: payload.result ?? '(no result text)', lease_expires_at: null });
     if (updated) settleAncestors(updated);
   } else if (outcome === 'split' && payload.children?.length) {
+    // Review #223 re-run finding 2: a FIX node (remediation_of set) that finishes
+    // `split` must pass its remediation_of onto every child, or a child that
+    // blocks is an unmarked node that re-arms the Smart Unblocker — the exact
+    // unbounded cascade the ask forbids. Inheriting keeps the whole subtree bound
+    // to the ORIGINAL node's one-pass fuse (walked flat at plant time, so this is
+    // already the root id, never an intermediate FIX id).
     const insert = sqliteDb.prepare(
-      `INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, status, depends_on, adapter, model)
-       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
+      `INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, status, depends_on, adapter, model, remediation_of)
+       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
     );
     let prevId: number | null = null;
     for (const c of payload.children.slice(0, 12)) {
       const deps = c.depends_on_prev && prevId != null ? JSON.stringify([prevId]) : null;
-      const info = insert.run(node.tree_id, node.id, c.title.slice(0, 300), c.spec ?? null, deps, node.adapter, node.model);
+      const info = insert.run(node.tree_id, node.id, c.title.slice(0, 300), c.spec ?? null, deps, node.adapter, node.model, node.remediation_of ?? null);
       prevId = Number(info.lastInsertRowid);
       const created = getNodeStmt.get(prevId);
       if (created) emitNode('created', created);

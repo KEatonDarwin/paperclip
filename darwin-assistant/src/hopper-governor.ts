@@ -294,9 +294,31 @@ export function governorStatusAll(): Record<GovernorProvider, GovernorVerdict> {
   return out;
 }
 
-function evaluate(provider: GovernorProvider): GovernorVerdict {
+/**
+ * Diversion probe (tree-6ecf478c): "if a ceiling-blocked node were re-routed
+ * onto THIS pool, would it clear at the raised diversion band?" Same evaluator
+ * as governorCheck, but the ceiling comparisons are floored UP to
+ * `diversionCeiling` (never down). Every other gate is byte-identical, so an
+ * override_off / stale-meter / weekly-maxed pool is still correctly refused as
+ * a diversion target — only the ordinary capacity ceiling is relaxed to the
+ * unstick band. No console logging (read-only, mirrors governorStatus).
+ */
+export function governorCheckDiversionTarget(adapter: string | null, diversionCeiling: number): GovernorVerdict {
+  return evaluate(providerFor(adapter ?? WORKER_DEFAULT_ADAPTER), { ceilingFloor: diversionCeiling });
+}
+
+function evaluate(provider: GovernorProvider, opts?: { ceilingFloor?: number }): GovernorVerdict {
   const CONFIG = currentConfig();
   const override = overrideSetting(provider);
+  // Diversion band: a ceiling-blocked node hunting an alternate pool passes a
+  // raised floor. This only ever RAISES a capacity ceiling (Math.max), never
+  // lowers one, and is applied strictly to the provider/5h ceiling + the
+  // kevin-active waiver threshold below — NEVER to the weekly budget, a stale
+  // meter, or an explicit override (those return before it's consulted). With
+  // opts undefined (every existing caller) raiseCeiling is the identity, so the
+  // normal-band verdict is unchanged.
+  const raiseCeiling = (normal: number): number =>
+    opts?.ceilingFloor != null ? Math.max(normal, opts.ceilingFloor) : normal;
 
   if (override === 'on') {
     return {
@@ -326,7 +348,7 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
 
   if (provider !== 'claude') {
     const meter = providerMeters()[provider];
-    const ceiling = meter.ceiling();
+    const ceiling = raiseCeiling(meter.ceiling());
     const { used, staleMinutes } = meter.file ? readProviderUsage(meter.file) : { used: null, staleMinutes: null };
     // A configured meter that's gone missing or stale (poller died) must HOLD,
     // not silently allow — an unmetered pool is exactly the failure mode the
@@ -379,8 +401,8 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
 
   // -- Claude lane --
   const { fiveHour, weekly, staleMinutes } = readUsage();
-  const FIVE_HOUR_CEILING = CONFIG.five_hour_ceiling;
-  const WEEKLY_CEILING = CONFIG.weekly_ceiling;
+  const FIVE_HOUR_CEILING = raiseCeiling(CONFIG.five_hour_ceiling);
+  const WEEKLY_CEILING = CONFIG.weekly_ceiling; // hard budget — never raised by the diversion band
 
   if (staleMinutes == null || staleMinutes > STALE_MINUTES) {
     notifyOnce(
@@ -442,7 +464,7 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
     // 2026-09-11: "it's OK to use Claude while I'm here" below half the 5h
     // window burned. Unknown utilization never grants the waiver — it holds
     // exactly like an at/above-threshold reading would.
-    const maxActive = CONFIG.kevin_active_claude_max_5h;
+    const maxActive = raiseCeiling(CONFIG.kevin_active_claude_max_5h);
     const waived = fiveHour != null && fiveHour < maxActive;
     if (!waived) {
       return {

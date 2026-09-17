@@ -3,7 +3,7 @@ import './spawn-tasks.js'; // side-effect: guarantees the spawn_tasks DDL ran be
 import { sqliteDb, getOrCreateConversation, renameConversation, setThreadModelOverride, getSetting } from './conversation-db.js';
 import { sseBus, type HopperNodeEvent } from './sse-bus.js';
 import { createNotification } from './notifications.js';
-import { governorCheck, governorStatus, kevinActive, providerFor, concurrencyCap, type GovernorProvider } from './hopper-governor.js';
+import { governorCheck, governorStatus, governorCheckDiversionTarget, kevinActive, providerFor, concurrencyCap, type GovernorProvider, type GovernorVerdict } from './hopper-governor.js';
 
 // HOPPER ENGINE — the autonomous work-tree executor (designed 2026-09-06 with
 // Kevin; worker-model details hashed out in cockpit:worker-engine-design-2026-09-06).
@@ -136,6 +136,110 @@ function retryRouteFor(node: HopperNodeRow): RetryRoute {
     ladder.find((candidate) => providerFor(candidate.adapter) !== provider && governorStatus(candidate.adapter).allow) ??
     ladder[ladder.length - 1];
   return { ...chosen, note: `cross-provider retry: ${loadoutLabel(current)} -> ${loadoutLabel(chosen)}` };
+}
+
+// -- Cross-pool diversion (tree-6ecf478c) ------------------------------------
+// When a ready leaf's OWN pool is ceiling-blocked, we don't just leave it
+// pending forever (the n266 stall) — we hunt an alternate pool that clears a
+// RAISED "diversion band" and re-route the node's loadout to the tier-equivalent
+// there. Bounded: only for a genuinely-stuck (ceiling-denied) ready node, one
+// decision per node per tick, and the no-alternate path is identical to today
+// (the caller falls through to `continue`). Additive only — the normal
+// new-work claim path is untouched when nothing is blocked.
+
+// Master on/off + band + preference order. Uncached settings-KV (getSetting is
+// a direct SELECT), env-fallback for ops parity with the governor's own knobs.
+function govDivSetting(bareKey: string): string | null {
+  const key = `gov_${bareKey}`;
+  const kv = getSetting(key)?.trim();
+  if (kv) return kv;
+  return process.env[key.toUpperCase()]?.trim() || null;
+}
+function diversionEnabled(): boolean {
+  const raw = govDivSetting('diversion_enabled')?.toLowerCase();
+  return !(raw === 'false' || raw === '0' || raw === 'off' || raw === 'no'); // default true
+}
+function diversionCeiling5h(): number {
+  const n = parseInt(govDivSetting('diversion_ceiling_5h') ?? '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : 85;
+}
+function diversionPoolOrder(): GovernorProvider[] {
+  const raw = govDivSetting('diversion_pool_order') || 'claude,codex,auggie';
+  const valid: GovernorProvider[] = ['claude', 'codex', 'auggie', 'devin'];
+  return raw
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter((s): s is GovernorProvider => (valid as string[]).includes(s));
+}
+
+// Only a true CEILING denial is divertible. Weekly budget (hard), a stale meter
+// (broken signal), and an explicit override_off (human hold) are deliberately
+// NOT — see docs/gov-diversion/RECON.md §5.
+const DIVERTIBLE_REASONS = new Set<GovernorVerdict['reason']>([
+  'provider_ceiling',
+  'five_hour_ceiling',
+  'kevin_active',
+]);
+
+type WorkerTier = 'standard' | 'frontier';
+function tierOf(loadout: WorkerLoadout): WorkerTier {
+  const provider = providerFor(loadout.adapter);
+  const model = (loadout.model ?? '').toLowerCase();
+  if (provider === 'claude') return model.includes('opus') || model.includes('fable') ? 'frontier' : 'standard';
+  if (provider === 'codex') return model.includes('astra') || model.includes('gpt-6') ? 'frontier' : 'standard';
+  if (provider === 'auggie') return model.includes('opus') ? 'frontier' : 'standard';
+  return 'standard'; // devin / unknown → standard
+}
+// (candidate pool, source tier) → the concrete loadout to run there. Matches the
+// tier-equivalence map in RECON.md §3 (codex gpt-5.5↔sonnet-5, gpt-6-astra↔opus-5,
+// auggie opus4.8↔opus-5, standard↔sonnet-5). Bidirectional so a reordered
+// pool-order can also divert a claude-ceilinged node outward.
+const DIVERSION_LOADOUTS: Record<GovernorProvider, Record<WorkerTier, WorkerLoadout>> = {
+  claude: { standard: { adapter: 'claude', model: 'claude-sonnet-5' }, frontier: { adapter: 'claude', model: 'claude-opus-5' } },
+  codex: { standard: { adapter: 'codex', model: 'gpt-5.5' }, frontier: { adapter: 'codex', model: 'gpt-6-astra' } },
+  auggie: { standard: { adapter: 'auggie', model: 'default' }, frontier: { adapter: 'auggie', model: 'opus4.8' } },
+  devin: { standard: { adapter: 'devin', model: null }, frontier: { adapter: 'devin', model: null } },
+};
+
+interface DiversionResult {
+  loadout: WorkerLoadout;
+  note: string;
+  labelPrefix: string;
+}
+/**
+ * Decide whether a ceiling-blocked ready node can divert to another pool this
+ * tick. Returns the diverted loadout (to restamp onto the node) or null to hold
+ * exactly as today. `divVerdicts` caches candidate probes per tick so N nodes
+ * needing the same alternate pool cost one governor eval, not N.
+ */
+function tryDivert(
+  node: HopperNodeRow,
+  verdict: GovernorVerdict,
+  order: GovernorProvider[],
+  ceiling: number,
+  divVerdicts: Map<GovernorProvider, GovernorVerdict>,
+): DiversionResult | null {
+  if (!DIVERTIBLE_REASONS.has(verdict.reason)) return null;
+  const current: WorkerLoadout = { adapter: node.adapter ?? WORKER_ADAPTER, model: node.model ?? defaultWorkerModel() };
+  const ownProvider = providerFor(current.adapter);
+  const tier = tierOf(current);
+  for (const candidate of order) {
+    if (candidate === ownProvider) continue; // never "divert" onto the blocked pool
+    let probe = divVerdicts.get(candidate);
+    if (probe === undefined) {
+      probe = governorCheckDiversionTarget(candidate, ceiling);
+      divVerdicts.set(candidate, probe);
+    }
+    if (!probe.allow) continue; // override_off / stale / weekly-maxed / still over the raised band
+    const loadout = DIVERSION_LOADOUTS[candidate][tier];
+    const label = `[DIVERTED ${loadoutLabel(current)}→${loadoutLabel(loadout)}: ${verdict.reason} ${verdict.detail}]`;
+    return {
+      loadout,
+      note: `diverted (${verdict.reason}): ${loadoutLabel(current)} -> ${loadoutLabel(loadout)} @ diversion band ${ceiling}%`,
+      labelPrefix: label.slice(0, 200),
+    };
+  }
+  return null;
 }
 
 sqliteDb.exec(`
@@ -526,7 +630,7 @@ const spawnTaskMarkRerouted = sqliteDb.prepare<[string, string]>(`
   UPDATE spawn_tasks SET status = 'failed', error = ?, updated_at = datetime('now') WHERE thread_ext = ?
 `);
 
-async function spawnWorker(node: HopperNodeRow, tree: HopperTreeRow): Promise<void> {
+async function spawnWorker(node: HopperNodeRow, tree: HopperTreeRow, labelPrefix?: string): Promise<void> {
   if (!processMessageRef) return;
   const ext = node.worker_thread_ext!;
   const conv = getOrCreateConversation(ext);
@@ -538,7 +642,8 @@ async function spawnWorker(node: HopperNodeRow, tree: HopperTreeRow): Promise<vo
   // Stamp hopper_tree_id/hopper_node_id at spawn time — the bulletproof grouping
   // key for spawn-monitor, so a retried node's attempts don't rely solely on
   // parsing the ext pattern (see src/spawn-monitor.ts).
-  spawnTaskInsert.run(ext, conv.id, tree.origin_thread_ext, `hopper #${node.id}: ${node.title.slice(0, 80)}`, prompt.slice(0, 2000), tree.id, node.id);
+  const label = `${labelPrefix ? labelPrefix + ' ' : ''}hopper #${node.id}: ${node.title.slice(0, 80)}`;
+  spawnTaskInsert.run(ext, conv.id, tree.origin_thread_ext, label, prompt.slice(0, 2000), tree.id, node.id);
   try {
     await processMessageRef(prompt, ext, `turn:${conv.id}:0`);
   } catch (err) {
@@ -725,17 +830,37 @@ export async function dispatchTick(reason: string): Promise<void> {
       ? runningAdaptersStmt.all().filter((r) => providerFor(r.adapter ?? WORKER_ADAPTER) !== 'claude').length
       : 0;
     let cappedLogged = false;
-    const verdicts = new Map<string, boolean>(); // one governor eval per adapter per tick
+    const verdicts = new Map<string, GovernorVerdict>(); // one governor eval per adapter per tick
+    // Cross-pool diversion knobs, read once per tick; candidate probes cached
+    // per alternate pool so multiple stuck nodes cost one governor eval each.
+    const divEnabled = diversionEnabled();
+    const divCeiling = diversionCeiling5h();
+    const divOrder = diversionPoolOrder();
+    const divVerdicts = new Map<GovernorProvider, GovernorVerdict>();
     for (const node of readyLeavesStmt.all()) {
       if (free <= 0) break;
       if (!depsSatisfied(node)) continue;
-      const adapter = node.adapter ?? WORKER_ADAPTER;
-      let allowed = verdicts.get(adapter);
-      if (allowed === undefined) {
-        allowed = governorCheck(adapter).allow;
-        verdicts.set(adapter, allowed);
+      let adapter = node.adapter ?? WORKER_ADAPTER;
+      let verdict = verdicts.get(adapter);
+      if (verdict === undefined) {
+        verdict = governorCheck(adapter);
+        verdicts.set(adapter, verdict);
       }
-      if (!allowed) continue;
+      let divertPrefix: string | undefined;
+      if (!verdict.allow) {
+        // Own pool is held. Try to unstick this genuinely-stuck ready node via
+        // cross-pool diversion (one decision per node per tick). No alternate
+        // clears the raised band → hold exactly as before.
+        const diversion = divEnabled ? tryDivert(node, verdict, divOrder, divCeiling, divVerdicts) : null;
+        if (!diversion) continue;
+        // Restamp the node's stored loadout BEFORE the claim re-reads the row so
+        // `fresh`, spawnWorker, and any later lease-expiry retry all see the
+        // diverted pool (mirrors the retry-reroute restamp above).
+        setNode(node.id, { adapter: diversion.loadout.adapter, model: diversion.loadout.model });
+        console.log(`[hopper-engine] node ${node.id} ${diversion.note}`);
+        adapter = diversion.loadout.adapter ?? WORKER_ADAPTER;
+        divertPrefix = diversion.labelPrefix;
+      }
       const nonClaude = providerFor(adapter) !== 'claude';
       if (daytime && nonClaude && daytimeRunning >= cap) {
         if (!cappedLogged) {
@@ -753,7 +878,7 @@ export async function dispatchTick(reason: string): Promise<void> {
       free -= 1;
       if (nonClaude) daytimeRunning += 1;
       console.log(`[hopper-engine] dispatch node ${node.id} (${reason}) → ${ext}`);
-      void spawnWorker(fresh, tree);
+      void spawnWorker(fresh, tree, divertPrefix);
     }
   } finally {
     ticking = false;

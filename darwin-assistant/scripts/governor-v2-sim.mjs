@@ -100,6 +100,12 @@ function setGovernorSettings(overrides = {}) {
     gov_weekly_ceiling: '30',
     gov_weekly_mode: 'hard',
     gov_concurrency_cap: '10',
+    // Cross-pool diversion is default-ON in production, but the legacy gating
+    // checks below assert pure own-pool governor behavior (a blocked node stays
+    // pending). Keep it OFF by default here so those tests verify the
+    // byte-identical no-diversion path; the dedicated diversion block (10)
+    // turns it on explicitly.
+    gov_diversion_enabled: 'false',
     ...overrides,
   };
   for (const [key, value] of Object.entries(settings)) convDb.setSetting(key, String(value));
@@ -486,6 +492,110 @@ setGovernorSettings();
     assert.doesNotMatch(after.result ?? '', /stale attempt claims victory/);
     assert.match(reconciler.stdout, /stale attempt .* no recovery/);
     assert.equal(oldSpawn.status, 'done', 'old ledger row should still be reconciled to done');
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 10) Cross-pool diversion (tree-6ecf478c): a ceiling-blocked ready node whose
+//     own pool is denied for a CEILING reason diverts to an alternate pool that
+//     clears the raised diversion band, restamping its loadout. Non-ceiling
+//     denials, override_off targets, and the master-off switch are respected.
+// ---------------------------------------------------------------------------
+function spawnLabelForNode(nodeId) {
+  return sqliteDb.prepare(`SELECT label FROM spawn_tasks WHERE hopper_node_id = ? ORDER BY rowid DESC LIMIT 1`).get(nodeId)?.label ?? '';
+}
+
+// 10a — provider_ceiling source diverts to the first clear pool (claude), and
+//       the node's stored loadout is restamped to the tier-equivalent there
+//       (auggie opus4.8 = frontier → claude-opus-5), with a [DIVERTED …] label.
+resetHopperState();
+setKevinActive(false);
+setUsage({ claude5h: 10, weekly: 0, codex: 20, auggie: 91 });
+setGovernorSettings({ gov_diversion_enabled: 'true', gov_diversion_ceiling_5h: '85', gov_diversion_pool_order: 'claude,codex,auggie' });
+{
+  const treeId = await createActiveTree('gov-diversion: provider_ceiling → claude', [
+    { title: 'auggie stuck', spec: 'diverts to claude', adapter: 'auggie', model: 'opus4.8' },
+  ]);
+  check('10a', 'Auggie node over ceiling diverts to Claude (frontier→opus-5), loadout restamped + labeled', () => {
+    const n = nodeByTitle(treeId, 'auggie stuck');
+    assert.equal(n.status, 'running', 'diverted node should be running');
+    assert.equal(n.adapter, 'claude', 'adapter restamped to claude');
+    assert.equal(n.model, 'claude-opus-5', 'opus4.8 (frontier) maps to claude-opus-5');
+    assert.match(spawnLabelForNode(n.id), /^\[DIVERTED /, 'spawn label records the diversion');
+    // governor itself is unchanged: auggie is still genuinely over its ceiling.
+    assert.equal(governor.governorStatus('auggie').reason, 'provider_ceiling');
+  });
+}
+
+// 10b — raised band: a codex node (over its ceiling) diverts onto Claude even
+//       though Claude is normally kevin_active-blocked — the diversion ceiling
+//       floor raises the waiver threshold (50→85) so 5h=60 clears as a target.
+resetHopperState();
+setKevinActive(true);
+setUsage({ claude5h: 60, weekly: 0, codex: 95, auggie: 20 });
+setGovernorSettings({ gov_diversion_enabled: 'true', gov_diversion_ceiling_5h: '85', gov_diversion_pool_order: 'claude,codex,auggie' });
+{
+  const treeId = await createActiveTree('gov-diversion: raised band vs kevin_active', [
+    { title: 'codex stuck', spec: 'diverts to claude under raised band', adapter: 'codex', model: 'gpt-5.5' },
+  ]);
+  check('10b', 'Codex node diverts to Claude under the raised band even while Kevin is active', () => {
+    const n = nodeByTitle(treeId, 'codex stuck');
+    assert.equal(n.status, 'running', 'diverted node should be running');
+    assert.equal(n.adapter, 'claude');
+    assert.equal(n.model, 'claude-sonnet-5', 'gpt-5.5 (standard) maps to claude-sonnet-5');
+    // Normal governor would hold claude (kevin_active), but the diversion probe clears it at the band.
+    assert.equal(governor.governorStatus('claude').reason, 'kevin_active');
+    assert.equal(governor.governorCheckDiversionTarget('claude', 85).allow, true);
+    assert.equal(governor.governorCheckDiversionTarget('claude', 85).reason, 'ok');
+  });
+}
+setKevinActive(false);
+
+// 10c — a WEEKLY-ceiling denial is not divertible (hard budget), so the node
+//       holds even with an alternate pool wide open.
+resetHopperState();
+setKevinActive(false);
+setUsage({ claude5h: 10, weekly: 35, codex: 20, auggie: 20 });
+setGovernorSettings({ gov_diversion_enabled: 'true', gov_weekly_mode: 'hard', gov_diversion_pool_order: 'claude,codex,auggie' });
+{
+  const treeId = await createActiveTree('gov-diversion: weekly not divertible', [
+    { title: 'claude weekly', spec: 'must hold', adapter: 'claude', model: 'claude-sonnet-5' },
+  ]);
+  check('10c', 'A weekly_ceiling denial is NOT divertible — node holds even with clear pools', () => {
+    assert.equal(nodeByTitle(treeId, 'claude weekly').status, 'pending');
+    assert.equal(governor.governorStatus('claude').reason, 'weekly_ceiling');
+  });
+}
+
+// 10d — an override_off pool is never a diversion target (explicit human hold).
+resetHopperState();
+setKevinActive(false);
+setUsage({ claude5h: 10, weekly: 0, codex: 20, auggie: 91 });
+setGovernorSettings({ gov_diversion_enabled: 'true', gov_diversion_pool_order: 'claude', gov_override_claude: 'off' });
+{
+  const treeId = await createActiveTree('gov-diversion: override_off target excluded', [
+    { title: 'auggie no target', spec: 'no eligible target', adapter: 'auggie', model: 'opus4.8' },
+  ]);
+  check('10d', 'override_off pool is refused as a diversion target — node holds', () => {
+    assert.equal(nodeByTitle(treeId, 'auggie no target').status, 'pending');
+    assert.equal(governor.governorCheckDiversionTarget('claude', 85).reason, 'override_off');
+  });
+  convDb.setSetting('gov_override_claude', 'auto');
+}
+
+// 10e — master switch off ⇒ byte-identical no-diversion behavior (node holds).
+resetHopperState();
+setKevinActive(false);
+setUsage({ claude5h: 10, weekly: 0, codex: 20, auggie: 91 });
+setGovernorSettings({ gov_diversion_enabled: 'false', gov_diversion_pool_order: 'claude,codex,auggie' });
+{
+  const treeId = await createActiveTree('gov-diversion: disabled holds', [
+    { title: 'auggie disabled', spec: 'diversion off', adapter: 'auggie', model: 'opus4.8' },
+  ]);
+  check('10e', 'gov_diversion_enabled=false ⇒ blocked node holds (no diversion)', () => {
+    const n = nodeByTitle(treeId, 'auggie disabled');
+    assert.equal(n.status, 'pending');
+    assert.equal(n.adapter, 'auggie', 'loadout untouched when diversion is off');
   });
 }
 

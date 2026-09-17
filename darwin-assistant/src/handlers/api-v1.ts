@@ -297,7 +297,10 @@ const PROTECTED_THREAD_IDS = new Set(['checkin:notifications']);
 // §Settings-KV Schema). Single source of truth for GET/PATCH
 // /hopper-engine/settings — every key here is a settings-KV row read
 // uncached by hopper-governor.ts, env-fallback baked in there.
-const GOVERNOR_SETTING_SPECS: Record<string, { type: 'number' } | { type: 'enum'; values: readonly string[] }> = {
+const GOVERNOR_SETTING_SPECS: Record<
+  string,
+  { type: 'number' } | { type: 'enum'; values: readonly string[] } | { type: 'csv'; values: readonly string[] }
+> = {
   gov_kevin_active_claude_max_5h: { type: 'number' },
   gov_5h_ceiling: { type: 'number' },
   gov_weekly_ceiling: { type: 'number' },
@@ -309,6 +312,12 @@ const GOVERNOR_SETTING_SPECS: Record<string, { type: 'number' } | { type: 'enum'
   gov_override_codex: { type: 'enum', values: ['auto', 'on', 'off'] },
   gov_override_auggie: { type: 'enum', values: ['auto', 'on', 'off'] },
   gov_override_devin: { type: 'enum', values: ['auto', 'on', 'off'] },
+  // Cross-pool diversion (tree-6ecf478c): a ceiling-blocked ready node diverts
+  // to an alternate pool that clears the raised band. Read uncached by
+  // hopper-engine.ts (env-fallback there).
+  gov_diversion_enabled: { type: 'enum', values: ['true', 'false'] },
+  gov_diversion_ceiling_5h: { type: 'number' },
+  gov_diversion_pool_order: { type: 'csv', values: ['claude', 'codex', 'auggie', 'devin'] },
 };
 const GOVERNOR_SETTING_KEYS = Object.keys(GOVERNOR_SETTING_SPECS);
 
@@ -1975,6 +1984,16 @@ export function createApiV1Router(): Router {
           return;
         }
         updates[key] = value;
+      } else if (spec.type === 'csv') {
+        const tokens =
+          typeof value === 'string'
+            ? value.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+            : [];
+        if (!tokens.length || tokens.some((t) => !spec.values.includes(t))) {
+          sendError(res, 400, 'invalid_setting', `${key} must be a comma-separated list of: ${spec.values.join(', ')}`);
+          return;
+        }
+        updates[key] = tokens.join(',');
       } else {
         const n = typeof value === 'number' ? value : parseFloat(String(value));
         // Governor reads these back with parseInt — store integers so what the

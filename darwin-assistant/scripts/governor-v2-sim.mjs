@@ -599,6 +599,99 @@ setGovernorSettings({ gov_diversion_enabled: 'false', gov_diversion_pool_order: 
   });
 }
 
+// ---------------------------------------------------------------------------
+// 11) SIM (node #301, tree-6ecf478c): dry-run the acceptance scenarios from the
+//     spec verbatim, on top of 10a–10e's coverage of the mechanism itself.
+// ---------------------------------------------------------------------------
+
+// 11a — THE ACTUAL CASE: a codex/gpt-5.5 ready node whose own pool (codex) is
+//       over its normal ceiling (91% ≥ 90%) diverts to Claude, which has plain
+//       headroom (61%, under both its own ceiling and the diversion band) with
+//       Kevin NOT active — this is the exact n266-stall shape (codex 91%),
+//       reproduced end-to-end without the kevin_active wrinkle from 10b.
+resetHopperState();
+setKevinActive(false);
+setUsage({ claude5h: 61, weekly: 0, codex: 91, auggie: 20 });
+setGovernorSettings({ gov_diversion_enabled: 'true', gov_diversion_ceiling_5h: '85', gov_diversion_pool_order: 'claude,codex,auggie' });
+{
+  const treeId = await createActiveTree('gov-diversion: n266 reproduction', [
+    { title: 'codex 91pct ready', spec: 'reproduces the real ceiling-blocked stall', adapter: 'codex', model: 'gpt-5.5' },
+  ]);
+  check('11a', 'THE ACTUAL CASE — codex 91% + claude 61% (no kevin_active) diverts to claude-sonnet-5 and dispatches', () => {
+    assert.equal(governor.governorStatus('codex').reason, 'provider_ceiling', 'setup: codex must genuinely be ceiling-blocked');
+    const n = nodeByTitle(treeId, 'codex 91pct ready');
+    assert.equal(n.status, 'running', 'node should have dispatched via diversion, not sat pending');
+    assert.equal(n.adapter, 'claude');
+    assert.equal(n.model, 'claude-sonnet-5', 'gpt-5.5 (standard) maps to claude-sonnet-5');
+    assert.match(spawnLabelForNode(n.id), /^\[DIVERTED codex\/gpt-5\.5→claude\/claude-sonnet-5: provider_ceiling/);
+  });
+}
+
+// 11b — all candidate pools over the diversion band ⇒ node holds, no dispatch.
+//       Own pool codex is blocked (91% ≥ 90%); BOTH alternates in the pool
+//       order (claude 95%, auggie 95%) are also over their own ceiling AND the
+//       85% band, so no diversion target clears — the node must stay pending
+//       with its original loadout untouched (not silently reassigned).
+resetHopperState();
+setKevinActive(false);
+setUsage({ claude5h: 95, weekly: 0, codex: 91, auggie: 95 });
+setGovernorSettings({ gov_diversion_enabled: 'true', gov_diversion_ceiling_5h: '85', gov_diversion_pool_order: 'claude,codex,auggie' });
+{
+  const treeId = await createActiveTree('gov-diversion: no target clears', [
+    { title: 'codex all-maxed', spec: 'no alternate pool clears the band', adapter: 'codex', model: 'gpt-5.5' },
+  ]);
+  check('11b', 'all candidate pools over the diversion band ⇒ node holds (no dispatch)', () => {
+    assert.equal(governor.governorCheckDiversionTarget('claude', 85).allow, false, 'setup: claude must be over the band too');
+    assert.equal(governor.governorCheckDiversionTarget('auggie', 85).allow, false, 'setup: auggie must be over the band too');
+    const n = nodeByTitle(treeId, 'codex all-maxed');
+    assert.equal(n.status, 'pending', 'no eligible target ⇒ node must not dispatch');
+    assert.equal(n.adapter, 'codex', 'loadout must stay untouched when no diversion happens');
+    assert.equal(n.model, 'gpt-5.5');
+  });
+}
+
+// 11c — a normal ready node whose OWN pool already has headroom is claimed
+//       directly — diversion is enabled but must never fire on a node that was
+//       never blocked in the first place (throughput not inflated by routing
+//       healthy work through the diversion path).
+resetHopperState();
+setKevinActive(false);
+setUsage({ claude5h: 10, weekly: 0, codex: 20, auggie: 20 });
+setGovernorSettings({ gov_diversion_enabled: 'true', gov_diversion_ceiling_5h: '85', gov_diversion_pool_order: 'claude,codex,auggie' });
+{
+  const treeId = await createActiveTree('gov-diversion: healthy pool no-op', [
+    { title: 'codex healthy', spec: 'own pool has headroom, must claim normally', adapter: 'codex', model: 'gpt-5.5' },
+  ]);
+  check('11c', 'own-pool-has-headroom node dispatches normally with NO diversion (loadout + label untouched)', () => {
+    const n = nodeByTitle(treeId, 'codex healthy');
+    assert.equal(n.status, 'running');
+    assert.equal(n.adapter, 'codex', 'must NOT be diverted when its own pool already allows it');
+    assert.equal(n.model, 'gpt-5.5');
+    assert.doesNotMatch(spawnLabelForNode(n.id), /^\[DIVERTED/, 'no diversion label on an undiverted claim');
+  });
+}
+
+// 11d — gov_diversion_enabled=false behaves EXACTLY like today, using the same
+//       "actual case" numbers as 11a: with the switch off, the codex-91%/
+//       claude-61% node must hold pending (today's pre-diversion behavior),
+//       not divert — proving the flag is a true kill-switch, not just a
+//       preference that only matters when no target would clear anyway.
+resetHopperState();
+setKevinActive(false);
+setUsage({ claude5h: 61, weekly: 0, codex: 91, auggie: 20 });
+setGovernorSettings({ gov_diversion_enabled: 'false', gov_diversion_pool_order: 'claude,codex,auggie' });
+{
+  const treeId = await createActiveTree('gov-diversion: disabled = today, actual-case numbers', [
+    { title: 'codex 91pct disabled', spec: 'same numbers as 11a but the switch is off', adapter: 'codex', model: 'gpt-5.5' },
+  ]);
+  check('11d', 'gov_diversion_enabled=false ⇒ the actual-case node holds exactly like pre-diversion today, even though a target (claude 61%) would have cleared', () => {
+    const n = nodeByTitle(treeId, 'codex 91pct disabled');
+    assert.equal(n.status, 'pending');
+    assert.equal(n.adapter, 'codex', 'loadout untouched when diversion is off');
+    assert.equal(n.model, 'gpt-5.5');
+  });
+}
+
 const failed = results.filter((r) => !r.pass);
 for (const r of results) {
   if (r.pass) {

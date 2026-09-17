@@ -16,7 +16,8 @@
     "claude-accounts:test": "JARVIS_DB_PATH=/tmp/claude-accounts-test.db node scripts/claude-accounts-test.mjs",
     "claude-adapter-account:test": "JARVIS_DB_PATH=/tmp/claude-adapter-account-test.db node scripts/claude-adapter-account-test.mjs",
     "claude-ratelimit-rescue:test": "JARVIS_DB_PATH=/tmp/claude-ratelimit-rescue-test.db node scripts/claude-ratelimit-rescue-test.mjs",
-    "claude-accounts-route:test": "JARVIS_DB_PATH=/tmp/claude-accounts-route-test.db node scripts/claude-accounts-route-test.mjs"
+    "claude-accounts-route:test": "JARVIS_DB_PATH=/tmp/claude-accounts-route-test.db node scripts/claude-accounts-route-test.mjs",
+    "multi-claude:e2e-sim": "JARVIS_DB_PATH=/tmp/multi-claude-e2e-sim.db node scripts/multi-claude-e2e-sim.mjs"
   },
   "dependencies": {
     "@slack/bolt": "^4.0.0",

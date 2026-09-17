@@ -1,6 +1,7 @@
 import { statSync, readFileSync } from 'node:fs';
 import { sqliteDb, getSetting } from './conversation-db.js';
 import { createNotification } from './notifications.js';
+import { listClaudeAccounts, readAccountUsage } from './claude-accounts.js';
 
 // HOPPER GOVERNOR v2 — the subscription throttle for overnight autonomous runs
 // (Kevin, 2026-09-06: "meter the connection and run all night"; upgraded
@@ -123,6 +124,15 @@ export interface GovernorConfig {
   concurrency_cap: number;
 }
 
+/** One Claude account's live window state, as reported in the governor payload. */
+export interface ClaudeAccountView {
+  key: string;
+  five_hour: number | null;
+  weekly: number | null;
+  /** True for the account a new Claude worker would run on right now. */
+  active: boolean;
+}
+
 export interface GovernorVerdict {
   allow: boolean;
   reason:
@@ -132,12 +142,18 @@ export interface GovernorVerdict {
     | 'weekly_ceiling'
     | 'usage_stale'
     | 'kevin_active'
-    | 'provider_ceiling';
+    | 'provider_ceiling'
+    // Every enabled Claude account is over its 5h ceiling (multi-account only).
+    | 'claude_all_accounts_full';
   detail: string;
   provider: GovernorProvider;
   five_hour?: number | null;
   weekly?: number | null;
   provider_usage?: number | null;
+  /** Claude lane only: the account key a new worker would run on (or null). */
+  active_account?: string | null;
+  /** Claude lane only: per-account window breakdown across all enabled accounts. */
+  claude_accounts?: ClaudeAccountView[];
   config: GovernorConfig;
 }
 
@@ -336,7 +352,42 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
     };
   }
 
-  // -- Claude lane --
+  // -- Claude lane (multi-account aware) --
+  // Kevin can register more than one Claude subscription (settings-KV
+  // `claude_accounts`). We allow Claude dispatch when ANY enabled account has 5h
+  // headroom, and only park all Claude work when every account is spent. The
+  // default single-subscription registry (`~/.claude`, key 'a') routes through
+  // the byte-identical legacy path so nothing changes for the common case.
+  const enabledAccounts = listClaudeAccounts().filter((a) => a.enabled);
+  const isDefaultSingle =
+    enabledAccounts.length === 1 &&
+    enabledAccounts[0].key === 'a' &&
+    enabledAccounts[0].config_dir === null;
+
+  if (isDefaultSingle) {
+    const v = evaluateClaudeLegacy(CONFIG);
+    const acct = enabledAccounts[0];
+    // Additive only — the gating decision above is untouched.
+    return {
+      ...v,
+      active_account: acct.key,
+      claude_accounts: [
+        { key: acct.key, five_hour: v.five_hour ?? null, weekly: v.weekly ?? null, active: v.allow },
+      ],
+    };
+  }
+
+  return evaluateClaudeAccounts(CONFIG, enabledAccounts);
+}
+
+/**
+ * The historical single-subscription Claude gate — reads the one
+ * `/tmp/claude-usage-live.json` snapshot and applies stale → weekly → 5h →
+ * Kevin-active in order. Kept verbatim so the default single-account path is
+ * byte-identical to before the multi-account feature existed.
+ */
+function evaluateClaudeLegacy(CONFIG: GovernorConfig): GovernorVerdict {
+  const provider: GovernorProvider = 'claude';
   const { fiveHour, weekly, staleMinutes } = readUsage();
   const FIVE_HOUR_CEILING = CONFIG.five_hour_ceiling;
   const WEEKLY_CEILING = CONFIG.weekly_ceiling;
@@ -424,4 +475,150 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
     weekly,
     config: CONFIG,
   };
+}
+
+/**
+ * Multi-account Claude gate (2+ enabled accounts, or a single non-default one).
+ * Allows Claude dispatch when ANY enabled account has real 5h headroom, picking
+ * the LEAST-used eligible account so concurrent workers spread across
+ * subscriptions (parallel throughput). Holds `claude_all_accounts_full` only
+ * when every readable account is at/above the 5h ceiling; `usage_stale` when
+ * every account's meter is dark; `weekly_ceiling` (hard mode) when the accounts
+ * with 5h headroom are all over their weekly budget. Weekly is still honored
+ * per soft/hard mode, exactly as the single-account gate does.
+ */
+function evaluateClaudeAccounts(CONFIG: GovernorConfig, accounts: ReturnType<typeof listClaudeAccounts>): GovernorVerdict {
+  const provider: GovernorProvider = 'claude';
+  const ceiling = CONFIG.five_hour_ceiling;
+  const weeklyCeil = CONFIG.weekly_ceiling;
+  const soft = CONFIG.weekly_mode === 'soft';
+
+  // No enabled accounts at all — nothing to dispatch on.
+  if (accounts.length === 0) {
+    return {
+      allow: false,
+      reason: 'claude_all_accounts_full',
+      detail: 'no enabled Claude accounts configured',
+      provider,
+      active_account: null,
+      claude_accounts: [],
+      config: CONFIG,
+    };
+  }
+
+  const entries = accounts.map((account) => ({ account, usage: readAccountUsage(account.key) }));
+
+  // Accounts with real, current 5h headroom. In hard weekly mode an account is
+  // also blocked when its own weekly window is spent (soft mode never blocks).
+  const withHeadroom = entries.filter(
+    (e) =>
+      !e.usage.stale &&
+      e.usage.five_hour != null &&
+      e.usage.five_hour < ceiling &&
+      (soft || e.usage.weekly == null || e.usage.weekly < weeklyCeil),
+  );
+
+  // Least-used eligible account (strict < keeps registry order on ties).
+  let selected: (typeof entries)[number] | null = null;
+  for (const e of withHeadroom) {
+    if (selected == null || (e.usage.five_hour as number) < (selected.usage.five_hour as number)) {
+      selected = e;
+    }
+  }
+
+  const claude_accounts: ClaudeAccountView[] = entries.map((e) => ({
+    key: e.account.key,
+    five_hour: e.usage.five_hour,
+    weekly: e.usage.weekly,
+    active: selected != null && e.account.key === selected.account.key,
+  }));
+
+  const withPayload = (v: Omit<GovernorVerdict, 'provider' | 'config' | 'active_account' | 'claude_accounts'>): GovernorVerdict => ({
+    ...v,
+    provider,
+    active_account: selected?.account.key ?? null,
+    claude_accounts,
+    config: CONFIG,
+  });
+
+  if (selected != null) {
+    const s = selected;
+    // Mirror the single-account soft-weekly notification for the account we'll burn.
+    if (soft && s.usage.weekly != null && s.usage.weekly >= weeklyCeil) {
+      notifyOnce(
+        'weekly',
+        'info',
+        '⛽ Hopper governor: weekly budget reached (soft — continuing)',
+        `Account ${s.account.key} weekly window at ${s.usage.weekly}% ≥ ceiling ${weeklyCeil}%. gov_weekly_mode=soft, so dispatch continues — this may burn extra-usage credits.`,
+      );
+    }
+    // Kevin-active waiver still applies globally, keyed to the account we'd run on.
+    if (kevinActive()) {
+      const maxActive = CONFIG.kevin_active_claude_max_5h;
+      const waived = s.usage.five_hour != null && s.usage.five_hour < maxActive;
+      if (!waived) {
+        return withPayload({
+          allow: false,
+          reason: 'kevin_active',
+          detail: `Kevin active within the last ${IDLE_MINUTES}m and account ${s.account.key} 5h ${s.usage.five_hour}% ≥ waiver threshold ${maxActive}% — his subscription, his turn`,
+          five_hour: s.usage.five_hour,
+          weekly: s.usage.weekly,
+        });
+      }
+    }
+    return withPayload({
+      allow: true,
+      reason: 'ok',
+      detail: `account ${s.account.key}: 5h ${s.usage.five_hour}% / weekly ${s.usage.weekly ?? '?'}% — clear (of ${entries.length} Claude accounts)`,
+      five_hour: s.usage.five_hour,
+      weekly: s.usage.weekly,
+    });
+  }
+
+  // No account has headroom — pick the most accurate hold reason.
+  const readable = entries.filter((e) => !e.usage.stale && e.usage.five_hour != null);
+  if (readable.length === 0) {
+    notifyOnce(
+      'stale',
+      'error',
+      '🛑 Hopper governor: all Claude usage meters are dark',
+      `All ${entries.length} Claude accounts have missing/stale usage snapshots (limit ${STALE_MINUTES}m). Holding new dispatches rather than burn unmetered — check the claude-usage pollers.`,
+    );
+    return withPayload({
+      allow: false,
+      reason: 'usage_stale',
+      detail: `all ${entries.length} Claude accounts have stale/unreadable usage meters`,
+    });
+  }
+
+  const overFive = readable.filter((e) => (e.usage.five_hour as number) >= ceiling);
+  if (overFive.length === readable.length) {
+    notifyOnce(
+      'claude_all_full',
+      'info',
+      '⛽ Hopper governor: all Claude accounts at their 5h ceiling',
+      `Every readable Claude account is ≥ the 5h ceiling ${ceiling}% — sleeping until a window resets, then dispatch resumes on its own.`,
+    );
+    const lowest = Math.min(...readable.map((e) => e.usage.five_hour as number));
+    return withPayload({
+      allow: false,
+      reason: 'claude_all_accounts_full',
+      detail: `all ${readable.length} readable Claude accounts ≥ 5h ceiling ${ceiling}% (lowest ${lowest}%)`,
+      five_hour: lowest,
+    });
+  }
+
+  // Some accounts still have 5h headroom but are parked by their weekly budget
+  // (only reachable in hard weekly mode, since soft never blocks on weekly).
+  notifyOnce(
+    'weekly',
+    'info',
+    '⛽ Hopper governor: weekly budget reached',
+    `Every Claude account with 5h headroom is over the weekly ceiling ${weeklyCeil}%. Overnight dispatch is parked to protect the workweek — raise gov_weekly_ceiling or set gov_weekly_mode=soft to keep going.`,
+  );
+  return withPayload({
+    allow: false,
+    reason: 'weekly_ceiling',
+    detail: `accounts with 5h headroom are over the weekly ceiling ${weeklyCeil}% (hard mode)`,
+  });
 }

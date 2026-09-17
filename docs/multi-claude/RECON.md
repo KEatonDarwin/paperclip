@@ -3,6 +3,20 @@
 Node #289 (tree tree-44d2ff4a). Recon only, no product code. All anchors verified
 live against this worktree (`hopper/multi-claude`, base commit at branch-cut).
 
+> **⚠️ Read `docs/multi-claude/DESIGN-ADDENDUM.md` before building.** It was
+> already sitting in this worktree (untracked, Kevin/2026-09-16) and changes
+> the shape of the selector: **primary mode is PARALLEL use of both accounts
+> (pick the LEAST-used enabled account under ceiling, not "first with
+> headroom"), with the 5h-exhaustion swap falling out of the same selector as
+> a side effect** — not the other way around as the original verbatim ask
+> implied. It also confirms login is a one-time-per-account manual step
+> (`CLAUDE_CONFIG_DIR=~/.claude-b claude login`, no automated login). This
+> recon's anchors are unaffected by that clarification — same seams, just
+> "pick min-utilization account" instead of "pick first-with-headroom
+> account" in the selector, and the governor's concurrency cap needs
+> reviewing so it doesn't bottleneck two accounts down to one account's worth
+> of throughput.
+
 ## 1. Claude adapter + env injection seam
 
 - `src/agent.ts:229` — `ADAPTERS.claude` block (the `claude:` adapter config).
@@ -132,12 +146,21 @@ unset).
 ## Summary — what the build node(s) actually need to change
 
 1. **New settings-KV `claude_accounts`** (JSON array) + read helper.
-2. **A selector function** (e.g. `selectClaudeAccount()`) choosing the first
-   enabled account under its 5h ceiling — consulted from both:
+2. **A selector function** (e.g. `selectActiveClaudeAccount(ceiling)` per the
+   DESIGN-ADDENDUM's naming) choosing the **LEAST-used enabled account under
+   its 5h ceiling** (not first-with-headroom — see addendum) — consulted from
+   both:
    - `src/agent.ts` `claude.envOverrides` (inject `CLAUDE_CONFIG_DIR` for the
      chosen account before spawn), and
    - `src/hopper-governor.ts` `evaluate()`'s claude branch (hold only when
      ALL enabled accounts are exhausted).
+   Because two concurrent workers should be able to land on two different
+   accounts (parallel mode), the selector likely needs to be called per-worker
+   at claim/spawn time (not cached for the process lifetime), and the
+   governor's `concurrencyCap()` (`src/hopper-governor.ts:98`, default 2) may
+   need a higher ceiling or a per-account cap so both accounts can actually be
+   saturated concurrently instead of one global cap bottlenecking to
+   effectively one account's throughput.
 3. **Usage poller generalization**: either N copies of
    `claude-usage-poll.sh`/service/timer (one per account, distinct cookie
    file + org id + output file) or one script looping `claude_accounts` and
@@ -149,3 +172,6 @@ unset).
    guardrail.
 5. Cookie/credential files stay OUTSIDE the repo and are never committed —
    confirmed no code path in this worktree writes them into the repo tree.
+6. Login is a manual one-time-per-account step (addendum): the setup script
+   should print `CLAUDE_CONFIG_DIR=~/.claude-b claude login` for Kevin to run
+   himself, not attempt to automate it.

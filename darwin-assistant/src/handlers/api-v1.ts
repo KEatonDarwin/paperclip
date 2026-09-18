@@ -165,6 +165,7 @@ import {
   type SmartTodoStatus,
 } from '../smart-todos.js';
 import { decomposeNote } from '../smart-todos-decompose.js';
+import { getWorkbenchScope, matchOrCreatePlacement } from '../workbench.js';
 import { listSpawnTasks, listAllSpawnTasks } from '../spawn-tasks.js';
 import {
   listActiveQuickCaptureItems,
@@ -2515,6 +2516,60 @@ export function createApiV1Router(): Router {
       reused: false,
       seed_text: seedLines.join('\n'),
     });
+  });
+
+  // ---------------------------------------------------------------------
+  // WORKBENCH — the idea tree as the place Kevin works (new endpoint, additive
+  // only; does NOT modify /smart-todos/* above). See docs/workbench/SPEC.md.
+  // Reads/writes the SAME smart_todo_nodes table via additive nullable columns.
+  // ---------------------------------------------------------------------
+
+  // Zoom: GET /workbench/scope/:id — id is a node id, or "root"/"0" for the whole tree.
+  router.get('/workbench/scope/:id', (req: AuthedRequest, res) => {
+    const raw = String(req.params.id);
+    const nodeId = raw === 'root' || raw === '0' ? null : parseInt(raw, 10);
+    if (nodeId !== null && Number.isNaN(nodeId)) {
+      sendError(res, 400, 'invalid_request', 'id must be a number or "root"');
+      return;
+    }
+    const scope = getWorkbenchScope(nodeId);
+    if (!scope) {
+      sendError(res, 404, 'smart_todo_not_found', 'node not found');
+      return;
+    }
+    res.json(scope);
+  });
+
+  // Placement: POST /workbench/jot { text, focus_id? } — match-or-create (spec §5).
+  // If focus_id is given, Kevin already scoped the jot bar to that node — it's the
+  // parent, no matching needed. Otherwise runs the deterministic shortlist + one
+  // claude one-shot to decide placement and get the decomposition together.
+  router.post('/workbench/jot', async (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { text?: unknown; focus_id?: unknown; group_id?: unknown };
+    const text = typeof body.text === 'string' ? body.text.trim() : '';
+    if (!text) {
+      sendError(res, 400, 'invalid_request', 'text is required and must be a non-empty string');
+      return;
+    }
+
+    let focusId: number | null = null;
+    if (body.focus_id !== undefined && body.focus_id !== null) {
+      const parsed = typeof body.focus_id === 'number' ? body.focus_id : parseInt(String(body.focus_id), 10);
+      if (Number.isNaN(parsed) || !getSmartTodoNode(parsed)) {
+        sendError(res, 404, 'smart_todo_not_found', `focus node ${String(body.focus_id)} not found`);
+        return;
+      }
+      focusId = parsed;
+    }
+
+    const groupId = typeof body.group_id === 'number' && getGroupById(body.group_id) ? body.group_id : null;
+
+    try {
+      const result = await matchOrCreatePlacement(text, { focusId, groupId });
+      res.status(201).json(result);
+    } catch (err) {
+      sendError(res, 500, 'jot_failed', (err as Error).message);
+    }
   });
 
   router.post('/notifications/:id/checkin-snooze', async (req: AuthedRequest, res) => {

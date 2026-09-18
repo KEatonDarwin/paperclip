@@ -33,6 +33,10 @@ export interface SmartTodoNodeRow {
   linked_thread_ext: string | null; // the thread tied to THIS node, if one was opened
   created_at: string;
   updated_at: string;
+  // WORKBENCH additive columns (nullable; /tree ignores these) — see docs/workbench/RECON.md §3.
+  context_notes: string | null;
+  match_key: string | null;
+  last_activity_at: string | null;
 }
 
 sqliteDb.exec(`
@@ -57,6 +61,21 @@ sqliteDb.exec(`
   CREATE INDEX IF NOT EXISTS idx_smart_todo_root   ON smart_todo_nodes(root_id, sort_order);
   CREATE INDEX IF NOT EXISTS idx_smart_todo_thread ON smart_todo_nodes(linked_thread_ext);
 `);
+
+// WORKBENCH additive columns (idempotent ALTER — /tree and the smart_todos tool
+// never reference these, so this is 100% backward compatible; see
+// docs/workbench/RECON.md §3). Never drop/rename/retype an existing column here.
+for (const col of [
+  'context_notes TEXT',      // machine-written context (chat outcomes, decisions) — never overwrites `notes`
+  'match_key TEXT',          // stable slug for placement matching (e.g. "dashboard-x")
+  'last_activity_at TEXT',   // drives recency ordering for the Workbench
+]) {
+  try {
+    sqliteDb.exec(`ALTER TABLE smart_todo_nodes ADD COLUMN ${col}`);
+  } catch {
+    /* column already exists */
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Statements
@@ -122,8 +141,9 @@ export function getSmartTodoByThread(threadExt: string): SmartTodoNodeRow | null
   return getByThreadStmt.get(threadExt) ?? null;
 }
 
-/** ids of a node + all its descendants (for cascade delete / cycle checks / root recompute). */
-function subtreeIds(id: number): number[] {
+/** ids of a node + all its descendants (for cascade delete / cycle checks / root recompute).
+ *  Exported for Workbench (scope queries, placement, tool scope-guard) — see docs/workbench/RECON.md §6.2. */
+export function subtreeIds(id: number): number[] {
   return sqliteDb
     .prepare<[number], { id: number }>(`
       WITH RECURSIVE sub(id) AS (

@@ -171,6 +171,7 @@ import {
   type SmartTodoStatus,
 } from '../smart-todos.js';
 import { decomposeNote } from '../smart-todos-decompose.js';
+import { getWorkbenchScope, matchOrCreatePlacement, buildWorkbenchSeedText } from '../workbench.js';
 import { listSpawnTasks, listAllSpawnTasks } from '../spawn-tasks.js';
 import {
   listActiveQuickCaptureItems,
@@ -2582,6 +2583,152 @@ export function createApiV1Router(): Router {
       group_id: groupId,
       reused: false,
       seed_text: seedLines.join('\n'),
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // WORKBENCH — the idea tree as the place Kevin works (new endpoint, additive
+  // only; does NOT modify /smart-todos/* above). See docs/workbench/SPEC.md.
+  // Reads/writes the SAME smart_todo_nodes table via additive nullable columns.
+  // ---------------------------------------------------------------------
+
+  // Zoom: GET /workbench/scope/:id — id is a node id, or "root"/"0" for the whole tree.
+  router.get('/workbench/scope/:id', (req: AuthedRequest, res) => {
+    const raw = String(req.params.id);
+    const nodeId = raw === 'root' || raw === '0' ? null : parseInt(raw, 10);
+    if (nodeId !== null && Number.isNaN(nodeId)) {
+      sendError(res, 400, 'invalid_request', 'id must be a number or "root"');
+      return;
+    }
+    const scope = getWorkbenchScope(nodeId);
+    if (!scope) {
+      sendError(res, 404, 'smart_todo_not_found', 'node not found');
+      return;
+    }
+    res.json(scope);
+  });
+
+  // Placement: POST /workbench/jot { text, focus_id? } — match-or-create (spec §5).
+  // If focus_id is given, Kevin already scoped the jot bar to that node — it's the
+  // parent, no matching needed. Otherwise runs the deterministic shortlist + one
+  // claude one-shot to decide placement and get the decomposition together.
+  router.post('/workbench/jot', async (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { text?: unknown; focus_id?: unknown; group_id?: unknown };
+    const text = typeof body.text === 'string' ? body.text.trim() : '';
+    if (!text) {
+      sendError(res, 400, 'invalid_request', 'text is required and must be a non-empty string');
+      return;
+    }
+
+    let focusId: number | null = null;
+    if (body.focus_id !== undefined && body.focus_id !== null) {
+      const parsed = typeof body.focus_id === 'number' ? body.focus_id : parseInt(String(body.focus_id), 10);
+      if (Number.isNaN(parsed) || !getSmartTodoNode(parsed)) {
+        sendError(res, 404, 'smart_todo_not_found', `focus node ${String(body.focus_id)} not found`);
+        return;
+      }
+      focusId = parsed;
+    }
+
+    const groupId = typeof body.group_id === 'number' && getGroupById(body.group_id) ? body.group_id : null;
+
+    try {
+      const result = await matchOrCreatePlacement(text, { focusId, groupId });
+      res.status(201).json(result);
+    } catch (err) {
+      sendError(res, 500, 'jot_failed', (err as Error).message);
+    }
+  });
+
+  // Docked scoped chat binding (spec §2/§4): POST /workbench/:id/open-chat, id
+  // is a node id or "root"/"0" for the whole-tree sentinel chat. Reuses the
+  // SAME `linked_thread_ext` field `/smart-todos/:id/open-chat` uses (a node
+  // opened from either surface always resolves to the same thread — never a
+  // second thread for the same node) but returns the richer Workbench seed
+  // (buildWorkbenchSeedText) instead of the plain `/tree` seed, since the
+  // scope-guarded `workbench` tool and the auto-notes contract need it. Does
+  // NOT touch /smart-todos/:id/open-chat itself.
+  router.post('/workbench/:id/open-chat', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const raw = String(req.params.id);
+    const isRoot = raw === 'root' || raw === '0';
+    const nodeId = isRoot ? null : parseInt(raw, 10);
+    if (!isRoot && Number.isNaN(nodeId)) {
+      sendError(res, 400, 'invalid_request', 'id must be a node id or "root"');
+      return;
+    }
+
+    if (isRoot) {
+      const externalId = `${callerExternalIdPrefix(caller.id)}workbench-root`;
+      const existing = getConversation(externalId);
+      const conv = existing ?? getOrCreateConversation(externalId);
+      if (existing) {
+        res.status(200).json({
+          thread: threadDescriptor(conv, req),
+          external_id: externalId,
+          group_id: conv.group_id ?? null,
+          reused: true,
+          seed_text: null,
+        });
+        return;
+      }
+      renameConversation(conv.id, 'Workbench — root');
+      const scope = getWorkbenchScope(null)!;
+      res.status(201).json({
+        thread: threadDescriptor(getConversationById(conv.id) ?? conv, req),
+        external_id: externalId,
+        group_id: null,
+        reused: false,
+        seed_text: buildWorkbenchSeedText(scope),
+      });
+      return;
+    }
+
+    const node = getSmartTodoNode(nodeId as number);
+    if (!node) {
+      sendError(res, 404, 'smart_todo_not_found', 'node not found');
+      return;
+    }
+
+    // Reuse an existing linked thread if it's still around (same contract as
+    // /smart-todos/:id/open-chat — never spawns a second thread for one node).
+    if (node.linked_thread_ext) {
+      const existing = getConversation(node.linked_thread_ext);
+      if (existing) {
+        res.status(200).json({
+          thread: threadDescriptor(existing, req),
+          external_id: existing.external_id,
+          group_id: existing.group_id ?? null,
+          reused: true,
+          seed_text: null,
+        });
+        return;
+      }
+    }
+
+    // Ensure the branch has a group (a group per root branch) — same side
+    // effect /smart-todos/:id/open-chat has (RECON.md §6 trap #3).
+    const rootNode = getSmartTodoNode(node.root_id) ?? node;
+    let groupId = rootNode.group_id;
+    if (groupId === null || !getGroupById(groupId)) {
+      const { group } = createGroup(rootNode.title.slice(0, 100), null);
+      groupId = group.id;
+      setSmartTodoGroup(rootNode.id, groupId);
+    }
+
+    const externalId = `${callerExternalIdPrefix(caller.id)}workbench-${randomUUID()}`;
+    const conv = getOrCreateConversation(externalId);
+    renameConversation(conv.id, node.title.slice(0, 120));
+    setThreadGroup(conv.id, groupId);
+    setSmartTodoThread(node.id, externalId);
+
+    const scope = getWorkbenchScope(node.id)!;
+    res.status(201).json({
+      thread: threadDescriptor(getConversationById(conv.id) ?? conv, req),
+      external_id: externalId,
+      group_id: groupId,
+      reused: false,
+      seed_text: buildWorkbenchSeedText(scope),
     });
   });
 

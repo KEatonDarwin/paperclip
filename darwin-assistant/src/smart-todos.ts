@@ -33,6 +33,10 @@ export interface SmartTodoNodeRow {
   linked_thread_ext: string | null; // the thread tied to THIS node, if one was opened
   created_at: string;
   updated_at: string;
+  // WORKBENCH additive columns (nullable; /tree ignores these) — see docs/workbench/RECON.md §3.
+  context_notes: string | null;
+  match_key: string | null;
+  last_activity_at: string | null;
 }
 
 sqliteDb.exec(`
@@ -57,6 +61,24 @@ sqliteDb.exec(`
   CREATE INDEX IF NOT EXISTS idx_smart_todo_root   ON smart_todo_nodes(root_id, sort_order);
   CREATE INDEX IF NOT EXISTS idx_smart_todo_thread ON smart_todo_nodes(linked_thread_ext);
 `);
+
+// WORKBENCH additive columns (idempotent ALTER — /tree and the smart_todos tool
+// never reference these, so this is 100% backward compatible; see
+// docs/workbench/RECON.md §3). Never drop/rename/retype an existing column here.
+for (const col of [
+  'context_notes TEXT',      // machine-written context (chat outcomes, decisions) — never overwrites `notes`
+  'match_key TEXT',          // stable slug for placement matching (e.g. "dashboard-x")
+  'last_activity_at TEXT',   // drives recency ordering for the Workbench
+]) {
+  try {
+    sqliteDb.exec(`ALTER TABLE smart_todo_nodes ADD COLUMN ${col}`);
+  } catch (err) {
+    // Only "already there" is expected. Anything else (locked/read-only DB) must
+    // NOT be swallowed: the prepared statements below reference these columns, so
+    // a silently-failed ALTER would surface as an inscrutable boot crash instead.
+    if (!/duplicate column name/i.test((err as Error).message)) throw err;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Statements
@@ -122,8 +144,9 @@ export function getSmartTodoByThread(threadExt: string): SmartTodoNodeRow | null
   return getByThreadStmt.get(threadExt) ?? null;
 }
 
-/** ids of a node + all its descendants (for cascade delete / cycle checks / root recompute). */
-function subtreeIds(id: number): number[] {
+/** ids of a node + all its descendants (for cascade delete / cycle checks / root recompute).
+ *  Exported for Workbench (scope queries, placement, tool scope-guard) — see docs/workbench/RECON.md §6.2. */
+export function subtreeIds(id: number): number[] {
   return sqliteDb
     .prepare<[number], { id: number }>(`
       WITH RECURSIVE sub(id) AS (
@@ -256,6 +279,27 @@ export function updateSmartTodoNode(
   if (patch.status !== undefined) updStatusStmt.run(patch.status, id);
   if (patch.collapsed !== undefined) updCollapsedStmt.run(patch.collapsed ? 1 : 0, id);
   if (patch.original_prompt !== undefined) updPromptStmt.run(patch.original_prompt, id);
+  const updated = getSmartTodoNode(id);
+  if (updated) emit('updated', updated);
+  return updated;
+}
+
+const appendContextStmt = sqliteDb.prepare<[string, number]>(
+  `UPDATE smart_todo_nodes SET context_notes = ?, last_activity_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
+);
+
+/** WORKBENCH auto-notes: append a machine-written outcome line to `context_notes`
+ *  (never touches Kevin's own `notes`) and stamp `last_activity_at`. This is the
+ *  write path behind the `workbench` tool's `write_context` op — see
+ *  docs/workbench/SPEC.md §4 ("Auto-notes") and RECON.md §3/§4. New, isolated
+ *  statement; does not change any existing query shape `/tree` depends on. */
+export function appendSmartTodoContext(id: number, text: string): SmartTodoNodeRow | null {
+  const node = getSmartTodoNode(id);
+  if (!node) return null;
+  const trimmed = text.trim();
+  if (!trimmed) return node;
+  const next = (node.context_notes ? `${node.context_notes}\n${trimmed}` : trimmed).slice(-8000);
+  appendContextStmt.run(next, id);
   const updated = getSmartTodoNode(id);
   if (updated) emit('updated', updated);
   return updated;

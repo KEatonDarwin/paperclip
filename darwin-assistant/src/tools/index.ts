@@ -133,6 +133,7 @@ import { threadLinks } from './thread-links-tool.js';
 import { hopper } from './hopper-tool.js';
 import { workstreams } from './workstreams-tool.js';
 import { smartTodos } from './smart-todos-tool.js';
+import { workbench } from './workbench-tool.js';
 import { notifications } from './notifications-tool.js';
 import { intakeDeploy } from './intake-deploy.js';
 import { cockpitDeploy } from './cockpit-deploy.js';
@@ -201,6 +202,7 @@ export const ALL_TOOLS: ToolDef[] = [
   hopper,
   workstreams,
   smartTodos,
+  workbench,
   notifications,
   intakeDeploy,
   cockpitDeploy,

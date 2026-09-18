@@ -4,7 +4,13 @@ import { randomUUID } from 'node:crypto';
 import { statSync, readFileSync } from 'node:fs';
 import { displayContentFromRawOutput, parseTurnSteps } from '../turn-steps.js';
 import { isPlanModeMessage } from '../agent.js';
-import { selectActiveClaudeAccount, claudeFiveHourCeiling, upsertClaudeAccount } from '../claude-accounts.js';
+import {
+  selectActiveClaudeAccount,
+  claudeFiveHourCeiling,
+  upsertClaudeAccount,
+  listClaudeAccounts,
+  usageFilePath,
+} from '../claude-accounts.js';
 import {
   getOrCreateConversation,
   getConversation,
@@ -686,6 +692,67 @@ function readClaudeLiveUsage(): ClaudeProviderUsage | null {
   }
 }
 
+// One Claude subscription's live meter, tagged with which account it is, so the
+// cockpit can show a bar per pool (A / B) once a 2nd account is registered. Same
+// window shape as `claude` above; reads each account's own usage file directly
+// (via usageFilePath) to keep the reset countdown, which readAccountUsage drops.
+type ClaudeAccountProviderUsage = ClaudeProviderUsage & {
+  key: string;
+  label: string;
+  active: boolean;
+  enabled: boolean;
+};
+
+// Reads every registered Claude account's live usage. Returns [] when only the
+// implicit single account exists — the widget then keeps its one "Claude" bar
+// unchanged (byte-identical to before multi-Claude). With ≥2 accounts each gets
+// its own labeled entry. Never throws: a missing/stale file yields null windows.
+function readClaudeAccountsUsage(): ClaudeAccountProviderUsage[] {
+  const accounts = listClaudeAccounts();
+  if (accounts.length < 2) return [];
+  const STALE_MS = 3 * 60 * 1000;
+  let activeKey: string | null = null;
+  try {
+    activeKey = selectActiveClaudeAccount(claudeFiveHourCeiling()).account?.key ?? null;
+  } catch {
+    activeKey = null;
+  }
+  const toWindow = (w?: { utilization?: number; resets_at?: string }): ProviderUsageWindow | null =>
+    w?.utilization != null && w?.resets_at
+      ? { used_percentage: w.utilization, resets_at: Math.floor(new Date(w.resets_at).getTime() / 1000) }
+      : null;
+  return accounts.map((account): ClaudeAccountProviderUsage => {
+    let five_hour: ProviderUsageWindow | null = null;
+    let seven_day: ProviderUsageWindow | null = null;
+    let updated_at = 0;
+    try {
+      const file = usageFilePath(account.key);
+      const st = statSync(file);
+      if (Date.now() - st.mtimeMs <= STALE_MS) {
+        const raw = JSON.parse(readFileSync(file, 'utf8')) as {
+          five_hour?: { utilization?: number; resets_at?: string };
+          seven_day?: { utilization?: number; resets_at?: string };
+        };
+        five_hour = toWindow(raw.five_hour);
+        seven_day = toWindow(raw.seven_day);
+        updated_at = Math.floor(st.mtimeMs / 1000);
+      }
+    } catch {
+      // leave windows null — the bar renders "no data" for this account
+    }
+    return {
+      key: account.key,
+      label: account.label,
+      active: account.key === activeKey,
+      enabled: account.enabled,
+      five_hour,
+      seven_day,
+      model: null,
+      updated_at,
+    };
+  });
+}
+
 function readCodexUsage(): CodexProviderUsage | null {
   const LIVE_PATH = '/tmp/codex-usage-live.json';
   try {
@@ -1014,6 +1081,7 @@ export function createApiV1Router(): Router {
   router.get('/provider-usage', (_req: AuthedRequest, res) => {
     res.json({
       claude: readClaudeLiveUsage(),
+      claude_accounts: readClaudeAccountsUsage(),
       openai_codex: readCodexUsage(),
       augment: readAugmentUsage(),
     });

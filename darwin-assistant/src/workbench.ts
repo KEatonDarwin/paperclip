@@ -80,6 +80,11 @@ export interface WorkbenchJotResult {
   parent_id: number | null;
   confidence: number;
   reason: string;
+  /** true = this landed at the root because we were NOT confident enough to put
+   *  it under a candidate (spec §5 step 4 — "lands at root flagged unsorted,
+   *  never a confident wrong guess"). The UI badges this differently from a
+   *  deliberate new top-level branch. */
+  unsorted: boolean;
   /** Top-level nodes created by this jot (usually one). */
   created: SmartTodoNodeRow[];
   /** created[0], for convenience — the primary "landed here" node. */
@@ -300,6 +305,7 @@ export async function matchOrCreatePlacement(
       parent_id: focusId,
       confidence: 1,
       reason: 'Placed under the item you were zoomed into.',
+      unsorted: false,
       created: [created],
       node: created,
       nodes: listSmartTodoNodes(),
@@ -315,14 +321,17 @@ export async function matchOrCreatePlacement(
   const items: DecompositionItem[] =
     decision && decision.decomposition.length ? decision.decomposition : [fallbackItem(note)];
 
+  let unsorted = false;
   if (parentId !== null && confidence < CONFIDENCE_THRESHOLD) {
     reason = `${reason} (low confidence; filed at root instead of guessing)`;
     parentId = null;
+    unsorted = true;
   }
   // A parent that vanished between the shortlist build and here (deleted mid-flight) — refuse
   // the write, fall back to root rather than throwing.
   if (parentId !== null && !getSmartTodoNode(parentId)) {
     parentId = null;
+    unsorted = true;
   }
 
   const created: SmartTodoNodeRow[] = items.map((item) =>
@@ -333,6 +342,7 @@ export async function matchOrCreatePlacement(
     parent_id: parentId,
     confidence,
     reason,
+    unsorted,
     created,
     node: created[0] ?? null,
     nodes: listSmartTodoNodes(),

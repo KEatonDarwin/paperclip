@@ -72,8 +72,11 @@ for (const col of [
 ]) {
   try {
     sqliteDb.exec(`ALTER TABLE smart_todo_nodes ADD COLUMN ${col}`);
-  } catch {
-    /* column already exists */
+  } catch (err) {
+    // Only "already there" is expected. Anything else (locked/read-only DB) must
+    // NOT be swallowed: the prepared statements below reference these columns, so
+    // a silently-failed ALTER would surface as an inscrutable boot crash instead.
+    if (!/duplicate column name/i.test((err as Error).message)) throw err;
   }
 }
 

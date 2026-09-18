@@ -6,16 +6,21 @@
 // additive nullable columns; see docs/workbench/SPEC.md ("Data decision") and
 // docs/workbench/RECON.md §3 for why that's safe.
 //
-// This file covers spec §1 (Zoom) and §5 (Placement — match-or-create on jot).
-// Scoped chat writes / read_up / auto-notes (§2-4) live in a separate tool file
-// (a later node) and are NOT implemented here.
+// This file covers spec §1 (Zoom), §5 (Placement — match-or-create on jot), and
+// (as of this node) the scope-resolution + seed-text plumbing that §2-4 (docked
+// scoped chat / chats write to the tree / context rules) need. The `workbench`
+// tool itself (add_child/split/update/set_status/move/write_context/read_up)
+// lives in src/tools/workbench-tool.ts and calls back into this file.
 
 import { execFile } from 'node:child_process';
+import { sqliteDb, getConversation } from './conversation-db.js';
+import { getLatestThreadSummary } from './thread-summaries.js';
 import {
   getSmartTodoNode,
   listSmartTodoNodes,
   createSmartTodoNode,
   insertSmartTodoTree,
+  getSmartTodoByThread,
   subtreeIds,
   type SmartTodoNodeRow,
 } from './smart-todos.js';
@@ -248,8 +253,9 @@ async function decidePlacement(note: string, shortlist: Candidate[]): Promise<Pl
 
 /** Insert a decomposed item as a NEW CHILD of an existing parent (recursively for its
  *  children) — the "attach under an existing node" path insertSmartTodoTree can't do,
- *  since that function always creates a fresh root (see RECON.md §6 trap #4). */
-function insertUnderParent(
+ *  since that function always creates a fresh root (see RECON.md §6 trap #4).
+ *  Exported for the `workbench` tool's `split` op (see src/tools/workbench-tool.ts). */
+export function insertUnderParent(
   parentId: number,
   item: DecompositionItem,
   opts: { group_id?: number | null } = {},
@@ -331,4 +337,159 @@ export async function matchOrCreatePlacement(
     node: created[0] ?? null,
     nodes: listSmartTodoNodes(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// §3/§4. Scope resolution for the `workbench` tool + the docked scoped chat's
+// seed text. See src/tools/workbench-tool.ts for the tool that consumes these.
+// ---------------------------------------------------------------------------
+
+export interface WorkbenchToolScope {
+  /** The node id this chat is bound to via linked_thread_ext, or null = root/
+   *  whole-tree scope (no smart_todo_nodes row is bound to this thread — the
+   *  root sentinel chat, or any thread that was never opened through a
+   *  workbench zoom). Root scope is intentionally unrestricted. */
+  focusId: number | null;
+  /** ids the tool may write to (includes focusId itself). null when focusId is
+   *  null — root scope has no restriction. */
+  allowedIds: Set<number> | null;
+  /** The automatic context payload — same shape GET /workbench/scope/:id returns. */
+  scope: WorkbenchScope;
+}
+
+/** Resolve which node (if any) a conversation is scoped to, purely from the
+ *  existing `linked_thread_ext` binding — the SAME field `/tree`'s open-chat
+ *  uses, so a node opened from either surface always resolves to one thread.
+ *  No external_id match = root/whole-tree scope (by design — see spec §2's
+ *  "Root/whole-tree scope gets its own thread too" and RECON.md §4). */
+export function resolveWorkbenchToolScope(externalId: string | null | undefined): WorkbenchToolScope {
+  const node = externalId ? getSmartTodoByThread(externalId) : null;
+  if (!node) {
+    return {
+      focusId: null,
+      allowedIds: null,
+      scope: { node: null, ancestors: [], subtree: listSmartTodoNodes() },
+    };
+  }
+  const scope = getWorkbenchScope(node.id) ?? { node, ancestors: ancestorChain(node), subtree: [node] };
+  return { focusId: node.id, allowedIds: new Set(scope.subtree.map((n) => n.id)), scope };
+}
+
+/** The load-bearing scope guard: is `targetId` something this chat may write to?
+ *  Root scope (allowedIds === null) is unrestricted. A scoped chat may only
+ *  touch its own focus node + descendants — never a sibling branch, never an
+ *  ancestor, never an unrelated part of the tree. */
+export function assertWorkbenchScope(
+  toolScope: WorkbenchToolScope,
+  targetId: number,
+): { ok: true } | { ok: false; error: string } {
+  if (toolScope.allowedIds === null) return { ok: true };
+  if (toolScope.allowedIds.has(targetId)) return { ok: true };
+  const label = toolScope.scope.node ? `"${toolScope.scope.node.title}" (node ${toolScope.focusId})` : 'the root';
+  return {
+    ok: false,
+    error:
+      `Node ${targetId} is outside your scope — you're scoped to ${label} and its subtree. ` +
+      'Tell Kevin what you wanted to change and where, instead of reaching across the tree.',
+  };
+}
+
+const touchActivityStmt = sqliteDb.prepare<[number]>(
+  `UPDATE smart_todo_nodes SET last_activity_at = datetime('now') WHERE id = ?`,
+);
+
+/** Stamp last_activity_at on a node the workbench tool just wrote to. A raw,
+ *  isolated write (not routed through smart-todos.ts's shared statements) —
+ *  see docs/workbench/RECON.md §3, option (a). */
+export function touchWorkbenchActivity(id: number): void {
+  touchActivityStmt.run(id);
+}
+
+/** Read an ancestor's linked-thread SUMMARY (never its transcript) — the
+ *  on-demand half of spec §4. Returns null if the ancestor has no chat of its
+ *  own yet, or no summary has been generated for it yet. */
+export function readAncestorSummary(
+  ancestorId: number,
+): { node: SmartTodoNodeRow; summary: { content: string; created_at: string } | null; note?: string } | null {
+  const ancestor = getSmartTodoNode(ancestorId);
+  if (!ancestor) return null;
+  if (!ancestor.linked_thread_ext) {
+    return { node: ancestor, summary: null, note: 'That branch has no chat of its own yet, so there is no summary to read.' };
+  }
+  const conv = getConversation(ancestor.linked_thread_ext);
+  if (!conv) {
+    return { node: ancestor, summary: null, note: 'That branch\'s chat no longer exists.' };
+  }
+  const latest = getLatestThreadSummary(conv.id);
+  if (!latest) {
+    return { node: ancestor, summary: null, note: 'That branch has a chat, but no summary has been generated for it yet.' };
+  }
+  return { node: ancestor, summary: { content: latest.content, created_at: latest.created_at } };
+}
+
+/** Build the seed text a scoped Workbench chat is booted with (spec §2/§4) —
+ *  the automatic context (focus node + full subtree + ancestor titles/notes)
+ *  plus the explicit scope statement and the auto-notes instruction that makes
+ *  the tree carry memory instead of the transcript. Pure/side-effect-free —
+ *  callers post the result as the thread's first message, same convention as
+ *  the existing /smart-todos/:id/open-chat seed. */
+export function buildWorkbenchSeedText(scope: WorkbenchScope): string {
+  const lines: string[] = [];
+
+  if (scope.node) {
+    lines.push(
+      `You are scoped to node ${scope.node.id}: "${scope.node.title}". Kevin is talking to THIS branch — ` +
+        'he should never have to tell you which project he means.',
+    );
+  } else {
+    lines.push('You are scoped to the ROOT — the whole idea tree. Kevin can talk about anything on the board here.');
+  }
+  lines.push('');
+
+  if (scope.ancestors.length) {
+    lines.push("Ancestor chain (root → here), for orientation only — you don't own these, you can only look:");
+    for (const a of scope.ancestors) {
+      lines.push(`- ${a.title}${a.notes ? ` — ${a.notes.slice(0, 160)}` : ''}`);
+    }
+    lines.push('');
+  }
+
+  lines.push('Everything in this branch (automatic — you always have this, no need to ask for it):');
+  const byParent = new Map<number | null, SmartTodoNodeRow[]>();
+  for (const n of scope.subtree) {
+    const key = n.parent_id;
+    if (!byParent.has(key)) byParent.set(key, []);
+    byParent.get(key)!.push(n);
+  }
+  const renderNode = (n: SmartTodoNodeRow, depth: number): void => {
+    const indent = '  '.repeat(depth);
+    lines.push(`${indent}- [${n.status}] ${n.title} (id ${n.id})`);
+    if (n.notes) lines.push(`${indent}  notes: ${n.notes.slice(0, 200)}`);
+    if (n.context_notes) lines.push(`${indent}  context: ${n.context_notes.slice(0, 300)}`);
+    const children = (byParent.get(n.id) ?? []).slice().sort((a, b) => a.sort_order - b.sort_order);
+    for (const c of children) renderNode(c, depth + 1);
+  };
+  const roots = scope.node ? [scope.node] : (byParent.get(null) ?? []).slice().sort((a, b) => a.sort_order - b.sort_order);
+  if (roots.length) {
+    for (const r of roots) renderNode(r, 0);
+  } else {
+    lines.push('(nothing here yet)');
+  }
+  lines.push('');
+
+  lines.push(
+    'How to work in this chat:',
+    '- Use the `workbench` tool to create/read/update items — list_scope, add_child, split, update, ' +
+      'set_status, move, write_context, read_up. Writes outside this branch are refused; if that happens, ' +
+      'just tell Kevin plainly what you wanted to change and where, instead of trying to route around it.',
+    "- `read_up` is ON DEMAND ONLY — call it with an ancestor's node id when you genuinely need context from " +
+      "above this branch. It returns that ancestor's chat SUMMARY, never its transcript, and only when you ask.",
+    '- AUTO-NOTES (do this every turn something real happens): before you finish responding, if you decided ' +
+      'something, changed something, or figured out a next step, call `workbench` `write_context` on this node ' +
+      '(or whichever node it applies to) with a 1-3 line outcome. This is what lets the tree itself carry the ' +
+      'memory forward — a future chat should be able to understand where things stand from the tree alone, ' +
+      'without ever reading this transcript.',
+  );
+
+  return lines.join('\n');
 }

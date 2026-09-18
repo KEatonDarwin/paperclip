@@ -281,6 +281,27 @@ export function updateSmartTodoNode(
   return updated;
 }
 
+const appendContextStmt = sqliteDb.prepare<[string, number]>(
+  `UPDATE smart_todo_nodes SET context_notes = ?, last_activity_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
+);
+
+/** WORKBENCH auto-notes: append a machine-written outcome line to `context_notes`
+ *  (never touches Kevin's own `notes`) and stamp `last_activity_at`. This is the
+ *  write path behind the `workbench` tool's `write_context` op — see
+ *  docs/workbench/SPEC.md §4 ("Auto-notes") and RECON.md §3/§4. New, isolated
+ *  statement; does not change any existing query shape `/tree` depends on. */
+export function appendSmartTodoContext(id: number, text: string): SmartTodoNodeRow | null {
+  const node = getSmartTodoNode(id);
+  if (!node) return null;
+  const trimmed = text.trim();
+  if (!trimmed) return node;
+  const next = (node.context_notes ? `${node.context_notes}\n${trimmed}` : trimmed).slice(-8000);
+  appendContextStmt.run(next, id);
+  const updated = getSmartTodoNode(id);
+  if (updated) emit('updated', updated);
+  return updated;
+}
+
 const setGroupTreeStmt = sqliteDb.prepare<[number | null, number]>(
   `UPDATE smart_todo_nodes SET group_id = ?, updated_at = datetime('now') WHERE root_id = ?`,
 );

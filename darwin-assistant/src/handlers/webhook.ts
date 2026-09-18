@@ -2,7 +2,7 @@ import express from 'express';
 import { processMessage, ConversationBusyError } from '../agent.js';
 import { handlePaperclipWebhook } from './paperclip-webhook.js';
 
-export function createWebhookRouter() {
+export function createWebhookRouter(): express.Router {
   const router = express.Router();
 
   router.use(express.json());

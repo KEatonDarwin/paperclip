@@ -166,3 +166,13 @@ const markSpawnTaskFailedStmt = sqliteDb.prepare<[string, string]>(`
 export function markSpawnTaskFailed(threadExt: string, error: string): void {
   markSpawnTaskFailedStmt.run(error.slice(0, 500), threadExt);
 }
+
+const getByThreadExtStmt = sqliteDb.prepare<[string], SpawnTaskRow>(`SELECT * FROM spawn_tasks WHERE thread_ext = ?`);
+
+/** The spawn_tasks row for a worker thread, by its external id (UNIQUE). Used
+ *  by the `workbench` tool's scope resolution so a Workbench dispatch worker
+ *  is mechanically scoped to the node it was dispatched for (REVIEW-V2 fix
+ *  #1) — not just asked nicely in its prompt. */
+export function getSpawnTaskByThreadExt(threadExt: string): SpawnTaskRow | null {
+  return getByThreadExtStmt.get(threadExt) ?? null;
+}

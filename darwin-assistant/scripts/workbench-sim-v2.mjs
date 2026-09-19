@@ -108,7 +108,9 @@ async function req(method, urlPath, { token, body } = {}) {
   return { status: res.status, json };
 }
 
-const key = mintApiKey('workbench-v2-sim', 'jarvis').plaintext;
+// 'cockpit' scope = what the real UI's JARVIS_COCKPIT_KEY carries — the whole /workbench surface
+// mints cockpit:-prefixed threads, which only an admin/cockpit caller may then post to (step 2).
+const key = mintApiKey('workbench-v2-sim', 'cockpit').plaintext;
 
 console.log(`[workbench-v2-sim] server: ${base}`);
 
@@ -230,6 +232,27 @@ try {
     assert.equal(say1.json.wrapped_text.includes('first message ever'), true);
   });
   const brainExt = say1.json.external_id;
+
+  // REVIEW-V2 fix #4: the seed is only DELIVERED by the client's follow-up
+  // POST /threads/:ext/messages. Until a turn exists on the conversation, a
+  // repeat /workbench/say must re-issue the seed (a failed first send must not
+  // leave the sitting seedless forever).
+  const say1b = await req('POST', '/workbench/say', { token: key, body: { text: 'retry after a failed first send', focus_id: null } });
+  check('REVIEW fix #4: /workbench/say BEFORE any message reached the model re-sends seed_text (same session)', () => {
+    assert.equal(say1b.status, 201);
+    assert.equal(say1b.json.external_id, brainExt);
+    assert.ok(say1b.json.seed_text && say1b.json.seed_text.includes('Workbench brain'));
+  });
+
+  // Now do what the real client does — step 2 of the 2-step pattern.
+  const post1 = await req('POST', `/threads/${encodeURIComponent(brainExt)}/messages`, {
+    token: key,
+    body: { text: `${say1b.json.seed_text}\n\n${say1b.json.wrapped_text}` },
+  });
+  check('client step 2: POST /threads/:ext/messages with the composed seed+wrapped text is accepted (202)', () => {
+    assert.equal(post1.status, 202);
+  });
+  await sleep(1500); // let the 0.6s fake claude land the turn
 
   const say2 = await req('POST', '/workbench/say', { token: key, body: { text: 'second message, same sitting', focus_id: null } });
   check('second /workbench/say within idle window -> 200, seed_text null (session reused), same external_id', () => {
@@ -544,9 +567,10 @@ try {
 
   // ═══════════════════════════════════════════════════════════════════════
   // 6. SCOPE GUARD — v1 per-node guard intact; brain/dispatch threads
-  //    (unbound to any node) get unrestricted tree-wide scope BY DESIGN.
+  //    (unbound to any node) get unrestricted tree-wide scope BY DESIGN — EXCEPT
+//    dispatch workers, which REVIEW-V2 fix #1 binds to their dispatched node.
   // ═══════════════════════════════════════════════════════════════════════
-  console.log('\n[6] scope guard: v1 intact + brain/dispatch tree-wide');
+  console.log('\n[6] scope guard: v1 intact + brain tree-wide + dispatch node-bound + review fixes #1-#6');
 
   const nodeB = await req('POST', '/smart-todos', { token: key, body: { title: 'Unrelated sibling branch' } });
   const nodeBId = nodeB.json.node.id;
@@ -583,12 +607,118 @@ try {
     assert.equal(brainWriteAnywhere.node.id, nodeBId);
   });
 
-  const dispatchWorkerWriteAnywhere = await workbenchTool.execute(
+  // REVIEW-V2 fix #1: a dispatch worker is MECHANICALLY scoped to the node it
+  // was dispatched for (via its spawn_tasks.workbench_node_id stamp) — the
+  // "keep every write scoped to THIS node" line in its prompt is no longer
+  // prose-only. Before the fix this thread resolved to unrestricted root scope.
+  const dispatchWorkerWriteOutside = await workbenchTool.execute(
     { operation: 'set_status', node_id: featureXId, status: 'done' },
-    { externalId: dispatch1.json.external_id }, // the dispatch worker thread — also unbound
+    { externalId: dispatch1.json.external_id },
   );
-  check('a DISPATCH WORKER thread is likewise unbound -> unrestricted scope, matching its own finish contract (write_context/set_status on its target node, or in principle any node)', () => {
-    assert.equal(dispatchWorkerWriteAnywhere.ok, true);
+  check('REVIEW fix #1: a DISPATCH WORKER thread is REFUSED writing outside the node it was dispatched for', () => {
+    assert.ok(dispatchWorkerWriteOutside.error, 'expected a scope-refusal error');
+    assert.ok(dispatchWorkerWriteOutside.error.includes('outside your scope'));
+  });
+  const dispatchWorkerWriteOwn = await workbenchTool.execute(
+    { operation: 'write_context', node_id: dispatchNodeId, text: 'worker outcome on its own node' },
+    { externalId: dispatch1.json.external_id },
+  );
+  check('REVIEW fix #1: the SAME dispatch worker CAN write_context on its own node (its finish contract still works)', () => {
+    assert.equal(dispatchWorkerWriteOwn.ok, true);
+    assert.equal(dispatchWorkerWriteOwn.node.id, dispatchNodeId);
+  });
+  const dispatchWorkerScope = await workbenchTool.execute({ operation: 'list_scope' }, { externalId: dispatch1.json.external_id });
+  check('REVIEW fix #1: list_scope from the dispatch worker resolves focus_id = its dispatched node', () => {
+    assert.equal(dispatchWorkerScope.focus_id, dispatchNodeId);
+  });
+
+  // REVIEW-V2 fix #2: `split` with >1 node is staged as a proposal batch (code-
+  // level bulk rule), a single child is still direct.
+  const splitParent = await req('POST', '/smart-todos', { token: key, body: { title: 'Split me (review)' } });
+  const splitParentId = splitParent.json.node.id;
+  const nodesBeforeSplit = sqliteDb.prepare('SELECT COUNT(*) AS c FROM smart_todo_nodes').get().c;
+  const splitMulti = await workbenchTool.execute(
+    { operation: 'split', node_id: splitParentId, children: [{ title: 'part a' }, { title: 'part b' }] },
+    { externalId: brainExt2, sourceMessageId: 'turn-split-1' },
+  );
+  const nodesAfterSplit = sqliteDb.prepare('SELECT COUNT(*) AS c FROM smart_todo_nodes').get().c;
+  check('REVIEW fix #2: split with 2 children is STAGED as ghosts (proposed:true, batch_id), zero real nodes written', () => {
+    assert.equal(splitMulti.ok, true);
+    assert.equal(splitMulti.proposed, true);
+    assert.ok(splitMulti.batch_id);
+    assert.equal(splitMulti.proposals.length, 2);
+    assert.equal(nodesAfterSplit, nodesBeforeSplit);
+  });
+  const splitSingle = await workbenchTool.execute(
+    { operation: 'split', node_id: splitParentId, children: [{ title: 'only child' }] },
+    { externalId: brainExt2, sourceMessageId: 'turn-split-2' },
+  );
+  check('REVIEW fix #2: split with exactly ONE child still writes it directly (the single-node carve-out)', () => {
+    assert.equal(splitSingle.ok, true);
+    assert.equal(splitSingle.proposed, undefined);
+    assert.equal(splitSingle.created.length, 1);
+  });
+
+  // REVIEW-V2 fix #3: the brain cannot accept a batch in the SAME turn it
+  // proposed it — Kevin has not seen it yet. A later turn (his reply) may.
+  const sameTurnAccept = await workbenchTool.execute(
+    { operation: 'accept_batch', batch_id: splitMulti.batch_id },
+    { externalId: brainExt2, sourceMessageId: 'turn-split-1' },
+  );
+  check('REVIEW fix #3: accept_batch from the SAME turn that proposed the batch is REFUSED', () => {
+    assert.ok(sameTurnAccept.error, 'expected a same-turn refusal');
+    assert.ok(sameTurnAccept.error.includes('this very turn'));
+    assert.equal(sqliteDb.prepare('SELECT COUNT(*) AS c FROM workbench_proposals WHERE batch_id = ?').get(splitMulti.batch_id).c, 2);
+  });
+  const laterTurnAccept = await workbenchTool.execute(
+    { operation: 'accept_batch', batch_id: splitMulti.batch_id },
+    { externalId: brainExt2, sourceMessageId: 'turn-kevin-said-yes' },
+  );
+  check('REVIEW fix #3: accept_batch from a LATER turn (Kevin replied) materializes it', () => {
+    assert.equal(laterTurnAccept.ok, true);
+    assert.equal(laterTurnAccept.created.length, 2);
+    for (const n of laterTurnAccept.created) assert.equal(n.parent_id, splitParentId);
+  });
+  const scopedAcceptOutside = await (async () => {
+    const b = await workbenchTool.execute(
+      { operation: 'propose_batch', parent_id: nodeBId, items: [{ title: 'x1' }, { title: 'x2' }] },
+      { externalId: brainExt2, sourceMessageId: 'turn-p1' },
+    );
+    return workbenchTool.execute({ operation: 'accept_batch', batch_id: b.batch_id }, { externalId: chatAExt, sourceMessageId: 'turn-p2' });
+  })();
+  check('REVIEW fix #3b: a SCOPED chat cannot accept_batch a batch that lands outside its branch', () => {
+    assert.ok(scopedAcceptOutside.error);
+    assert.ok(scopedAcceptOutside.error.includes('outside your scope'));
+  });
+
+  // REVIEW-V2 fix #5: orphaned proposals (parent node deleted after proposing)
+  // are pruned on list instead of lingering invisibly forever.
+  const orphanParent = await req('POST', '/smart-todos', { token: key, body: { title: 'Doomed parent' } });
+  const orphanBatch = await workbenchTool.execute(
+    { operation: 'propose_batch', parent_id: orphanParent.json.node.id, items: [{ title: 'o1' }, { title: 'o2' }] },
+    { externalId: brainExt2, sourceMessageId: 'turn-o1' },
+  );
+  await req('DELETE', `/smart-todos/${orphanParent.json.node.id}`, { token: key });
+  const listAfterOrphan = await req('GET', '/workbench/proposals', { token: key });
+  check('REVIEW fix #5: a batch whose parent node was deleted is pruned from GET /workbench/proposals (rows gone, not just hidden)', () => {
+    assert.equal(listAfterOrphan.status, 200);
+    assert.ok(!listAfterOrphan.json.batches.some((b) => b.batch_id === orphanBatch.batch_id));
+    assert.equal(sqliteDb.prepare('SELECT COUNT(*) AS c FROM workbench_proposals WHERE batch_id = ?').get(orphanBatch.batch_id).c, 0);
+  });
+
+  // REVIEW-V2 fix #6: a v1-style per-node "Open chat" thread gets its branch
+  // scope injected EVERY turn (the v2 UI no longer posts the seed on open).
+  const { buildWorkbenchThreadContext } = await import(path.join(distDir, 'workbench.js'));
+  const perTurnBlock = buildWorkbenchThreadContext(chatAExt);
+  check('REVIEW fix #6: per-node workbench chat thread gets a <workbench_scope> per-turn block naming its node', () => {
+    assert.ok(perTurnBlock.startsWith('<workbench_scope>'));
+    assert.ok(perTurnBlock.includes(`You are scoped to node ${nodeAId}`));
+  });
+  check('REVIEW fix #6: brain session, dispatch worker, and a plain thread get NO per-turn block', () => {
+    assert.equal(buildWorkbenchThreadContext(brainExt2), '');
+    assert.equal(buildWorkbenchThreadContext(dispatch1.json.external_id), '');
+    assert.equal(buildWorkbenchThreadContext('cockpit:tree-abc'), '');
+    assert.equal(buildWorkbenchThreadContext('slack:D0B2:123'), '');
   });
 
   // ═══════════════════════════════════════════════════════════════════════

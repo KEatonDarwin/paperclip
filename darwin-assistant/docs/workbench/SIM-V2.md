@@ -12,7 +12,16 @@ jarvis.db). Real Express router, real HTTP over a throwaway port, real `workbenc
 zero live model calls (a fake `claude` binary stands in for both the placement one-shot path and
 the dispatch route's real `processMessage()` call, same pattern as `multi-claude-e2e-sim.mjs`).
 
-**Result: ALL 55 checks passed, 1 non-blocking finding (see §4 below).**
+**Result (node #451): ALL 55 checks passed, 1 non-blocking finding (see §4 below).**
+**Result after node #452's adversarial review: ALL 68 checks passed, 0 open findings** — the review
+(`docs/workbench/REVIEW-V2.md`) applied six fixes and extended this sim to cover each: dispatch
+workers now node-scoped (F1), `split` >1 → proposals (F2, closes §4 below), same-turn/scoped
+`accept_batch` refusals (F3), seed re-issued until a turn exists (F4), orphaned batches pruned
+on list (F5), per-turn `<workbench_scope>` block for per-node chats (F6). Two sim corrections
+along the way: the key is now minted with `cockpit` scope (what the real UI's key carries — the
+old `jarvis` scope could never have performed client step 2 against a `cockpit:` ext), and §1
+now actually performs step 2 (`POST /threads/:ext/messages` through the fake claude) before
+asserting the "reused session, seed null" case.
 
 ## How this sim avoids the v1 failure class
 
@@ -63,7 +72,7 @@ RECON-V2 flagged). `accept_batch` called via the tool itself (the "Kevin said ye
 path) uses the identical internal code path as the HTTP route. `workbench_proposal` SSE events fire
 for `created`, `rejected`, and `accepted`.
 
-**4. Bulk-creation rule — ⚠️ one honest finding, not a wiring break.** `add_child` is mechanically
+**4. Bulk-creation rule — ⚠️ one honest finding, not a wiring break. → RESOLVED by REVIEW-V2 F2: `split` with >1 item is now redirected to `proposeBatch` in code; the sim's `else` branch ("split also refuses/redirects") is the one that runs now.** `add_child` is mechanically
 capped at one node per call — its execute() handler only ever reads a single `title`; even smuggling
 an `items` array into the call args produces exactly one node and the smuggled items are never
 materialized. That part of SPEC.md's rule is real and enforced in code. **However: `split` still

@@ -19,6 +19,7 @@ import {
   deleteProposalCascade,
   acceptProposalBatch,
   getWorkbenchProposal,
+  listProposalsForBatch,
   type DecompositionItem,
   type WorkbenchProposalRow,
 } from '../workbench.js';
@@ -76,6 +77,10 @@ function sanitizeChildren(raw: unknown, depth = 0): DecompositionItem[] {
   return out;
 }
 
+function countItems(items: DecompositionItem[]): number {
+  return items.reduce((n, it) => n + 1 + countItems(it.children ?? []), 0);
+}
+
 function numArray(raw: unknown): number[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const out = raw.filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
@@ -106,7 +111,8 @@ export const workbench: ToolDef = {
     "node + its full subtree + the ancestor chain above it — call this if you need to refresh what you " +
     "can see), 'add_child' (one new item under a node in scope — defaults to your focus node if parent_id " +
     "omitted; needs title), 'split' (decompose ONE existing node in scope into child items you've already " +
-    "worked out in conversation — needs node_id, children: [{title, notes?, children?}]), 'update' (title/" +
+    "worked out in conversation — needs node_id, children: [{title, notes?, children?}]; more than one child " +
+    "is automatically staged as a proposal batch, not written directly), 'update' (title/" +
     "notes on a node in scope — needs node_id), 'set_status' (needs node_id + status), 'move' (re-parent a " +
     "node WITHIN your scope — needs node_id + new_parent_id, null only allowed from root scope), " +
     "'write_context' (**do this at the end of any turn where something real happened** — appends a short " +
@@ -221,6 +227,26 @@ export const workbench: ToolDef = {
       if (!getSmartTodoNode(targetId)) return { error: `node ${targetId} not found` };
       const children = sanitizeChildren(args.children);
       if (!children.length) return { error: 'split needs a non-empty children array with at least one {title}' };
+      // SPEC.md V2 bulk rule, enforced in CODE not just the description
+      // (REVIEW-V2 fix #2): more than one node → it's a proposal batch Kevin
+      // corrects first, never a direct multi-row write. A single child stays
+      // direct (the "one node he explicitly asked for" carve-out).
+      if (countItems(children) > 1) {
+        const { batch_id, proposals } = proposeBatch(children, {
+          parentNodeId: targetId,
+          createdByThread: context?.externalId ?? null,
+          createdByMessage: context?.sourceMessageId ?? null,
+        });
+        return {
+          ok: true,
+          proposed: true,
+          batch_id,
+          proposals: proposals.map(serializeProposal),
+          note:
+            'That was more than one node, so it was staged as a ghost proposal batch (not written as real ' +
+            'nodes). Kevin corrects it by talking or clicking ✓/✕; call accept_batch only once he has said yes.',
+        };
+      }
       const created = children.map((item) => insertUnderParent(targetId, item));
       touchWorkbenchActivity(targetId);
       return { ok: true, created: created.map(serializeNode) };
@@ -358,7 +384,11 @@ export const workbench: ToolDef = {
       } else {
         parentNodeId = toolScope.focusId;
       }
-      const { batch_id, proposals } = proposeBatch(items, { parentNodeId, createdByThread: context?.externalId ?? null });
+      const { batch_id, proposals } = proposeBatch(items, {
+        parentNodeId,
+        createdByThread: context?.externalId ?? null,
+        createdByMessage: context?.sourceMessageId ?? null,
+      });
       return { ok: true, batch_id, proposals: proposals.map(serializeProposal) };
     }
 
@@ -387,6 +417,29 @@ export const workbench: ToolDef = {
       const batchId = str(args.batch_id);
       if (!batchId) return { error: 'accept_batch needs a batch_id' };
       const ids = numArray(args.ids);
+      const batchRows = listProposalsForBatch(batchId);
+      if (!batchRows.length) return { error: `no pending proposals for batch ${batchId}` };
+      // REVIEW-V2 fix #3 — the mechanical half of "his utterance is the gate":
+      // a batch proposed in THIS SAME TURN cannot be accepted in this turn.
+      // Kevin has not even seen it yet; the earliest legitimate accept is a
+      // later turn (his reply), or his own click on the page.
+      const turnId = context?.sourceMessageId ?? null;
+      if (turnId && batchRows.some((r) => r.created_by_message === turnId)) {
+        return {
+          error:
+            'You proposed this batch in this very turn — Kevin has not seen it yet. Stop and let him correct/' +
+            'approve it (by replying or clicking ✓/✕). accept_batch is only for a batch he has already said yes to.',
+        };
+      }
+      // A scoped chat (v1 per-node / a dispatch worker) may only materialize
+      // proposals that land inside its own branch.
+      if (toolScope.allowedIds !== null) {
+        for (const r of batchRows.filter((x) => x.parent_proposal_id === null)) {
+          if (r.parent_node_id === null) return { error: "Can't accept a top-level batch from a scoped chat — that's a root-scope action." };
+          const guard = assertWorkbenchScope(toolScope, r.parent_node_id);
+          if (!guard.ok) return { error: guard.error };
+        }
+      }
       try {
         const { created } = acceptProposalBatch(batchId, ids);
         for (const node of created) touchWorkbenchActivity(node.id);

@@ -20,7 +20,9 @@ import {
   getOrCreateConversation,
   renameConversation,
   getSetting,
+  countTurns,
 } from './conversation-db.js';
+import { getSpawnTaskByThreadExt } from './spawn-tasks.js';
 import { sseBus, type WorkbenchProposalEvent } from './sse-bus.js';
 import { getLatestThreadSummary } from './thread-summaries.js';
 import {
@@ -381,7 +383,23 @@ export interface WorkbenchToolScope {
  *  No external_id match = root/whole-tree scope (by design — see spec §2's
  *  "Root/whole-tree scope gets its own thread too" and RECON.md §4). */
 export function resolveWorkbenchToolScope(externalId: string | null | undefined): WorkbenchToolScope {
-  const node = externalId ? getSmartTodoByThread(externalId) : null;
+  let node = externalId ? getSmartTodoByThread(externalId) : null;
+  // V2 dispatch workers (REVIEW-V2 fix #1): a `POST /workbench/nodes/:id/dispatch`
+  // worker's thread is never a node's linked_thread_ext, so without this it
+  // would resolve to ROOT scope and the "keep every write scoped to THIS node"
+  // rule in its prompt would be prose only. The spawn_tasks row it was born
+  // with stamps workbench_node_id — that is the mechanical binding.
+  if (!node && externalId) {
+    const spawn = getSpawnTaskByThreadExt(externalId);
+    if (spawn?.workbench_node_id != null) {
+      node = getSmartTodoNode(spawn.workbench_node_id);
+      if (!node) {
+        // Its node was deleted out from under it — a dead worker must NOT
+        // widen to root; it gets an empty write scope instead.
+        return { focusId: null, allowedIds: new Set<number>(), scope: { node: null, ancestors: [], subtree: [] } };
+      }
+    }
+  }
   if (!node) {
     return {
       focusId: null,
@@ -522,6 +540,33 @@ export function buildWorkbenchSeedText(scope: WorkbenchScope): string {
   return lines.join('\n');
 }
 
+/** Per-turn context block for a v1-style per-node Workbench chat (the "Open
+ *  chat" deep-dive, thread ext `cockpit:workbench-<uuid>` bound via
+ *  linked_thread_ext). REVIEW-V2 fix #6: v2 stopped auto-posting the seed on
+ *  open (correct — nothing may "start to think" on a click), but the v2 UI then
+ *  simply dropped the seed, leaving the deep-dive chat with no idea what branch
+ *  it's scoped to until the tool refused it. Injecting the scope every turn —
+ *  same shape as buildQuickChatContext — is the durable version: always
+ *  current, no first-message coupling. Returns '' for every other thread
+ *  (brain sessions carry their own seed via /workbench/say; dispatch workers
+ *  carry theirs in the dispatch prompt; /tree's `cockpit:tree-*` chats are
+ *  untouched). Capped so a big branch can't balloon the per-turn prefix. */
+export function buildWorkbenchThreadContext(externalId: string): string {
+  try {
+    if (!externalId.includes(':workbench-')) return '';
+    if (externalId.includes('workbench-brain-') || externalId.includes('workbench-worker-')) return '';
+    const node = getSmartTodoByThread(externalId);
+    if (!node) return '';
+    const scope = getWorkbenchScope(node.id);
+    if (!scope) return '';
+    const body = buildWorkbenchSeedText(scope);
+    const capped = body.length > 6000 ? `${body.slice(0, 6000)}\n… (branch digest truncated — use list_scope for the rest)` : body;
+    return `<workbench_scope>\n${capped}\n</workbench_scope>\n`;
+  } catch {
+    return '';
+  }
+}
+
 // ---------------------------------------------------------------------------
 // V2 §"Dispatch" — POST /workbench/nodes/:id/dispatch. Spawns ONE ephemeral
 // cockpit worker attached to a single node (explicit-dispatch, never on
@@ -529,9 +574,10 @@ export function buildWorkbenchSeedText(scope: WorkbenchScope): string {
 // NOT bound to the node via linked_thread_ext (that field is the node's
 // persistent opt-in chat from §2 — dispatch must never hijack it); instead the
 // worker is told its target node id directly and always passes it explicitly
-// to the `workbench` tool, which the unbound thread can do freely (an
-// unbound/unscoped thread gets unrestricted root scope — see
-// resolveWorkbenchToolScope). The route layer (api-v1.ts) owns spawning +
+// to the `workbench` tool. Its scope is MECHANICAL, not prose: the spawn_tasks
+// row stamps workbench_node_id and resolveWorkbenchToolScope binds the worker
+// thread to that node's subtree (REVIEW-V2 fix #1), so a write outside the
+// node it was dispatched for is refused. The route layer (api-v1.ts) owns spawning +
 // the spawn_tasks row; this function only composes the one-shot prompt.
 // ---------------------------------------------------------------------------
 
@@ -607,6 +653,10 @@ export interface WorkbenchProposalRow {
   notes: string | null;
   sort_order: number;
   created_by_thread: string | null;
+  /** The JARVIS turn (sourceMessageId) that proposed this batch — the
+   *  mechanical half of "the brain never accepts a batch it just proposed":
+   *  `accept_batch` from the SAME turn is refused (REVIEW-V2 fix #3). */
+  created_by_message: string | null;
   created_at: string;
 }
 
@@ -632,6 +682,12 @@ sqliteDb.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_workbench_proposals_batch ON workbench_proposals(batch_id, sort_order, id);
 `);
+// Lazy migration (same pattern as spawn_tasks' stamp columns).
+try {
+  sqliteDb.exec(`ALTER TABLE workbench_proposals ADD COLUMN created_by_message TEXT`);
+} catch {
+  /* column already exists */
+}
 
 const getProposalStmt = sqliteDb.prepare<[number], WorkbenchProposalRow>(
   `SELECT * FROM workbench_proposals WHERE id = ?`,
@@ -643,11 +699,11 @@ const listBatchProposalsStmt = sqliteDb.prepare<[string], WorkbenchProposalRow>(
   `SELECT * FROM workbench_proposals WHERE batch_id = ? ORDER BY id ASC`,
 );
 const insertProposalStmt = sqliteDb.prepare<
-  [string, number | null, number | null, string, string | null, number, string | null]
+  [string, number | null, number | null, string, string | null, number, string | null, string | null]
 >(`
   INSERT INTO workbench_proposals
-    (batch_id, parent_node_id, parent_proposal_id, title, notes, sort_order, created_by_thread)
-  VALUES (?, ?, ?, ?, ?, ?, ?)
+    (batch_id, parent_node_id, parent_proposal_id, title, notes, sort_order, created_by_thread, created_by_message)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `);
 const updProposalTitleStmt = sqliteDb.prepare<[string, number]>(
   `UPDATE workbench_proposals SET title = ? WHERE id = ?`,
@@ -676,6 +732,18 @@ export function listPendingProposalBatches(): WorkbenchProposalBatch[] {
     if (!byBatch.has(row.batch_id)) byBatch.set(row.batch_id, []);
     byBatch.get(row.batch_id)!.push(row);
   }
+  // REVIEW-V2 fix #5: a batch whose real parent node was deleted after it was
+  // proposed is an orphan — the UI renders ghosts under their parent row, so
+  // it would be invisible yet still pending (and un-acceptable) forever.
+  // smart-todos.ts is off-limits (byte-for-byte), so prune lazily here: drop
+  // the whole batch, emit `rejected` so any open page refetches.
+  for (const [batchId, proposals] of Array.from(byBatch.entries())) {
+    const orphaned = proposals.some((p) => p.parent_node_id !== null && !getSmartTodoNode(p.parent_node_id));
+    if (!orphaned) continue;
+    deleteProposalRows(proposals.map((p) => p.id));
+    byBatch.delete(batchId);
+    emitProposal('rejected', batchId);
+  }
   return Array.from(byBatch.entries()).map(([batch_id, proposals]) => ({
     batch_id,
     created_at: proposals[0]?.created_at ?? '',
@@ -691,7 +759,13 @@ export function listPendingProposalBatches(): WorkbenchProposalBatch[] {
 function insertProposalItem(
   batchId: string,
   item: DecompositionItem,
-  opts: { parentNodeId: number | null; parentProposalId: number | null; sortOrder: number; createdByThread: string | null },
+  opts: {
+    parentNodeId: number | null;
+    parentProposalId: number | null;
+    sortOrder: number;
+    createdByThread: string | null;
+    createdByMessage: string | null;
+  },
   acc: WorkbenchProposalRow[],
 ): WorkbenchProposalRow {
   const info = insertProposalStmt.run(
@@ -702,12 +776,18 @@ function insertProposalItem(
     item.notes ?? null,
     opts.sortOrder,
     opts.createdByThread,
+    opts.createdByMessage,
   );
   const id = Number(info.lastInsertRowid);
   const row = getProposalStmt.get(id)!;
   acc.push(row);
   (item.children ?? []).forEach((child, idx) => {
-    insertProposalItem(batchId, child, { parentNodeId: null, parentProposalId: id, sortOrder: idx, createdByThread: opts.createdByThread }, acc);
+    insertProposalItem(
+      batchId,
+      child,
+      { parentNodeId: null, parentProposalId: id, sortOrder: idx, createdByThread: opts.createdByThread, createdByMessage: opts.createdByMessage },
+      acc,
+    );
   });
   return row;
 }
@@ -721,15 +801,19 @@ function insertProposalItem(
  *  nesting) comes through here per SPEC.md's bulk rule. */
 export function proposeBatch(
   items: DecompositionItem[],
-  opts: { parentNodeId?: number | null; createdByThread?: string | null } = {},
+  opts: { parentNodeId?: number | null; createdByThread?: string | null; createdByMessage?: string | null } = {},
 ): { batch_id: string; proposals: WorkbenchProposalRow[] } {
   if (!items.length) throw new Error('propose_batch needs at least one item');
   const batchId = randomUUID();
   const parentNodeId = opts.parentNodeId ?? null;
   const createdByThread = opts.createdByThread ?? null;
+  const createdByMessage = opts.createdByMessage ?? null;
+  if (parentNodeId !== null && !getSmartTodoNode(parentNodeId)) throw new Error(`parent node ${parentNodeId} not found`);
   const run = sqliteDb.transaction((): WorkbenchProposalRow[] => {
     const acc: WorkbenchProposalRow[] = [];
-    items.forEach((item, idx) => insertProposalItem(batchId, item, { parentNodeId, parentProposalId: null, sortOrder: idx, createdByThread }, acc));
+    items.forEach((item, idx) =>
+      insertProposalItem(batchId, item, { parentNodeId, parentProposalId: null, sortOrder: idx, createdByThread, createdByMessage }, acc),
+    );
     return acc;
   });
   const proposals = run();
@@ -1090,14 +1174,19 @@ export function composeBrainSay(
   // Bind the underlying conversation the first time this session's thread is
   // actually used — mirrors /workbench/:id/open-chat's own
   // getOrCreateConversation + renameConversation pairing.
-  getOrCreateConversation(session.thread_ext);
-  if (isNew) {
-    const conv = getConversation(session.thread_ext);
-    if (conv) renameConversation(conv.id, 'Workbench — brain');
-  }
+  const conv = getOrCreateConversation(session.thread_ext);
+  if (isNew) renameConversation(conv.id, 'Workbench — brain');
 
-  const focusChanged = isNew || focusId !== session.last_focus_id;
-  const seedText = isNew ? buildBrainSeedText() : null;
+  // REVIEW-V2 fix #4: the seed is only DELIVERED when the client's follow-up
+  // POST /threads/:ext/messages succeeds (2-step pattern). Keying "needs seed"
+  // off the session row's birth alone meant one failed first send left the
+  // whole sitting seedless forever (the brain never learns what the board is).
+  // Key it off the conversation instead: no turns yet = nothing has ever
+  // reached the model = seed again. Idempotent — once a turn exists it stops.
+  const needsSeed = isNew || countTurns(conv.id) === 0;
+
+  const focusChanged = needsSeed || focusId !== session.last_focus_id;
+  const seedText = needsSeed ? buildBrainSeedText() : null;
   const wrappedText = composeBrainWrappedText(focusId, focusChanged, text);
 
   touchWorkbenchSession(session.id, focusId);

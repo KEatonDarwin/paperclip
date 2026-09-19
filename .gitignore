@@ -57,3 +57,4 @@ darwin-assistant/jarvis.db
 darwin-assistant/jarvis.db-shm
 darwin-assistant/jarvis.db-wal
 darwin-assistant/jarvis.db.bak-*
+darwin-assistant/node_modules

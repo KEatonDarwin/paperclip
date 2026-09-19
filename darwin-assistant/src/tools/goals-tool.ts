@@ -11,6 +11,7 @@ import {
   acceptAllGoalNodes,
   discardGoalNode,
   discardGoalBatch,
+  patchGoalNode,
   proposeEdit,
   proposeRemoval,
   setLeafKind,
@@ -81,7 +82,8 @@ export const goals: ToolDef = {
     'spelled out (title + what done means) in this conversation; everything you think of, infer, reword, split, or remove ' +
     'goes through propose / propose_edit / propose_remove and renders as a ghost until he ✓s it. Never create ' +
     'grandchildren: propose children only under the focused node or a node he named, one layer at a time. Every proposed ' +
-    'node MUST carry a one-line done_means. Inside a goal thread (cockpit:goal-<id>), goal_id and the default parent_id ' +
+    'node MUST carry a one-line done_means. While a proposal is still a ghost, reword it in place with `edit_ghost` as you and '+
+    'Kevin talk it through (that is the "watch it change until I am good with it" loop) — do NOT discard and re-propose. Inside a goal thread (cockpit:goal-<id>), goal_id and the default parent_id ' +
     '(the current focus) are inferred automatically — omit goal_id there.',
   parameters: {
     type: 'object',
@@ -90,7 +92,7 @@ export const goals: ToolDef = {
         type: 'string',
         enum: [
           'list', 'set_goal_done_means', 'propose', 'set_from_kevin', 'accept', 'discard',
-          'propose_edit', 'propose_remove', 'set_leaf_kind', 'propose_plan', 'dispatch',
+          'edit_ghost', 'propose_edit', 'propose_remove', 'set_leaf_kind', 'propose_plan', 'dispatch',
           'verify', 'human_done', 'park', 'unpark', 'log', 'promote', 'focus',
         ],
         description: 'What to do.',
@@ -194,6 +196,25 @@ export const goals: ToolDef = {
         if (batchId) return { nodes: discardGoalBatch(goalId, batchId, undefined, 'jarvis') };
         if (args.node_id !== undefined) return { node: discardGoalNode(goalId, Number(args.node_id), str(args.reason), 'jarvis') };
         return { error: 'discard needs node_id or batch_id' };
+      }
+
+      if (op === 'edit_ghost') {
+        // A ghost is JARVIS's own not-yet-approved proposal, so it may be
+        // reworded in place while Kevin talks it through (CONTRACT route 16:
+        // actor='jarvis' PATCH is permitted on ghosts ONLY — the server 403s
+        // `jarvis_must_propose` on anything already set).
+        if (args.node_id === undefined) return { error: 'node_id is required' };
+        if (args.title === undefined && args.done_means === undefined && args.notes === undefined) {
+          return { error: 'edit_ghost needs at least one of title/done_means/notes' };
+        }
+        return {
+          node: patchGoalNode(goalId, Number(args.node_id), {
+            title: str(args.title),
+            done_means: str(args.done_means),
+            notes: str(args.notes),
+            actor: 'jarvis',
+          }),
+        };
       }
 
       if (op === 'propose_edit') {

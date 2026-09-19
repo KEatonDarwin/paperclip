@@ -651,6 +651,12 @@ export function patchGoal(id: number, patch: {
     WHERE id = ?
   `).run(title, doneMeans, notes, sortOrder, archived, status, id);
 
+  // CONTRACT §8: the conversation label is `🎯 <goal title>`, re-applied on rename.
+  if (title !== existing.title && existing.thread_ext) {
+    const conv = getConversation(existing.thread_ext);
+    if (conv) renameConversation(conv.id, `🎯 ${title}`.slice(0, 120));
+  }
+
   insertEvent(id, null, actor, flipped ? 'goal_set' : 'goal_updated', flipped ? 'Goal set: done_means confirmed.' : 'Goal updated.');
   emitGoal('updated', id);
   return toGoalSummary(getGoalRowStmt.get(id) as GoalRow);
@@ -658,13 +664,15 @@ export function patchGoal(id: number, patch: {
 
 export function verifyGoal(id: number, passed: boolean, note?: string, actor?: unknown): { goal: GoalSummary; verified: boolean } {
   const existing = requireGoal(id);
+  // REVIEW fix: `passed:false` is a no-op 200 per CONTRACT route 5 — it must not
+  // 409 just because the goal isn't `set` (e.g. a stray reopen on a done goal).
+  if (!passed) {
+    return { goal: toGoalSummary(existing), verified: false };
+  }
   if (existing.status !== 'set') {
     throw new GoalError(409, 'invalid_transition', `goal is ${existing.status}, not set`, { from: existing.status, to: 'done' });
   }
   const act = assertActor(actor, 'kevin');
-  if (!passed) {
-    return { goal: toGoalSummary(existing), verified: false };
-  }
   const nodes = listRawNodesForGoal(id, true);
   const blocking = nodes.filter((n) => n.state !== 'discarded' && n.state !== 'parked' && n.state !== 'done');
   if (blocking.length) {
@@ -956,6 +964,11 @@ export function patchGoalNode(goalId: number, nodeId: number, patch: {
   const title = patch.title !== undefined ? patch.title.trim() : node.title;
   if (!title) throw new GoalError(400, 'title_required', 'title cannot be empty');
   const doneMeans = patch.done_means !== undefined ? (patch.done_means.trim() || null) : node.done_means;
+  // done_means is REQUIRED at every level once a node is real (CONTRACT §1.1) —
+  // a direct edit must not be able to strip it back off a non-ghost node.
+  if (!doneMeans && node.state !== 'ghost') {
+    throw new GoalError(409, 'done_means_required', 'done_means cannot be cleared on a node that is already set');
+  }
   const notes = patch.notes !== undefined ? (patch.notes.trim() || null) : node.notes;
   const sortOrder = patch.sort_order !== undefined ? patch.sort_order : node.sort_order;
 
@@ -983,8 +996,11 @@ export function proposeEdit(goalId: number, nodeId: number, args: { title?: stri
     throw new GoalError(400, 'invalid_request', 'propose_edit needs at least one of title/done_means');
   }
   const actor = assertActor(args.actor, 'jarvis');
+  // A pending EDIT and a pending REMOVAL cannot coexist: resolve_pending reads
+  // pending_removal first, so leaving a stale removal flag set would silently
+  // discard the node when Kevin ✓s what he was shown as a text diff.
   sqliteDb.prepare(`
-    UPDATE goal_nodes SET pending_title = ?, pending_done_means = ?, pending_by = 'jarvis', updated_at = datetime('now') WHERE id = ?
+    UPDATE goal_nodes SET pending_title = ?, pending_done_means = ?, pending_removal = 0, pending_by = 'jarvis', updated_at = datetime('now') WHERE id = ?
   `).run(
     args.title !== undefined ? args.title.trim() : null,
     args.done_means !== undefined ? args.done_means.trim() : null,
@@ -1004,7 +1020,8 @@ export function proposeRemoval(goalId: number, nodeId: number, reason?: string, 
   const childCount = (sqliteDb.prepare(`SELECT COUNT(*) AS n FROM goal_nodes WHERE parent_id = ? AND state != 'discarded'`).get(nodeId) as { n: number }).n;
   if (childCount > 0) throw new GoalError(409, 'node_has_children', 'node has children and cannot be removed directly');
   const actor2 = assertActor(actor, 'jarvis');
-  sqliteDb.prepare(`UPDATE goal_nodes SET pending_removal = 1, pending_by = 'jarvis', updated_at = datetime('now') WHERE id = ?`).run(nodeId);
+  // Mirror of propose_edit: a removal supersedes any pending text edit.
+  sqliteDb.prepare(`UPDATE goal_nodes SET pending_removal = 1, pending_title = NULL, pending_done_means = NULL, pending_by = 'jarvis', updated_at = datetime('now') WHERE id = ?`).run(nodeId);
   insertEvent(goalId, nodeId, actor2, 'removal_proposed', reason ? `Removal proposed: ${reason}` : 'Removal proposed.', reason ? { reason } : undefined);
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
@@ -1118,6 +1135,18 @@ export function unparkGoalNode(goalId: number, nodeId: number, actor?: unknown):
       if (parsed.from) restoreTo = parsed.from as GoalNodeState;
     } catch { /* fall back to 'set' */ }
   }
+  // A hopper tree keeps running while its node is parked. If it finished (or
+  // finished before the park was even recorded), restoring `working` would
+  // strand the node forever — nothing fires goalsOnTreeStatus a second time.
+  if (restoreTo === 'working' && node.tree_id) {
+    const treeDone = node.tree_status_cache === 'done' || getHopperTree(node.tree_id)?.status === 'done';
+    if (treeDone) {
+      restoreTo = 'check';
+      sqliteDb.prepare(`UPDATE goal_nodes SET tree_status_cache = 'done' WHERE id = ?`).run(nodeId);
+      insertEvent(goalId, nodeId, 'system', 'tree_done', `Tree finished while parked: ${node.title}`, { tree_id: node.tree_id });
+    }
+  }
+
   sqliteDb.prepare(`UPDATE goal_nodes SET state = ?, updated_at = datetime('now') WHERE id = ?`).run(restoreTo, nodeId);
   insertEvent(goalId, nodeId, act, 'node_unparked', `Unparked to ${restoreTo}.`);
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
@@ -1157,7 +1186,13 @@ export function setLeafKind(goalId: number, nodeId: number, leafKindInput: unkno
   if (leafKindInput !== 'none' && childCount > 0) {
     throw new GoalError(409, 'node_has_children', 'node has non-discarded children and cannot be classified as a leaf');
   }
-  if (!['ghost', 'set', 'planned', 'working', 'check'].includes(node.state)) {
+  // Re-classifying a leaf after dispatch would clear the plan out from under a
+  // live hopper tree (and orphan tree_id), so leaf kind is frozen from `planned`
+  // onward — CONTRACT §1.1's `leaf_already_dispatched` rule.
+  if (['planned', 'working', 'check'].includes(node.state)) {
+    throw new GoalError(409, 'leaf_already_dispatched', `node is ${node.state}; leaf_kind is frozen once a leaf has been dispatched`, { from: node.state, to: node.state });
+  }
+  if (!['ghost', 'set'].includes(node.state)) {
     throw new GoalError(409, 'invalid_transition', `node is ${node.state}, leaf_kind cannot be changed`, { from: node.state, to: node.state });
   }
   const act = assertActor(actor, 'jarvis');
@@ -1350,13 +1385,23 @@ export function approvePlan(goalId: number, nodeId: number, actor?: unknown): {
 export function goalsOnTreeStatus(treeId: string, status: 'done' | 'blocked' | 'active'): void {
   const node = sqliteDb.prepare(`SELECT * FROM goal_nodes WHERE tree_id = ?`).get(treeId) as GoalNodeDbRow | undefined;
   if (!node) return;
+  // A reopened node (check -> set) KEEPS its old tree_id for reference
+  // (CONTRACT route 25), so a late status callback from that finished tree must
+  // not paint a badge onto — or re-flip — a node that has moved on.
+  if (node.state !== 'working' && node.state !== 'parked') return;
+
   if (status === 'done') {
-    if (node.state !== 'working') return;
-    sqliteDb.prepare(`UPDATE goal_nodes SET state = 'check', tree_status_cache = 'done', updated_at = datetime('now') WHERE id = ?`).run(node.id);
-    insertEvent(node.goal_id, node.id, 'system', 'tree_done', `Tree finished: ${node.title}`, { tree_id: treeId });
+    // Parked-while-working is legal (CONTRACT §2.1) and the engine keeps
+    // running. Record the completion on the cache so unpark can land the node
+    // on `check` instead of stranding it at `working` with a finished tree.
+    sqliteDb.prepare(`UPDATE goal_nodes SET tree_status_cache = 'done', updated_at = datetime('now') WHERE id = ?`).run(node.id);
+    if (node.state === 'working') {
+      sqliteDb.prepare(`UPDATE goal_nodes SET state = 'check', updated_at = datetime('now') WHERE id = ?`).run(node.id);
+    }
+    insertEvent(node.goal_id, node.id, 'system', 'tree_done', `Tree finished: ${node.title}`, { tree_id: treeId, parked: node.state === 'parked' });
     emitNode('updated', getRawNodeStmt.get(node.id) as GoalNodeDbRow);
   } else if (status === 'blocked') {
-    if (node.tree_status_cache === 'blocked') return; // fire once per transition
+    if (node.tree_status_cache === 'blocked' || node.tree_status_cache === 'done') return; // fire once per transition
     sqliteDb.prepare(`UPDATE goal_nodes SET tree_status_cache = 'blocked', updated_at = datetime('now') WHERE id = ?`).run(node.id);
     insertEvent(node.goal_id, node.id, 'system', 'tree_blocked', `Tree blocked: ${node.title}`, { tree_id: treeId });
     emitNode('updated', getRawNodeStmt.get(node.id) as GoalNodeDbRow);
@@ -1512,7 +1557,7 @@ function pendingLabel(n: GoalNodeDbRow): string {
 }
 
 function escapeAttr(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 /** CONTRACT §6 — injected once per turn for `cockpit:goal-<id>` threads only.
@@ -1566,16 +1611,13 @@ export function buildGoalThreadContext(externalId: string): string {
         const marker = nodeMarker(n) + (isFocused ? ' ▶' : '');
         const stub = n.promoted_to_goal_id ? ` → goal #${n.promoted_to_goal_id}` : '';
         const doneMeans = n.done_means ? n.done_means : '(no done_means yet)';
-        lines.push(`${indent}- [${marker}] #${n.id} ${n.title}${stub} — done: ${doneMeans}`);
         const children = byParent.get(n.id) ?? [];
-        if (!children.length) continue;
-        const showChildren = focusNode ? (n.id === focusNode.id || ancestorIds.has(n.id)) : depth === 0;
-        if (showChildren) {
-          walk(n.id, depth + 1);
-        } else {
-          const hidden = countDescendants(n.id);
-          if (hidden > 0) lines.push(`${indent}  (+${hidden} more)`);
-        }
+        const showChildren = children.length > 0
+          && (focusNode ? (n.id === focusNode.id || ancestorIds.has(n.id)) : depth === 0);
+        const hidden = children.length && !showChildren ? countDescendants(n.id) : 0;
+        const collapsed = hidden > 0 ? ` (+${hidden})` : '';
+        lines.push(`${indent}- [${marker}] #${n.id} ${n.title}${stub} — done: ${doneMeans}${collapsed}`);
+        if (showChildren) walk(n.id, depth + 1);
       }
     }
     walk(null, 0);

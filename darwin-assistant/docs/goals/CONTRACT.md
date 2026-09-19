@@ -344,6 +344,7 @@ Emission rules: one `goal_node` per affected node row (a batch of 6 ghosts = 6 e
 | `set_from_kevin` | `parent_id` (same default), `title`, `done_means`, `notes?`, `leaf_kind?` | POST …/nodes with `authored_by='kevin'` | `{ node }` (born set) |
 | `accept` | `node_id?` \| `batch_id?` \| `all:true` (+ `parent_id?` for all) — exactly one | routes 11/12/13 — **use ONLY when Kevin said yes in this conversation** ("yep", "go", "✓ all"); never accept your own proposal unprompted | `{ nodes }` |
 | `discard` | `node_id?` \| `batch_id?` — exactly one | routes 14/15 | `{ nodes }` |
+| `edit_ghost` | `node_id`, `title?`, `done_means?`, `notes?` | route 16 PATCH with `actor='jarvis'` — reword YOUR OWN still-ghost proposal in place while Kevin talks it through (DESIGN: "we'd talk about it a little bit more and watch it change"). The server 403s `jarvis_must_propose` on anything already set, so this cannot write real content. Do NOT discard + re-propose to reword — that loses the row and its batch bracket. | `{ node }` |
 | `propose_edit` | `node_id`, `title?`, `done_means?` | route 17 | `{ node }` |
 | `propose_remove` | `node_id`, `reason?` | route 18 | `{ node }` |
 | `set_leaf_kind` | `node_id`, `leaf_kind` | route 20 | `{ node }` |
@@ -356,7 +357,9 @@ Emission rules: one `goal_node` per affected node row (a batch of 6 ghosts = 6 e
 | `promote` | `node_id` | route 27 | `{ goal, node, thread }` — the tool ALSO posts `seed_text` to the new thread via the internal ingest so the promoted goal's chat boots (tool-side only; HTTP callers do the 2-step) |
 | `focus` | `node_id: number \| null` | PUT focus with `set_by='jarvis'` — use sparingly (e.g. right after Kevin accepts a batch, focus the first child so the next layer proposal lands there) | `{ focus }` |
 
-Arg schema (JSON-schema, for the tool `parameters`): `operation` enum of the ops above incl. `set_goal_done_means` (required); `goal_id`, `node_id`, `parent_id` (number \| null), `batch_id` (string), `all` (boolean), `items` (array of objects `{title, done_means, notes?, leaf_kind?}`), `title`, `done_means`, `notes`, `leaf_kind` (enum), `plan` (object), `passed` (boolean), `note`, `reason`, `text`, `goal` (boolean). Every op returns `{ error: string }` (not a throw) on precondition failure, echoing the server's `error.code` + message so JARVIS can explain it to Kevin.
+Arg schema (JSON-schema, for the tool `parameters`): `operation` enum of the ops above incl. `set_goal_done_means` (required); `goal_id`, `node_id`, `parent_id` (number \| null), `batch_id` (string), `all` (boolean), `items` (array of objects `{title, done_means, notes?, leaf_kind?}`), `title`, `done_means`, `notes`, `leaf_kind` (enum), `plan` (object), `passed` (boolean), `note`, `reason`, `text`, `goal` (boolean).
+
+> **Added by the review node (#460), additive per this file's preamble:** the `edit_ghost` op above. §3.2 route 16 always allowed `actor='jarvis'` to PATCH a ghost, but §5's op table had no way to reach it, so the only way for JARVIS to reword a proposal mid-conversation was discard + re-propose — which destroys the ghost row and its batch bracket under Kevin's cursor. The op is a thin wrapper over the existing route; the ghost-only guard is unchanged and still server-side. Every op returns `{ error: string }` (not a throw) on precondition failure, echoing the server's `error.code` + message so JARVIS can explain it to Kevin.
 
 ---
 

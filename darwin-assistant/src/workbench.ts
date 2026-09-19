@@ -684,10 +684,15 @@ export function listPendingProposalBatches(): WorkbenchProposalBatch[] {
   }));
 }
 
+/** Inserts `item` (and recursively, its children as nested ghosts) and pushes
+ *  EVERY row created — the item itself plus all descendants — onto `acc`, so
+ *  a caller processing a whole decomposition tree gets back every row it
+ *  actually wrote, not just the top-level ones. Returns the item's own row. */
 function insertProposalItem(
   batchId: string,
   item: DecompositionItem,
   opts: { parentNodeId: number | null; parentProposalId: number | null; sortOrder: number; createdByThread: string | null },
+  acc: WorkbenchProposalRow[],
 ): WorkbenchProposalRow {
   const info = insertProposalStmt.run(
     batchId,
@@ -699,10 +704,12 @@ function insertProposalItem(
     opts.createdByThread,
   );
   const id = Number(info.lastInsertRowid);
+  const row = getProposalStmt.get(id)!;
+  acc.push(row);
   (item.children ?? []).forEach((child, idx) => {
-    insertProposalItem(batchId, child, { parentNodeId: null, parentProposalId: id, sortOrder: idx, createdByThread: opts.createdByThread });
+    insertProposalItem(batchId, child, { parentNodeId: null, parentProposalId: id, sortOrder: idx, createdByThread: opts.createdByThread }, acc);
   });
-  return getProposalStmt.get(id)!;
+  return row;
 }
 
 /** The `workbench` tool's `propose_batch` op (and, in principle, any future
@@ -720,9 +727,11 @@ export function proposeBatch(
   const batchId = randomUUID();
   const parentNodeId = opts.parentNodeId ?? null;
   const createdByThread = opts.createdByThread ?? null;
-  const run = sqliteDb.transaction((): WorkbenchProposalRow[] =>
-    items.map((item, idx) => insertProposalItem(batchId, item, { parentNodeId, parentProposalId: null, sortOrder: idx, createdByThread })),
-  );
+  const run = sqliteDb.transaction((): WorkbenchProposalRow[] => {
+    const acc: WorkbenchProposalRow[] = [];
+    items.forEach((item, idx) => insertProposalItem(batchId, item, { parentNodeId, parentProposalId: null, sortOrder: idx, createdByThread }, acc));
+    return acc;
+  });
   const proposals = run();
   emitProposal('created', batchId);
   return { batch_id: batchId, proposals };

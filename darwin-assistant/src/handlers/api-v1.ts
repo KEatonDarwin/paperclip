@@ -2742,6 +2742,49 @@ export function createApiV1Router(): Router {
     });
   });
 
+  // V2 "Sessions" (SPEC.md "V2 — THE INTERACTION CORRECTION"): the docked
+  // chat bar talks to ONE ongoing brain session per sitting, never a
+  // per-node thread. This route never itself posts to /threads/:ext/messages
+  // — same 2-step create-then-post pattern as hopper promote (RECON-V2.md
+  // §2/§6): the client takes {external_id, seed_text, wrapped_text} and does
+  // that POST itself.
+  router.post('/workbench/say', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { text?: unknown; focus_id?: unknown; force_new?: unknown };
+    const text = typeof body.text === 'string' ? body.text.trim() : '';
+    if (!text) {
+      sendError(res, 400, 'invalid_request', 'text is required and must be a non-empty string');
+      return;
+    }
+
+    let focusId: number | null = null;
+    if (body.focus_id !== undefined && body.focus_id !== null) {
+      const parsed = typeof body.focus_id === 'number' ? body.focus_id : parseInt(String(body.focus_id), 10);
+      if (Number.isNaN(parsed) || !getSmartTodoNode(parsed)) {
+        sendError(res, 404, 'smart_todo_not_found', `focus node ${String(body.focus_id)} not found`);
+        return;
+      }
+      focusId = parsed;
+    }
+
+    const forceNew = body.force_new === true;
+    const result = composeBrainSay(text, focusId, { forceNew });
+    // 201 when this call just started a fresh sitting (seed_text present), 200
+    // when it's reusing the still-open session — mirrors /workbench/:id/open-chat's
+    // new-vs-reused status convention just above.
+    res.status(result.seed_text !== null ? 201 : 200).json(result);
+  });
+
+  // Read-only session discovery for the docked bar's mount — lets a page
+  // reload mid-sitting resolve the already-open session (and render its
+  // Timeline via the existing GET /threads/:ext) instead of looking like a
+  // fresh sitting with nothing to fetch (RECON-V2.md §4's gap). Never
+  // extends last_activity_at — a page load must not itself keep a sitting
+  // alive.
+  router.get('/workbench/session', (_req: AuthedRequest, res) => {
+    const open = peekOpenWorkbenchSession();
+    res.json(open ? { external_id: open.thread_ext, last_activity_at: open.last_activity_at } : { external_id: null });
+  });
+
   // V2 "Dispatch" (SPEC.md "V2 — THE INTERACTION CORRECTION"): explicit,
   // deliberate worker dispatch attached to ONE node — never spawned on
   // click/zoom. Spawns an ephemeral cockpit worker in-process (same pattern as

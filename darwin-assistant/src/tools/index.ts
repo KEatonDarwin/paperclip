@@ -138,6 +138,7 @@ import { notifications } from './notifications-tool.js';
 import { intakeDeploy } from './intake-deploy.js';
 import { cockpitDeploy } from './cockpit-deploy.js';
 import { getMemberThread } from './group-chat-tool.js';
+import { goals } from './goals-tool.js';
 
 function instrumentTool(tool: ToolDef): ToolDef {
   return {
@@ -207,6 +208,7 @@ export const ALL_TOOLS: ToolDef[] = [
   intakeDeploy,
   cockpitDeploy,
   getMemberThread,
+  goals,
 ].map(instrumentTool);
 
 export const TOOL_MAP: Map<string, ToolDef> = new Map(

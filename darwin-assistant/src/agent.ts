@@ -29,6 +29,7 @@ import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent,
 import { buildGroupChatContext } from './group-chat-context.js';
 import { buildQuickChatContext } from './quick-chat-profiles.js';
 import { buildWorkbenchThreadContext } from './workbench.js';
+import { buildGoalThreadContext } from './goals.js';
 import { dirname } from 'node:path';
 import type { SavedImage } from './image-store.js';
 
@@ -1398,6 +1399,10 @@ async function runConversationTurn(
   // turn instead of a one-time seed post (nothing is posted on open anymore).
   // '' for every non-workbench thread — see buildWorkbenchThreadContext.
   const workbenchContextBlock = buildWorkbenchThreadContext(conv.external_id);
+  // GOALS (CONTRACT.md §6) — the goal-driven development surface. Every turn
+  // of a `cockpit:goal-<id>` thread gets a fresh <goal_focus/>+<goal_tree>
+  // snapshot instead of transcript memory. '' for every other thread.
+  const goalContextBlock = buildGoalThreadContext(conv.external_id);
 
   // DAR-744: hand the model an absolute file path per attached image, mirroring
   // the working vision-critique.ts pattern (local claude CLI reads an image when
@@ -1412,7 +1417,7 @@ async function runConversationTurn(
     ? `<attached_images>\nThe user attached ${images.length} image(s) to this message. Open and look at each one now before responding — absolute paths:\n${images.map((img) => `- ${img.absPath}`).join('\n')}\n</attached_images>\n\n`
     : '';
 
-  const perTurnContextPrefix = threadContextLine + autonomyDialLine + groupContextBlock + quickChatContextBlock + workbenchContextBlock + imageBlock;
+  const perTurnContextPrefix = threadContextLine + autonomyDialLine + groupContextBlock + quickChatContextBlock + workbenchContextBlock + goalContextBlock + imageBlock;
 
   // The resume path re-injects memory on EVERY turn that has a live sessionId
   // (the common case), so an uncapped loadMemoryBlock() here was the dominant

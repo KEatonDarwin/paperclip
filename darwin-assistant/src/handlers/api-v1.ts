@@ -101,6 +101,13 @@ import {
   unparkGoalNode,
   getGoalFocus,
   setGoalFocus,
+  setLeafKind,
+  proposePlan,
+  rejectPlan,
+  approvePlan,
+  promoteNode,
+  getNodeTreeOverlay,
+  getOrCreateGoalThread,
 } from '../goals.js';
 import {
   DETAIL_EVENT_LIMIT,
@@ -2300,6 +2307,22 @@ export function createApiV1Router(): Router {
     }
   });
 
+  // Find-or-create the goal's dedicated thread (CONTRACT §8). In practice
+  // `POST /goals` already creates+links the thread eagerly, so this mostly
+  // returns created:false — it exists for the edge case (thread_ext missing
+  // or its conversation row gone) and for symmetry with the promote/discuss
+  // 2-step pattern. GET and POST behave identically.
+  const goalThreadHandler = (req: AuthedRequest, res: Response) => {
+    const id = parseInt(String(req.params.id), 10);
+    try {
+      res.json(getOrCreateGoalThread(id));
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  };
+  router.get('/goals/:id/thread', goalThreadHandler);
+  router.post('/goals/:id/thread', goalThreadHandler);
+
   // -- Nodes ------------------------------------------------------------------
 
   router.post('/goals/:id/nodes', (req: AuthedRequest, res) => {
@@ -2543,6 +2566,73 @@ export function createApiV1Router(): Router {
     }
     try {
       res.json({ focus: setGoalFocus(goalId, body.node_id, body.set_by) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  // -- leaf_kind / plan / dispatch / promote / tree overlay (BACKEND B) ------
+
+  router.post('/goals/:id/nodes/:nodeId/leaf_kind', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { leaf_kind?: unknown; actor?: unknown };
+    try {
+      res.json({ node: setLeafKind(goalId, nodeId, body.leaf_kind, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/propose_plan', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { plan?: unknown; actor?: unknown };
+    try {
+      res.json({ node: proposePlan(goalId, nodeId, body.plan, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/reject_plan', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { reason?: unknown; actor?: unknown };
+    try {
+      res.json({ node: rejectPlan(goalId, nodeId, typeof body.reason === 'string' ? body.reason : undefined, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/approve_plan', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { actor?: unknown };
+    try {
+      res.json(approvePlan(goalId, nodeId, body.actor));
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/promote', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { actor?: unknown };
+    try {
+      res.status(201).json(promoteNode(goalId, nodeId, body.actor));
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.get('/goals/:id/nodes/:nodeId/tree', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    try {
+      res.json(getNodeTreeOverlay(goalId, nodeId));
     } catch (err) {
       sendCaughtGoalError(res, err);
     }

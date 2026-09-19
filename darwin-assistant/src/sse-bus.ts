@@ -17,6 +17,7 @@ import type { WorkstreamWithDetails } from './workstreams.js';
 import type { MonitorRow, MonitorRunRow } from './monitors.js';
 import type { FoundryModuleResponse, FoundryProjectResponse } from './foundry.js';
 import type { IntelItem, IntelRun } from './intel-desk.js';
+import type { GoalSummary, GoalNodeRow, FocusRow } from './goals.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -306,6 +307,26 @@ export interface IntelItemEvent {
   item: IntelItem;
 }
 
+// GOALS — the goal-driven development surface. Global like HopperItemEvent
+// (no conversationId); the cockpit filters by goal_id client-side.
+export interface GoalEvent {
+  type: 'goal';
+  action: 'created' | 'updated' | 'deleted';
+  goal: GoalSummary;
+}
+export interface GoalNodeEvent {
+  type: 'goal_node';
+  action: 'created' | 'updated' | 'deleted';
+  goal_id: number;
+  node: GoalNodeRow;
+  batch_id?: string;
+}
+export interface GoalFocusEvent {
+  type: 'goal_focus';
+  goal_id: number;
+  focus: FocusRow;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
@@ -317,7 +338,8 @@ export type SSEEvent =
   | ThreadGroupEvent | NotificationEvent
   | DispatchEvent | DispatchCueEvent | HopperItemEvent | HopperNodeEvent | SmartTodoEvent
   | WorkstreamEvent | MonitorEvent | MonitorRunEvent | FoundryProjectEvent | FoundryModuleEvent
-  | IntelRunEvent | IntelItemEvent | WorkbenchProposalEvent;
+  | IntelRunEvent | IntelItemEvent | WorkbenchProposalEvent
+  | GoalEvent | GoalNodeEvent | GoalFocusEvent;
 
 class SSEBus extends EventEmitter {}
 

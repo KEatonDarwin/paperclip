@@ -1,0 +1,865 @@
+// GOALS LIFECYCLE SIM (hopper node #459) — drives the real goals.ts + hopper-engine.ts
+// through the express router on a throwaway port, against a SCRATCH sqlite DB.
+// No live model calls: the hopper engine's worker spawn is stubbed with a fake
+// processMessage (mirrors scripts/foundry-sim.mjs's fakeProcessMessage), and we
+// never POST to /threads/:ext/messages (which would run a real agent.ts turn).
+//
+//   npm run build
+//   npm run goals:sim
+//   (or: JARVIS_DB_PATH=/tmp/goals-sim.db HOPPER_GOV_ENABLED=0 npx tsx scripts/goals-sim.ts)
+//
+// Writes a full pass/fail report to
+// /home/kevin/obsidian/paperclip-wiki/outbox/goals/sim-report.md.
+
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(__dirname, '..');
+
+// ── scratch DB guard (must run before any dist/ module is imported — ──────
+// conversation-db.js opens the sqlite handle at import time) ──────────────
+const raw = process.env.JARVIS_DB_PATH ?? '/tmp/goals-sim.db';
+const DB_PATH = path.resolve(raw);
+const LIVE_DB = path.resolve('/home/kevin/paperclip/darwin-assistant/jarvis.db');
+if (DB_PATH === LIVE_DB) {
+  console.error('FATAL: refusing to run against the live jarvis.db. Use a /tmp scratch path.');
+  process.exit(1);
+}
+process.env.JARVIS_DB_PATH = DB_PATH;
+for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) fs.rmSync(p, { force: true });
+console.log(`[goals-sim] scratch DB: ${DB_PATH}`);
+
+// No real model calls anywhere in this file's checks. Governor disabled +
+// generous slots so dispatchTick claims ready hopper leaves immediately.
+process.env.HOPPER_GOV_ENABLED = '0';
+process.env.HOPPER_ENGINE_SLOTS = process.env.HOPPER_ENGINE_SLOTS ?? '8';
+delete process.env.ANTHROPIC_API_KEY;
+
+const distDir = path.join(repoRoot, 'dist');
+const express = (await import('express')).default;
+const { createApiV1Router } = await import(path.join(distDir, 'handlers', 'api-v1.js'));
+const { mintApiKey } = await import(path.join(distDir, 'api-keys.js'));
+const hopperEngine = await import(path.join(distDir, 'hopper-engine.js'));
+const goalsModule = await import(path.join(distDir, 'goals.js'));
+
+// ── fake worker — no model calls, mirrors scripts/foundry-sim.mjs exactly ──
+const dispatchedNodeIds = new Set<number>();
+async function fakeProcessMessage(prompt: string): Promise<string> {
+  const m = /node #(\d+)/.exec(prompt);
+  if (m) dispatchedNodeIds.add(Number(m[1]));
+  return 'FAKE_WORKER_OK — no model call made.';
+}
+hopperEngine.startHopperEngine(fakeProcessMessage);
+
+// ── real express app, real HTTP, throwaway port ────────────────────────────
+const app = express();
+app.use(express.json());
+app.use('/api/v1', createApiV1Router());
+const server = await new Promise<import('node:http').Server>((resolve) => {
+  const s = app.listen(0, '127.0.0.1', () => resolve(s as import('node:http').Server));
+});
+const address = server.address();
+const port = typeof address === 'object' && address ? address.port : 0;
+const base = `http://127.0.0.1:${port}/api/v1`;
+console.log(`[goals-sim] server: ${base}`);
+
+const cockpitKey = mintApiKey('goals-sim-admin', 'cockpit').plaintext; // admin scope
+const jarvisKey = mintApiKey('goals-sim-jarvis', 'jarvis').plaintext; // non-admin scope
+
+type ReqOpts = { token?: string; body?: unknown };
+async function req(method: string, urlPath: string, opts: ReqOpts = {}): Promise<{ status: number; json: any }> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (opts.token) headers['Authorization'] = `Bearer ${opts.token}`;
+  const res = await fetch(`${base}${urlPath}`, {
+    method,
+    headers,
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+  });
+  const json = await res.json().catch(() => null);
+  return { status: res.status, json };
+}
+function get(p: string, token = cockpitKey) {
+  return req('GET', p, { token });
+}
+function post(p: string, body: unknown = {}, token = cockpitKey) {
+  return req('POST', p, { token, body });
+}
+function patch(p: string, body: unknown = {}, token = cockpitKey) {
+  return req('PATCH', p, { token, body });
+}
+function put(p: string, body: unknown = {}, token = cockpitKey) {
+  return req('PUT', p, { token, body });
+}
+
+async function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Poll a condition (used to let dispatchTick's queueMicrotask + async claim
+// loop settle after agreeHopperTree, without a fixed arbitrary sleep).
+async function waitFor(label: string, fn: () => Promise<boolean>, timeoutMs = 4000, stepMs = 40): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await fn()) return;
+    await sleep(stepMs);
+  }
+  throw new Error(`waitFor timed out: ${label}`);
+}
+
+// ── result collection — never abort the whole run on one failure ───────────
+type Result = { id: string; description: string; pass: boolean; error?: string };
+const results: Result[] = [];
+async function check(id: string, description: string, fn: () => void | Promise<void>): Promise<void> {
+  try {
+    await fn();
+    results.push({ id, description, pass: true });
+    console.log(`  ✓ [${id}] ${description}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    results.push({ id, description, pass: false, error: msg });
+    console.log(`  ✗ [${id}] ${description}\n      ${msg}`);
+  }
+}
+
+// ── SSE capture (real HTTP GET /api/v1/events, both admin + non-admin keys) ─
+type SSECapture = { close: () => void; events: { type: string }[] };
+function captureSSE(token: string): SSECapture {
+  const events: { type: string }[] = [];
+  const ctrl = new AbortController();
+  (async () => {
+    try {
+      const res = await fetch(`${base}/events`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: ctrl.signal,
+      });
+      if (!res.body) return;
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          const chunk = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const dataLine = chunk.split('\n').find((l) => l.startsWith('data: '));
+          if (dataLine) {
+            try {
+              const parsed = JSON.parse(dataLine.slice(6));
+              events.push(parsed);
+            } catch { /* heartbeat or malformed, ignore */ }
+          }
+        }
+      }
+    } catch {
+      // aborted on close — expected
+    }
+  })();
+  return { close: () => ctrl.abort(), events };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+try {
+  console.log('\n[SETUP] two SSE streams (admin=cockpit-scope, non-admin=jarvis-scope)');
+  const sseAdmin = captureSSE(cockpitKey);
+  const sseNonAdmin = captureSSE(jarvisKey);
+  await sleep(150); // let the connections establish before anything fires
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[1] Goal creation: ghost -> set, thread eagerly created');
+  let goalId = -1;
+  let humanThreadCreated = false;
+  await check('1a', 'POST /goals without done_means -> ghost goal + thread created eagerly', async () => {
+    const r = await post('/goals', { title: 'Ship Perclickity v2 media-buy stats' });
+    assert.equal(r.status, 201, JSON.stringify(r.json));
+    assert.equal(r.json.goal.status, 'ghost');
+    assert.equal(r.json.goal.authored_by, 'kevin');
+    goalId = r.json.goal.id;
+    assert.equal(r.json.thread.created, true);
+    assert.equal(r.json.thread.external_id, `cockpit:goal-${goalId}`);
+    assert.ok(typeof r.json.thread.seed_text === 'string' && r.json.thread.seed_text.includes('GOAL CHAT'));
+    humanThreadCreated = true;
+  });
+
+  await check('1b', 'GET /goals/:id/thread on an already-created thread -> created:false, seed_text:null', async () => {
+    const r = await get(`/goals/${goalId}/thread`);
+    assert.equal(r.status, 200);
+    assert.equal(r.json.created, false);
+    assert.equal(r.json.seed_text, null);
+    assert.equal(r.json.external_id, `cockpit:goal-${goalId}`);
+  });
+
+  await check('1c', 'PATCH done_means on a ghost goal flips it to set', async () => {
+    const r = await patch(`/goals/${goalId}`, {
+      done_means: 'Kevin can see media-buy revenue per link in the dashboard, reconciled to QB',
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.goal.status, 'set');
+  });
+
+  await check('1d', 'POST /goals {title, done_means} together -> set directly (no ghost step)', async () => {
+    const r = await post('/goals', { title: 'Throwaway direct-set goal', done_means: 'exists for one assertion' });
+    assert.equal(r.status, 201);
+    assert.equal(r.json.goal.status, 'set');
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[2] Nodes: authored_by=kevin (born set) vs authored_by=jarvis (born ghost)');
+  await check('2a', 'POST node authored_by=kevin without done_means -> 409 done_means_required', async () => {
+    const r = await post(`/goals/${goalId}/nodes`, { title: 'No done means', authored_by: 'kevin' });
+    assert.equal(r.status, 409);
+    assert.equal(r.json.error.code, 'done_means_required');
+  });
+
+  let kevinNodeId = -1;
+  await check('2b', 'POST node authored_by=kevin WITH done_means -> born set', async () => {
+    const r = await post(`/goals/${goalId}/nodes`, {
+      title: 'Kevin-dictated root node',
+      done_means: 'a Kevin-authored acceptance criterion',
+      authored_by: 'kevin',
+    });
+    assert.equal(r.status, 201);
+    assert.equal(r.json.node.state, 'set');
+    assert.equal(r.json.node.authored_by, 'kevin');
+    kevinNodeId = r.json.node.id;
+  });
+
+  let soloGhostId = -1;
+  let soloGhostBatch = '';
+  await check('2c', 'POST node authored_by=jarvis -> born ghost, own batch', async () => {
+    const r = await post(`/goals/${goalId}/nodes`, {
+      title: 'JARVIS solo proposal',
+      done_means: 'a jarvis-authored ghost',
+      authored_by: 'jarvis',
+    });
+    assert.equal(r.status, 201);
+    assert.equal(r.json.node.state, 'ghost');
+    assert.ok(r.json.node.proposal_batch);
+    soloGhostId = r.json.node.id;
+    soloGhostBatch = r.json.node.proposal_batch;
+  });
+
+  await check('2d', "PATCH (direct edit) on a ghost as actor=jarvis is allowed (it's JARVIS's own proposal)", async () => {
+    const r = await patch(`/goals/${goalId}/nodes/${soloGhostId}`, { title: 'JARVIS solo proposal (reworded)', actor: 'jarvis' });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.title, 'JARVIS solo proposal (reworded)');
+  });
+
+  await check('2e', 'discard the solo ghost (not needed further)', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${soloGhostId}/discard`, {});
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.state, 'discarded');
+  });
+  void soloGhostBatch;
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[3] propose 4 ghosts (root-level) — nesting + parent-not-set guards');
+  await check('3a', 'propose with nested items[].children -> 400 no_nesting', async () => {
+    const r = await post(`/goals/${goalId}/nodes/propose`, {
+      parent_id: null,
+      items: [{ title: 'x', done_means: 'y', children: [{ title: 'grandchild' }] }],
+    });
+    assert.equal(r.status, 400);
+    assert.equal(r.json.error.code, 'no_nesting');
+  });
+
+  await check('3b', 'propose under a ghost parent -> 409 parent_not_set', async () => {
+    const ghostParent = await post(`/goals/${goalId}/nodes`, {
+      title: 'transient ghost parent',
+      done_means: 'x',
+      authored_by: 'jarvis',
+    });
+    const r = await post(`/goals/${goalId}/nodes/propose`, {
+      parent_id: ghostParent.json.node.id,
+      items: [{ title: 'child of a ghost', done_means: 'x' }],
+    });
+    assert.equal(r.status, 409);
+    assert.equal(r.json.error.code, 'parent_not_set');
+    await post(`/goals/${goalId}/nodes/${ghostParent.json.node.id}/discard`, {});
+  });
+
+  let batchId = '';
+  let fourIds: number[] = [];
+  await check('3c', 'propose 4 ghosts under the goal root -> one shared batch', async () => {
+    const r = await post(`/goals/${goalId}/nodes/propose`, {
+      parent_id: null,
+      items: [
+        { title: 'Media-buy stats', done_means: '/stats page shows revenue per linkId for any date range' },
+        { title: 'QB reconciliation', done_means: 'monthly totals match QB within $1' },
+        { title: 'Docs', done_means: 'outbox/perclickity-v2.md reviewed' },
+        { title: 'A ghost we will reject', done_means: "doesn't survive review" },
+      ],
+      actor: 'jarvis',
+    });
+    assert.equal(r.status, 201);
+    assert.equal(r.json.nodes.length, 4);
+    assert.ok(r.json.nodes.every((n: any) => n.state === 'ghost'));
+    batchId = r.json.batch_id;
+    fourIds = r.json.nodes.map((n: any) => n.id);
+  });
+
+  let mediaBuyId = -1, qbId = -1, docsId = -1, rejectId = -1;
+  await check('4a', 'accept 3 of the 4 via batch accept (ids subset)', async () => {
+    [mediaBuyId, qbId, docsId, rejectId] = fourIds;
+    const r = await post(`/goals/${goalId}/batches/${batchId}/accept`, { ids: [mediaBuyId, qbId, docsId] });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.nodes.length, 3);
+    assert.ok(r.json.nodes.every((n: any) => n.state === 'set'));
+    assert.ok(r.json.nodes.every((n: any) => n.proposal_batch === null), 'batch cleared on accepted rows');
+  });
+
+  await check('4b', 'discard the 4th ghost individually', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${rejectId}/discard`, { reason: 'not aligned with the goal' });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.state, 'discarded');
+  });
+
+  await check('4c', 'accept_all with no remaining ghosts -> { nodes: [] } 200', async () => {
+    const r = await post(`/goals/${goalId}/accept_all`, {});
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json.nodes, []);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[5] focus + propose children under the focused node');
+  let focusEventSeenAtCount = 0;
+  await check('5a', 'PUT focus on Media-buy stats -> goal_focus SSE fires', async () => {
+    const before = sseAdmin.events.filter((e) => e.type === 'goal_focus').length;
+    const r = await put(`/goals/${goalId}/focus`, { node_id: mediaBuyId });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.focus.node_id, mediaBuyId);
+    await waitFor('goal_focus SSE after PUT focus', async () => sseAdmin.events.filter((e) => e.type === 'goal_focus').length > before);
+    focusEventSeenAtCount = sseAdmin.events.filter((e) => e.type === 'goal_focus').length;
+  });
+
+  await check('5b', 'PUT focus on the SAME node again -> no new focus_set event/SSE (repeat click is a no-op)', async () => {
+    const r = await put(`/goals/${goalId}/focus`, { node_id: mediaBuyId });
+    assert.equal(r.status, 200);
+    await sleep(150);
+    assert.equal(
+      sseAdmin.events.filter((e) => e.type === 'goal_focus').length,
+      focusEventSeenAtCount,
+      'no additional goal_focus SSE on an unchanged focus',
+    );
+  });
+
+  await check('5c', 'PUT focus on a discarded node -> 409', async () => {
+    const r = await put(`/goals/${goalId}/focus`, { node_id: rejectId });
+    assert.equal(r.status, 409);
+  });
+
+  let machineChildId = -1, humanChildId = -1;
+  await check('5d', 'propose 2 children under the focused node (Media-buy stats), one layer only', async () => {
+    const r = await post(`/goals/${goalId}/nodes/propose`, {
+      parent_id: mediaBuyId,
+      items: [
+        { title: 'Create monitoring', done_means: 'an Overwatch query rule fails when daily revenue < 7-day avg -5%' },
+        { title: 'Kevin places the redirect', done_means: 'redirect live on prod' },
+      ],
+      actor: 'jarvis',
+    });
+    assert.equal(r.status, 201);
+    assert.equal(r.json.nodes.length, 2);
+    machineChildId = r.json.nodes[0].id;
+    humanChildId = r.json.nodes[1].id;
+  });
+
+  await check('5e', 'accept both children (accept_all scoped to parent_id)', async () => {
+    const r = await post(`/goals/${goalId}/accept_all`, { parent_id: mediaBuyId });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.nodes.length, 2);
+    assert.ok(r.json.nodes.every((n: any) => n.state === 'set'));
+  });
+
+  await check('5f', 'propose_removal on a SET node WITH (non-discarded) children -> 409 node_has_children', async () => {
+    // Must run while mediaBuyId is still 'set' — propose_removal's base precondition
+    // is state='set' (see the 7f note below), so this is the one legal window to
+    // observe node_has_children specifically (later it's 'check'/'done').
+    const r = await post(`/goals/${goalId}/nodes/${mediaBuyId}/propose_removal`, { reason: 'x' });
+    assert.equal(r.status, 409);
+    assert.equal(r.json.error.code, 'node_has_children');
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[6] leaf kinds: 1 machine, 1 human');
+  await check('6a', "setting leaf_kind on Media-buy stats (has children) -> 409 node_has_children", async () => {
+    const r = await post(`/goals/${goalId}/nodes/${mediaBuyId}/leaf_kind`, { leaf_kind: 'machine' });
+    assert.equal(r.status, 409);
+    assert.equal(r.json.error.code, 'node_has_children');
+  });
+
+  await check('6b', "set 'Create monitoring' leaf_kind=machine", async () => {
+    const r = await post(`/goals/${goalId}/nodes/${machineChildId}/leaf_kind`, { leaf_kind: 'machine' });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.leaf_kind, 'machine');
+  });
+
+  await check('6c', "set 'Kevin places the redirect' leaf_kind=human", async () => {
+    const r = await post(`/goals/${goalId}/nodes/${humanChildId}/leaf_kind`, { leaf_kind: 'human' });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.leaf_kind, 'human');
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[7] machine leaf: invalid plan rejected, valid plan proposed + approved -> hopper tree');
+  await check('7a', 'propose_plan with a fable model -> 400 plan_invalid', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${machineChildId}/propose_plan`, {
+      plan: {
+        what: 'x', deliverable: 'y', model: 'claude-fable-5', adapter: 'claude',
+        nodes: [{ title: 'n1', spec: 's1', adapter: 'claude', model: 'claude-fable-5' }],
+      },
+    });
+    assert.equal(r.status, 400);
+    assert.equal(r.json.error.code, 'plan_invalid');
+  });
+
+  await check('7b', 'propose_plan with an empty nodes[] -> 400 plan_invalid', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${machineChildId}/propose_plan`, {
+      plan: { what: 'x', deliverable: 'y', model: 'claude-sonnet-5', adapter: 'claude', nodes: [] },
+    });
+    assert.equal(r.status, 400);
+  });
+
+  await check('7c', 'valid propose_plan (2 nodes: sonnet build + opus review) -> plan_state=proposed', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${machineChildId}/propose_plan`, {
+      plan: {
+        what: 'Capture the query + register an Overwatch rule.',
+        deliverable: 'rule id returned by lanes-tool',
+        model: 'claude-sonnet-5',
+        adapter: 'claude',
+        estimate: '~30 min',
+        nodes: [
+          { title: 'Capture the SQL from smarty-pants', spec: 'pull the proven query for daily-vs-7-day-avg revenue', adapter: 'claude', model: 'claude-sonnet-5' },
+          { title: 'Register + review the rule', spec: 'register via lanes-tool, then adversarial-review the rule body', adapter: 'claude', model: 'claude-opus-5', depends_on_indexes: [0] },
+        ],
+      },
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.plan_state, 'proposed');
+  });
+
+  let treeId = '';
+  const hopperNodeIds: number[] = [];
+  await check('7d', 'approve_plan -> plan_state=approved, hopper tree created+agreed, node state=working, tree_id linked', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${machineChildId}/approve_plan`, {});
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.node.state, 'working');
+    assert.ok(r.json.node.tree_id);
+    assert.equal(r.json.tree.id, r.json.node.tree_id);
+    assert.equal(r.json.hopper_nodes.length, 2);
+    treeId = r.json.tree.id;
+    for (const n of r.json.hopper_nodes) hopperNodeIds.push(n.id);
+
+    const treeRow = await get(`/hopper-trees/${treeId}`);
+    assert.equal(treeRow.status, 200);
+    assert.equal(treeRow.json.tree.status, 'active');
+  });
+
+  await check('7e', 're-approve_plan on an already-working node -> 409 plan_not_proposed', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${machineChildId}/approve_plan`, {});
+    assert.equal(r.status, 409);
+  });
+
+  await check(
+    '7f',
+    "propose_removal on a working leaf -> 409 (blocked either way; CONTRACT.md §3.3 route 18 names " +
+      "'leaf_already_dispatched' for this case, but proposeRemoval's actual first-hit precondition is " +
+      "'state must be set', so a working node 409s as invalid_transition instead — see sim-report notes, " +
+      "this is a CONTRACT-wording ambiguity flagged for REVIEW-BACKEND, not patched here)",
+    async () => {
+      const r = await post(`/goals/${goalId}/nodes/${machineChildId}/propose_removal`, { reason: 'x' });
+      assert.equal(r.status, 409);
+      assert.equal(r.json.error.code, 'invalid_transition');
+    },
+  );
+
+  await check('7g', 'creating a child under a machine leaf while working -> 409 leaf_already_dispatched', async () => {
+    const r = await post(`/goals/${goalId}/nodes`, {
+      title: 'illegal grandchild', done_means: 'x', parent_id: machineChildId, authored_by: 'kevin',
+    });
+    assert.equal(r.status, 409);
+    assert.equal(r.json.error.code, 'leaf_already_dispatched');
+  });
+
+  await check('7h', 'park a working node -> parked, hopper tree left untouched (still active); unpark restores working', async () => {
+    const parked = await post(`/goals/${goalId}/nodes/${machineChildId}/park`, {});
+    assert.equal(parked.status, 200);
+    assert.equal(parked.json.node.state, 'parked');
+    const treeStillActive = await get(`/hopper-trees/${treeId}`);
+    assert.equal(treeStillActive.json.tree.status, 'active', 'park must not touch the running hopper tree');
+    const unparked = await post(`/goals/${goalId}/nodes/${machineChildId}/unpark`, {});
+    assert.equal(unparked.status, 200);
+    assert.equal(unparked.json.node.state, 'working', 'unpark must restore the exact prior state');
+  });
+
+  await check(
+    '7i',
+    'dispatchTick claims both hopper leaves into running (fake worker, governor disabled)',
+    async () => {
+      await waitFor('hopper nodes -> running', async () => {
+        const overlay = await get(`/goals/${goalId}/nodes/${machineChildId}/tree`);
+        if (overlay.status !== 200) return false;
+        return overlay.json.nodes.filter((n: any) => n.status === 'running').length >= 1;
+      });
+      assert.ok(dispatchedNodeIds.has(hopperNodeIds[0]), 'fake worker prompt should reference node #<id>');
+    },
+  );
+
+  await check('7j', 'finish the first hopper node via POST /hopper-nodes/:id/finish {done} -> second node then claims', async () => {
+    const r = await post(`/hopper-nodes/${hopperNodeIds[0]}/finish`, { outcome: 'done', result: 'query captured.' });
+    assert.equal(r.status, 200);
+    await waitFor('second hopper node -> running (dependency satisfied)', async () => {
+      const overlay = await get(`/goals/${goalId}/nodes/${machineChildId}/tree`);
+      const second = overlay.json.nodes.find((n: any) => n.id === hopperNodeIds[1]);
+      return second?.status === 'running';
+    });
+  });
+
+  await check('7k', 'finish the second hopper node -> tree done -> goalsOnTreeStatus flips the goal node to check', async () => {
+    const r = await post(`/hopper-nodes/${hopperNodeIds[1]}/finish`, { outcome: 'done', result: 'rule registered + reviewed.' });
+    assert.equal(r.status, 200);
+    await waitFor('goal node -> check (tree_done)', async () => {
+      const node = await get(`/goals/${goalId}`).then((res) => res.json.nodes.find((n: any) => n.id === machineChildId));
+      return node?.state === 'check' && node?.tree_status_cache === 'done';
+    });
+    const treeRow = await get(`/hopper-trees/${treeId}`);
+    assert.equal(treeRow.json.tree.status, 'done');
+  });
+
+  await check('7l', 'verify passed:false reopens check->set, plan_state resets to none (tree_id kept for reference)', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${machineChildId}/verify`, { passed: false, note: 'not quite — reopening as a drill' });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.state, 'set');
+    assert.equal(r.json.node.plan_state, 'none');
+    assert.ok(r.json.node.tree_id, 'tree_id kept for reference after reopen');
+  });
+
+  await check('7m', 're-propose + re-approve a plan after reopen plants a NEW tree', async () => {
+    const propose = await post(`/goals/${goalId}/nodes/${machineChildId}/propose_plan`, {
+      plan: {
+        what: 'same work, one node this time.', deliverable: 'rule id', model: 'claude-sonnet-5', adapter: 'claude',
+        nodes: [{ title: 'Capture + register in one pass', spec: 'x', adapter: 'claude', model: 'claude-sonnet-5' }],
+      },
+    });
+    assert.equal(propose.status, 200);
+    const approve = await post(`/goals/${goalId}/nodes/${machineChildId}/approve_plan`, {});
+    assert.equal(approve.status, 200);
+    assert.notEqual(approve.json.tree.id, treeId, 'a fresh approve after reopen must plant a NEW tree');
+    treeId = approve.json.tree.id;
+    hopperNodeIds.length = 0;
+    for (const n of approve.json.hopper_nodes) hopperNodeIds.push(n.id);
+    await waitFor('new hopper node -> running', async () => {
+      const overlay = await get(`/goals/${goalId}/nodes/${machineChildId}/tree`);
+      return overlay.json.nodes.some((n: any) => n.status === 'running');
+    });
+    const fin = await post(`/hopper-nodes/${hopperNodeIds[0]}/finish`, { outcome: 'done', result: 'done, second time for real.' });
+    assert.equal(fin.status, 200);
+    await waitFor('goal node -> check again', async () => {
+      const node = await get(`/goals/${goalId}`).then((res) => res.json.nodes.find((n: any) => n.id === machineChildId));
+      return node?.state === 'check';
+    });
+  });
+
+  await check('7n', 'verify passed:true -> done, verified_at set', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${machineChildId}/verify`, { passed: true });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.state, 'done');
+    assert.ok(r.json.node.verified_at);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[8] human leaf: human_done -> check -> verify -> done; then parent auto-check');
+  await check('8a', 'human_done on the human leaf -> check', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${humanChildId}/human_done`, { note: 'redirect is live' });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.state, 'check');
+  });
+
+  await check('8b', 'verify the human leaf -> done', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${humanChildId}/verify`, { passed: true });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.state, 'done');
+  });
+
+  await check('8c', 'PARENT AUTO-CHECK: Media-buy stats had exactly these 2 children, both now done -> auto-flips to check', async () => {
+    const tree = await get(`/goals/${goalId}`);
+    const parent = tree.json.nodes.find((n: any) => n.id === mediaBuyId);
+    assert.equal(parent?.state, 'check', `expected parent auto-check, got ${parent?.state}`);
+  });
+
+  await check('8d', 'verify the parent -> done (explicit verify, not auto)', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${mediaBuyId}/verify`, { passed: true });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.state, 'done');
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[9] pending edit propose/resolve on a set node');
+  await check('9a', 'propose_edit on a ghost -> 409 (JARVIS edits its own ghosts via PATCH, not propose_edit)', async () => {
+    const ghost = await post(`/goals/${goalId}/nodes`, { title: 'temp ghost', done_means: 'x', authored_by: 'jarvis' });
+    const r = await post(`/goals/${goalId}/nodes/${ghost.json.node.id}/propose_edit`, { title: 'edited ghost', actor: 'jarvis' });
+    assert.equal(r.status, 409);
+    await post(`/goals/${goalId}/nodes/${ghost.json.node.id}/discard`, {});
+  });
+
+  await check('9b', 'propose_edit on the set QB node -> pending_title/pending_done_means set, node.state stays set', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${qbId}/propose_edit`, {
+      title: 'QB reconciliation (monthly)',
+      done_means: 'monthly totals match QB within $1, reconciled by the 5th business day',
+      actor: 'jarvis',
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.state, 'set');
+    assert.equal(r.json.node.pending_title, 'QB reconciliation (monthly)');
+    assert.equal(r.json.node.pending_by, 'jarvis');
+  });
+
+  await check('9c', 'resolve_pending {accept:true} -> title/done_means applied, pending cleared', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${qbId}/resolve_pending`, { accept: true });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.title, 'QB reconciliation (monthly)');
+    assert.equal(r.json.node.pending_title, null);
+    assert.equal(r.json.node.pending_by, null);
+  });
+
+  await check('9d', 'a SECOND propose_edit + resolve_pending {accept:false} -> cleared, node UNCHANGED', async () => {
+    const before = await get(`/goals/${goalId}`).then((r) => r.json.nodes.find((n: any) => n.id === qbId));
+    const p = await post(`/goals/${goalId}/nodes/${qbId}/propose_edit`, { title: 'a title Kevin will reject', actor: 'jarvis' });
+    assert.equal(p.status, 200);
+    const r = await post(`/goals/${goalId}/nodes/${qbId}/resolve_pending`, { accept: false });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.title, before.title, 'rejected edit must leave the node untouched');
+    assert.equal(r.json.node.pending_title, null);
+  });
+
+  await check('9e', 'resolve_pending with nothing pending -> 409 nothing_pending', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${qbId}/resolve_pending`, { accept: true });
+    assert.equal(r.status, 409);
+  });
+
+  await check('9f', 'propose_removal on the (now childless) Docs node, then accept -> discarded', async () => {
+    const propose = await post(`/goals/${goalId}/nodes/${docsId}/propose_removal`, { reason: 'folding into the QB node' });
+    assert.equal(propose.status, 200);
+    assert.equal(propose.json.node.pending_removal, 1);
+    const resolve = await post(`/goals/${goalId}/nodes/${docsId}/resolve_pending`, { accept: true });
+    assert.equal(resolve.status, 200);
+    assert.equal(resolve.json.node.state, 'discarded');
+  });
+
+  await check('9g', 'take the QB node (childless, leaf_kind still none) to done via the human-leaf path so the goal can eventually verify', async () => {
+    const leaf = await post(`/goals/${goalId}/nodes/${qbId}/leaf_kind`, { leaf_kind: 'human' });
+    assert.equal(leaf.status, 200);
+    const done = await post(`/goals/${goalId}/nodes/${qbId}/human_done`, { note: 'reconciled by hand this cycle' });
+    assert.equal(done.status, 200);
+    assert.equal(done.json.node.state, 'check');
+    const verified = await post(`/goals/${goalId}/nodes/${qbId}/verify`, { passed: true });
+    assert.equal(verified.status, 200);
+    assert.equal(verified.json.node.state, 'done');
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[10] promote a node to its own goal');
+  let promotedGoalId = -1;
+  await check('10a', 'promote the Kevin-dictated root node -> new goal, thread, back-link', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${kevinNodeId}/promote`, {});
+    assert.equal(r.status, 201, JSON.stringify(r.json));
+    assert.equal(r.json.goal.status, 'set');
+    assert.equal(r.json.goal.promoted_from_node_id, kevinNodeId);
+    promotedGoalId = r.json.goal.id;
+    assert.equal(r.json.thread.external_id, `cockpit:goal-${promotedGoalId}`);
+    assert.equal(r.json.thread.created, true);
+    assert.ok(typeof r.json.thread.seed_text === 'string' && r.json.thread.seed_text.length > 0);
+    assert.equal(r.json.node.promoted_to_goal_id, promotedGoalId);
+  });
+
+  await check('10b', 're-promoting an already-promoted node -> 409 already_promoted', async () => {
+    const r = await post(`/goals/${goalId}/nodes/${kevinNodeId}/promote`, {});
+    assert.equal(r.status, 409);
+    assert.equal(r.json.error.code, 'already_promoted');
+  });
+
+  await check('10c', 'new goal reaching done flips the stub node to check (back in the ORIGINAL goal)', async () => {
+    const newGoalTree = await get(`/goals/${promotedGoalId}`);
+    assert.equal(newGoalTree.status, 200);
+    assert.equal(newGoalTree.json.nodes.length, 0, 'promoted node had no children to move');
+    const verified = await post(`/goals/${promotedGoalId}/verify`, { passed: true });
+    assert.equal(verified.status, 200, JSON.stringify(verified.json));
+    assert.equal(verified.json.goal.status, 'done');
+
+    const stub = await get(`/goals/${goalId}`).then((r) => r.json.nodes.find((n: any) => n.id === kevinNodeId));
+    assert.equal(stub?.state, 'check', 'promoted stub must flip to check once the new goal is done');
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[11] goal verify preconditions');
+  await check('11a', 'POST /goals/:id/verify with non-done children -> 409 children_not_done', async () => {
+    // kevinNodeId(stub, check) needs its own verify; the rest may still be open.
+    const r = await post(`/goals/${goalId}/verify`, { passed: true });
+    assert.equal(r.status, 409);
+    assert.equal(r.json.error.code, 'children_not_done');
+  });
+
+  await check('11b', 'verify the stub node -> done; then goal verify succeeds once every non-discarded/non-parked node is done', async () => {
+    const stubVerify = await post(`/goals/${goalId}/nodes/${kevinNodeId}/verify`, { passed: true });
+    assert.equal(stubVerify.status, 200);
+    assert.equal(stubVerify.json.node.state, 'done');
+
+    const r = await post(`/goals/${goalId}/verify`, { passed: true });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.goal.status, 'done');
+    assert.ok(r.json.goal.verified_at);
+  });
+
+  await check('11c', 'goal park/unpark — only legal from status=set (a ghost goal cannot be parked, per CONTRACT §2.2)', async () => {
+    const ghost = await post('/goals', { title: 'park/unpark drill (still a ghost)' });
+    const ghostParkAttempt = await post(`/goals/${ghost.json.goal.id}/park`, {});
+    assert.equal(ghostParkAttempt.status, 409, 'a ghost goal has no park transition in CONTRACT §2.2');
+
+    const fresh = await post('/goals', { title: 'park/unpark drill', done_means: 'exists for this one assertion' });
+    const gid = fresh.json.goal.id;
+    const parked = await post(`/goals/${gid}/park`, {});
+    assert.equal(parked.status, 200, JSON.stringify(parked.json));
+    assert.equal(parked.json.goal.status, 'parked');
+    const unparked = await post(`/goals/${gid}/unpark`, {});
+    assert.equal(unparked.status, 200);
+    assert.equal(unparked.json.goal.status, 'set');
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[12] focus-injection helper: buildGoalThreadContext');
+  await check('12a', "buildGoalThreadContext on a non-goal thread ext returns ''", () => {
+    const block = goalsModule.buildGoalThreadContext('cockpit:some-random-thread');
+    assert.equal(block, '');
+  });
+
+  await check('12b', "buildGoalThreadContext on a goal thread ext for a goal that doesn't exist returns ''", () => {
+    const block = goalsModule.buildGoalThreadContext('cockpit:goal-999999');
+    assert.equal(block, '');
+  });
+
+  await check(
+    '12c',
+    "buildGoalThreadContext on the promoted goal (focus=none) renders <goal_focus/> + <goal_tree> with root-level nodes " +
+      "(CONTRACT §6's example only shows a FOCUSED render; the no-focus attrs come back as empty strings rather than " +
+      "the literal 'null' — a defensible reading, not asserted as a bug, but worth REVIEW-BACKEND's eyes since a " +
+      "focus_node_id-driven prompt template downstream might expect one or the other)",
+    async () => {
+      const block: string = goalsModule.buildGoalThreadContext(`cockpit:goal-${promotedGoalId}`);
+      assert.match(block, /^<goal_focus goal_id="\d+" node_id="[^"]*"/);
+      assert.match(block, /<goal_tree goal_id="\d+" status="done"/);
+      assert.match(block, /^# .+ — done: /m);
+      assert.ok(block.trimEnd().endsWith('</goal_tree>'), 'block must be exactly the two tags, nothing appended after');
+    },
+  );
+
+  await check('12d', 'buildGoalThreadContext respects focus + collapse: focused node shows siblings/children, unrelated branches collapse', async () => {
+    // Build a small multi-branch fixture on goalId (already done/verified but
+    // still readable — nodes are terminal, not deleted).
+    const focusTarget = mediaBuyId; // done, but still a real node with 2 children
+    await put(`/goals/${goalId}/focus`, { node_id: focusTarget });
+    const block: string = goalsModule.buildGoalThreadContext(`cockpit:goal-${goalId}`);
+    assert.match(block, new RegExp(`node_id="${focusTarget}"`));
+    assert.match(block, /▶/, 'focused node must carry the ▶ marker');
+    assert.match(block, /Create monitoring|Capture \+ register/, 'focused node\'s children must render');
+    assert.ok(block.split('\n').length <= 62, 'must respect the ~60-line cap (+ a little slack for the two tag lines)');
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[13] SSE breadth: goal/goal_node/goal_focus reach BOTH admin and non-admin keys');
+  await sleep(300); // let the streams catch up on everything emitted above
+  await check('13a', 'admin-scope (cockpit) SSE stream saw goal, goal_node, and goal_focus events', () => {
+    const types = new Set(sseAdmin.events.map((e) => e.type));
+    assert.ok(types.has('goal'), 'missing goal event on admin stream');
+    assert.ok(types.has('goal_node'), 'missing goal_node event on admin stream');
+    assert.ok(types.has('goal_focus'), 'missing goal_focus event on admin stream');
+  });
+  await check('13b', 'non-admin-scope (jarvis) SSE stream ALSO saw all three (global events are not thread-scoped)', () => {
+    const types = new Set(sseNonAdmin.events.map((e) => e.type));
+    assert.ok(types.has('goal'), 'missing goal event on non-admin stream');
+    assert.ok(types.has('goal_node'), 'missing goal_node event on non-admin stream');
+    assert.ok(types.has('goal_focus'), 'missing goal_focus event on non-admin stream');
+  });
+  await check('13c', 'a batch propose carries a shared batch_id across its goal_node events', () => {
+    const batchEvents = sseAdmin.events.filter((e: any) => e.type === 'goal_node' && e.batch_id === batchId);
+    assert.ok(batchEvents.length >= 3, `expected >=3 goal_node events sharing batch_id ${batchId}, got ${batchEvents.length}`);
+  });
+
+  sseAdmin.close();
+  sseNonAdmin.close();
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[14] auth: no bearer token -> 401 (same bearerAuth as every other /api/v1 route)');
+  await check('14a', 'GET /goals with no Authorization header -> 401', async () => {
+    const res = await fetch(`${base}/goals`);
+    assert.equal(res.status, 401);
+  });
+} finally {
+  server.close();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+const passed = results.filter((r) => r.pass).length;
+const failed = results.filter((r) => !r.pass);
+console.log(`\n[goals-sim] ${passed}/${results.length} checks passed${failed.length ? `, ${failed.length} FAILED` : ' ✅'}`);
+
+const outDir = '/home/kevin/obsidian/paperclip-wiki/outbox/goals';
+fs.mkdirSync(outDir, { recursive: true });
+const reportPath = path.join(outDir, 'sim-report.md');
+const lines: string[] = [];
+lines.push('# GOALS — sim report (hopper node #459)');
+lines.push('');
+lines.push(`Run at ${new Date().toISOString()}. Scratch DB: \`${DB_PATH}\`. ${passed}/${results.length} checks passed.`);
+lines.push('');
+lines.push('Drives the real `createApiV1Router()` over real HTTP on a throwaway port, against a scratch');
+lines.push('sqlite copy — never `jarvis.db`. Hopper worker spawn is stubbed with a fake `processMessage`');
+lines.push('(mirrors `scripts/foundry-sim.mjs`) so `dispatchTick` runs for real (claims ready leaves,');
+lines.push('applies dependency ordering) but **zero live model calls are made anywhere in this file**.');
+lines.push('Tree completion is driven through the real finish contract, `POST /hopper-nodes/:id/finish`.');
+lines.push('');
+lines.push('| # | Check | Result |');
+lines.push('|---|---|---|');
+for (const r of results) {
+  lines.push(`| ${r.id} | ${r.description} | ${r.pass ? '✅ pass' : `❌ **FAIL** — ${r.error}`} |`);
+}
+lines.push('');
+if (failed.length) {
+  lines.push('## Failures');
+  lines.push('');
+  for (const r of failed) {
+    lines.push(`### [${r.id}] ${r.description}`);
+    lines.push('');
+    lines.push('```');
+    lines.push(r.error ?? '(no error captured)');
+    lines.push('```');
+    lines.push('');
+  }
+} else {
+  lines.push("All checks passed against `CONTRACT.md` §10's acceptance list during this run.");
+}
+lines.push('');
+lines.push('## Notes for REVIEW-BACKEND (not treated as bugs, not patched here)');
+lines.push('');
+lines.push(
+  '1. **`proposeRemoval`\'s error code on a `working` leaf.** CONTRACT.md §3.3 route 18 says propose_removal ' +
+    'is "Only on `state ∈ {set}` … and not `working` (`409 leaf_already_dispatched`)". But the implementation\'s ' +
+    'first-hit precondition is simply `state !== \'set\' → 409 invalid_transition`, and `working` is never `set` ' +
+    '— so that specific branch is unreachable as literally worded; a working leaf 409s with `invalid_transition` ' +
+    'instead of `leaf_already_dispatched`. The BLOCK itself is correct (removal is refused either way); this is ' +
+    'purely an error-code-specificity question. Left as-is rather than guessing the intended fix (see check 7f).',
+);
+lines.push(
+  '2. **`buildGoalThreadContext`\'s no-focus attribute rendering.** CONTRACT.md §6\'s example only shows a ' +
+    '*focused* render (`node_id="87"`, real `path`/`state`/`leaf_kind` values). With no focus set, the ' +
+    'implementation renders `node_id=""` and empty `path`/`state`/`leaf_kind` attrs rather than a literal `"null"` ' +
+    'or omitting the line. Defensible, but worth a second look if any downstream prompt template string-matches ' +
+    'on `node_id="null"` (see check 12c).',
+);
+fs.writeFileSync(reportPath, lines.join('\n') + '\n');
+console.log(`[goals-sim] report written: ${reportPath}`);
+
+if (failed.length) process.exitCode = 1;

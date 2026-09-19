@@ -23,6 +23,7 @@
     "goals:review-checks": "npm run build && JARVIS_DB_PATH=/tmp/goals-review.db npx tsx scripts/goals-review-checks.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@slack/bolt": "^4.0.0",
     "better-sqlite3": "^12.9.0",
     "dotenv": "^16.0.0",

@@ -12,6 +12,7 @@ import type { DispatchRow, DispatchWorkerRow } from './dispatches.js';
 import type { HopperItemRow } from './hopper.js';
 import type { HopperNodeRow } from './hopper-engine.js';
 import type { SmartTodoNodeRow } from './smart-todos.js';
+import type { WorkbenchProposalRow } from './workbench.js';
 import type { WorkstreamWithDetails } from './workstreams.js';
 import type { MonitorRow, MonitorRunRow } from './monitors.js';
 import type { FoundryModuleResponse, FoundryProjectResponse } from './foundry.js';
@@ -235,6 +236,19 @@ export interface SmartTodoEvent {
   node?: SmartTodoNodeRow;
 }
 
+// WORKBENCH V2 — the ghost/proposal layer (draft nodes Kevin corrects before
+// they become real). Global, not conversation-scoped (same treatment as
+// HopperItemEvent/SmartTodoEvent). A batch can contain many rows at once, so
+// clients simply refetch GET /workbench/proposals on any event — same
+// reload-on-SSE pattern workbench.tsx already uses for smart_todo. See
+// docs/workbench/SPEC.md "V2 — THE INTERACTION CORRECTION" + RECON-V2.md §5/§6.
+export interface WorkbenchProposalEvent {
+  type: 'workbench_proposal';
+  action: 'created' | 'updated' | 'accepted' | 'rejected';
+  batch_id: string;
+  proposal?: WorkbenchProposalRow;
+}
+
 // FLIGHT DECK — Kevin/JARVIS workstreams, the "balls in the air" surface.
 // Global like HopperItemEvent; payload includes links + latest timeline events
 // so clients can patch a card/drawer from one event or simply refetch.
@@ -303,7 +317,7 @@ export type SSEEvent =
   | ThreadGroupEvent | NotificationEvent
   | DispatchEvent | DispatchCueEvent | HopperItemEvent | HopperNodeEvent | SmartTodoEvent
   | WorkstreamEvent | MonitorEvent | MonitorRunEvent | FoundryProjectEvent | FoundryModuleEvent
-  | IntelRunEvent | IntelItemEvent;
+  | IntelRunEvent | IntelItemEvent | WorkbenchProposalEvent;
 
 class SSEBus extends EventEmitter {}
 

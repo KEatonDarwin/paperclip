@@ -13,7 +13,15 @@
 // lives in src/tools/workbench-tool.ts and calls back into this file.
 
 import { execFile } from 'node:child_process';
-import { sqliteDb, getConversation } from './conversation-db.js';
+import { randomUUID } from 'node:crypto';
+import {
+  sqliteDb,
+  getConversation,
+  getOrCreateConversation,
+  renameConversation,
+  getSetting,
+} from './conversation-db.js';
+import { sseBus, type WorkbenchProposalEvent } from './sse-bus.js';
 import { getLatestThreadSummary } from './thread-summaries.js';
 import {
   getSmartTodoNode,
@@ -437,6 +445,35 @@ export function readAncestorSummary(
   return { node: ancestor, summary: { content: latest.content, created_at: latest.created_at } };
 }
 
+/** Shared status/notes/context_notes-per-node, indented-by-depth digest of a
+ *  scope's subtree. Factored out so buildWorkbenchSeedText (v1's per-node
+ *  scoped chat) and the v2 brain session's focus snapshot (below) render the
+ *  same shape instead of drifting. */
+function renderSubtreeDigest(scope: WorkbenchScope): string {
+  const lines: string[] = [];
+  const byParent = new Map<number | null, SmartTodoNodeRow[]>();
+  for (const n of scope.subtree) {
+    const key = n.parent_id;
+    if (!byParent.has(key)) byParent.set(key, []);
+    byParent.get(key)!.push(n);
+  }
+  const renderNode = (n: SmartTodoNodeRow, depth: number): void => {
+    const indent = '  '.repeat(depth);
+    lines.push(`${indent}- [${n.status}] ${n.title} (id ${n.id})`);
+    if (n.notes) lines.push(`${indent}  notes: ${n.notes.slice(0, 200)}`);
+    if (n.context_notes) lines.push(`${indent}  context: ${n.context_notes.slice(0, 300)}`);
+    const children = (byParent.get(n.id) ?? []).slice().sort((a, b) => a.sort_order - b.sort_order);
+    for (const c of children) renderNode(c, depth + 1);
+  };
+  const roots = scope.node ? [scope.node] : (byParent.get(null) ?? []).slice().sort((a, b) => a.sort_order - b.sort_order);
+  if (roots.length) {
+    for (const r of roots) renderNode(r, 0);
+  } else {
+    lines.push('(nothing here yet)');
+  }
+  return lines.join('\n');
+}
+
 /** Build the seed text a scoped Workbench chat is booted with (spec §2/§4) —
  *  the automatic context (focus node + full subtree + ancestor titles/notes)
  *  plus the explicit scope statement and the auto-notes instruction that makes
@@ -465,26 +502,7 @@ export function buildWorkbenchSeedText(scope: WorkbenchScope): string {
   }
 
   lines.push('Everything in this branch (automatic — you always have this, no need to ask for it):');
-  const byParent = new Map<number | null, SmartTodoNodeRow[]>();
-  for (const n of scope.subtree) {
-    const key = n.parent_id;
-    if (!byParent.has(key)) byParent.set(key, []);
-    byParent.get(key)!.push(n);
-  }
-  const renderNode = (n: SmartTodoNodeRow, depth: number): void => {
-    const indent = '  '.repeat(depth);
-    lines.push(`${indent}- [${n.status}] ${n.title} (id ${n.id})`);
-    if (n.notes) lines.push(`${indent}  notes: ${n.notes.slice(0, 200)}`);
-    if (n.context_notes) lines.push(`${indent}  context: ${n.context_notes.slice(0, 300)}`);
-    const children = (byParent.get(n.id) ?? []).slice().sort((a, b) => a.sort_order - b.sort_order);
-    for (const c of children) renderNode(c, depth + 1);
-  };
-  const roots = scope.node ? [scope.node] : (byParent.get(null) ?? []).slice().sort((a, b) => a.sort_order - b.sort_order);
-  if (roots.length) {
-    for (const r of roots) renderNode(r, 0);
-  } else {
-    lines.push('(nothing here yet)');
-  }
+  lines.push(renderSubtreeDigest(scope));
   lines.push('');
 
   lines.push(
@@ -502,4 +520,578 @@ export function buildWorkbenchSeedText(scope: WorkbenchScope): string {
   );
 
   return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// V2 §"Dispatch" — POST /workbench/nodes/:id/dispatch. Spawns ONE ephemeral
+// cockpit worker attached to a single node (explicit-dispatch, never on
+// click/zoom — see SPEC.md's "V2 — THE INTERACTION CORRECTION"). The worker is
+// NOT bound to the node via linked_thread_ext (that field is the node's
+// persistent opt-in chat from §2 — dispatch must never hijack it); instead the
+// worker is told its target node id directly and always passes it explicitly
+// to the `workbench` tool, which the unbound thread can do freely (an
+// unbound/unscoped thread gets unrestricted root scope — see
+// resolveWorkbenchToolScope). The route layer (api-v1.ts) owns spawning +
+// the spawn_tasks row; this function only composes the one-shot prompt.
+// ---------------------------------------------------------------------------
+
+/** The one prompt a workbench dispatch worker is born with: node + ancestor
+ *  context + Kevin's instructions + the finish contract (write_context, not a
+ *  curl — there is no separate "finish" endpoint; the existing 5-minute
+ *  spawn_tasks reconciler flips running -> done off server-owned run-state,
+ *  same as every other spawned worker). */
+export function composeDispatchPrompt(
+  node: SmartTodoNodeRow,
+  ancestors: SmartTodoNodeRow[],
+  instructions: string | null,
+): string {
+  const lines: string[] = [
+    'You are a SPAWNED WORKBENCH DISPATCH WORKER — an ephemeral JARVIS instance born to advance ONE item ' +
+      "in Kevin's idea tree (the Workbench), report your outcome back into the tree, and stop. You are not " +
+      'a conversation; nobody will reply to your messages. Kevin sees your work through the tree, not this thread.',
+    '',
+    `**Your node (id ${node.id}):** ${node.title}`,
+  ];
+  if (node.notes) lines.push('', `**Notes:** ${node.notes}`);
+  if (node.context_notes) lines.push('', `**Prior context on this node:**`, node.context_notes);
+  if (ancestors.length) {
+    lines.push('', '**Ancestor chain (root → here), for orientation:**');
+    for (const a of ancestors) lines.push(`- ${a.title}${a.notes ? ` — ${a.notes.slice(0, 200)}` : ''}`);
+  }
+  if (instructions) lines.push('', "**Kevin's instructions for this dispatch:**", instructions);
+  lines.push(
+    '',
+    '**Guardrails (hard):** no touching live production systems/databases, no merging to main, no external ' +
+      "sends (Slack/email/PRs) under Kevin's identity, no new spend, and NO API KEYS for model calls — " +
+      'subscription CLI binaries only.',
+    '',
+    '**FINISH CONTRACT — mandatory, and it is a tool call, not a curl.** When you are done (or genuinely ' +
+      `stuck), call the \`workbench\` tool with operation "write_context", node_id ${node.id}, and a concise ` +
+      '1-3+ line outcome note (what you did, artifacts/paths/commits, or why you are stuck) — that note is ' +
+      'how Kevin and any future chat learn what happened; keep every write scoped to THIS node id, never a ' +
+      "sibling or ancestor. If the work is genuinely complete, also call `workbench` \"set_status\" on node " +
+      `${node.id} with status "done". Do this before you stop responding — there is no separate finish ` +
+      'endpoint for a dispatch worker; ending your turn without a write_context call means Kevin sees nothing.',
+    '',
+    'Work efficiently, verify what you build, and do not gold-plate. Begin now.',
+  );
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// V2 — Proposals (the ghost layer). See docs/workbench/SPEC.md "V2 — THE
+// INTERACTION CORRECTION" + docs/workbench/RECON-V2.md §6 (contract table)
+// and §7 traps #2/#5. Multi-node decompositions land here as PROPOSALS Kevin
+// corrects (talk or click ✓/✕) BEFORE they become real smart_todo_nodes rows
+// — the real tree stays pure until accept. A single explicitly-requested node
+// may still be added directly via the `workbench` tool's existing `add_child`.
+//
+// Storage note (a deliberate refinement of RECON-V2 trap #2's "flat rows,
+// parent_id may point at a real node OR another proposal in the same batch"
+// resolution): rather than overload one `parent_id` column — which risks an
+// id collision between the two tables — this uses two mutually-exclusive
+// columns, `parent_node_id` (a real smart_todo_nodes.id, or null) and
+// `parent_proposal_id` (another proposal row's id within the SAME batch, or
+// null). Exactly one of the two is non-null for a nested item; both are null
+// only for a batch's own top-level items when the batch itself has no real
+// parent (i.e. new top-level branches). This removes the ambiguity trap #2
+// flagged without changing the accept-time resolution algorithm it describes.
+// ---------------------------------------------------------------------------
+
+export interface WorkbenchProposalRow {
+  id: number;
+  batch_id: string;
+  parent_node_id: number | null;
+  parent_proposal_id: number | null;
+  title: string;
+  notes: string | null;
+  sort_order: number;
+  created_by_thread: string | null;
+  created_at: string;
+}
+
+export interface WorkbenchProposalBatch {
+  batch_id: string;
+  created_at: string;
+  created_by_thread: string | null;
+  proposals: WorkbenchProposalRow[];
+}
+
+sqliteDb.exec(`
+  CREATE TABLE IF NOT EXISTS workbench_proposals (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id           TEXT NOT NULL,
+    parent_node_id     INTEGER,
+    parent_proposal_id INTEGER,
+    title              TEXT NOT NULL,
+    notes              TEXT,
+    sort_order         INTEGER NOT NULL DEFAULT 0,
+    created_by_thread  TEXT,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_workbench_proposals_batch ON workbench_proposals(batch_id, sort_order, id);
+`);
+
+const getProposalStmt = sqliteDb.prepare<[number], WorkbenchProposalRow>(
+  `SELECT * FROM workbench_proposals WHERE id = ?`,
+);
+const listAllProposalsStmt = sqliteDb.prepare<[], WorkbenchProposalRow>(
+  `SELECT * FROM workbench_proposals ORDER BY batch_id ASC, id ASC`,
+);
+const listBatchProposalsStmt = sqliteDb.prepare<[string], WorkbenchProposalRow>(
+  `SELECT * FROM workbench_proposals WHERE batch_id = ? ORDER BY id ASC`,
+);
+const insertProposalStmt = sqliteDb.prepare<
+  [string, number | null, number | null, string, string | null, number, string | null]
+>(`
+  INSERT INTO workbench_proposals
+    (batch_id, parent_node_id, parent_proposal_id, title, notes, sort_order, created_by_thread)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
+`);
+const updProposalTitleStmt = sqliteDb.prepare<[string, number]>(
+  `UPDATE workbench_proposals SET title = ? WHERE id = ?`,
+);
+const updProposalNotesStmt = sqliteDb.prepare<[string | null, number]>(
+  `UPDATE workbench_proposals SET notes = ? WHERE id = ?`,
+);
+
+function emitProposal(action: WorkbenchProposalEvent['action'], batchId: string, proposal?: WorkbenchProposalRow): void {
+  sseBus.emit('sse', { type: 'workbench_proposal', action, batch_id: batchId, proposal } satisfies WorkbenchProposalEvent);
+}
+
+export function getWorkbenchProposal(id: number): WorkbenchProposalRow | null {
+  return getProposalStmt.get(id) ?? null;
+}
+
+export function listProposalsForBatch(batchId: string): WorkbenchProposalRow[] {
+  return listBatchProposalsStmt.all(batchId);
+}
+
+/** GET /workbench/proposals — every pending proposal, grouped by batch. */
+export function listPendingProposalBatches(): WorkbenchProposalBatch[] {
+  const rows = listAllProposalsStmt.all();
+  const byBatch = new Map<string, WorkbenchProposalRow[]>();
+  for (const row of rows) {
+    if (!byBatch.has(row.batch_id)) byBatch.set(row.batch_id, []);
+    byBatch.get(row.batch_id)!.push(row);
+  }
+  return Array.from(byBatch.entries()).map(([batch_id, proposals]) => ({
+    batch_id,
+    created_at: proposals[0]?.created_at ?? '',
+    created_by_thread: proposals[0]?.created_by_thread ?? null,
+    proposals,
+  }));
+}
+
+function insertProposalItem(
+  batchId: string,
+  item: DecompositionItem,
+  opts: { parentNodeId: number | null; parentProposalId: number | null; sortOrder: number; createdByThread: string | null },
+): WorkbenchProposalRow {
+  const info = insertProposalStmt.run(
+    batchId,
+    opts.parentNodeId,
+    opts.parentProposalId,
+    item.title.slice(0, 500),
+    item.notes ?? null,
+    opts.sortOrder,
+    opts.createdByThread,
+  );
+  const id = Number(info.lastInsertRowid);
+  (item.children ?? []).forEach((child, idx) => {
+    insertProposalItem(batchId, child, { parentNodeId: null, parentProposalId: id, sortOrder: idx, createdByThread: opts.createdByThread });
+  });
+  return getProposalStmt.get(id)!;
+}
+
+/** The `workbench` tool's `propose_batch` op (and, in principle, any future
+ *  caller): stage a multi-node decomposition as ghost rows under one batch id
+ *  instead of writing real nodes. `parentNodeId` is the REAL node the whole
+ *  batch's top-level items attach under (null = new top-level branch(es)) —
+ *  this is the "single node" trust boundary: a lone item Kevin explicitly
+ *  asked for goes straight to `add_child`, anything with >1 node (or any
+ *  nesting) comes through here per SPEC.md's bulk rule. */
+export function proposeBatch(
+  items: DecompositionItem[],
+  opts: { parentNodeId?: number | null; createdByThread?: string | null } = {},
+): { batch_id: string; proposals: WorkbenchProposalRow[] } {
+  if (!items.length) throw new Error('propose_batch needs at least one item');
+  const batchId = randomUUID();
+  const parentNodeId = opts.parentNodeId ?? null;
+  const createdByThread = opts.createdByThread ?? null;
+  const run = sqliteDb.transaction((): WorkbenchProposalRow[] =>
+    items.map((item, idx) => insertProposalItem(batchId, item, { parentNodeId, parentProposalId: null, sortOrder: idx, createdByThread })),
+  );
+  const proposals = run();
+  emitProposal('created', batchId);
+  return { batch_id: batchId, proposals };
+}
+
+/** Edit a still-pending proposal's own title/notes (does not touch structure). */
+export function updateWorkbenchProposal(id: number, patch: { title?: string; notes?: string | null }): WorkbenchProposalRow | null {
+  const existing = getProposalStmt.get(id);
+  if (!existing) return null;
+  if (patch.title !== undefined && patch.title.trim()) updProposalTitleStmt.run(patch.title.trim().slice(0, 500), id);
+  if (patch.notes !== undefined) updProposalNotesStmt.run(patch.notes, id);
+  const updated = getProposalStmt.get(id) ?? null;
+  if (updated) emitProposal('updated', updated.batch_id, updated);
+  return updated;
+}
+
+/** ids of a proposal + all its nested proposal descendants WITHIN the same batch. */
+function proposalDescendantIds(id: number, batchRows: WorkbenchProposalRow[]): number[] {
+  const out = [id];
+  for (const child of batchRows.filter((r) => r.parent_proposal_id === id)) {
+    out.push(...proposalDescendantIds(child.id, batchRows));
+  }
+  return out;
+}
+
+/** ids from `id` up through its proposal ancestors within the batch (id-first,
+ *  root-last) — a child can't be materialized without its parent existing
+ *  somewhere real first, so accepting a nested proposal implicitly pulls in
+ *  its whole ancestor chain (RECON-V2 §7 trap #2's locked-in accept rule). */
+function proposalAncestorChainIds(id: number, batchRows: WorkbenchProposalRow[]): number[] {
+  const byId = new Map(batchRows.map((r) => [r.id, r]));
+  const out: number[] = [];
+  let cur = byId.get(id);
+  while (cur) {
+    out.push(cur.id);
+    cur = cur.parent_proposal_id !== null ? byId.get(cur.parent_proposal_id) : undefined;
+  }
+  return out;
+}
+
+function deleteProposalRows(ids: number[]): void {
+  if (!ids.length) return;
+  sqliteDb.prepare(`DELETE FROM workbench_proposals WHERE id IN (${ids.map(() => '?').join(',')})`).run(...ids);
+}
+
+/** Delete ONE proposal + its nested descendants (the `workbench` tool's
+ *  `delete_proposal` op — a targeted reject of a single ghost, distinct from
+ *  rejecting a whole batch). Returns how many rows were removed. */
+export function deleteProposalCascade(id: number): number {
+  const row = getProposalStmt.get(id);
+  if (!row) return 0;
+  const batchRows = listBatchProposalsStmt.all(row.batch_id);
+  const ids = proposalDescendantIds(id, batchRows);
+  deleteProposalRows(ids);
+  emitProposal('rejected', row.batch_id);
+  return ids.length;
+}
+
+/** POST /workbench/proposals/:batchId/accept — materialize proposals into real
+ *  smart_todo_nodes via the existing createSmartTodoNode path (so real-tree
+ *  writes stay on ONE code path whether Kevin clicks Accept or the brain calls
+ *  `accept_batch` after he says "yes do that" — RECON-V2 §6). `ids` omitted =
+ *  accept the whole batch; when given, each requested id implicitly pulls in
+ *  its proposal ancestor chain (see proposalAncestorChainIds) so a child is
+ *  never materialized before its parent. Rows are resolved in ascending id
+ *  order, which is guaranteed topological: a parent proposal is always
+ *  inserted (and thus gets a lower id) before its children in the same
+ *  transaction (proposeBatch/insertProposalItem). Atomic — any failure rolls
+ *  back the whole accept, never a half-materialized batch. */
+export function acceptProposalBatch(batchId: string, ids?: number[]): { created: SmartTodoNodeRow[] } {
+  const batchRows = listBatchProposalsStmt.all(batchId);
+  if (!batchRows.length) throw new Error(`no pending proposals for batch ${batchId}`);
+
+  let selected: Set<number>;
+  if (ids && ids.length) {
+    const batchIds = new Set(batchRows.map((r) => r.id));
+    const expanded = new Set<number>();
+    for (const id of ids) {
+      if (!batchIds.has(id)) throw new Error(`proposal ${id} not found in batch ${batchId}`);
+      for (const a of proposalAncestorChainIds(id, batchRows)) expanded.add(a);
+    }
+    selected = expanded;
+  } else {
+    selected = new Set(batchRows.map((r) => r.id));
+  }
+
+  const toMaterialize = batchRows.filter((r) => selected.has(r.id)).sort((a, b) => a.id - b.id);
+  const proposalToReal = new Map<number, number>();
+  const created: SmartTodoNodeRow[] = [];
+
+  const run = sqliteDb.transaction((): SmartTodoNodeRow[] => {
+    for (const row of toMaterialize) {
+      let parentId: number | null;
+      if (row.parent_proposal_id !== null) {
+        const real = proposalToReal.get(row.parent_proposal_id);
+        if (real === undefined) {
+          throw new Error(`proposal ${row.id} depends on unresolved parent proposal ${row.parent_proposal_id}`);
+        }
+        parentId = real;
+      } else {
+        parentId = row.parent_node_id;
+      }
+      if (parentId !== null && !getSmartTodoNode(parentId)) {
+        throw new Error(`parent node ${parentId} not found`);
+      }
+      const node = createSmartTodoNode({ parent_id: parentId, title: row.title, notes: row.notes, origin: 'workbench' });
+      proposalToReal.set(row.id, node.id);
+      created.push(node);
+    }
+    deleteProposalRows(toMaterialize.map((r) => r.id));
+    return created;
+  });
+
+  const result = run();
+  emitProposal('accepted', batchId);
+  return { created: result };
+}
+
+/** POST /workbench/proposals/:batchId/reject — discard proposals without
+ *  materializing them. `ids` omitted = reject the whole batch; when given,
+ *  each requested id pulls in its nested descendants too (rejecting a row
+ *  rejects everything nested under it in the batch — the other half of the
+ *  accept rule above). */
+export function rejectProposalBatch(batchId: string, ids?: number[]): { removed: number } {
+  const batchRows = listBatchProposalsStmt.all(batchId);
+  if (!batchRows.length) return { removed: 0 };
+
+  let toRemove: Set<number>;
+  if (ids && ids.length) {
+    const batchIds = new Set(batchRows.map((r) => r.id));
+    const expanded = new Set<number>();
+    for (const id of ids) {
+      if (!batchIds.has(id)) throw new Error(`proposal ${id} not found in batch ${batchId}`);
+      for (const d of proposalDescendantIds(id, batchRows)) expanded.add(d);
+    }
+    toRemove = expanded;
+  } else {
+    toRemove = new Set(batchRows.map((r) => r.id));
+  }
+
+  deleteProposalRows(Array.from(toRemove));
+  emitProposal('rejected', batchId);
+  return { removed: toRemove.size };
+}
+
+// ---------------------------------------------------------------------------
+// V2 §"Sessions" — POST /workbench/say. See docs/workbench/SPEC.md "V2 — THE
+// INTERACTION CORRECTION" and docs/workbench/RECON-V2.md §1/§4/§6.
+//
+// v1 bound a thread PER NODE, eagerly, on every zoom (the removed defect —
+// RECON-V2 §1). v2 replaces that with ONE ongoing "brain" conversation per
+// sitting, fed by the docked bar; zooming only moves a silent focus pointer,
+// it never creates or rebinds a thread. A "sitting" is PER-SITTING, not
+// forever: idle for `workbench_session_idle_hours` (settings-KV, default 4h)
+// and the next /workbench/say starts a fresh session. The TREE itself
+// (titles/status/notes/context_notes) is the durable memory; the conversation
+// stays disposable — same Persistence Principle as every other JARVIS worker.
+// ---------------------------------------------------------------------------
+
+export interface WorkbenchSessionRow {
+  id: number;
+  thread_ext: string;
+  last_focus_id: number | null;
+  started_at: string;
+  last_activity_at: string;
+  ended_at: string | null;
+}
+
+sqliteDb.exec(`
+  CREATE TABLE IF NOT EXISTS workbench_sessions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_ext       TEXT NOT NULL UNIQUE,
+    last_focus_id    INTEGER,
+    started_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    last_activity_at TEXT NOT NULL DEFAULT (datetime('now')),
+    ended_at         TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_workbench_sessions_open ON workbench_sessions(ended_at, last_activity_at);
+`);
+
+const DEFAULT_SESSION_IDLE_HOURS = 4;
+const SESSION_IDLE_HOURS_SETTING = 'workbench_session_idle_hours';
+
+function getSessionIdleHours(): number {
+  const raw = getSetting(SESSION_IDLE_HOURS_SETTING);
+  const parsed = raw !== null ? Number(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SESSION_IDLE_HOURS;
+}
+
+const findOpenSessionStmt = sqliteDb.prepare<[], WorkbenchSessionRow>(
+  `SELECT * FROM workbench_sessions WHERE ended_at IS NULL ORDER BY last_activity_at DESC LIMIT 1`,
+);
+const endOpenSessionsStmt = sqliteDb.prepare<[]>(
+  `UPDATE workbench_sessions SET ended_at = datetime('now') WHERE ended_at IS NULL`,
+);
+const insertSessionStmt = sqliteDb.prepare<[string]>(
+  `INSERT INTO workbench_sessions (thread_ext) VALUES (?)`,
+);
+const getSessionByIdStmt = sqliteDb.prepare<[number], WorkbenchSessionRow>(
+  `SELECT * FROM workbench_sessions WHERE id = ?`,
+);
+const touchSessionStmt = sqliteDb.prepare<[number | null, number]>(
+  `UPDATE workbench_sessions SET last_focus_id = ?, last_activity_at = datetime('now') WHERE id = ?`,
+);
+
+/** sqlite `datetime('now')` (UTC, no 'Z') → a real Date. Same convention as
+ *  monitors.ts's existing sqlite-timestamp parsing. */
+function parseSqliteDatetime(raw: string): Date {
+  return new Date(raw.includes('T') ? raw : `${raw.replace(' ', 'T')}Z`);
+}
+
+function isSessionFresh(session: WorkbenchSessionRow, idleHours: number): boolean {
+  const last = parseSqliteDatetime(session.last_activity_at).getTime();
+  if (Number.isNaN(last)) return false;
+  return Date.now() - last <= idleHours * 60 * 60 * 1000;
+}
+
+/** Read-only: the currently-open session, if it's still within the idle
+ *  window. Never touches last_activity_at — a page-load discovery poll must
+ *  not itself extend a sitting. Powers `GET /workbench/session`, which closes
+ *  the gap RECON-V2 §4 flagged (without it, a reload mid-sitting looks like a
+ *  fresh session because there'd be nothing to resolve an ext from before the
+ *  first send). */
+export function peekOpenWorkbenchSession(): WorkbenchSessionRow | null {
+  const open = findOpenSessionStmt.get();
+  if (!open) return null;
+  return isSessionFresh(open, getSessionIdleHours()) ? open : null;
+}
+
+/** Find-or-create the Workbench brain session. Reuses the open session if
+ *  it's still within `workbench_session_idle_hours`; otherwise (idle expiry,
+ *  or `forceNew` — the "New session" affordance) ends whatever's open and
+ *  starts a fresh one, so at most one session is ever open at a time. */
+export function findOrCreateWorkbenchSession(opts: { forceNew?: boolean } = {}): {
+  session: WorkbenchSessionRow;
+  isNew: boolean;
+} {
+  if (!opts.forceNew) {
+    const fresh = peekOpenWorkbenchSession();
+    if (fresh) return { session: fresh, isNew: false };
+  }
+  endOpenSessionsStmt.run();
+  const threadExt = `cockpit:workbench-brain-${randomUUID()}`;
+  const info = insertSessionStmt.run(threadExt);
+  const created = getSessionByIdStmt.get(Number(info.lastInsertRowid));
+  if (!created) throw new Error('Failed to load workbench session after insert');
+  return { session: created, isNew: true };
+}
+
+/** Stamp last_activity_at + the focus pointer for next time — "Touching
+ *  /workbench/say updates last_activity_at" (spec). */
+export function touchWorkbenchSession(sessionId: number, focusId: number | null): void {
+  touchSessionStmt.run(focusId, sessionId);
+}
+
+function renderRootDigest(): string {
+  const roots = listSmartTodoNodes()
+    .filter((n) => n.parent_id === null)
+    .sort((a, b) => a.sort_order - b.sort_order);
+  if (!roots.length) return '(the tree is empty — nothing jotted yet)';
+  return roots
+    .map((r) => {
+      const rowLines = [`- [${r.status}] ${r.title} (id ${r.id})`];
+      if (r.notes) rowLines.push(`  notes: ${r.notes.slice(0, 200)}`);
+      if (r.context_notes) rowLines.push(`  context: ${r.context_notes.slice(0, 300)}`);
+      return rowLines.join('\n');
+    })
+    .join('\n');
+}
+
+/** The tree digest a BRAND-NEW brain session is booted with — root branches
+ *  only (status/notes/context_notes), never transcripts, plus the standing
+ *  instructions for how the brain drives the tree. This (not Kevin) is what
+ *  makes "he should never have to say which project he means" true from the
+ *  first message of a sitting. */
+function buildBrainSeedText(): string {
+  const lines: string[] = [
+    "You are JARVIS's Workbench brain — the ONE ongoing conversation behind Kevin's docked chat " +
+      "bar on the Workbench idea tree. Unlike a normal thread you are not bound to a single branch; " +
+      'you persist across whatever he talks about in this sitting. Every message he sends silently ' +
+      'carries a FOCUS POINTER (whichever node — if any — he is currently zoomed into on the page). ' +
+      'A message that opens with a `[focus: ...]` header is telling you the pointer just moved — ' +
+      'that is what it is now pointed at. He should never have to tell you which project he means: ' +
+      'the header (when present) plus the tree digest below are how you already know.',
+    '',
+    'Everything currently on the board (root branches — automatic, no need to ask for it):',
+    renderRootDigest(),
+    '',
+    'How to work in this chat:',
+    '- Use the `workbench` tool to read/create/update the tree: list_scope, add_child, split, update, ' +
+      'set_status, move, write_context, read_up, propose_batch, update_proposal, delete_proposal, accept_batch.',
+    '- Creating a node is not free the way talking is. If what Kevin describes breaks into MORE THAN ONE ' +
+      'node, use `propose_batch` — that lands the breakdown as dashed "ghost" proposals he corrects ' +
+      '(by talking or clicking ✓/✕) before anything becomes real. A single node he explicitly asked for ' +
+      'may still go straight to `add_child`.',
+    '- Only call `accept_batch` when Kevin has actually said yes/approved IN THIS CONVERSATION — his ' +
+      'utterance is the gate. Never accept a batch you just proposed unprompted.',
+    '- AUTO-NOTES: whenever you materially advance a node — a decision, a change, a next step — call ' +
+      '`write_context` on that node with a 1-3 line outcome before you finish responding. The TREE is the ' +
+      'long-term memory here, not this conversation; a future sitting (or a dispatched worker) should be ' +
+      'able to pick up from the tree alone.',
+    '- `read_up` is on demand only — an ancestor node id, when you genuinely need context above wherever ' +
+      'the focus pointer currently is. It returns a SUMMARY, never a transcript.',
+  ];
+  return lines.join('\n');
+}
+
+/** `[focus: #43 "Design refresh strategy" — path: A > B]`, or the root
+ *  sentinel when nothing is zoomed in. Only shown when the pointer changed
+ *  since the session's last message (see composeBrainWrappedText) — not on
+ *  every turn, so the bar doesn't repeat itself. */
+function buildFocusHeader(focusId: number | null): string {
+  if (focusId === null) return '[focus: root — the whole tree]';
+  const node = getSmartTodoNode(focusId);
+  if (!node) return '[focus: root — the whole tree (the previously focused node no longer exists)]';
+  const ancestors = ancestorChain(node);
+  const path = ancestors.length ? ` — path: ${ancestors.map((a) => a.title).join(' > ')}` : '';
+  return `[focus: #${node.id} "${node.title}"${path}]`;
+}
+
+/** What the CLIENT actually posts to `/threads/:ext/messages` after a
+ *  `/workbench/say` call (2-step pattern — this never posts the message
+ *  itself). `focusChanged` gates the header + subtree snapshot so a run of
+ *  messages at the same focus doesn't repeat context every turn; otherwise
+ *  it's Kevin's text, verbatim. */
+function composeBrainWrappedText(focusId: number | null, focusChanged: boolean, text: string): string {
+  if (!focusChanged) return text;
+  const header = buildFocusHeader(focusId);
+  const scope = getWorkbenchScope(focusId) ?? { node: null, ancestors: [], subtree: listSmartTodoNodes() };
+  const snapshot = renderSubtreeDigest(scope);
+  return [header, '', snapshot, '', text].join('\n');
+}
+
+export interface WorkbenchSayResult {
+  external_id: string;
+  seed_text: string | null;
+  wrapped_text: string;
+}
+
+/** POST /workbench/say's full brain: find-or-create the session (+ bind its
+ *  backing conversation), compose what the client should post, and stamp
+ *  last_activity_at/the focus pointer for next time. Owns the session +
+ *  conversation side effects itself — same "the route stays thin, the module
+ *  owns the writes" shape as matchOrCreatePlacement above — so the route
+ *  handler is just validation + one call. Never posts to
+ *  /threads/:ext/messages itself (do NOT dispatch server-side — the client
+ *  does the actual send, same 2-step pattern as hopper promote). */
+export function composeBrainSay(
+  text: string,
+  focusId: number | null,
+  opts: { forceNew?: boolean } = {},
+): WorkbenchSayResult {
+  const { session, isNew } = findOrCreateWorkbenchSession(opts);
+
+  // Bind the underlying conversation the first time this session's thread is
+  // actually used — mirrors /workbench/:id/open-chat's own
+  // getOrCreateConversation + renameConversation pairing.
+  getOrCreateConversation(session.thread_ext);
+  if (isNew) {
+    const conv = getConversation(session.thread_ext);
+    if (conv) renameConversation(conv.id, 'Workbench — brain');
+  }
+
+  const focusChanged = isNew || focusId !== session.last_focus_id;
+  const seedText = isNew ? buildBrainSeedText() : null;
+  const wrappedText = composeBrainWrappedText(focusId, focusChanged, text);
+
+  touchWorkbenchSession(session.id, focusId);
+
+  return { external_id: session.thread_ext, seed_text: seedText, wrapped_text: wrappedText };
 }

@@ -20,7 +20,8 @@
     "multi-claude:e2e-sim": "JARVIS_DB_PATH=/tmp/multi-claude-e2e-sim.db node scripts/multi-claude-e2e-sim.mjs",
     "claude-session-account:test": "JARVIS_DB_PATH=/tmp/claude-session-account-test.db node scripts/claude-session-account-test.mjs",
     "goals:sim": "npm run build && JARVIS_DB_PATH=/tmp/goals-sim.db npx tsx scripts/goals-sim.ts",
-    "goals:review-checks": "npm run build && JARVIS_DB_PATH=/tmp/goals-review.db npx tsx scripts/goals-review-checks.ts"
+    "goals:review-checks": "npm run build && JARVIS_DB_PATH=/tmp/goals-review.db npx tsx scripts/goals-review-checks.ts",
+    "persona-mcp:sim": "npm run build && JARVIS_DB_PATH=/tmp/persona-mcp-sim.db npx tsx scripts/persona-mcp-sim.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

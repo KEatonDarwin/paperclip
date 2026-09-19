@@ -171,8 +171,18 @@ import {
   type SmartTodoStatus,
 } from '../smart-todos.js';
 import { decomposeNote } from '../smart-todos-decompose.js';
-import { getWorkbenchScope, matchOrCreatePlacement, buildWorkbenchSeedText } from '../workbench.js';
-import { listSpawnTasks, listAllSpawnTasks } from '../spawn-tasks.js';
+import {
+  getWorkbenchScope, matchOrCreatePlacement, buildWorkbenchSeedText, composeDispatchPrompt,
+  listPendingProposalBatches, acceptProposalBatch, rejectProposalBatch,
+  composeBrainSay, peekOpenWorkbenchSession,
+} from '../workbench.js';
+import {
+  listSpawnTasks,
+  listAllSpawnTasks,
+  getLatestSpawnTaskForWorkbenchNode,
+  recordWorkbenchDispatch,
+  markSpawnTaskFailed,
+} from '../spawn-tasks.js';
 import {
   listActiveQuickCaptureItems,
   createQuickCaptureItem,
@@ -2732,6 +2742,194 @@ export function createApiV1Router(): Router {
     });
   });
 
+  // V2 "Sessions" (SPEC.md "V2 — THE INTERACTION CORRECTION"): the docked
+  // chat bar talks to ONE ongoing brain session per sitting, never a
+  // per-node thread. This route never itself posts to /threads/:ext/messages
+  // — same 2-step create-then-post pattern as hopper promote (RECON-V2.md
+  // §2/§6): the client takes {external_id, seed_text, wrapped_text} and does
+  // that POST itself.
+  router.post('/workbench/say', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { text?: unknown; focus_id?: unknown; force_new?: unknown };
+    const text = typeof body.text === 'string' ? body.text.trim() : '';
+    if (!text) {
+      sendError(res, 400, 'invalid_request', 'text is required and must be a non-empty string');
+      return;
+    }
+
+    let focusId: number | null = null;
+    if (body.focus_id !== undefined && body.focus_id !== null) {
+      const parsed = typeof body.focus_id === 'number' ? body.focus_id : parseInt(String(body.focus_id), 10);
+      if (Number.isNaN(parsed) || !getSmartTodoNode(parsed)) {
+        sendError(res, 404, 'smart_todo_not_found', `focus node ${String(body.focus_id)} not found`);
+        return;
+      }
+      focusId = parsed;
+    }
+
+    const forceNew = body.force_new === true;
+    const result = composeBrainSay(text, focusId, { forceNew });
+    // 201 when this call just started a fresh sitting (seed_text present), 200
+    // when it's reusing the still-open session — mirrors /workbench/:id/open-chat's
+    // new-vs-reused status convention just above.
+    res.status(result.seed_text !== null ? 201 : 200).json(result);
+  });
+
+  // Read-only session discovery for the docked bar's mount — lets a page
+  // reload mid-sitting resolve the already-open session (and render its
+  // Timeline via the existing GET /threads/:ext) instead of looking like a
+  // fresh sitting with nothing to fetch (RECON-V2.md §4's gap). Never
+  // extends last_activity_at — a page load must not itself keep a sitting
+  // alive.
+  router.get('/workbench/session', (_req: AuthedRequest, res) => {
+    const open = peekOpenWorkbenchSession();
+    res.json(open ? { external_id: open.thread_ext, last_activity_at: open.last_activity_at } : { external_id: null });
+  });
+
+  // V2 "Dispatch" (SPEC.md "V2 — THE INTERACTION CORRECTION"): explicit,
+  // deliberate worker dispatch attached to ONE node — never spawned on
+  // click/zoom. Spawns an ephemeral cockpit worker in-process (same pattern as
+  // hopper-engine.ts's spawnWorker — processMessage is already imported at
+  // module scope in this file, so no self-HTTP round trip is needed) with an
+  // EXPLICIT model, never inherited. The worker's finish contract is a normal
+  // `workbench` write_context tool call, not a curl — the existing 5-minute
+  // spawn_tasks reconciler (jarvis-spawn-reconcile.py) tracks running -> done
+  // off server-owned run-state exactly like every other spawned worker.
+  router.post('/workbench/nodes/:id/dispatch', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const nodeId = parseInt(String(req.params.id), 10);
+    if (Number.isNaN(nodeId)) {
+      sendError(res, 400, 'invalid_request', 'id must be a node id');
+      return;
+    }
+    const node = getSmartTodoNode(nodeId);
+    if (!node) {
+      sendError(res, 404, 'smart_todo_not_found', 'node not found');
+      return;
+    }
+
+    const existing = getLatestSpawnTaskForWorkbenchNode(nodeId);
+    if (existing && existing.status === 'running') {
+      sendError(res, 409, 'dispatch_already_running', `node ${nodeId} already has a dispatch in progress`);
+      return;
+    }
+
+    const body = (req.body ?? {}) as { instructions?: unknown };
+    const instructions = typeof body.instructions === 'string' && body.instructions.trim() ? body.instructions.trim() : null;
+
+    const scope = getWorkbenchScope(nodeId)!;
+    const model = getSetting('workbench_dispatch_model') || 'claude-sonnet-5';
+    const externalId = `${callerExternalIdPrefix(caller.id)}workbench-worker-${nodeId}-${randomUUID().slice(0, 8)}`;
+    const conv = getOrCreateConversation(externalId);
+    renameConversation(conv.id, `⚙️ ${node.title.slice(0, 100)}`);
+    // Explicit model, NEVER inherited — the One Rule (skills/jarvis-router/SKILL.md).
+    setThreadModelOverride(conv.id, 'claude', model);
+
+    const prompt = composeDispatchPrompt(node, scope.ancestors, instructions);
+    const dispatch = recordWorkbenchDispatch({
+      threadExt: externalId,
+      conversationId: conv.id,
+      parentThreadExt: node.linked_thread_ext ?? null,
+      label: `workbench #${node.id}: ${node.title.slice(0, 80)}`,
+      taskPrompt: prompt,
+      model,
+      workbenchNodeId: nodeId,
+    });
+
+    processMessage(prompt, externalId, `turn:${conv.id}:0`).catch((err: unknown) => {
+      // Spawn itself failed (busy/adapter error) — release the row so the UI
+      // badge reflects reality instead of a phantom 'running' forever.
+      const message = err instanceof Error ? err.message : String(err);
+      markSpawnTaskFailed(externalId, message);
+    });
+
+    res.status(201).json({
+      dispatch: {
+        id: dispatch.id,
+        status: dispatch.status,
+        worker_thread_ext: dispatch.thread_ext,
+        model: dispatch.model,
+        created_at: dispatch.created_at,
+      },
+      external_id: externalId,
+    });
+  });
+
+  // GET /workbench/nodes/:id/dispatch — latest attempt's status for the UI
+  // badge. 'none' = never dispatched (no spawn_tasks row exists yet).
+  router.get('/workbench/nodes/:id/dispatch', (req: AuthedRequest, res) => {
+    const nodeId = parseInt(String(req.params.id), 10);
+    if (Number.isNaN(nodeId)) {
+      sendError(res, 400, 'invalid_request', 'id must be a node id');
+      return;
+    }
+    if (!getSmartTodoNode(nodeId)) {
+      sendError(res, 404, 'smart_todo_not_found', 'node not found');
+      return;
+    }
+    const latest = getLatestSpawnTaskForWorkbenchNode(nodeId);
+    if (!latest) {
+      res.json({ status: 'none', worker_thread_ext: null, model: null, created_at: null, updated_at: null });
+      return;
+    }
+    res.json({
+      status: latest.status,
+      worker_thread_ext: latest.thread_ext,
+      model: latest.model,
+      result: latest.result,
+      error: latest.error,
+      created_at: latest.created_at,
+      updated_at: latest.updated_at,
+    });
+  });
+
+  // V2 "Proposals" (the ghost layer, SPEC.md "V2 — THE INTERACTION CORRECTION"):
+  // multi-node decompositions land as pending ghosts (`workbench_proposals`)
+  // via the `workbench` tool's `propose_batch` op, NOT via an HTTP create route
+  // — creation is always model-driven, from inside a Workbench chat. These
+  // three routes are the "Kevin clicks Accept/Reject" half; the SAME internal
+  // accept/reject functions back the tool's `accept_batch`/`delete_proposal`
+  // ops too, so there is one write path regardless of which surface triggers it.
+
+  // GET /workbench/proposals — every pending proposal, grouped by batch.
+  router.get('/workbench/proposals', (_req: AuthedRequest, res) => {
+    res.json({ batches: listPendingProposalBatches() });
+  });
+
+  // POST /workbench/proposals/:batchId/accept { ids? } — materialize (some or
+  // all of) a batch into real smart_todo_nodes. Omitting ids accepts the whole
+  // batch. Accepting a nested proposal implicitly accepts its ghost ancestors
+  // (a child can't be materialized without its parent existing somewhere real).
+  router.post('/workbench/proposals/:batchId/accept', (req: AuthedRequest, res) => {
+    const batchId = String(req.params.batchId);
+    const body = (req.body ?? {}) as { ids?: unknown };
+    const ids = Array.isArray(body.ids)
+      ? body.ids.filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
+      : undefined;
+    try {
+      const { created } = acceptProposalBatch(batchId, ids && ids.length ? ids : undefined);
+      res.status(200).json({ ok: true, created });
+    } catch (err) {
+      sendError(res, 400, 'accept_failed', (err as Error).message);
+    }
+  });
+
+  // POST /workbench/proposals/:batchId/reject { ids? } — discard (some or all
+  // of) a batch without materializing it. Omitting ids rejects the whole
+  // batch. Rejecting a proposal also rejects everything nested under it.
+  router.post('/workbench/proposals/:batchId/reject', (req: AuthedRequest, res) => {
+    const batchId = String(req.params.batchId);
+    const body = (req.body ?? {}) as { ids?: unknown };
+    const ids = Array.isArray(body.ids)
+      ? body.ids.filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
+      : undefined;
+    try {
+      const { removed } = rejectProposalBatch(batchId, ids && ids.length ? ids : undefined);
+      res.status(200).json({ ok: true, removed });
+    } catch (err) {
+      sendError(res, 400, 'reject_failed', (err as Error).message);
+    }
+  });
+
   router.post('/notifications/:id/checkin-snooze', async (req: AuthedRequest, res) => {
     const id = parseInt(String(req.params.id), 10);
     const notification = getNotification(id);
@@ -4393,7 +4591,7 @@ export function createApiV1Router(): Router {
       'quick_capture', 'thread_summary', 'notification',
       'dispatch', 'dispatch_cue', 'hopper_item', 'hopper_node', 'smart_todo',
       'workstream', 'monitor', 'monitor_run', 'foundry_project', 'foundry_module',
-      'intel_run', 'intel_item',
+      'intel_run', 'intel_item', 'workbench_proposal',
     ]);
 
     res.writeHead(200, {

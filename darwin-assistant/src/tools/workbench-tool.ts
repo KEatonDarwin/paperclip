@@ -14,7 +14,14 @@ import {
   assertWorkbenchScope,
   touchWorkbenchActivity,
   readAncestorSummary,
+  proposeBatch,
+  updateWorkbenchProposal,
+  deleteProposalCascade,
+  acceptProposalBatch,
+  getWorkbenchProposal,
+  listProposalsForBatch,
   type DecompositionItem,
+  type WorkbenchProposalRow,
 } from '../workbench.js';
 
 // WORKBENCH tool — lets a chat that's ZOOMED INTO a branch of the idea tree
@@ -70,6 +77,28 @@ function sanitizeChildren(raw: unknown, depth = 0): DecompositionItem[] {
   return out;
 }
 
+function countItems(items: DecompositionItem[]): number {
+  return items.reduce((n, it) => n + 1 + countItems(it.children ?? []), 0);
+}
+
+function numArray(raw: unknown): number[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out = raw.filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
+  return out.length ? out : undefined;
+}
+
+function serializeProposal(p: WorkbenchProposalRow): Record<string, unknown> {
+  return {
+    id: p.id,
+    batch_id: p.batch_id,
+    parent_node_id: p.parent_node_id,
+    parent_proposal_id: p.parent_proposal_id,
+    title: p.title,
+    notes: p.notes,
+    sort_order: p.sort_order,
+  };
+}
+
 export const workbench: ToolDef = {
   name: 'workbench',
   description:
@@ -82,20 +111,37 @@ export const workbench: ToolDef = {
     "node + its full subtree + the ancestor chain above it — call this if you need to refresh what you " +
     "can see), 'add_child' (one new item under a node in scope — defaults to your focus node if parent_id " +
     "omitted; needs title), 'split' (decompose ONE existing node in scope into child items you've already " +
-    "worked out in conversation — needs node_id, children: [{title, notes?, children?}]), 'update' (title/" +
+    "worked out in conversation — needs node_id, children: [{title, notes?, children?}]; more than one child " +
+    "is automatically staged as a proposal batch, not written directly), 'update' (title/" +
     "notes on a node in scope — needs node_id), 'set_status' (needs node_id + status), 'move' (re-parent a " +
     "node WITHIN your scope — needs node_id + new_parent_id, null only allowed from root scope), " +
     "'write_context' (**do this at the end of any turn where something real happened** — appends a short " +
     "machine-written outcome note to a node's context_notes, defaulting to your focus node; this is what " +
     "lets the tree carry memory forward instead of the transcript, needs text), 'read_up' (ON DEMAND ONLY " +
     "— pulls an ancestor node's chat SUMMARY, never its transcript, for when you genuinely need context " +
-    "from above your branch; needs node_id, must be one of your current ancestors).",
+    "from above your branch; needs node_id, must be one of your current ancestors). " +
+    "PROPOSALS (the ghost layer — draft nodes Kevin corrects before they become real): " +
+    "**any time you're creating MORE THAN ONE node at once — a multi-item breakdown of something Kevin " +
+    "described vaguely — you MUST use 'propose_batch', never add_child/split, for every item. A single " +
+    "node Kevin explicitly and unambiguously asked for may still go straight to add_child.** " +
+    "'propose_batch' (stage a decomposition as pending ghosts instead of real nodes — needs items: " +
+    "[{title, notes?, children?}], optional parent_id (a REAL node in scope; omit for your focus node, or " +
+    "pass null only from root scope for new top-level branches) — items/children can nest, nested items " +
+    "become nested ghosts under their parent item, not real nodes), 'update_proposal' (edit a still-pending " +
+    "ghost's title/notes — needs proposal_id), 'delete_proposal' (discard ONE ghost + anything nested under " +
+    "it — needs proposal_id), 'accept_batch' (materialize some or all of a batch into real nodes — needs " +
+    "batch_id, optional ids to accept only some of the batch (accepting a nested ghost also accepts its " +
+    "ghost ancestors) — **only call this when Kevin has actually said yes/approved in this conversation; " +
+    "never accept a batch unprompted, even one you just proposed**).",
   parameters: {
     type: 'object',
     properties: {
       operation: {
         type: 'string',
-        enum: ['list_scope', 'add_child', 'split', 'update', 'set_status', 'move', 'write_context', 'read_up'],
+        enum: [
+          'list_scope', 'add_child', 'split', 'update', 'set_status', 'move', 'write_context', 'read_up',
+          'propose_batch', 'update_proposal', 'delete_proposal', 'accept_batch',
+        ],
         description: 'What to do.',
       },
       node_id: {
@@ -126,6 +172,23 @@ export const workbench: ToolDef = {
       },
       sort_order: { type: 'number', description: 'Position among the new siblings for move. Defaults to 0.' },
       text: { type: 'string', description: 'The 1-3 line outcome note. Required for write_context.' },
+      items: {
+        type: 'array',
+        description:
+          'The decomposition to propose. Required for propose_batch. Each item: {title, notes?, children?} ' +
+          '(children nest further as ghost items, not real nodes).',
+        items: { type: 'object' },
+      },
+      proposal_id: {
+        type: 'number',
+        description: 'Target proposal id. Required for update_proposal and delete_proposal.',
+      },
+      batch_id: { type: 'string', description: 'Target batch id. Required for accept_batch.' },
+      ids: {
+        type: 'array',
+        items: { type: 'number' },
+        description: 'For accept_batch: specific proposal ids to accept. Omit to accept the whole batch.',
+      },
     },
     required: ['operation'],
   },
@@ -164,6 +227,26 @@ export const workbench: ToolDef = {
       if (!getSmartTodoNode(targetId)) return { error: `node ${targetId} not found` };
       const children = sanitizeChildren(args.children);
       if (!children.length) return { error: 'split needs a non-empty children array with at least one {title}' };
+      // SPEC.md V2 bulk rule, enforced in CODE not just the description
+      // (REVIEW-V2 fix #2): more than one node → it's a proposal batch Kevin
+      // corrects first, never a direct multi-row write. A single child stays
+      // direct (the "one node he explicitly asked for" carve-out).
+      if (countItems(children) > 1) {
+        const { batch_id, proposals } = proposeBatch(children, {
+          parentNodeId: targetId,
+          createdByThread: context?.externalId ?? null,
+          createdByMessage: context?.sourceMessageId ?? null,
+        });
+        return {
+          ok: true,
+          proposed: true,
+          batch_id,
+          proposals: proposals.map(serializeProposal),
+          note:
+            'That was more than one node, so it was staged as a ghost proposal batch (not written as real ' +
+            'nodes). Kevin corrects it by talking or clicking ✓/✕; call accept_batch only once he has said yes.',
+        };
+      }
       const created = children.map((item) => insertUnderParent(targetId, item));
       touchWorkbenchActivity(targetId);
       return { ok: true, created: created.map(serializeNode) };
@@ -274,6 +357,96 @@ export const workbench: ToolDef = {
         summary: result.summary,
         note: result.note,
       };
+    }
+
+    if (op === 'propose_batch') {
+      const items = sanitizeChildren(args.items);
+      if (!items.length) return { error: 'propose_batch needs a non-empty items array with at least one {title}' };
+      let parentNodeId: number | null;
+      if (Object.prototype.hasOwnProperty.call(args, 'parent_id') && args.parent_id !== undefined) {
+        if (args.parent_id === null) {
+          if (toolScope.allowedIds !== null) {
+            return {
+              error:
+                "Can't propose a new top-level branch while you're zoomed in — zoom out to the root chat " +
+                "first if that's really what Kevin wants.",
+            };
+          }
+          parentNodeId = null;
+        } else if (typeof args.parent_id === 'number' && Number.isFinite(args.parent_id)) {
+          parentNodeId = args.parent_id;
+          const guard = assertWorkbenchScope(toolScope, parentNodeId);
+          if (!guard.ok) return { error: guard.error };
+          if (!getSmartTodoNode(parentNodeId)) return { error: `parent node ${parentNodeId} not found` };
+        } else {
+          return { error: 'parent_id must be a node id or null' };
+        }
+      } else {
+        parentNodeId = toolScope.focusId;
+      }
+      const { batch_id, proposals } = proposeBatch(items, {
+        parentNodeId,
+        createdByThread: context?.externalId ?? null,
+        createdByMessage: context?.sourceMessageId ?? null,
+      });
+      return { ok: true, batch_id, proposals: proposals.map(serializeProposal) };
+    }
+
+    if (op === 'update_proposal') {
+      const id = num(args.proposal_id);
+      if (id === null) return { error: 'update_proposal needs a proposal_id' };
+      if (!getWorkbenchProposal(id)) return { error: `proposal ${id} not found` };
+      const title = str(args.title);
+      const updated = updateWorkbenchProposal(id, {
+        title: title ?? undefined,
+        notes: args.notes !== undefined ? str(args.notes) : undefined,
+      });
+      if (!updated) return { error: `proposal ${id} not found` };
+      return { ok: true, proposal: serializeProposal(updated) };
+    }
+
+    if (op === 'delete_proposal') {
+      const id = num(args.proposal_id);
+      if (id === null) return { error: 'delete_proposal needs a proposal_id' };
+      if (!getWorkbenchProposal(id)) return { error: `proposal ${id} not found` };
+      const removed = deleteProposalCascade(id);
+      return { ok: true, removed };
+    }
+
+    if (op === 'accept_batch') {
+      const batchId = str(args.batch_id);
+      if (!batchId) return { error: 'accept_batch needs a batch_id' };
+      const ids = numArray(args.ids);
+      const batchRows = listProposalsForBatch(batchId);
+      if (!batchRows.length) return { error: `no pending proposals for batch ${batchId}` };
+      // REVIEW-V2 fix #3 — the mechanical half of "his utterance is the gate":
+      // a batch proposed in THIS SAME TURN cannot be accepted in this turn.
+      // Kevin has not even seen it yet; the earliest legitimate accept is a
+      // later turn (his reply), or his own click on the page.
+      const turnId = context?.sourceMessageId ?? null;
+      if (turnId && batchRows.some((r) => r.created_by_message === turnId)) {
+        return {
+          error:
+            'You proposed this batch in this very turn — Kevin has not seen it yet. Stop and let him correct/' +
+            'approve it (by replying or clicking ✓/✕). accept_batch is only for a batch he has already said yes to.',
+        };
+      }
+      // A scoped chat (v1 per-node / a dispatch worker) may only materialize
+      // proposals that land inside its own branch.
+      if (toolScope.allowedIds !== null) {
+        for (const r of batchRows.filter((x) => x.parent_proposal_id === null)) {
+          if (r.parent_node_id === null) return { error: "Can't accept a top-level batch from a scoped chat — that's a root-scope action." };
+          const guard = assertWorkbenchScope(toolScope, r.parent_node_id);
+          if (!guard.ok) return { error: guard.error };
+        }
+      }
+      try {
+        const { created } = acceptProposalBatch(batchId, ids);
+        for (const node of created) touchWorkbenchActivity(node.id);
+        return { ok: true, created: created.map(serializeNode) };
+      } catch (err) {
+        return { error: (err as Error).message };
+      }
     }
 
     return { error: `unknown operation: ${op || '(none)'}` };

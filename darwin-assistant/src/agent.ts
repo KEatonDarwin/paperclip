@@ -592,6 +592,7 @@ export function buildToolsBlock(): string {
   return [
     '## Tools',
     'When you need to call a tool, output EXACTLY this format then STOP — do not write anything after the closing tag:',
+    'IMPORTANT: the tools listed below are NOT native functions of your harness — a native tool-use call fails with "No such tool available". They only work as the plain-text block below, written in your reply; the harness parses it, runs the tool, and feeds the result back as the next turn. Never conclude a listed tool is "not wired" — use this block.',
     '<tool_call>',
     '{"name": "tool_name", "arguments": {"param": "value"}}',
     '</tool_call>',

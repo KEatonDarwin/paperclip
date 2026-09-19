@@ -256,6 +256,33 @@ function isFoundryTree(tree: HopperTreeRow | null | undefined): boolean {
   return !!tree && tree.topic.startsWith('foundry:');
 }
 
+// GOALS integration (CONTRACT.md §7) — a goal machine-leaf node can link a
+// hopper tree via tree_id. Rather than importing goals.ts here (which would
+// create an import cycle, since goals.ts imports createHopperTree/etc from
+// this file), goals.ts registers a listener at module load. No-op when no
+// listener is registered (e.g. goals.ts never loaded) or no goal node
+// references the tree — callers must be defensive either way.
+type TreeStatusListener = (treeId: string, status: 'done' | 'blocked' | 'active') => void;
+const treeStatusListeners: TreeStatusListener[] = [];
+export function registerTreeStatusListener(fn: TreeStatusListener): void {
+  treeStatusListeners.push(fn);
+}
+function notifyTreeStatusListeners(treeId: string, status: 'done' | 'blocked' | 'active'): void {
+  for (const fn of treeStatusListeners) {
+    try {
+      fn(treeId, status);
+    } catch (err) {
+      console.error('[hopper-engine] tree status listener failed', err);
+    }
+  }
+}
+
+/** True if `treeId` has no node left in blocked/blocked_question. Used to
+ *  decide whether clearing one blocked node returns the tree to 'active'. */
+function treeHasNoBlockedNodes(treeId: string): boolean {
+  return !listTreeNodes(treeId).some((n) => n.status === 'blocked' || n.status === 'blocked_question');
+}
+
 function setNode(id: number, fields: Partial<Record<keyof HopperNodeRow, unknown>>): HopperNodeRow | null {
   const keys = Object.keys(fields);
   if (keys.length) {
@@ -583,6 +610,7 @@ function maybeFinishTree(treeId: string): void {
       body: `All ${nodes.length} tasks are done. Tree ${treeId}.`,
       source: 'hopper-engine',
     });
+    notifyTreeStatusListeners(treeId, 'done');
   }
 }
 
@@ -624,6 +652,7 @@ export function finishHopperNode(
         source: 'hopper-engine',
       });
     }
+    notifyTreeStatusListeners(node.tree_id, 'blocked');
   } else {
     setNode(id, { status: 'blocked', result: payload.result ?? null, lease_expires_at: null });
     const latest = getNodeStmt.get(id) ?? null;
@@ -635,6 +664,7 @@ export function finishHopperNode(
         source: 'hopper-engine',
       });
     }
+    notifyTreeStatusListeners(node.tree_id, 'blocked');
   }
   queueMicrotask(() => void dispatchTick('node_finished'));
   return getNodeStmt.get(id) ?? null;
@@ -645,6 +675,7 @@ export function answerHopperNode(id: number, answer: string): HopperNodeRow | nu
   const node = getNodeStmt.get(id);
   if (!node || node.status !== 'blocked_question') return node ?? null;
   const updated = setNode(id, { status: 'pending', answer, worker_thread_ext: null });
+  if (updated && treeHasNoBlockedNodes(updated.tree_id)) notifyTreeStatusListeners(updated.tree_id, 'active');
   queueMicrotask(() => void dispatchTick('question_answered'));
   return updated;
 }
@@ -662,6 +693,7 @@ export function retryHopperNode(id: number): HopperNodeRow | null {
     worker_thread_ext: null,
     lease_expires_at: null,
   });
+  if (updated && treeHasNoBlockedNodes(updated.tree_id)) notifyTreeStatusListeners(updated.tree_id, 'active');
   queueMicrotask(() => void dispatchTick('node_retry'));
   return updated;
 }
@@ -687,6 +719,7 @@ export async function dispatchTick(reason: string): Promise<void> {
             source: 'hopper-engine',
           });
         }
+        notifyTreeStatusListeners(node.tree_id, 'blocked');
       } else {
         // Retry rides one rung up: Claude keeps its tier ladder; non-Claude
         // hops provider so a provider-specific failure doesn't repeat itself.

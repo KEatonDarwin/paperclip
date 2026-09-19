@@ -75,6 +75,41 @@ import {
   type HopperStatus,
 } from '../hopper.js';
 import {
+  GoalError,
+  listGoals,
+  createGoal,
+  getGoalTree,
+  patchGoal,
+  verifyGoal,
+  parkGoal,
+  unparkGoal,
+  listGoalEvents,
+  createGoalNode,
+  proposeGoalNodes,
+  acceptGoalNode,
+  acceptGoalBatch,
+  acceptAllGoalNodes,
+  discardGoalNode,
+  discardGoalBatch,
+  patchGoalNode,
+  proposeEdit,
+  proposeRemoval,
+  resolvePending,
+  humanDoneNode,
+  verifyGoalNode,
+  parkGoalNode,
+  unparkGoalNode,
+  getGoalFocus,
+  setGoalFocus,
+  setLeafKind,
+  proposePlan,
+  rejectPlan,
+  approvePlan,
+  promoteNode,
+  getNodeTreeOverlay,
+  getOrCreateGoalThread,
+} from '../goals.js';
+import {
   DETAIL_EVENT_LIMIT,
   attachWorkstreamLink,
   completeWorkstreamStep,
@@ -388,6 +423,14 @@ function sendCaughtFoundryError(res: Response, err: unknown): void {
     return;
   }
   sendError(res, 500, 'foundry_error', err instanceof Error ? err.message : String(err));
+}
+
+function sendCaughtGoalError(res: Response, err: unknown): void {
+  if (err instanceof GoalError) {
+    sendError(res, err.status, err.code, err.message, err.extra);
+    return;
+  }
+  sendError(res, 500, 'goal_error', err instanceof Error ? err.message : String(err));
 }
 
 function parseJsonSetting<T>(key: string): T | null {
@@ -2151,6 +2194,448 @@ export function createApiV1Router(): Router {
     }
     deleteHopperItem(id);
     res.status(204).end();
+  });
+
+  // == Goals ===================================================================
+  // The goal-driven development surface (tree-2d558f04). See
+  // skills/goals/CONTRACT.md — this block covers §3.1/§3.2/§3.3/§3.5 (BACKEND A,
+  // node #455). leaf_kind/propose_plan/reject_plan/approve_plan/promote/the
+  // GET|POST .../thread endpoint/tree overlay proxy are BACKEND B (node #456).
+
+  router.get('/goals', (req: AuthedRequest, res) => {
+    const includeDone = req.query.include_done === '1';
+    const includeArchived = req.query.include_archived === '1';
+    res.json({ goals: listGoals(includeDone, includeArchived) });
+  });
+
+  router.post('/goals', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as {
+      title?: unknown; done_means?: unknown; notes?: unknown; authored_by?: unknown; actor?: unknown;
+    };
+    if (typeof body.title !== 'string' || !body.title.trim()) {
+      sendError(res, 400, 'title_required', 'title is required and must be a non-empty string');
+      return;
+    }
+    try {
+      const created = createGoal({
+        title: body.title,
+        done_means: typeof body.done_means === 'string' ? body.done_means : null,
+        notes: typeof body.notes === 'string' ? body.notes : null,
+        authored_by: body.authored_by,
+        actor: body.actor,
+      });
+      res.status(201).json(created);
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.get('/goals/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const includeDiscarded = req.query.include_discarded === '1';
+    const tree = getGoalTree(id, includeDiscarded);
+    if (!tree) {
+      sendError(res, 404, 'goal_not_found', 'goal not found');
+      return;
+    }
+    res.json(tree);
+  });
+
+  router.patch('/goals/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const body = (req.body ?? {}) as {
+      title?: unknown; done_means?: unknown; notes?: unknown; sort_order?: unknown; archived?: unknown; actor?: unknown;
+    };
+    try {
+      const goal = patchGoal(id, {
+        title: typeof body.title === 'string' ? body.title : undefined,
+        done_means: body.done_means === undefined ? undefined : (typeof body.done_means === 'string' ? body.done_means : null),
+        notes: body.notes === undefined ? undefined : (typeof body.notes === 'string' ? body.notes : null),
+        sort_order: typeof body.sort_order === 'number' ? body.sort_order : undefined,
+        archived: typeof body.archived === 'boolean' ? body.archived : undefined,
+        actor: body.actor,
+      });
+      res.json({ goal });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/verify', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const body = (req.body ?? {}) as { passed?: unknown; note?: unknown; actor?: unknown };
+    if (typeof body.passed !== 'boolean') {
+      sendError(res, 400, 'invalid_request', 'passed must be a boolean');
+      return;
+    }
+    try {
+      const result = verifyGoal(id, body.passed, typeof body.note === 'string' ? body.note : undefined, body.actor);
+      res.json(result);
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/park', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const body = (req.body ?? {}) as { actor?: unknown };
+    try {
+      res.json({ goal: parkGoal(id, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/unpark', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const body = (req.body ?? {}) as { actor?: unknown };
+    try {
+      res.json({ goal: unparkGoal(id, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.get('/goals/:id/events', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const after = req.query.after !== undefined ? parseInt(String(req.query.after), 10) : undefined;
+    const limit = req.query.limit !== undefined ? parseInt(String(req.query.limit), 10) : 100;
+    try {
+      res.json({ events: listGoalEvents(id, Number.isFinite(after) ? after : undefined, Number.isFinite(limit) ? limit : 100) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  // Find-or-create the goal's dedicated thread (CONTRACT §8). In practice
+  // `POST /goals` already creates+links the thread eagerly, so this mostly
+  // returns created:false — it exists for the edge case (thread_ext missing
+  // or its conversation row gone) and for symmetry with the promote/discuss
+  // 2-step pattern. GET and POST behave identically.
+  const goalThreadHandler = (req: AuthedRequest, res: Response) => {
+    const id = parseInt(String(req.params.id), 10);
+    try {
+      res.json(getOrCreateGoalThread(id));
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  };
+  router.get('/goals/:id/thread', goalThreadHandler);
+  router.post('/goals/:id/thread', goalThreadHandler);
+
+  // -- Nodes ------------------------------------------------------------------
+
+  router.post('/goals/:id/nodes', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const body = (req.body ?? {}) as {
+      title?: unknown; done_means?: unknown; notes?: unknown; parent_id?: unknown;
+      authored_by?: unknown; leaf_kind?: unknown; sort_order?: unknown; actor?: unknown;
+    };
+    if (typeof body.title !== 'string' || !body.title.trim()) {
+      sendError(res, 400, 'title_required', 'title is required and must be a non-empty string');
+      return;
+    }
+    try {
+      const node = createGoalNode(goalId, {
+        title: body.title,
+        done_means: typeof body.done_means === 'string' ? body.done_means : null,
+        notes: typeof body.notes === 'string' ? body.notes : null,
+        parent_id: body.parent_id === null || body.parent_id === undefined ? null : Number(body.parent_id),
+        authored_by: body.authored_by,
+        leaf_kind: body.leaf_kind,
+        sort_order: typeof body.sort_order === 'number' ? body.sort_order : undefined,
+        actor: body.actor,
+      });
+      res.status(201).json({ node });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/propose', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const body = (req.body ?? {}) as { parent_id?: unknown; items?: unknown; actor?: unknown };
+    if (!Array.isArray(body.items)) {
+      sendError(res, 400, 'invalid_request', 'items must be an array');
+      return;
+    }
+    try {
+      const result = proposeGoalNodes(goalId, {
+        parent_id: body.parent_id === null || body.parent_id === undefined ? null : Number(body.parent_id),
+        items: body.items as Array<{ title: string; done_means: string; notes?: string; leaf_kind?: unknown; children?: unknown }>,
+        actor: body.actor,
+      });
+      res.status(201).json(result);
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/accept', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { actor?: unknown };
+    try {
+      res.json({ node: acceptGoalNode(goalId, nodeId, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/batches/:batchId/accept', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const batchId = paramString(req.params.batchId);
+    const body = (req.body ?? {}) as { ids?: unknown; actor?: unknown };
+    try {
+      const ids = Array.isArray(body.ids) ? (body.ids as unknown[]).map((v) => Number(v)) : undefined;
+      res.json({ nodes: acceptGoalBatch(goalId, batchId, ids, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/accept_all', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const body = (req.body ?? {}) as { parent_id?: unknown; actor?: unknown };
+    try {
+      const parentId = !('parent_id' in body)
+        ? undefined
+        : (body.parent_id === null ? null : Number(body.parent_id));
+      res.json({ nodes: acceptAllGoalNodes(goalId, parentId, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/discard', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { reason?: unknown; actor?: unknown };
+    try {
+      res.json({ node: discardGoalNode(goalId, nodeId, typeof body.reason === 'string' ? body.reason : undefined, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/batches/:batchId/discard', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const batchId = paramString(req.params.batchId);
+    const body = (req.body ?? {}) as { ids?: unknown; actor?: unknown };
+    try {
+      const ids = Array.isArray(body.ids) ? (body.ids as unknown[]).map((v) => Number(v)) : undefined;
+      res.json({ nodes: discardGoalBatch(goalId, batchId, ids, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.patch('/goals/:id/nodes/:nodeId', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as {
+      title?: unknown; done_means?: unknown; notes?: unknown; sort_order?: unknown; actor?: unknown;
+    };
+    try {
+      const node = patchGoalNode(goalId, nodeId, {
+        title: typeof body.title === 'string' ? body.title : undefined,
+        done_means: typeof body.done_means === 'string' ? body.done_means : undefined,
+        notes: typeof body.notes === 'string' ? body.notes : undefined,
+        sort_order: typeof body.sort_order === 'number' ? body.sort_order : undefined,
+        actor: body.actor,
+      });
+      res.json({ node });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  // -- Pending edits / removals -------------------------------------------
+
+  router.post('/goals/:id/nodes/:nodeId/propose_edit', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { title?: unknown; done_means?: unknown; actor?: unknown };
+    try {
+      const node = proposeEdit(goalId, nodeId, {
+        title: typeof body.title === 'string' ? body.title : undefined,
+        done_means: typeof body.done_means === 'string' ? body.done_means : undefined,
+        actor: body.actor,
+      });
+      res.json({ node });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/propose_removal', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { reason?: unknown; actor?: unknown };
+    try {
+      const node = proposeRemoval(goalId, nodeId, typeof body.reason === 'string' ? body.reason : undefined, body.actor);
+      res.json({ node });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/resolve_pending', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { accept?: unknown; actor?: unknown };
+    if (typeof body.accept !== 'boolean') {
+      sendError(res, 400, 'invalid_request', 'accept must be a boolean');
+      return;
+    }
+    try {
+      res.json({ node: resolvePending(goalId, nodeId, body.accept, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  // -- human_done / verify / park / unpark (node) ------------------------
+
+  router.post('/goals/:id/nodes/:nodeId/human_done', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { note?: unknown; actor?: unknown };
+    try {
+      res.json({ node: humanDoneNode(goalId, nodeId, typeof body.note === 'string' ? body.note : undefined, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/verify', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { passed?: unknown; note?: unknown; actor?: unknown };
+    if (typeof body.passed !== 'boolean') {
+      sendError(res, 400, 'invalid_request', 'passed must be a boolean');
+      return;
+    }
+    try {
+      const node = verifyGoalNode(goalId, nodeId, body.passed, typeof body.note === 'string' ? body.note : undefined, body.actor);
+      res.json({ node });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/park', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { actor?: unknown };
+    try {
+      res.json({ node: parkGoalNode(goalId, nodeId, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/unpark', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { actor?: unknown };
+    try {
+      res.json({ node: unparkGoalNode(goalId, nodeId, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  // -- Focus ----------------------------------------------------------------
+
+  router.get('/goals/:id/focus', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    try {
+      res.json({ focus: getGoalFocus(goalId) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.put('/goals/:id/focus', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const body = (req.body ?? {}) as { node_id?: unknown; set_by?: unknown };
+    if (body.node_id !== null && typeof body.node_id !== 'number') {
+      sendError(res, 400, 'invalid_request', 'node_id must be a number or null');
+      return;
+    }
+    try {
+      res.json({ focus: setGoalFocus(goalId, body.node_id, body.set_by) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  // -- leaf_kind / plan / dispatch / promote / tree overlay (BACKEND B) ------
+
+  router.post('/goals/:id/nodes/:nodeId/leaf_kind', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { leaf_kind?: unknown; actor?: unknown };
+    try {
+      res.json({ node: setLeafKind(goalId, nodeId, body.leaf_kind, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/propose_plan', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { plan?: unknown; actor?: unknown };
+    try {
+      res.json({ node: proposePlan(goalId, nodeId, body.plan, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/reject_plan', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { reason?: unknown; actor?: unknown };
+    try {
+      res.json({ node: rejectPlan(goalId, nodeId, typeof body.reason === 'string' ? body.reason : undefined, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/approve_plan', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { actor?: unknown };
+    try {
+      res.json(approvePlan(goalId, nodeId, body.actor));
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/nodes/:nodeId/promote', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { actor?: unknown };
+    try {
+      res.status(201).json(promoteNode(goalId, nodeId, body.actor));
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.get('/goals/:id/nodes/:nodeId/tree', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    try {
+      res.json(getNodeTreeOverlay(goalId, nodeId));
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
   });
 
   // == Hopper Engine ==========================================================
@@ -4592,6 +5077,7 @@ export function createApiV1Router(): Router {
       'dispatch', 'dispatch_cue', 'hopper_item', 'hopper_node', 'smart_todo',
       'workstream', 'monitor', 'monitor_run', 'foundry_project', 'foundry_module',
       'intel_run', 'intel_item', 'workbench_proposal',
+      'goal', 'goal_node', 'goal_focus',
     ]);
 
     res.writeHead(200, {

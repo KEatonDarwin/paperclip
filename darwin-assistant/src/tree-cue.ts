@@ -50,7 +50,9 @@ const HAS_DEFERRED_SCOPE = treeCols.includes('deferred_scope');
 const getLastCueStmt = sqliteDb.prepare<[string], { last_cue_status: string | null }>(
   `SELECT last_cue_status FROM hopper_trees WHERE id = ?`,
 );
-const setLastCueStmt = sqliteDb.prepare(`UPDATE hopper_trees SET last_cue_status = ? WHERE id = ?`);
+const setLastCueStmt = sqliteDb.prepare<[string | null, string]>(
+  `UPDATE hopper_trees SET last_cue_status = ? WHERE id = ?`,
+);
 
 /** Origin threads we must never wake: an ephemeral hopper worker, a checkin /
  *  other ephemeral plumbing thread, or a disposable quick chat. */
@@ -88,7 +90,9 @@ function composeCue(
   nodes: HopperNodeRow[],
 ): string {
   const total = nodes.length;
-  const doneCount = nodes.filter((n) => n.status === 'done').length;
+  // A `split` parent is SETTLED (its children bubbled it up), so it counts as
+  // done — otherwise a finished tree reads "7/9 nodes done" in its own DONE cue.
+  const doneCount = nodes.filter((n) => n.status === 'done' || n.status === 'split').length;
   const blockedNodes = nodes.filter((n) => n.status === 'blocked' || n.status === 'blocked_question');
   const blockedCount = blockedNodes.length;
 
@@ -117,10 +121,21 @@ function composeCue(
   } else {
     lines.push('blocked node(s):');
     for (const n of blockedNodes.slice(0, MAX_NODE_LINES)) {
-      const last = firstLine(n.result, 200);
-      lines.push(`  #${n.id} ${firstLine(n.title, 120)}${last ? ` — ${last}` : ''}`);
+      // A worker's wall lands in `result`; a blocked_question parks the text in
+      // `question` — reading `result` for those printed a bare title.
+      const why = firstLine(n.status === 'blocked_question' ? n.question : n.result, 200);
+      const tag = n.status === 'blocked_question' ? ' [needs Kevin]' : '';
+      lines.push(`  #${n.id} ${firstLine(n.title, 120)}${tag}${why ? ` — ${why}` : ''}`);
     }
-    lines.push('Next: unstick per the Smart Unblocker rule or escalate.');
+    // blocked_question is reserved for a call only Kevin can make (the Smart
+    // Unblocker explicitly never touches them) — the cue must not invite JARVIS
+    // to answer one on his behalf.
+    const questionOnly = blockedNodes.every((n) => n.status === 'blocked_question');
+    lines.push(
+      questionOnly
+        ? "Next: this is a blocked_question — Kevin's call, not yours. Surface it to him and answer the node only once he has decided."
+        : "Next: unstick the blocked node(s) per the Smart Unblocker rule if the subscription juice allows; any node tagged [needs Kevin] is his call — surface it, don't answer it yourself.",
+    );
   }
 
   return lines.join('\n');
@@ -136,10 +151,13 @@ export function treeCueOnTreeStatus(treeId: string, status: 'done' | 'blocked' |
   const last = getLastCueStmt.get(treeId)?.last_cue_status ?? null;
 
   if (status === 'active') {
-    // Re-arm: a tree that was blocked and is now unblocked may block again and
-    // should cue again. Only touch the guard when it was actually 'blocked' so
-    // the frequent no-op 'active' pings (fired on every node finish) don't write.
-    if (last === 'blocked') setLastCueStmt.run('active', treeId);
+    // Re-arm so the NEXT done/blocked cues again. Two cases, not one: a tree
+    // that was blocked and got unstuck may block again, AND a DONE tree that was
+    // re-agreed (a repair / continuation run, agreeHopperTree) must cue when it
+    // finishes the second time — with the old `last === 'blocked'` guard that
+    // second completion was silently deduped away forever. Only write when a
+    // guard is actually set, so no-op 'active' pings don't touch the row.
+    if (last !== null && last !== 'active') setLastCueStmt.run('active', treeId);
     return;
   }
 
@@ -148,6 +166,13 @@ export function treeCueOnTreeStatus(treeId: string, status: 'done' | 'blocked' |
 
   const tree = getHopperTree(treeId);
   if (!tree) return;
+  // FOUNDRY: a project plants ONE hopper tree per module plus an integration
+  // tree, and every one of them carries the PROJECT's origin thread. Cueing each
+  // would storm that thread with a JARVIS turn per module AND fight foundry's own
+  // auto-decide / integration-retry ladder — which is exactly why hopper-engine
+  // already suppresses foundry bells (isFoundryTree). Foundry reports through
+  // /foundry; the module trees are its internal steps, not Kevin's review gate.
+  if (tree.topic.startsWith('foundry:')) return;
   const originExt = tree.origin_thread_ext;
   if (!originExt) return; // no planting thread to wake
   if (isNonWakeableOrigin(originExt)) return;
@@ -181,7 +206,16 @@ export function treeCueOnTreeStatus(treeId: string, status: 'done' | 'blocked' |
         else console.error(`[tree-cue] ${treeId} ${status} post failed`, err);
       });
     })
-    .catch((err) => console.error(`[tree-cue] ${treeId} ${status} import failed`, err));
+    .catch((err) => {
+      console.error(`[tree-cue] ${treeId} ${status} import failed`, err);
+      // The cue never left the building — clear the guard so a later notify for
+      // the same status retries instead of being deduped into silence.
+      try {
+        setLastCueStmt.run(null, treeId);
+      } catch {
+        /* best effort */
+      }
+    });
 }
 
 registerTreeStatusListener(treeCueOnTreeStatus);

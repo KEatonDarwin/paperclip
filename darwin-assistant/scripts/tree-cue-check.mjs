@@ -104,7 +104,7 @@ assert.equal(blockedCue.externalId, ORIGIN2);
 assert.match(blockedCue.text, new RegExp(`^\\[tree ${t2.tree.id} "foundation gate build" BLOCKED — 1/3 nodes done, 1 blocked\\]`), 'blocked header w/ blocked count');
 assert.match(blockedCue.text, /blocked node\(s\):/, 'blocked node section');
 assert.match(blockedCue.text, /missing PHP toolchain/, 'blocked node last result line');
-assert.match(blockedCue.text, /Next: unstick per the Smart Unblocker rule or escalate\./, 'blocked Next line');
+assert.match(blockedCue.text, /Next: unstick the blocked node\(s\) per the Smart Unblocker rule/, 'blocked Next line');
 console.log('\n=== BLOCKED cue text ===\n');
 console.log(blockedCue.text);
 
@@ -150,6 +150,69 @@ treeCue.treeCueOnTreeStatus(tNoOrigin.tree.id, 'done');
 await new Promise((r) => setTimeout(r, 150));
 assert.equal(cueCalls().length, 3, 'a tree with no origin thread must not cue');
 console.log('=== null origin skipped: OK ===');
+
+// ── 9) REVIEW (#474): foundry module/integration trees never cue ────────────
+// A foundry project plants one tree per module + an integration tree, all
+// carrying the PROJECT's origin thread — cueing each would storm that thread
+// and fight foundry's own auto-decide ladder.
+const ORIGIN_F = 'cockpit:test-origin-foundry';
+convDb.getOrCreateConversation(ORIGIN_F);
+const before9 = cueCalls().length;
+for (const topic of ['foundry:proj-1/api', 'foundry:proj-1/integration']) {
+  const tf = hopper.createHopperTree(topic, ORIGIN_F, [{ title: 'BUILD' }]);
+  finishAll(tf.nodes, 'done');
+  treeCue.treeCueOnTreeStatus(tf.tree.id, 'done');
+}
+await new Promise((r) => setTimeout(r, 200));
+assert.equal(cueCalls().length, before9, 'foundry: trees must never cue the origin thread');
+console.log('=== foundry module/integration trees skipped: OK ===');
+
+// ── 10) REVIEW (#474): blocked_question shows the QUESTION and is Kevin's call ─
+const ORIGIN_Q = 'cockpit:test-origin-question';
+convDb.getOrCreateConversation(ORIGIN_Q);
+const tq = hopper.createHopperTree('needs a product call', ORIGIN_Q, [
+  { title: 'RECON' },
+  { title: 'BUILD the export' },
+]);
+sqliteDb.prepare(`UPDATE hopper_nodes SET status = 'done' WHERE id = ?`).run(tq.nodes[0].id);
+sqliteDb
+  .prepare(`UPDATE hopper_nodes SET status = 'blocked_question', question = ? WHERE id = ?`)
+  .run('CSV or XLSX for the advertiser export?', tq.nodes[1].id);
+treeCue.treeCueOnTreeStatus(tq.tree.id, 'blocked');
+await waitForCueCount(before9 + 1);
+assert.equal(cueCalls().length, before9 + 1, 'blocked_question must still cue once');
+const qCue = cueCalls()[before9];
+assert.match(qCue.text, /CSV or XLSX for the advertiser export\?/, 'blocked_question text must come from `question`, not `result`');
+assert.match(qCue.text, /\[needs Kevin\]/, 'blocked_question node is tagged for Kevin');
+assert.match(qCue.text, /Kevin's call, not yours/, 'question-only tree must not invite JARVIS to answer it');
+assert.doesNotMatch(qCue.text, /Smart Unblocker/, 'the Smart Unblocker line must not appear on a question-only tree');
+console.log('\n=== BLOCKED_QUESTION cue text ===\n');
+console.log(qCue.text);
+
+// ── 11) REVIEW (#474): a `split` parent counts as done in the header ─────────
+const ORIGIN_S = 'cockpit:test-origin-split';
+convDb.getOrCreateConversation(ORIGIN_S);
+const ts = hopper.createHopperTree('tree with a split parent', ORIGIN_S, [
+  { title: 'PLAN' },
+  { title: 'BUILD' },
+]);
+sqliteDb.prepare(`UPDATE hopper_nodes SET status = 'split' WHERE id = ?`).run(ts.nodes[0].id);
+sqliteDb.prepare(`UPDATE hopper_nodes SET status = 'done' WHERE id = ?`).run(ts.nodes[1].id);
+treeCue.treeCueOnTreeStatus(ts.tree.id, 'done');
+await waitForCueCount(before9 + 2);
+assert.match(cueCalls()[before9 + 1].text, /DONE — 2\/2 nodes done\]/, 'a split parent is settled and must count as done');
+console.log('=== split parent counted as done: OK ===');
+
+// ── 12) REVIEW (#474): re-agreeing a DONE tree re-arms the guard ─────────────
+// agreeHopperTree now notifies 'active'; without that re-arm a repair /
+// continuation run of an already-cued tree stayed deduped forever.
+const countBefore12 = cueCalls().length;
+hopper.agreeHopperTree(tree.id); // the tree from check 1 — already cued 'done'
+sqliteDb.prepare(`UPDATE hopper_nodes SET status = 'done' WHERE tree_id = ?`).run(tree.id);
+treeCue.treeCueOnTreeStatus(tree.id, 'done');
+await waitForCueCount(countBefore12 + 1);
+assert.equal(cueCalls().length, countBefore12 + 1, 'a re-agreed tree must cue again when it finishes the second time');
+console.log('=== re-agreed tree cues again: OK ===');
 
 console.log('\nALL TREE-CUE CHECKS PASSED ✅');
 process.exit(0);

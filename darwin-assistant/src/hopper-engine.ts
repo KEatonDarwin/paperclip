@@ -462,6 +462,11 @@ export function agreeHopperTree(treeId: string): HopperTreeRow | null {
     .prepare(`UPDATE hopper_nodes SET status = 'pending', updated_at = datetime('now') WHERE tree_id = ? AND status = 'draft'`)
     .run(treeId);
   listTreeNodes(treeId).forEach((n) => emitNode('updated', n));
+  // The tree is live again. Listeners need this transition: tree-cue re-arms its
+  // one-cue-per-(tree,status) guard here, so a tree that already finished and was
+  // re-agreed for a repair / continuation run still cues its origin thread when
+  // it finishes the SECOND time (goals' listener no-ops unless it was blocked).
+  notifyTreeStatusListeners(treeId, 'active');
   queueMicrotask(() => void dispatchTick('tree_agreed'));
   return getHopperTree(treeId);
 }

@@ -32,6 +32,14 @@ register(pathToFileURL(path.join(__dirname, 'goals-v01-cue-check.hooks.mjs')), i
 // import('./agent.js'), from a different dist file (goals-guards.js). Stub
 // that one too, onto the same __goalsCueCalls array (see the hook file).
 register(pathToFileURL(path.join(__dirname, 'goals-guards-sim-cue.hooks.mjs')), import.meta.url);
+// v0.3 §14.6 — tree-cue.ts's treeCueOnTreeStatus does the SAME dynamic import
+// from dist/tree-cue.js (imported lazily inside the V03 section so earlier
+// tree completions don't add cue calls). Stub it onto the same array.
+register(pathToFileURL(path.join(__dirname, 'goals-tree-cue-sim.hooks.mjs')), import.meta.url);
+// v0.3 §14.7 — the `goals` tool's open_node_chat (and promote) post the seed
+// text through import('../agent.js') from dist/tools/goals-tool.js. Stub that
+// too — the V03 checks drive the real tool and must never run a real turn.
+register(pathToFileURL(path.join(__dirname, 'goals-tool-sim-seed.hooks.mjs')), import.meta.url);
 
 // ── scratch DB guard (must run before any dist/ module is imported — ──────
 // conversation-db.js opens the sqlite handle at import time) ──────────────
@@ -2061,6 +2069,349 @@ try {
     }
     sseV02.close();
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // v0.3 §14 — NODE CHATS: a linked, pinned-focus chat for ONE node, on
+  // Kevin's say-so. CONTRACT.md §14.9, checks V03-*.
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[17] v0.3 §14: node chats — pinned scope, linked both ways, cue routing');
+  const toolsModule = await import(path.join(distDir, 'tools', 'goals-tool.js'));
+  const convDb = await import(path.join(distDir, 'conversation-db.js'));
+  const tool = (args: Record<string, unknown>, externalId: string): Promise<any> =>
+    toolsModule.goals.execute(args, { externalId } as any);
+
+  let v03GoalId = -1;
+  let nA = -1, nB = -1, nA1 = -1, nA1a = -1;
+  let nodeExt = '';
+  let goalExt = '';
+  await check('V03-0', 'setup: set goal; A, B root-level; A1 under A; A1a under A1 (all set, no review rounds open)', async () => {
+    const g = await post('/goals', { title: 'v0.3 node-chat drill', done_means: 'node chats work end to end' });
+    assert.equal(g.status, 201, JSON.stringify(g.json));
+    v03GoalId = g.json.goal.id;
+    goalExt = `cockpit:goal-${v03GoalId}`;
+    const roots = await post(`/goals/${v03GoalId}/nodes/propose`, {
+      parent_id: null, actor: 'jarvis',
+      items: [{ title: 'A', done_means: 'a done' }, { title: 'B', done_means: 'b done' }],
+    });
+    assert.equal(roots.status, 201, JSON.stringify(roots.json));
+    nA = roots.json.nodes[0].id; nB = roots.json.nodes[1].id;
+    assert.equal((await post(`/goals/${v03GoalId}/batches/${roots.json.batch_id}/accept`, {})).status, 200);
+    const a1 = await post(`/goals/${v03GoalId}/nodes/propose`, { parent_id: nA, actor: 'jarvis', items: [{ title: 'A1', done_means: 'a1 done' }] });
+    nA1 = a1.json.nodes[0].id;
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${nA1}/accept`, {})).status, 200);
+    const a1a = await post(`/goals/${v03GoalId}/nodes/propose`, { parent_id: nA1, actor: 'jarvis', items: [{ title: 'A1a', done_means: 'a1a done' }] });
+    nA1a = a1a.json.nodes[0].id;
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${nA1a}/accept`, {})).status, 200);
+    const tree = (await get(`/goals/${v03GoalId}`)).json;
+    assert.equal(tree.goal.counts.awaiting_jarvis, 0);
+    assert.equal(tree.goal.counts.node_chats, 0, 'no node chats yet');
+    for (const n of tree.nodes) assert.equal(n.thread_ext, null, 'thread_ext present + null on every read');
+  });
+
+  await check('V03-1', 'route 36 on A1 -> created:true, cockpit:goal-<g>-node-<n>, §14.2 seed, thread_ext set, node_thread_opened, labelled conversation; second call -> created:false; counts.node_chats=1', async () => {
+    const r = await post(`/goals/${v03GoalId}/nodes/${nA1}/thread`, {});
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.created, true);
+    nodeExt = r.json.external_id;
+    assert.equal(nodeExt, `cockpit:goal-${v03GoalId}-node-${nA1}`);
+    assert.ok(typeof r.json.seed_text === 'string' && r.json.seed_text.length > 0);
+    assert.match(r.json.seed_text, new RegExp(`^💬 NODE CHAT — this thread belongs to node #${nA1} "A1" of goal #${v03GoalId} "v0.3 node-chat drill"`));
+    assert.match(r.json.seed_text, /\nPath: v0\.3 node-chat drill › A\n/);
+    assert.match(r.json.seed_text, new RegExp(`\\nNode: #${nA1} A1\\n`));
+    assert.match(r.json.seed_text, /\n7\. Cues for this branch/);
+    assert.equal(r.json.node.thread_ext, nodeExt);
+    const conv = convDb.getConversation(nodeExt);
+    assert.ok(conv, 'conversation row exists');
+    assert.match(String(conv.title ?? ''), new RegExp(`^💬 #${nA1} A1 · 🎯 v0\\.3 node-chat drill`));
+    const events = (await get(`/goals/${v03GoalId}/events?limit=1000`)).json.events;
+    assert.ok(events.some((e: any) => e.kind === 'node_thread_opened' && e.node_id === nA1 && e.data?.external_id === nodeExt));
+    const again = await get(`/goals/${v03GoalId}/nodes/${nA1}/thread`);
+    assert.equal(again.status, 200);
+    assert.equal(again.json.created, false);
+    assert.equal(again.json.seed_text, null);
+    assert.equal(again.json.external_id, nodeExt);
+    const tree = (await get(`/goals/${v03GoalId}`)).json;
+    assert.equal(tree.goal.counts.node_chats, 1);
+    assert.equal(tree.nodes.find((n: any) => n.id === nA1).thread_ext, nodeExt);
+    assert.equal(events.filter((e: any) => e.kind === 'node_thread_opened' && e.node_id === nA1).length, 1, 'opened once');
+  });
+
+  await check('V03-2', 'route 36 preconditions: discarded -> 409 node_discarded; promoted stub -> 409 already_promoted; other goal -> 404 node_not_found', async () => {
+    const ghost = (await post(`/goals/${v03GoalId}/nodes/propose`, { parent_id: nB, actor: 'jarvis', items: [{ title: 'doomed', done_means: 'x' }] })).json.nodes[0];
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${ghost.id}/discard`, {})).status, 200);
+    const d = await post(`/goals/${v03GoalId}/nodes/${ghost.id}/thread`, {});
+    assert.equal(d.status, 409); assert.equal(d.json.error.code, 'node_discarded');
+    // promote B into its own goal -> B is a stub here
+    const promoted = await post(`/goals/${v03GoalId}/nodes/${nB}/promote`, {});
+    assert.equal(promoted.status, 201, JSON.stringify(promoted.json));
+    const p = await post(`/goals/${v03GoalId}/nodes/${nB}/thread`, {});
+    assert.equal(p.status, 409); assert.equal(p.json.error.code, 'already_promoted');
+    const other = await post(`/goals/${promoted.json.goal.id}/nodes/${nA1}/thread`, {});
+    assert.equal(other.status, 404); assert.equal(other.json.error.code, 'node_not_found');
+    // fresh root-level C replaces B for the rest of the section (set, no round)
+    const c = await post(`/goals/${v03GoalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'C', done_means: 'c done' }] });
+    nB = c.json.nodes[0].id;
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${nB}/accept`, {})).status, 200);
+  });
+
+  let ghostUnderC = -1;
+  await check('V03-3a', 'tool scope in the node chat: propose with no parent_id lands under the pinned node; parent_id outside / null -> outside_pinned_scope', async () => {
+    // goal focus is on C (outside the branch) -> implicit parent must still be A1
+    assert.equal((await put(`/goals/${v03GoalId}/focus`, { node_id: nB })).status, 200);
+    const inside = await tool({ operation: 'propose', items: [{ title: 'A1b', done_means: 'a1b done' }] }, nodeExt);
+    assert.ok(inside.nodes, JSON.stringify(inside));
+    assert.equal(inside.nodes[0].parent_id, nA1);
+    const outside = await tool({ operation: 'propose', parent_id: nB, items: [{ title: 'nope', done_means: 'x' }] }, nodeExt);
+    assert.equal(outside.code, 'outside_pinned_scope', JSON.stringify(outside));
+    assert.match(outside.error, new RegExp(`#${nB} "C" is outside this chat's branch \\(#${nA1} "A1"\\)`));
+    const root = await tool({ operation: 'propose', parent_id: null, items: [{ title: 'nope', done_means: 'x' }] }, nodeExt);
+    assert.equal(root.code, 'outside_pinned_scope');
+    // the goal chat is unrestricted: the same propose under C works there
+    const fromGoal = await tool({ operation: 'propose', parent_id: nB, items: [{ title: 'C1', done_means: 'c1 done' }] }, goalExt);
+    assert.ok(fromGoal.nodes, JSON.stringify(fromGoal));
+    ghostUnderC = fromGoal.nodes[0].id;
+  });
+
+  await check('V03-3b', 'named ids outside the branch -> outside_pinned_scope on accept/propose_edit/move/focus/propose_guard; goal-level ops refused; descendants allowed', async () => {
+    const refused = async (args: Record<string, unknown>) => {
+      const r = await tool(args, nodeExt);
+      assert.equal(r.code, 'outside_pinned_scope', `${JSON.stringify(args)} -> ${JSON.stringify(r)}`);
+    };
+    await refused({ operation: 'accept', node_id: ghostUnderC });
+    await refused({ operation: 'propose_edit', node_id: nB, title: 'C!' });
+    await refused({ operation: 'move', node_id: nA1a, parent_id: nB });
+    await refused({ operation: 'move', node_id: nA1, parent_id: nB });
+    await refused({ operation: 'focus', node_id: nB });
+    await refused({ operation: 'propose_guard', node_id: nB, mode: 'query', title: 't', sql: 'select 1 as v', comparator: 'gte', threshold: 1 });
+    await refused({ operation: 'set_goal_done_means', done_means: 'rewritten' });
+    await refused({ operation: 'verify', goal: true, passed: true });
+    await refused({ operation: 'promote', node_id: nA1 });
+    await refused({ operation: 'park' });
+    await refused({ operation: 'open_node_chat', node_id: nB });
+    // descendant: allowed
+    const ok = await tool({ operation: 'propose_edit', node_id: nA1a, title: 'A1a (sharper)' }, nodeExt);
+    assert.equal(ok.node?.pending_title, 'A1a (sharper)', JSON.stringify(ok));
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${nA1a}/resolve_pending`, { accept: false })).status, 200);
+    const okPropose = await tool({ operation: 'propose', parent_id: nA1a, items: [{ title: 'A1a-i', done_means: 'x' }] }, nodeExt);
+    assert.ok(okPropose.nodes, JSON.stringify(okPropose));
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${okPropose.nodes[0].id}/discard`, {})).status, 200);
+    // goal remains untouched by the refused goal-level ops
+    const tree = (await get(`/goals/${v03GoalId}`)).json;
+    assert.equal(tree.goal.done_means, 'node chats work end to end');
+    assert.equal(tree.goal.status, 'set');
+  });
+
+  await check('V03-4', 'focus {node_id:null} in the node chat clamps to the pinned node (set_by jarvis); a descendant works; ONE focus pointer per goal', async () => {
+    const f = await tool({ operation: 'focus', node_id: null }, nodeExt);
+    assert.equal(f.focus?.node_id, nA1, JSON.stringify(f));
+    assert.equal(f.focus.set_by, 'jarvis');
+    const f2 = await tool({ operation: 'focus', node_id: nA1a }, nodeExt);
+    assert.equal(f2.focus?.node_id, nA1a);
+    const shared = (await get(`/goals/${v03GoalId}/focus`)).json.focus;
+    assert.equal(shared.node_id, nA1a, 'the goal chat / tree pane sees the same pointer');
+    const viaGoal = await tool({ operation: 'list' }, goalExt);
+    assert.equal(viaGoal.focus.node_id, nA1a);
+  });
+
+  await check('V03-5a', 'injection, node chat: <goal_focus pinned>, the ↑ path line, pinned node at depth 0 + its subtree only — no ancestor/sibling node lines', async () => {
+    // goal focus outside the branch -> effective focus = the pinned node
+    assert.equal((await put(`/goals/${v03GoalId}/focus`, { node_id: nB })).status, 200);
+    const ctx: string = goalsModule.buildGoalThreadContext(nodeExt);
+    assert.ok(ctx.length > 0, 'non-empty for a node chat');
+    assert.match(ctx, new RegExp(`^<goal_focus goal_id="${v03GoalId}" node_id="${nA1}" pinned="${nA1}" path="A › A1"`));
+    assert.match(ctx, new RegExp(`<goal_tree goal_id="${v03GoalId}" pinned="${nA1}" `));
+    assert.match(ctx, /\n# v0\.3 node-chat drill — done: node chats work end to end\n/);
+    assert.match(ctx, /\n↑ A   \(above this chat — changes there happen in the goal chat\)\n/);
+    assert.match(ctx, new RegExp(`\\n- \\[set ▶\\] #${nA1} A1 — done: a1 done\\n`), 'pinned node at depth 0, focused');
+    assert.match(ctx, new RegExp(`\\n  - \\[set\\] #${nA1a} A1a — done: a1a done\\n`), 'child expanded one layer');
+    assert.match(ctx, new RegExp(`\\n  - \\[ghost b:[0-9a-f]{4}\\] #\\d+ A1b`), 'the ghost proposed from this chat is visible');
+    assert.doesNotMatch(ctx, new RegExp(`#${nA} A —`), 'ancestor A is not a node line');
+    assert.doesNotMatch(ctx, new RegExp(`#${nB} C —`), 'sibling-of-ancestor C is not a node line');
+    assert.doesNotMatch(ctx, /<node_chats/, 'a node chat carries no node_chats block');
+    // goal focus inside the branch -> effective focus follows it
+    assert.equal((await put(`/goals/${v03GoalId}/focus`, { node_id: nA1a })).status, 200);
+    const ctx2: string = goalsModule.buildGoalThreadContext(nodeExt);
+    assert.match(ctx2, new RegExp(`node_id="${nA1a}" pinned="${nA1}" path="A › A1 › A1a"`));
+    assert.match(ctx2, new RegExp(`#${nA1a} A1a — done: a1a done ▶|\\[set ▶\\] #${nA1a} A1a`));
+  });
+
+  await check('V03-5b', 'injection, goal chat: 💬 on the chatted node line + <node_chats count="1"> ("no replies yet" -> latest assistant line ≤160 chars with age)', async () => {
+    const ctx: string = goalsModule.buildGoalThreadContext(goalExt);
+    assert.match(ctx, new RegExp(`#${nA1} A1 — done: a1 done 💬`), '💬 marker on the chatted node');
+    assert.match(ctx, new RegExp(`</goal_tree>\\n<node_chats goal_id="${v03GoalId}" count="1">\\n#${nA1} chat, last: \\(no replies yet\\)\\n</node_chats>\\n$`));
+    // an assistant reply lands in the node chat
+    const conv = convDb.getConversation(nodeExt);
+    const long = 'Proposed A1b under #' + nA1 + '; waiting on your ✓. ' + 'x'.repeat(200);
+    convDb.addTurn(conv.id, 'user', 'hi');
+    convDb.addTurn(conv.id, 'assistant', long);
+    const ctx2: string = goalsModule.buildGoalThreadContext(goalExt);
+    const m = new RegExp(`#${nA1} chat, last: "([^"]+)" \\((<1m|\\d+[mhd]) ago\\)`).exec(ctx2);
+    assert.ok(m, `node_chats line with age: ${ctx2.split('<node_chats')[1]}`);
+    assert.ok(m![1].length <= 160, `clipped to ≤160 (${m![1].length})`);
+    assert.ok(m![1].endsWith('…'));
+    assert.match(m![1], /^Proposed A1b under #/);
+    assert.doesNotMatch(ctx2, /pinned=/, 'the goal chat is not pinned');
+  });
+
+  await check('V03-6a', 'cue routing — review cue: Kevin edits + ✓s a ghost under A1 -> cue posts to the NODE chat; the same on a ghost under C -> the GOAL chat', async () => {
+    const tree = (await get(`/goals/${v03GoalId}`)).json;
+    const a1b = tree.nodes.find((n: any) => n.title === 'A1b' && n.state === 'ghost');
+    assert.ok(a1b, 'A1b ghost exists');
+    assert.equal((await patch(`/goals/${v03GoalId}/nodes/${a1b.id}`, { title: 'A1b (Kevin)' })).status, 200);
+    let before = cueCallCount();
+    const acc = await post(`/goals/${v03GoalId}/nodes/${a1b.id}/accept`, {});
+    assert.equal(acc.status, 200); assert.equal(acc.json.node.review_state, 'awaiting_jarvis');
+    await waitForCueCalls(before + 1);
+    assert.equal(cueCallCount(), before + 1);
+    assert.equal(lastCueCall().externalId, nodeExt, 'review cue routed to the node chat');
+    assert.match(lastCueCall().text, new RegExp(`^\\[goal #${v03GoalId} — Kevin edited 1 of your proposals? and OK'd it\\. Weigh in\\.\\]\\n#${a1b.id} now: "A1b \\(Kevin\\)"`));
+    assert.match(lastCueCall().correlationKey ?? '', new RegExp(`^goal-cue:${v03GoalId}:`));
+    // JARVIS agrees from the node chat (in scope)
+    const agreed = await tool({ operation: 'accept', node_id: a1b.id }, nodeExt);
+    assert.equal(agreed.node?.state, 'set', JSON.stringify(agreed));
+    // same dance under C -> goal chat
+    assert.equal((await patch(`/goals/${v03GoalId}/nodes/${ghostUnderC}`, { title: 'C1 (Kevin)' })).status, 200);
+    before = cueCallCount();
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${ghostUnderC}/accept`, {})).status, 200);
+    await waitForCueCalls(before + 1);
+    assert.equal(cueCallCount(), before + 1);
+    assert.equal(lastCueCall().externalId, goalExt, 'no node chat above C -> goal chat');
+    const agreed2 = await tool({ operation: 'accept', node_id: ghostUnderC }, goalExt);
+    assert.equal(agreed2.node?.state, 'set', JSON.stringify(agreed2));
+  });
+
+  await check('V03-6b', 'cue routing — structure burst spanning both branches -> TWO cues (one per chat), each listing only its own nodes; ONE kevin_restructured event', async () => {
+    const before = cueCallCount();
+    const evBefore = (await get(`/goals/${v03GoalId}/events?limit=1000`)).json.events.filter((e: any) => e.kind === 'kevin_restructured').length;
+    const k1 = await post(`/goals/${v03GoalId}/nodes`, { title: 'A1c (Kevin)', done_means: 'k', parent_id: nA1, authored_by: 'kevin' });
+    const k2 = await post(`/goals/${v03GoalId}/nodes`, { title: 'C2 (Kevin)', done_means: 'k', parent_id: nB, authored_by: 'kevin' });
+    assert.equal(k1.status, 201); assert.equal(k2.status, 201);
+    await waitForCueCalls(before + 2, 3000);
+    assert.equal(cueCallCount(), before + 2, 'exactly two cues for the burst');
+    const cues = cueCalls().slice(before);
+    const toNode = cues.find((c) => c.externalId === nodeExt);
+    const toGoal = cues.find((c) => c.externalId === goalExt);
+    assert.ok(toNode && toGoal, `one per target: ${cues.map((c) => c.externalId).join(', ')}`);
+    assert.match(toNode!.text, new RegExp(`#${k1.json.node.id} added: "A1c \\(Kevin\\)"`));
+    assert.doesNotMatch(toNode!.text, new RegExp(`#${k2.json.node.id} `), 'node chat cue lists only its branch');
+    assert.match(toGoal!.text, new RegExp(`#${k2.json.node.id} added: "C2 \\(Kevin\\)"`));
+    assert.doesNotMatch(toGoal!.text, new RegExp(`#${k1.json.node.id} `), 'goal chat cue lists only the unchatted branch');
+    assert.equal(toNode!.correlationKey, toGoal!.correlationKey, 'same burst, same correlation key');
+    const evAfter = (await get(`/goals/${v03GoalId}/events?limit=1000`)).json.events.filter((e: any) => e.kind === 'kevin_restructured');
+    assert.equal(evAfter.length, evBefore + 1, 'one digest event for the burst');
+    assert.deepEqual([...evAfter[evAfter.length - 1].data.targets].sort(), [goalExt, nodeExt].sort());
+    // close both rounds
+    assert.ok((await tool({ operation: 'accept', node_id: k1.json.node.id }, nodeExt)).node);
+    assert.ok((await tool({ operation: 'accept', node_id: k2.json.node.id }, goalExt)).node);
+  });
+
+  await check('V03-6c', 'cue routing — guard health flip on a node under A1 -> node chat; a root guard -> goal chat', async () => {
+    // A1a must be done to carry a guard: human leaf -> human_done -> verify
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${nA1a}/leaf_kind`, { leaf_kind: 'human' })).status, 200);
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${nA1a}/human_done`, {})).status, 200);
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${nA1a}/verify`, { passed: true })).status, 200);
+    const gp = await tool({ operation: 'propose_guard', node_id: nA1a, mode: 'query', title: 'a1a stays true', sql: 'select 1 as v', comparator: 'gte', threshold: 1 }, nodeExt);
+    assert.ok(gp.guard, JSON.stringify(gp));
+    const acc = await post(`/goals/${v03GoalId}/guards/${gp.guard.id}/accept`, {});
+    assert.equal(acc.status, 200, JSON.stringify(acc.json));
+    let before = cueCallCount();
+    guardsModule.applyGuardHealth(gp.guard.id, { status: 'fail', value: 0, summary: 'a1a broke', at: new Date().toISOString() });
+    await waitForCueCalls(before + 1);
+    assert.equal(cueCallCount(), before + 1);
+    assert.equal(lastCueCall().externalId, nodeExt, 'guard cue routed to the node chat');
+    assert.match(lastCueCall().text, new RegExp(`guard on #${nA1a} "A1a" is FAILING: a1a broke`));
+    // a root guard (goal-level) -> the goal chat. Root guards need a done goal;
+    // use the promoted goal (B) which has no nodes -> verify it directly.
+    const promotedGoal = (await get(`/goals?include_done=1`)).json.goals.find((g: any) => g.promoted_from_node_id != null && g.title === 'B');
+    assert.ok(promotedGoal, 'promoted goal B exists');
+    assert.equal((await post(`/goals/${promotedGoal.id}/verify`, { passed: true })).status, 200);
+    const rootGuard = await post(`/goals/${promotedGoal.id}/guards/propose`, { node_id: null, mode: 'query', title: 'b root', sql: 'select 1 as v', comparator: 'gte', threshold: 1 });
+    assert.equal(rootGuard.status, 201, JSON.stringify(rootGuard.json));
+    assert.equal((await post(`/goals/${promotedGoal.id}/guards/${rootGuard.json.guard.id}/accept`, {})).status, 200);
+    before = cueCallCount();
+    guardsModule.applyGuardHealth(rootGuard.json.guard.id, { status: 'fail', value: 0, summary: 'root broke', at: new Date().toISOString() });
+    await waitForCueCalls(before + 1);
+    assert.equal(lastCueCall().externalId, `cockpit:goal-${promotedGoal.id}`, 'root guard -> goal chat');
+  });
+
+  await check('V03-6d', 'cue routing — a hopper tree planted from a machine leaf under A1 finishes -> tree cue posts to the NODE chat, not the tree origin (goal chat)', async () => {
+    // tree-cue.js registers its listener at import; imported here (not at the
+    // top) so the earlier sections' tree completions never added cue calls.
+    await import(path.join(distDir, 'tree-cue.js'));
+    const tree = (await get(`/goals/${v03GoalId}`)).json;
+    const a1c = tree.nodes.find((n: any) => n.title === 'A1c (Kevin)');
+    assert.ok(a1c);
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${a1c.id}/leaf_kind`, { leaf_kind: 'machine' })).status, 200);
+    const pp = await tool({ operation: 'propose_plan', node_id: a1c.id, plan: {
+      what: 'one node', deliverable: 'x', model: 'claude-sonnet-5',
+      nodes: [{ title: 'do the thing', spec: 'x', model: 'claude-sonnet-5' }],
+    } }, nodeExt);
+    assert.ok(pp.node, JSON.stringify(pp));
+    const approve = await post(`/goals/${v03GoalId}/nodes/${a1c.id}/approve_plan`, {});
+    assert.equal(approve.status, 200, JSON.stringify(approve.json));
+    const treeId = approve.json.tree.id;
+    const treeRow = (await get(`/hopper-trees/${treeId}`)).json.tree;
+    assert.equal(treeRow.origin_thread_ext, goalExt, 'the tree itself is planted from the goal chat (unchanged)');
+    assert.equal(goalsModule.cueTargetForTree(treeId), nodeExt, 'but its cue target is the node chat');
+    const hopperNodeId = approve.json.hopper_nodes[0].id;
+    await waitFor('hopper node -> running', async () => {
+      const overlay = await get(`/goals/${v03GoalId}/nodes/${a1c.id}/tree`);
+      return overlay.status === 200 && overlay.json.nodes.some((n: any) => n.id === hopperNodeId && n.status === 'running');
+    });
+    const before = cueCallCount();
+    assert.equal((await post(`/hopper-nodes/${hopperNodeId}/finish`, { outcome: 'done', result: 'done.' })).status, 200);
+    await waitFor('goal node -> check', async () => {
+      const n = (await get(`/goals/${v03GoalId}`)).json.nodes.find((x: any) => x.id === a1c.id);
+      return n?.state === 'check';
+    });
+    await waitForCueCalls(before + 1, 3000);
+    const treeCue = cueCalls().slice(before).find((c) => (c.correlationKey ?? '').startsWith('tree-cue:'));
+    assert.ok(treeCue, `tree cue fired: ${JSON.stringify(cueCalls().slice(before).map((c) => c.correlationKey))}`);
+    assert.equal(treeCue!.externalId, nodeExt, 'tree-done cue routed to the node chat');
+    assert.equal(treeCue!.correlationKey, `tree-cue:${treeId}:done`);
+    assert.ok(!cueCalls().slice(before).some((c) => c.externalId === goalExt && (c.correlationKey ?? '').startsWith('tree-cue:')), 'never both');
+  });
+
+  await check('V03-7', 'open_node_chat op (Kevin asked in words) from the goal chat; two node chats -> counts.node_chats=2; a discarded chatted ghost does not count', async () => {
+    const before = cueCallCount();
+    const opened = await tool({ operation: 'open_node_chat', node_id: nB }, goalExt);
+    assert.equal(opened.created, true, JSON.stringify(opened));
+    assert.equal(opened.external_id, `cockpit:goal-${v03GoalId}-node-${nB}`);
+    assert.equal(opened.node.thread_ext, opened.external_id);
+    // the tool posted the seed itself (stubbed via goals-tool-sim-seed.hooks.mjs)
+    await waitForCueCalls(before + 1);
+    const seedPost = cueCalls().slice(before).find((c) => c.externalId === opened.external_id);
+    assert.ok(seedPost, 'tool-side seed post went to the new node chat');
+    assert.match(seedPost!.text, new RegExp(`^💬 NODE CHAT — this thread belongs to node #${nB} "C"`));
+    const conv = convDb.getConversation(opened.external_id);
+    assert.ok(conv);
+    assert.match(String(conv.title ?? ''), new RegExp(`^💬 #${nB} C · 🎯 `));
+    assert.equal((await tool({ operation: 'open_node_chat', node_id: nB }, goalExt)).created, false, 'find-or-create');
+    let tree = (await get(`/goals/${v03GoalId}`)).json;
+    assert.equal(tree.goal.counts.node_chats, 2);
+    // a ghost may have a chat; discarding it drops it from the count
+    const ghost = (await tool({ operation: 'propose', items: [{ title: 'A1z', done_means: 'z' }] }, nodeExt)).nodes[0];
+    const nested = await tool({ operation: 'open_node_chat', node_id: ghost.id }, nodeExt);
+    assert.equal(nested.created, true, JSON.stringify(nested));
+    tree = (await get(`/goals/${v03GoalId}`)).json;
+    assert.equal(tree.goal.counts.node_chats, 3);
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${ghost.id}/discard`, {})).status, 200);
+    tree = (await get(`/goals/${v03GoalId}`)).json;
+    assert.equal(tree.goal.counts.node_chats, 2);
+    assert.equal(goalsModule.resolveGoalScope(nested.external_id), null, 'a discarded node chat resolves to no scope');
+    const gone = await tool({ operation: 'list' }, nested.external_id);
+    assert.equal(gone.code, 'pinned_node_gone', JSON.stringify(gone));
+    assert.equal(goalsModule.buildGoalThreadContext(nested.external_id), '', 'and injects nothing');
+  });
+
+  await check('V03-8', 'labels follow renames: node title PATCH and goal title PATCH re-label the node chat conversation', async () => {
+    assert.equal((await patch(`/goals/${v03GoalId}/nodes/${nA1}`, { title: 'A1 renamed' })).status, 200);
+    assert.match(String(convDb.getConversation(nodeExt)?.title ?? ''), new RegExp(`^💬 #${nA1} A1 renamed · 🎯 v0\\.3 node-chat drill`));
+    assert.equal((await patch(`/goals/${v03GoalId}`, { title: 'v0.3 drill (renamed)' })).status, 200);
+    assert.match(String(convDb.getConversation(nodeExt)?.title ?? ''), new RegExp(`^💬 #${nA1} A1 renamed · 🎯 v0\\.3 drill \\(renamed\\)`));
+    // close the round the rename opened so the goal ends clean
+    assert.ok((await tool({ operation: 'accept', node_id: nA1 }, nodeExt)).node);
+  });
 } finally {
   server.close();
   owServer?.close();
@@ -2075,7 +2426,7 @@ const outDir = '/home/kevin/obsidian/paperclip-wiki/outbox/goals';
 fs.mkdirSync(outDir, { recursive: true });
 const reportPath = path.join(outDir, 'sim-report.md');
 const lines: string[] = [];
-lines.push('# GOALS — sim report (hopper node #459)');
+lines.push('# GOALS — sim report (hopper node #459; v0.3 §14 node chats added by node #489)');
 lines.push('');
 lines.push(`Run at ${new Date().toISOString()}. Scratch DB: \`${DB_PATH}\`. ${passed}/${results.length} checks passed.`);
 lines.push('');

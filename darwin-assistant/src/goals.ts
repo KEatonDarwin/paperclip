@@ -85,6 +85,7 @@ export interface GoalCounts {
   ghosts: number;
   human_open: number;
   awaiting_jarvis: number;   // v0.1 §11.1 — ghosts Kevin OK'd, waiting on JARVIS to weigh in
+  node_chats: number;        // v0.3 §14.1 — non-discarded nodes that have their own node chat (thread_ext set)
   guards: number;            // v0.2 §12.11 — count of state='set' guards in the goal
   guards_failing: number;    // v0.2 §12.11 — set guards with health IN ('failing','error')
   progress: number;
@@ -126,6 +127,8 @@ export interface GoalNodeDbRow {
   kevin_moved_at: string | null;        // ISO datetime of Kevin's last move of this node; NULL once the round closes
   kevin_move_from: number | null;       // parent id it was moved FROM (-1 = root); NULL with kevin_moved_at
   pending_parent_id: number | null;     // JARVIS-proposed re-parent awaiting ✓/✕ (-1 = to root); NULL = none
+  // v0.3 §14.1 — the node's own chat (`cockpit:goal-<g>-node-<n>`); NULL until Kevin opens one, never cleared.
+  thread_ext: string | null;
   sort_order: number;
   verified_at: string | null;
   created_at: string;
@@ -310,6 +313,9 @@ ensureGoalNodeColumn('review_note', `review_note TEXT`);
 ensureGoalNodeColumn('kevin_moved_at', `kevin_moved_at TEXT`);
 ensureGoalNodeColumn('kevin_move_from', `kevin_move_from INTEGER`);
 ensureGoalNodeColumn('pending_parent_id', `pending_parent_id INTEGER`);
+// v0.3 (CONTRACT §14.1) — node chats: one pinned-focus conversation per node, on Kevin's say-so.
+ensureGoalNodeColumn('thread_ext', `thread_ext TEXT`);
+sqliteDb.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_nodes_thread_ext ON goal_nodes(thread_ext) WHERE thread_ext IS NOT NULL`);
 
 // ---------------------------------------------------------------------------
 // Low-level accessors
@@ -438,6 +444,7 @@ const countsStmt = sqliteDb.prepare(`
     SUM(CASE WHEN leaf_kind = 'human' AND state = 'set' THEN 1 ELSE 0 END) AS human_open,
     SUM(CASE WHEN plan_state = 'proposed' THEN 1 ELSE 0 END) AS plan_proposed,
     SUM(CASE WHEN review_state = 'awaiting_jarvis' THEN 1 ELSE 0 END) AS awaiting_jarvis,
+    SUM(CASE WHEN thread_ext IS NOT NULL AND state != 'discarded' THEN 1 ELSE 0 END) AS node_chats,
     SUM(CASE WHEN state NOT IN ('discarded','parked') THEN 1 ELSE 0 END) AS denom
   FROM goal_nodes WHERE goal_id = ?
 `);
@@ -453,7 +460,7 @@ function computeCounts(goalId: number): GoalCounts {
   const row = countsStmt.get(goalId) as {
     total: number | null; done: number | null; working: number | null; check_count: number | null;
     ghost_state: number | null; pending_count: number | null; human_open: number | null;
-    plan_proposed: number | null; awaiting_jarvis: number | null; denom: number | null;
+    plan_proposed: number | null; awaiting_jarvis: number | null; node_chats: number | null; denom: number | null;
   };
   const guardRow = guardCountsStmt.get(goalId) as { guards: number | null; guards_failing: number | null };
   const ghosts = (row.ghost_state ?? 0) + (row.pending_count ?? 0);
@@ -471,6 +478,7 @@ function computeCounts(goalId: number): GoalCounts {
     ghosts,
     human_open: humanOpen,
     awaiting_jarvis: row.awaiting_jarvis ?? 0,
+    node_chats: row.node_chats ?? 0,
     guards: guardRow.guards ?? 0,
     guards_failing: guardRow.guards_failing ?? 0,
     progress: Math.round((100 * done) / denom),
@@ -748,6 +756,11 @@ export function patchGoal(id: number, patch: {
   if (title !== existing.title && existing.thread_ext) {
     const conv = getConversation(existing.thread_ext);
     if (conv) renameConversation(conv.id, `🎯 ${title}`.slice(0, 120));
+  }
+  // v0.3 §14.1 — node-chat labels carry the goal title too; re-apply on rename.
+  if (title !== existing.title) {
+    const chats = sqliteDb.prepare(`SELECT * FROM goal_nodes WHERE goal_id = ? AND thread_ext IS NOT NULL`).all(id) as GoalNodeDbRow[];
+    for (const n of chats) applyNodeChatLabel(n, title);
   }
 
   insertEvent(id, null, actor, flipped ? 'goal_set' : 'goal_updated', flipped ? 'Goal set: done_means confirmed.' : 'Goal updated.');
@@ -1132,46 +1145,30 @@ const lastEventIdStmt = sqliteDb.prepare(`SELECT id FROM goal_events WHERE goal_
  *  the accept transaction (which has already committed by the time this runs). */
 export function fireGoalReviewCue(goalId: number, nodes: GoalNodeRow[], reask = false): void {
   if (!nodes.length) return;
-  const externalId = `cockpit:goal-${goalId}`;
-  const conv = getConversation(externalId);
-  if (!conv) {
-    console.warn(`[goals] review cue skipped — no conversation for ${externalId}`);
-    return;
-  }
-  const n = nodes.length;
-  const header = `[goal #${goalId} — Kevin edited ${n} of your proposal${n === 1 ? '' : 's'} and OK'd ${n === 1 ? 'it' : 'them'}. Weigh in.]`;
-  const blocks = nodes.map((node) => {
-    let orig: { title?: string; done_means?: string } = {};
-    if (node.kevin_edit_original) {
-      try { orig = JSON.parse(node.kevin_edit_original) as { title?: string; done_means?: string }; } catch { /* keep {} */ }
-    }
-    let block =
-      `#${node.id} now: "${node.title}" — done: "${node.done_means ?? ''}"\n` +
-      `    was (yours): "${orig.title ?? ''}" — done: "${orig.done_means ?? ''}"`;
-    if (node.review_note) block += `\n    you pushed back with: "${node.review_note}"`;
-    return block;
-  });
+  void reask; // header/per-node note already convey re-ask; param kept for the §11 contract signature
   const footer =
     'For each node: acknowledge the change in a sentence, then either agree → `goals` op `accept` {node_id} (it solidifies), ' +
     'or `push_back` {node_id, note} with your reason in one or two sentences and talk it out. Don\'t restate the rest of the tree.';
-  const text = [header, ...blocks, footer].join('\n');
   const eventId = (lastEventIdStmt.get(goalId) as { id: number } | undefined)?.id ?? 0;
-  const correlationKey = `goal-cue:${goalId}:${eventId}`;
-  const convId = conv.id;
-
-  void reask; // header/per-node note already convey re-ask; param kept for the §11 contract signature
-  Promise.all([import('./agent.js'), import('./thread-message-queue.js')])
-    .then(([agent, queue]) => {
-      if (agent.getInFlightMessageId(convId)) {
-        queue.enqueueMessage(convId, text);
-        return;
+  // v0.3 §14.6 — one cue per target chat: a node under a node chat cues THERE,
+  // everything else cues the goal chat. Never both.
+  for (const [target, group] of groupByCueTarget(goalId, nodes)) {
+    const n = group.length;
+    const header = `[goal #${goalId} — Kevin edited ${n} of your proposal${n === 1 ? '' : 's'} and OK'd ${n === 1 ? 'it' : 'them'}. Weigh in.]`;
+    const blocks = group.map((node) => {
+      let orig: { title?: string; done_means?: string } = {};
+      if (node.kevin_edit_original) {
+        try { orig = JSON.parse(node.kevin_edit_original) as { title?: string; done_means?: string }; } catch { /* keep {} */ }
       }
-      agent.processMessage(text, externalId, correlationKey).catch((err: unknown) => {
-        if (err instanceof agent.ConversationBusyError) queue.enqueueMessage(convId, text);
-        else console.error('[goals] review cue post failed', err);
-      });
-    })
-    .catch((err) => console.error('[goals] review cue import failed', err));
+      let block =
+        `#${node.id} now: "${node.title}" — done: "${node.done_means ?? ''}"\n` +
+        `    was (yours): "${orig.title ?? ''}" — done: "${orig.done_means ?? ''}"`;
+      if (node.review_note) block += `\n    you pushed back with: "${node.review_note}"`;
+      return block;
+    });
+    const text = [header, ...blocks, footer].join('\n');
+    postCue(target, text, `goal-cue:${goalId}:${eventId}`, 'review');
+  }
 }
 
 /** If the goal's focus points at `nodeId` (which just became discarded), move it
@@ -1304,6 +1301,7 @@ export function patchGoalNode(goalId: number, nodeId: number, patch: {
     new: { title, done_means: doneMeans },
   });
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
+  if (title !== node.title && fresh.thread_ext) applyNodeChatLabel(fresh); // v0.3 §14.1
   emitNode('updated', fresh);
   if (setEdit) scheduleStructureDigest(goalId, { node_id: nodeId, kind: 'edited', from: null, to: null, at: new Date().toISOString() });
   return deriveSingleNode(fresh);
@@ -1650,59 +1648,52 @@ export function fireGoalStructureCue(goalId: number): void {
   });
   if (!entries.length) return;
 
-  const summary: string[] = [];
-  const blocks: string[] = [];
-  for (const e of entries) {
-    const n = getRawNodeStmt.get(e.node_id) as GoalNodeDbRow;
-    const nowParent = parentLabel(goal, n.parent_id);
-    if (e.kind === 'moved') {
-      summary.push(`moved "${n.title}" under "${n.parent_id != null ? (getRawNodeStmt.get(n.parent_id) as GoalNodeDbRow | undefined)?.title ?? `#${n.parent_id}` : 'root'}"`);
-      blocks.push(`#${n.id} moved: "${n.title}" — from: ${parentLabel(goal, n.kevin_move_from ?? e.from)} → now: ${nowParent}`);
-    } else if (e.kind === 'added') {
-      summary.push(`added "${n.title}" under "${n.parent_id != null ? (getRawNodeStmt.get(n.parent_id) as GoalNodeDbRow | undefined)?.title ?? `#${n.parent_id}` : 'root'}"`);
-      blocks.push(`#${n.id} added: "${n.title}" under ${nowParent} — done: "${n.done_means ?? ''}"`);
-    } else {
-      let orig: { title?: string; done_means?: string } = {};
-      if (n.kevin_edit_original) {
-        try { orig = JSON.parse(n.kevin_edit_original) as { title?: string; done_means?: string }; } catch { /* keep {} */ }
-      }
-      summary.push(`edited "${orig.title ?? n.title}"`);
-      blocks.push(
-        `#${n.id} edited: "${orig.title ?? n.title}" now: "${n.title}" — done: "${n.done_means ?? ''}"\n` +
-        `    was: "${orig.title ?? ''}" — done: "${orig.done_means ?? ''}"`,
-      );
-    }
-  }
-  const header = `[goal #${goalId} — Kevin restructured the tree: ${summary.join('; ')}. Weigh in.]`;
   const footer =
     'For each node: acknowledge the change in a sentence, then either agree → `goals` op `accept` {node_id} (the flag clears; it stays set), ' +
     'or `push_back` {node_id, note} with your reason in one or two sentences and talk it out. Don\'t restate the rest of the tree.';
-  const text = [header, ...blocks, footer].join('\n');
 
-  insertEvent(goalId, null, 'system', 'kevin_restructured', header, { entries });
+  // v0.3 §14.6 — the burst is split by target chat (node chat vs goal chat);
+  // ONE kevin_restructured event for the whole burst, ONE cue per target.
+  const grouped = groupByCueTarget(goalId, entries.map((e) => ({ id: e.node_id, entry: e })));
+  const rendered: Array<{ target: string; text: string }> = [];
+  for (const [target, group] of grouped) {
+    const summary: string[] = [];
+    const blocks: string[] = [];
+    for (const { entry: e } of group) {
+      const n = getRawNodeStmt.get(e.node_id) as GoalNodeDbRow;
+      const nowParent = parentLabel(goal, n.parent_id);
+      if (e.kind === 'moved') {
+        summary.push(`moved "${n.title}" under "${n.parent_id != null ? (getRawNodeStmt.get(n.parent_id) as GoalNodeDbRow | undefined)?.title ?? `#${n.parent_id}` : 'root'}"`);
+        blocks.push(`#${n.id} moved: "${n.title}" — from: ${parentLabel(goal, n.kevin_move_from ?? e.from)} → now: ${nowParent}`);
+      } else if (e.kind === 'added') {
+        summary.push(`added "${n.title}" under "${n.parent_id != null ? (getRawNodeStmt.get(n.parent_id) as GoalNodeDbRow | undefined)?.title ?? `#${n.parent_id}` : 'root'}"`);
+        blocks.push(`#${n.id} added: "${n.title}" under ${nowParent} — done: "${n.done_means ?? ''}"`);
+      } else {
+        let orig: { title?: string; done_means?: string } = {};
+        if (n.kevin_edit_original) {
+          try { orig = JSON.parse(n.kevin_edit_original) as { title?: string; done_means?: string }; } catch { /* keep {} */ }
+        }
+        summary.push(`edited "${orig.title ?? n.title}"`);
+        blocks.push(
+          `#${n.id} edited: "${orig.title ?? n.title}" now: "${n.title}" — done: "${n.done_means ?? ''}"\n` +
+          `    was: "${orig.title ?? ''}" — done: "${orig.done_means ?? ''}"`,
+        );
+      }
+    }
+    const header = `[goal #${goalId} — Kevin restructured the tree: ${summary.join('; ')}. Weigh in.]`;
+    rendered.push({ target, text: [header, ...blocks, footer].join('\n') });
+  }
+
+  const eventHeader = rendered.length === 1
+    ? rendered[0].text.split('\n')[0]
+    : `[goal #${goalId} — Kevin restructured the tree (${entries.length} change${entries.length === 1 ? '' : 's'} across ${rendered.length} chats). Weigh in.]`;
+  insertEvent(goalId, null, 'system', 'kevin_restructured', eventHeader, { entries, targets: rendered.map((r) => r.target) });
   emitGoal('updated', goalId);
 
-  const externalId = `cockpit:goal-${goalId}`;
-  const conv = getConversation(externalId);
-  if (!conv) {
-    console.warn(`[goals] structure cue skipped — no conversation for ${externalId}`);
-    return;
-  }
   const eventId = (lastEventIdStmt.get(goalId) as { id: number } | undefined)?.id ?? 0;
-  const correlationKey = `goal-structure:${goalId}:${eventId}`;
-  const convId = conv.id;
-  Promise.all([import('./agent.js'), import('./thread-message-queue.js')])
-    .then(([agent, queue]) => {
-      if (agent.getInFlightMessageId(convId)) {
-        queue.enqueueMessage(convId, text);
-        return;
-      }
-      agent.processMessage(text, externalId, correlationKey).catch((err: unknown) => {
-        if (err instanceof agent.ConversationBusyError) queue.enqueueMessage(convId, text);
-        else console.error('[goals] structure cue post failed', err);
-      });
-    })
-    .catch((err) => console.error('[goals] structure cue import failed', err));
+  for (const { target, text } of rendered) {
+    postCue(target, text, `goal-structure:${goalId}:${eventId}`, 'structure');
+  }
 }
 
 /** Test/ops helper: is a digest pending for this goal? */
@@ -2098,6 +2089,205 @@ export function getOrCreateGoalThread(goalId: number): { external_id: string; cr
   return { external_id: externalId, created: !existingConv, seed_text: seedText };
 }
 
+// ---------------------------------------------------------------------------
+// v0.3 §14 — NODE CHATS: one pinned-focus conversation per node, on Kevin's
+// say-so. Same goal machinery, focus pinned to one node, linked both ways
+// (goal_nodes.thread_ext ↔ `cockpit:goal-<g>-node-<n>`), cues routed to the
+// nearest chat. NOT a promotion — nothing leaves the goal's tree.
+// ---------------------------------------------------------------------------
+
+export interface GoalScope {
+  goal_id: number;
+  /** The pinned node inside `cockpit:goal-<g>-node-<n>`; null in a plain goal chat. */
+  pinned_node_id: number | null;
+}
+
+/** CONTRACT §14.3 — which goal (and which pinned node, if any) a thread
+ *  external_id belongs to. The NODE id is authoritative for a node chat (its
+ *  goal_id is read off the row, so a thread follows its node through a
+ *  promotion); the `<g>` in the ext is only a hint. Null for non-goal threads
+ *  and for a node chat whose node is gone/discarded. */
+export function resolveGoalScope(externalId: string | undefined | null): GoalScope | null {
+  if (!externalId) return null;
+  const mNode = /^cockpit:goal-(\d+)-node-(\d+)$/.exec(externalId);
+  if (mNode) {
+    const node = getRawNodeStmt.get(Number(mNode[2])) as GoalNodeDbRow | undefined;
+    if (!node || node.state === 'discarded') return null;
+    if (!getGoalRowStmt.get(node.goal_id)) return null;
+    return { goal_id: node.goal_id, pinned_node_id: node.id };
+  }
+  const mGoal = /^cockpit:goal-(\d+)$/.exec(externalId);
+  if (mGoal) return { goal_id: Number(mGoal[1]), pinned_node_id: null };
+  return null;
+}
+
+/** Ancestor chain of a node, nearest first (excludes the node itself). */
+function ancestorIdsOf(nodeId: number): number[] {
+  const out: number[] = [];
+  let cur = getRawNodeStmt.get(nodeId) as GoalNodeDbRow | undefined;
+  const seen = new Set<number>();
+  while (cur && cur.parent_id != null && !seen.has(cur.parent_id)) {
+    seen.add(cur.parent_id);
+    out.push(cur.parent_id);
+    cur = getRawNodeStmt.get(cur.parent_id) as GoalNodeDbRow | undefined;
+  }
+  return out;
+}
+
+/** True when `nodeId` is `rootId` or one of its descendants (same goal). */
+export function isNodeInSubtree(rootId: number, nodeId: number): boolean {
+  if (rootId === nodeId) return true;
+  return ancestorIdsOf(nodeId).includes(rootId);
+}
+
+/** Conversation label for a node chat (CONTRACT §14.1). */
+function nodeChatLabel(node: GoalNodeDbRow, goalTitle: string): string {
+  return `💬 #${node.id} ${node.title} · 🎯 ${goalTitle}`.slice(0, 120);
+}
+
+function applyNodeChatLabel(node: GoalNodeDbRow, goalTitle?: string): void {
+  if (!node.thread_ext) return;
+  const conv = getConversation(node.thread_ext);
+  if (!conv) return;
+  const title = goalTitle ?? (getGoalRowStmt.get(node.goal_id) as GoalRow | undefined)?.title ?? '';
+  renameConversation(conv.id, nodeChatLabel(node, title));
+}
+
+function subtreeCounts(goalId: number, rootId: number): { total: number; done: number; working: number; ghosts: number } {
+  const all = listRawNodesForGoal(goalId, false);
+  const ids = new Set<number>([rootId, ...collectDescendantIds(goalId, rootId)]);
+  let total = 0, done = 0, working = 0, ghosts = 0;
+  for (const n of all) {
+    if (!ids.has(n.id)) continue;
+    total += 1;
+    if (n.state === 'done') done += 1;
+    else if (n.state === 'working') working += 1;
+    else if (n.state === 'ghost') ghosts += 1;
+  }
+  return { total, done, working, ghosts };
+}
+
+/** Seed text for a node chat (CONTRACT §14.2) — exactly that shape. */
+export function composeNodeChatSeed(goal: GoalRow, node: GoalNodeDbRow): string {
+  const fullPath = pathForNode(node.id) ?? [goal.title, node.title];
+  const above = fullPath.slice(0, -1); // goal title + ancestors
+  const pathLine = above.length > 1 ? above.join(' › ') : '(root-level node)';
+  const c = subtreeCounts(goal.id, node.id);
+  const g = goal.id;
+  const n = node.id;
+  return [
+    `💬 NODE CHAT — this thread belongs to node #${n} "${node.title}" of goal #${g} "${goal.title}" and nothing else. Read skills/goals/SKILL.md before your first reply (it is the operating contract for goal chats; the "Node chats" section applies here); the \`goals\` tool is how you touch the tree. Every turn of this thread is prefixed with a <goal_focus pinned="${n}"/> line + a <goal_tree> snapshot of THIS BRANCH ONLY — that snapshot is your memory of it; never ask Kevin to restate it.`,
+    '',
+    `Goal: ${goal.title} — done means: ${goal.done_means || '(not set yet)'}`,
+    `Path: ${pathLine}`,
+    `Node: #${n} ${node.title}`,
+    `Done means: ${node.done_means || '(not set yet)'}`,
+    `Notes: ${node.notes || '(none)'}`,
+    `State: ${node.state} · leaf: ${node.leaf_kind} · subtree: ${c.total} node(s) (${c.done} done · ${c.working} working · ${c.ghosts} ghost)`,
+    '',
+    'Rules for this chat (short form; SKILL.md has the long form):',
+    `1. You can only shape INSIDE this branch: propose / propose_edit / propose_remove / move / plans / verify on #${n} and its descendants. Anything above it — or a sibling of it — is out of scope: say so in one line and it happens in the goal chat (the ↑ back to goal chat link in the header).`,
+    "2. Everything you add/reword/remove is a ghost until Kevin ✓s: use `propose` / `propose_edit` / `propose_remove`. `set_from_kevin` only for nodes he dictated verbatim.",
+    `3. One layer ahead, never two: propose children only under the focused node (default: #${n} itself).`,
+    "4. A node that can't split is a leaf: `set_leaf_kind` machine (you can spec it) or human (only Kevin can do it). Machine leaves get a `propose_plan`; Kevin approves on the card (or says go → `dispatch`).",
+    `5. Push back when a branch doesn't serve #${n}'s done_means. Verify against done_means before anything becomes done (\`verify\`).`,
+    "6. Kevin never has to say which node he means — the focus line tells you. If he clearly means a different node, say which one you're taking it as.",
+    `7. Cues for this branch (Kevin's edits + restructures, guard failures, finished trees) land HERE, not in the goal chat. A \`[goal #${g} — …]\` message is one of those; handle it the same way SKILL.md says.`,
+    '',
+    `Open with: a two-line read of where #${n} stands against its done_means and what you'd propose next under it.`,
+  ].join('\n');
+}
+
+/** CONTRACT §14.2 route 36 — find-or-create the node's own chat. 2-step like
+ *  route 8: the CALLER posts `seed_text` to /threads/:ext/messages when
+ *  `created=true` (the `goals` tool's `open_node_chat` op does it itself). */
+export function getOrCreateNodeThread(goalId: number, nodeId: number, actor?: unknown): {
+  external_id: string; created: boolean; seed_text: string | null; node: GoalNodeRow;
+} {
+  const goal = requireGoal(goalId);
+  const node = requireNode(goalId, nodeId);
+  if (node.state === 'discarded') throw new GoalError(409, 'node_discarded', 'cannot open a chat for a discarded node');
+  if (node.promoted_to_goal_id != null) {
+    throw new GoalError(409, 'already_promoted', `this node was promoted to goal #${node.promoted_to_goal_id} — talk to that goal's chat instead`, { new_goal_id: node.promoted_to_goal_id });
+  }
+  const act = assertActor(actor, 'kevin');
+  const externalId = node.thread_ext ?? `cockpit:goal-${goalId}-node-${nodeId}`;
+  const existingConv = getConversation(externalId);
+  if (existingConv && node.thread_ext === externalId) {
+    return { external_id: externalId, created: false, seed_text: null, node: deriveSingleNode(node) };
+  }
+  const conv = getOrCreateConversation(externalId);
+  if (!existingConv) renameConversation(conv.id, nodeChatLabel(node, goal.title));
+  if (node.thread_ext !== externalId) {
+    sqliteDb.prepare(`UPDATE goal_nodes SET thread_ext = ?, updated_at = datetime('now') WHERE id = ?`).run(externalId, nodeId);
+    insertEvent(goalId, nodeId, act, 'node_thread_opened', `Node chat opened: #${nodeId} ${node.title}`, { external_id: externalId });
+  }
+  const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
+  emitNode('updated', fresh); // carries thread_ext; emitNode also touches the goal (counts.node_chats)
+  const seedText = existingConv ? null : composeNodeChatSeed(goal, fresh);
+  return { external_id: externalId, created: !existingConv, seed_text: seedText, node: deriveSingleNode(fresh) };
+}
+
+/** CONTRACT §14.6 — the ONE cue-routing resolver. Nearest ancestor-or-self with
+ *  a node chat whose conversation exists → that chat; otherwise the goal chat.
+ *  `nodeId` null = a goal-level cue (root guard) → always the goal chat. */
+export function cueTargetForNode(goalId: number, nodeId: number | null | undefined): string {
+  const goalExt = `cockpit:goal-${goalId}`;
+  if (nodeId == null) return goalExt;
+  const node = getRawNodeStmt.get(nodeId) as GoalNodeDbRow | undefined;
+  if (!node || node.goal_id !== goalId) return goalExt;
+  const chain = [node.id, ...ancestorIdsOf(node.id)];
+  for (const id of chain) {
+    const n = id === node.id ? node : (getRawNodeStmt.get(id) as GoalNodeDbRow | undefined);
+    if (n?.thread_ext && n.state !== 'discarded' && getConversation(n.thread_ext)) return n.thread_ext;
+  }
+  return goalExt;
+}
+
+/** CONTRACT §14.6 — for tree-cue.ts: when a goal node owns this hopper tree,
+ *  the finished/blocked cue goes to that node's nearest chat instead of the
+ *  tree's origin thread. Null when no goal node references the tree. */
+export function cueTargetForTree(treeId: string): string | null {
+  const node = sqliteDb.prepare(`SELECT * FROM goal_nodes WHERE tree_id = ? AND state != 'discarded' ORDER BY id DESC LIMIT 1`).get(treeId) as GoalNodeDbRow | undefined;
+  if (!node) return null;
+  return cueTargetForNode(node.goal_id, node.id);
+}
+
+/** Group nodes by their cue target so a multi-node request posts ONE cue per
+ *  chat (§14.6: never both). Insertion order preserved. */
+function groupByCueTarget<T extends { id: number }>(goalId: number, nodes: T[]): Map<string, T[]> {
+  const groups = new Map<string, T[]>();
+  for (const n of nodes) {
+    const target = cueTargetForNode(goalId, n.id);
+    if (!groups.has(target)) groups.set(target, []);
+    groups.get(target)!.push(n);
+  }
+  return groups;
+}
+
+/** Shared "post a cue as a real JARVIS turn" seam (§11.3 / §12.6 / §13.5 /
+ *  §14.6): in-flight → enqueue; busy → enqueue; else processMessage. */
+function postCue(externalId: string, text: string, correlationKey: string, tag: string): void {
+  const conv = getConversation(externalId);
+  if (!conv) {
+    console.warn(`[goals] ${tag} cue skipped — no conversation for ${externalId}`);
+    return;
+  }
+  const convId = conv.id;
+  Promise.all([import('./agent.js'), import('./thread-message-queue.js')])
+    .then(([agent, queue]) => {
+      if (agent.getInFlightMessageId(convId)) {
+        queue.enqueueMessage(convId, text);
+        return;
+      }
+      agent.processMessage(text, externalId, correlationKey).catch((err: unknown) => {
+        if (err instanceof agent.ConversationBusyError) queue.enqueueMessage(convId, text);
+        else console.error(`[goals] ${tag} cue post failed`, err);
+      });
+    })
+    .catch((err) => console.error(`[goals] ${tag} cue import failed`, err));
+}
+
 // -- §3.6 route 27: promote (the only escape hatch) ------------------------
 
 export function promoteNode(goalId: number, nodeId: number, actor?: unknown): {
@@ -2256,23 +2446,56 @@ function escapeAttr(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-/** CONTRACT §6 — injected once per turn for `cockpit:goal-<id>` threads only.
- *  '' for every other thread. Never stored in the transcript; regenerated
- *  fresh from the DB every turn (no caching). */
+/** First non-empty line of a thread's latest assistant turn (tool-call turns
+ *  excluded), clipped to `max` chars, plus its age — for the goal chat's
+ *  `<node_chats>` block (CONTRACT §14.4). Null when the thread has no reply yet. */
+function latestAssistantLine(externalId: string, max = 160): { text: string; age: string } | null {
+  const conv = getConversation(externalId);
+  if (!conv) return null;
+  const row = sqliteDb.prepare(`
+    SELECT content, created_at FROM turns
+    WHERE conversation_id = ? AND role = 'assistant' AND tool_name IS NULL AND content IS NOT NULL AND TRIM(content) != ''
+    ORDER BY turn_index DESC LIMIT 1
+  `).get(conv.id) as { content: string; created_at: string } | undefined;
+  if (!row) return null;
+  const line = row.content.split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? '';
+  const text = line.length > max ? `${line.slice(0, max - 1)}…` : line;
+  // turns.created_at is sqlite datetime('now') = UTC without a zone marker.
+  const ts = Date.parse(row.created_at.includes('T') ? row.created_at : `${row.created_at.replace(' ', 'T')}Z`);
+  const mins = Number.isFinite(ts) ? Math.max(0, Math.round((Date.now() - ts) / 60000)) : 0;
+  const age = mins < 1 ? '<1m ago' : mins < 60 ? `${mins}m ago` : mins < 1440 ? `${Math.round(mins / 60)}h ago` : `${Math.round(mins / 1440)}d ago`;
+  return { text, age };
+}
+
+/** CONTRACT §6 (+ §14.4) — injected once per turn for `cockpit:goal-<id>` and
+ *  `cockpit:goal-<g>-node-<n>` threads only. '' for every other thread. Never
+ *  stored in the transcript; regenerated fresh from the DB every turn (no
+ *  caching). A node chat sees the goal root + the path above its node + its
+ *  own subtree ONLY; the goal chat sees the whole tree with 💬 on chatted
+ *  nodes + a `<node_chats>` block. */
 export function buildGoalThreadContext(externalId: string): string {
   try {
-    const m = /^cockpit:goal-(\d+)$/.exec(externalId);
-    if (!m) return '';
-    const goalId = Number(m[1]);
+    const scope = resolveGoalScope(externalId);
+    if (!scope) return '';
+    const goalId = scope.goal_id;
     const goal = getGoalRowStmt.get(goalId) as GoalRow | undefined;
     if (!goal) return '';
+    const pinned = scope.pinned_node_id != null ? (getRawNodeStmt.get(scope.pinned_node_id) as GoalNodeDbRow | undefined) : undefined;
+    if (scope.pinned_node_id != null && !pinned) return '';
 
     const counts = computeCounts(goalId);
     const focusRaw = getFocusRaw(goalId);
-    const focusNode = focusRaw.node_id != null ? (getRawNodeStmt.get(focusRaw.node_id) as GoalNodeDbRow | undefined) : undefined;
-    const focusPath = focusRaw.node_id != null ? pathForNode(focusRaw.node_id) : null;
+    // v0.3 §14.4 — in a node chat the EFFECTIVE focus is the goal's focus row
+    // when it points inside the subtree, else the pinned node itself.
+    let focusId: number | null = focusRaw.node_id;
+    if (pinned) {
+      focusId = focusId != null && isNodeInSubtree(pinned.id, focusId) ? focusId : pinned.id;
+    }
+    const focusNode = focusId != null ? (getRawNodeStmt.get(focusId) as GoalNodeDbRow | undefined) : undefined;
+    const focusPath = focusId != null ? pathForNode(focusId) : null;
     const focusPathStr = focusPath ? escapeAttr(focusPath.slice(1).join(' › ')) : '';
-    const focusLine = `<goal_focus goal_id="${goalId}" node_id="${focusRaw.node_id ?? ''}" path="${focusPathStr}" state="${focusNode?.state ?? ''}" leaf_kind="${focusNode?.leaf_kind ?? ''}" pending="${focusNode ? pendingLabel(focusNode) : 'none'}"/>`;
+    const pinnedAttr = pinned ? ` pinned="${pinned.id}"` : '';
+    const focusLine = `<goal_focus goal_id="${goalId}" node_id="${focusId ?? ''}"${pinnedAttr} path="${focusPathStr}" state="${focusNode?.state ?? ''}" leaf_kind="${focusNode?.leaf_kind ?? ''}" pending="${focusNode ? pendingLabel(focusNode) : 'none'}"/>`;
 
     // v0.2 §12.11 — set guards, keyed by node_id (null = the goal root). Each
     // node/root carrying a set guard gets a 🛡 / 🛡✗ suffix in the snapshot.
@@ -2287,6 +2510,16 @@ export function buildGoalThreadContext(externalId: string): string {
       if (g.health === 'failing' || g.health === 'error') return ` 🛡✗ "${g.last_summary ?? ''}"`;
       return ' 🛡';
     };
+
+    const header = `# ${goal.title} — done: ${goal.done_means ?? '(not set yet)'}${guardSuffix(null)}`;
+    const guardsFailingAttr = counts.guards_failing > 0 ? ` guards_failing="${counts.guards_failing}"` : '';
+    const treeOpen = `<goal_tree goal_id="${goalId}"${pinnedAttr} status="${goal.status}" progress="${counts.progress}" working="${counts.working}" need_you="${counts.need_you}" awaiting_you="${counts.awaiting_jarvis}"${guardsFailingAttr}>`;
+
+    // v0.3 §14.4 — a pinned node that became a promoted stub: one line, no tree.
+    if (pinned && pinned.promoted_to_goal_id != null) {
+      const stubLine = `- [${nodeMarker(pinned)}] #${pinned.id} ${pinned.title} → goal #${pinned.promoted_to_goal_id} — this branch now lives in cockpit:goal-${pinned.promoted_to_goal_id}; talk there.`;
+      return `${focusLine}\n${treeOpen}\n${header}\n${stubLine}\n</goal_tree>\n`;
+    }
 
     const allNodes = listRawNodesForGoal(goalId, false); // discarded never appear
     const byId = new Map(allNodes.map((n) => [n.id, n]));
@@ -2314,34 +2547,54 @@ export function buildGoalThreadContext(externalId: string): string {
     }
 
     const lines: string[] = [];
-    function walk(parentId: number | null, depth: number): void {
-      for (const n of byParent.get(parentId) ?? []) {
-        const indent = '  '.repeat(depth);
-        const isFocused = focusNode ? n.id === focusNode.id : false;
-        const marker = nodeMarker(n) + (isFocused ? ' ▶' : '');
-        const stub = n.promoted_to_goal_id ? ` → goal #${n.promoted_to_goal_id}` : '';
-        const doneMeans = n.done_means ? n.done_means : '(no done_means yet)';
-        const children = byParent.get(n.id) ?? [];
-        const showChildren = children.length > 0
-          && (focusNode ? (n.id === focusNode.id || ancestorIds.has(n.id)) : depth === 0);
-        const hidden = children.length && !showChildren ? countDescendants(n.id) : 0;
-        const collapsed = hidden > 0 ? ` (+${hidden})` : '';
-        const reviewSuffix = reviewLineSuffix(n);
-        lines.push(`${indent}- [${marker}] #${n.id} ${n.title}${stub} — done: ${doneMeans}${guardSuffix(n.id)}${collapsed}${reviewSuffix}`);
-        if (showChildren) walk(n.id, depth + 1);
-      }
+    function renderNode(n: GoalNodeDbRow, depth: number, topLevel: boolean): void {
+      const indent = '  '.repeat(depth);
+      const isFocused = focusNode ? n.id === focusNode.id : false;
+      const marker = nodeMarker(n) + (isFocused ? ' ▶' : '');
+      const stub = n.promoted_to_goal_id ? ` → goal #${n.promoted_to_goal_id}` : '';
+      const doneMeans = n.done_means ? n.done_means : '(no done_means yet)';
+      const children = byParent.get(n.id) ?? [];
+      // §6 collapse rule: root-level nodes, the focused node and its ancestors
+      // show children; §14.4: the pinned node is ALWAYS expanded one layer.
+      const showChildren = children.length > 0
+        && ((pinned && n.id === pinned.id) || (focusNode ? (n.id === focusNode.id || ancestorIds.has(n.id)) : topLevel));
+      const hidden = children.length && !showChildren ? countDescendants(n.id) : 0;
+      const collapsed = hidden > 0 ? ` (+${hidden})` : '';
+      const chat = n.thread_ext && !pinned ? ' 💬' : ''; // v0.3 §14.4 — goal chat only
+      const reviewSuffix = reviewLineSuffix(n);
+      lines.push(`${indent}- [${marker}] #${n.id} ${n.title}${stub} — done: ${doneMeans}${guardSuffix(n.id)}${chat}${collapsed}${reviewSuffix}`);
+      if (showChildren) for (const c of children) renderNode(c, depth + 1, false);
     }
-    walk(null, 0);
+
+    if (pinned) {
+      // v0.3 §14.4 — path line above the pinned node, then the node at depth 0.
+      const fullPath = pathForNode(pinned.id) ?? [];
+      const above = fullPath.slice(1, -1);
+      if (above.length) lines.push(`↑ ${above.join(' › ')}   (above this chat — changes there happen in the goal chat)`);
+      renderNode(pinned, 0, true);
+    } else {
+      for (const n of byParent.get(null) ?? []) renderNode(n, 0, true);
+    }
 
     let body = lines;
     if (body.length > 60) {
       body = body.slice(0, 59).concat([`… (+${lines.length - 59} more)`]);
     }
 
-    const header = `# ${goal.title} — done: ${goal.done_means ?? '(not set yet)'}${guardSuffix(null)}`;
-    const guardsFailingAttr = counts.guards_failing > 0 ? ` guards_failing="${counts.guards_failing}"` : '';
-    const treeBlock = `<goal_tree goal_id="${goalId}" status="${goal.status}" progress="${counts.progress}" working="${counts.working}" need_you="${counts.need_you}" awaiting_you="${counts.awaiting_jarvis}"${guardsFailingAttr}>\n${header}\n${body.join('\n')}\n</goal_tree>`;
-    return `${focusLine}\n${treeBlock}\n`;
+    let out = `${focusLine}\n${treeOpen}\n${header}\n${body.join('\n')}\n</goal_tree>\n`;
+
+    // v0.3 §14.4 — the goal chat stays aware of every node chat: one line each.
+    if (!pinned) {
+      const chatted = allNodes.filter((n) => n.thread_ext).sort((a, b) => a.id - b.id);
+      if (chatted.length) {
+        const rows = chatted.map((n) => {
+          const last = latestAssistantLine(n.thread_ext as string);
+          return last ? `#${n.id} chat, last: "${last.text}" (${last.age})` : `#${n.id} chat, last: (no replies yet)`;
+        });
+        out += `<node_chats goal_id="${goalId}" count="${chatted.length}">\n${rows.join('\n')}\n</node_chats>\n`;
+      }
+    }
+    return out;
   } catch {
     return '';
   }

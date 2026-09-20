@@ -114,6 +114,7 @@ import {
   promoteNode,
   getNodeTreeOverlay,
   getOrCreateGoalThread,
+  getOrCreateNodeThread,
 } from '../goals.js';
 import {
   listGuards,
@@ -2356,6 +2357,23 @@ export function createApiV1Router(): Router {
   };
   router.get('/goals/:id/thread', goalThreadHandler);
   router.post('/goals/:id/thread', goalThreadHandler);
+
+  // v0.3 §14.2 route 36 — find-or-create a NODE's own chat (pinned-focus
+  // thread `cockpit:goal-<g>-node-<n>`). Same 2-step as route 8: when
+  // `created=true` the CLIENT posts `seed_text` to /threads/:ext/messages.
+  // Explicit Kevin action only — clicking a row never lands here (§3.5).
+  const nodeThreadHandler = (req: AuthedRequest, res: Response) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    try {
+      res.json(getOrCreateNodeThread(goalId, nodeId, body.actor));
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  };
+  router.get('/goals/:id/nodes/:nodeId/thread', nodeThreadHandler);
+  router.post('/goals/:id/nodes/:nodeId/thread', nodeThreadHandler);
 
   // -- Nodes ------------------------------------------------------------------
 

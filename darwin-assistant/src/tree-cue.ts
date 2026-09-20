@@ -25,6 +25,7 @@ import {
   listTreeNodes,
   type HopperNodeRow,
 } from './hopper-engine.js';
+import { cueTargetForTree } from './goals.js';
 
 // -- dedupe column: one cue per (tree, status) transition ------------------
 // PRAGMA-checked additive ALTER, same pattern as hopper-engine's router cols.
@@ -173,7 +174,11 @@ export function treeCueOnTreeStatus(treeId: string, status: 'done' | 'blocked' |
   // already suppresses foundry bells (isFoundryTree). Foundry reports through
   // /foundry; the module trees are its internal steps, not Kevin's review gate.
   if (tree.topic.startsWith('foundry:')) return;
-  const originExt = tree.origin_thread_ext;
+  // GOALS v0.3 (CONTRACT §14.6): a tree planted from a goal node (approve_plan)
+  // carries the GOAL chat as its origin; when that node — or an ancestor — has
+  // its own node chat, the cue belongs there instead. cueTargetForTree is null
+  // for every non-goal tree, so this changes nothing outside Goals.
+  const originExt = cueTargetForTree(treeId) ?? tree.origin_thread_ext;
   if (!originExt) return; // no planting thread to wake
   if (isNonWakeableOrigin(originExt)) return;
 

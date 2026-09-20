@@ -25,6 +25,7 @@ import {
   touchGoal,
   getRawGoal,
   getRawGoalNode,
+  cueTargetForNode,
   type GoalActor,
 } from './goals.js';
 import * as overwatch from './goals-overwatch.js';
@@ -592,7 +593,9 @@ const lastEventIdStmt = sqliteDb.prepare(`SELECT id FROM goal_events WHERE goal_
 
 function fireGuardCue(guard: GuardDbRow, health: GuardHealth): void {
   const goalId = guard.goal_id;
-  const externalId = `cockpit:goal-${goalId}`;
+  // v0.3 §14.6 — a guard on a node under a node chat cues THAT chat; root
+  // guards (node_id null) and unchatted branches cue the goal chat. Never both.
+  const externalId = cueTargetForNode(goalId, guard.node_id);
   const conv = getConversation(externalId);
   if (!conv) {
     console.warn(`[goals-guards] cue skipped — no conversation for ${externalId}`);

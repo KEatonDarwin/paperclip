@@ -181,8 +181,10 @@ await check('R7a', "a collapsed branch carries `(+N)` ON its own row, not as an 
   const block: string = goalsModule.buildGoalThreadContext(`cockpit:goal-${g.id}`);
   assert.ok(block.includes('<goal_focus'), 'focus line missing');
   assert.ok(!/^\s*\(\+\d+ more\)\s*$/m.test(block), 'REGRESSION: `(+N more)` emitted as its own line');
-  assert.ok(/- \[set\] #\d+ Branch A — done: a \(\+2\)/.test(block), `collapsed row not in CONTRACT format:\n${block}`);
-  assert.ok(/#\d+ Branch B — done: b$/m.test(block), 'focused branch must not be collapsed');
+  // v0.2 §13.7: Kevin-created rows carry ` ✎K` + an AWAITING YOUR TAKE suffix
+  // until JARVIS weighs in — the check predates that marker (fixed by node #489).
+  assert.ok(/- \[set( ✎K)?\] #\d+ Branch A — done: a \(\+2\)/.test(block), `collapsed row not in CONTRACT format:\n${block}`);
+  assert.ok(/#\d+ Branch B — done: b( — AWAITING YOUR TAKE[^\n]*)?$/m.test(block), 'focused branch must not be collapsed');
   assert.ok(block.includes('B child'), "the focused node's children must be shown");
   assert.ok(!block.includes('A grandchild'), 'an unfocused branch must stay collapsed');
 });

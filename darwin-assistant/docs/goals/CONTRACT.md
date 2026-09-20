@@ -216,6 +216,7 @@ type GoalCounts = {
   ghosts: number;          // state='ghost' OR any pending_* set
   human_open: number;      // leaf_kind='human' AND state='set'
   awaiting_jarvis: number; // v0.1 §11.1 — ghosts with review_state='awaiting_jarvis' (Kevin OK'd, waiting on JARVIS); need_you unchanged
+  node_chats: number;      // v0.3 §14.1 — non-discarded nodes with a node chat (thread_ext set)
   progress: number;        // 0..100 = round(100 * done / max(1, total_non_discarded_non_parked))
 };
 type GoalSummary = GoalRow & { counts: GoalCounts; focus_node_id: number | null; last_event_at: string | null };
@@ -238,6 +239,7 @@ type GoalNodeRow = {
   // v0.2 §13.1 — Kevin structure changes + JARVIS pending move:
   kevin_moved_at: string | null; kevin_move_from: number | null;   // Kevin's last move of this node (from parent id, -1 = root); NULL once the round closes
   pending_parent_id: number | null;           // JARVIS-proposed re-parent awaiting ✓/✕ (-1 = to root); resolved by route 19
+  thread_ext: string | null;                  // v0.3 §14.1 — the node's own chat `cockpit:goal-<g>-node-<n>`, NULL until Kevin opens one
   sort_order: number; verified_at: string | null; created_at: string; updated_at: string;
   // derived, always present on reads:
   depth: number;             // 0 = direct child of root
@@ -864,3 +866,143 @@ The op table's `accept` row now also closes a set-node round (§13.4). `push_bac
 10. (review fix) A same-parent reorder writes `sort_order` + logs `node_moved`, but leaves `review_state='none'` / `kevin_moved_at=NULL` and fires no cue; a genuine re-parent of the same node still does both.
 11. (review fix) `propose_move` onto a `planned`/`working` leaf → `409 leaf_already_dispatched` at proposal time; a pending text edit on that node is untouched and still resolves cleanly on its own.
 12. (review fix) A non-finite `sort_order` is ignored rather than clobbering the row to 0.
+
+---
+
+## 14. v0.3 — Node chats: a linked, pinned-focus chat for ONE node, on Kevin's say-so (added 2026-09-20, additive)
+
+**Why (Kevin, verbatim, 2026-09-20, thread cockpit:fff28b3e-…):** *"if we have one chat going for this goal, which is what I wanted to begin with, but I wanted to talk directly about #7 there, which could end up being one heck of a long chat, I'm thinking it would make sense to spawn another chat, 'link' them together, and allow me to talk to it to straighten some of the things out that need to be straightened out. I would want that to be my decision, I don't wanna spawn a chat for everything when I click on it. But I want to be able to click on something and be like 'this deserves a new chat' and make it easy to 'switch' to that chat when I want to keep working on it. Or even open that extra chat in a new window and work on it at the same time."*
+
+**What a node chat IS:** the same goal machinery with the FOCUS PINNED to one node. It is **NOT a promotion** (§3.6 re-roots a subtree into a new goal; a node chat stays inside the same goal and the same server-owned tree, so nothing can diverge). Both chats read the same `goal_nodes` rows; the node chat just cannot see or touch anything above its node.
+
+**Four rules this section adds:**
+1. **Explicit Kevin action only.** A node chat exists only after Kevin opened it (a row/drawer action, the `⧉`/💬 affordance, or telling JARVIS in words). Clicking a row still only sets focus (§3.5 — zero model calls, zero thread creation). One chat per node, find-or-create, forever.
+2. **Pinned scope.** Inside `cockpit:goal-<g>-node-<n>` the `goals` tool's implicit goal is `g`, its implicit parent is `n`, and every op that names a node/parent/batch/guard outside `n`'s subtree is refused with `outside_pinned_scope` — a plain message telling JARVIS to say so, because it happens in the goal chat. `focus` is clamped to the subtree.
+3. **One snapshot, two windows.** Both chats are injected from the same DB every turn (§6). The goal chat marks a node with 💬 when it has a chat and carries one line per node chat ("#7 chat, last: …"); the node chat carries the goal root + the path above the node + the node's own subtree only.
+4. **Cues route to the nearest chat.** Weigh-in (§11.3), structure (§13.5), guard (§12.6) and tree-done/blocked cues for a node — or anything in its subtree — go to the node's chat if it exists, else to the goal chat. **Never both.** `cueTargetForNode` is the single resolver.
+
+### 14.1 DDL (additive `ALTER TABLE goal_nodes ADD COLUMN …`, idempotent, guarded by PRAGMA table_info — same `ensureGoalNodeColumn` helper as §11.1)
+
+```
+thread_ext   TEXT   -- the node's own conversation external_id, `cockpit:goal-<g>-node-<n>`; NULL until Kevin opens one; never cleared (the thread is a record)
+```
+plus `CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_nodes_thread_ext ON goal_nodes(thread_ext) WHERE thread_ext IS NOT NULL`.
+
+`GoalNodeRow` (§3.0) gains `thread_ext: string | null`. `GoalCounts` gains `node_chats: number` (non-discarded nodes with a non-null `thread_ext`). `need_you` is unchanged. `goal_events.kind` closed list gains `node_thread_opened` (first open only; data `{ external_id }`).
+
+**Thread naming:** `cockpit:goal-<goal.id>-node-<node.id>` (numeric ids, never titles). Conversation label: `💬 #<n> <node title> · 🎯 <goal title>` (≤120 chars), re-applied when the node's title changes (route 16) and when the goal is renamed (route 4). **The node id is authoritative for scope; `<g>` is a hint** — if the node was later promoted into another goal (§3.6) the thread follows the node (`goal_id` is read off the row), and a node chat whose pinned node has itself become a promoted stub renders a one-line snapshot pointing at the new goal's chat instead of a tree.
+
+### 14.2 Route 36 — `GET|POST /goals/:id/nodes/:nodeId/thread` (find-or-create, same 2-step shape as route 8)
+
+| Body | Response | Event |
+|---|---|---|
+| `{ actor? ('kevin' default) }` (GET: none) | `200 { external_id: 'cockpit:goal-<g>-node-<n>', created: boolean, seed_text: string \| null, node: GoalNodeRow }` — **the caller posts `seed_text` to `POST /threads/:ext/messages` when `created=true`** (§8 2-step; `seed_text` is `null` when `created=false` and nothing is posted). Sets `goal_nodes.thread_ext`, renames the conversation, emits `goal_node` `updated` + `goal` (counts). Preconditions: node in goal (`404 node_not_found`), `state != 'discarded'` (`409 node_discarded`), not a promoted stub (`409 already_promoted` — "talk to goal #<new> instead"). GET and POST behave identically. | `node_thread_opened` (first time only) + `thread_opened`-style `goal_node` SSE |
+
+**Seed text (`composeNodeChatSeed(goal, node)`), exactly this shape** (the `Rules` block mirrors §8 so SKILL.md has one numbered list to teach; rules 1 and 7 are the node-chat-specific ones):
+
+```
+💬 NODE CHAT — this thread belongs to node #<n> "<node title>" of goal #<g> "<goal title>" and nothing else. Read skills/goals/SKILL.md before your first reply (it is the operating contract for goal chats; the "Node chats" section applies here); the `goals` tool is how you touch the tree. Every turn of this thread is prefixed with a <goal_focus pinned="<n>"/> line + a <goal_tree> snapshot of THIS BRANCH ONLY — that snapshot is your memory of it; never ask Kevin to restate it.
+
+Goal: <goal title> — done means: <goal done_means | "(not set yet)">
+Path: <Goal title › … › parent title | "(root-level node)">
+Node: #<n> <node title>
+Done means: <node done_means | "(not set yet)">
+Notes: <notes | "(none)">
+State: <state> · leaf: <leaf_kind> · subtree: <N> node(s) (<done> done · <working> working · <ghosts> ghost)
+
+Rules for this chat (short form; SKILL.md has the long form):
+1. You can only shape INSIDE this branch: propose / propose_edit / propose_remove / move / plans / verify on #<n> and its descendants. Anything above it — or a sibling of it — is out of scope: say so in one line and it happens in the goal chat (the ↑ back to goal chat link in the header).
+2. Everything you add/reword/remove is a ghost until Kevin ✓s: use `propose` / `propose_edit` / `propose_remove`. `set_from_kevin` only for nodes he dictated verbatim.
+3. One layer ahead, never two: propose children only under the focused node (default: #<n> itself).
+4. A node that can't split is a leaf: `set_leaf_kind` machine (you can spec it) or human (only Kevin can do it). Machine leaves get a `propose_plan`; Kevin approves on the card (or says go → `dispatch`).
+5. Push back when a branch doesn't serve #<n>'s done_means. Verify against done_means before anything becomes done (`verify`).
+6. Kevin never has to say which node he means — the focus line tells you. If he clearly means a different node, say which one you're taking it as.
+7. Cues for this branch (Kevin's edits + restructures, guard failures, finished trees) land HERE, not in the goal chat. A `[goal #<g> — …]` message is one of those; handle it the same way SKILL.md says.
+
+Open with: a two-line read of where #<n> stands against its done_means and what you'd propose next under it.
+```
+
+### 14.3 Pinned scope (server-side in `src/goals.ts` `resolveGoalScope`, enforced by `src/tools/goals-tool.ts`)
+
+`resolveGoalScope(externalId)` → `{ goal_id, pinned_node_id: number | null } | null`:
+- `^cockpit:goal-(\d+)$` → `{ goal_id: g, pinned_node_id: null }` (unchanged §5 behaviour).
+- `^cockpit:goal-(\d+)-node-(\d+)$` → node `n` is loaded; `{ goal_id: node.goal_id, pinned_node_id: n }`. A missing/discarded node → `null` (the tool answers `pinned_node_gone`; the injection is `''`).
+
+Inside a node chat the tool applies, before any route:
+- **Implicit parent** (`propose`, `set_from_kevin`, `propose_guard` when omitted): the goal focus **if it is inside the subtree** (walked up to the nearest set-ish ancestor, never above `n`), else `n` itself. `parent_id: null` (root-level) → `outside_pinned_scope`.
+- **Named ids:** `node_id` / `parent_id` / the ids behind `batch_id` / a guard's `node_id` must be `n` or a descendant of `n` → otherwise `403 outside_pinned_scope` with message *"#<x> '<title>' is outside this chat's branch (#<n> '<title>'). Say so in one line — that change happens in the goal chat."* A `batch_id` is in scope only if **every** ghost in the batch is (a batch never spans a pinned boundary in practice; if it does, name the nodes).
+- **`accept all:true`** → every ghost in the subtree (`parent_id` optional, must be in scope). One review cue for the whole request (§11.2), routed per §14.6.
+- **Goal-level ops** — `set_goal_done_means`, `verify {goal:true}`, `park`/`unpark` with no `node_id`, `promote` of `n` itself, `move` of `n` itself (its parent is above the boundary) → `outside_pinned_scope`. `promote`/`move` of a **descendant** are allowed (a promoted descendant leaves the subtree; its own chat, if any, follows it — §14.1).
+- **`focus`** → `node_id` must be in scope; `null` is clamped to `n` (the node chat's "nothing focused" IS the pinned node). Set with `set_by='jarvis'` on the goal's single focus row — **there is only one focus pointer per goal**; the tree pane (either window) shows it.
+- **`log`** without `node_id` logs on `n`; with one, in scope only.
+- **`list`**, **`list_guards`** are read-only and unrestricted (the whole goal, so JARVIS can explain what is above it).
+- **`open_node_chat`** (§14.7) inside a node chat → `outside_pinned_scope` unless the target is a descendant (opening a chat for a grandchild from a node chat is allowed; it nests).
+
+HTTP routes are **not** scoped — the cockpit is Kevin's hand and a node-chat window's tree pane still shows the whole goal. Scope is a JARVIS discipline, enforced in the tool layer where JARVIS lives.
+
+### 14.4 Focus injection (§6 additions) — two shapes
+
+**Goal chat (`cockpit:goal-<g>`):**
+- Node line suffix ` 💬` for a node with `thread_ext` (after the guard suffix, before `(+N)`/the review suffix).
+- After `</goal_tree>`, when the goal has ≥1 node chat, ONE block:
+```
+<node_chats goal_id="12" count="2">
+#7 chat, last: "Proposed 3 children under #7; waiting on Kevin's ✓" (14m ago)
+#41 chat, last: (no replies yet)
+</node_chats>
+```
+`last` = the first non-empty line of that thread's latest assistant turn (`turns.role='assistant'`, `tool_name IS NULL`, non-empty `content`), ≤160 chars with `…`; age from `created_at` (`<1m` / `Nm` / `Nh` / `Nd` ago). Discarded nodes never appear.
+
+**Node chat (`cockpit:goal-<g>-node-<n>`):**
+```
+<goal_focus goal_id="12" node_id="102" pinned="87" path="Media-buy stats › Create monitoring › Register the rule" state="ghost" leaf_kind="none" pending="none"/>
+<goal_tree goal_id="12" pinned="87" status="set" progress="38" working="1" need_you="3" awaiting_you="0">
+# Ship Perclickity v2 — done: Kevin can see media-buy revenue per link in the dashboard, reconciled to QB
+↑ Media-buy stats   (above this chat — changes there happen in the goal chat)
+- [set ▶] #87 Create monitoring — done: an Overwatch query rule fails when daily revenue < 7-day avg -5%
+  - [ghost b:3f9c] #101 Capture the SQL from smarty-pants — done: rule body = the proven query
+  - [ghost b:3f9c ▶] #102 Register the rule via lanes-tool — done: rule id returned, status query
+</goal_tree>
+```
+- `node_id` on `<goal_focus>` = the **effective** focus: the goal's focus row when it points inside the subtree, else `n`. `pinned="n"` is always present. `path` is the full path (goal title omitted, as today).
+- Root line as today; then ONE `↑ <ancestor titles joined by " › ">   (above this chat — changes there happen in the goal chat)` line when the node is not root-level; then the pinned node at depth 0 and its subtree beneath. Collapse rule (§6) applies relative to the effective focus **with the pinned node always expanded one layer**. Same 60-line cap. Counts on `<goal_tree>` are the whole goal's (so JARVIS knows the goal's temperature), `guards_failing` as §12.11.
+- A pinned node that is a promoted stub renders only: `# <goal> — …` + `- [<marker>] #n <title> → goal #<new> — this branch now lives in cockpit:goal-<new>; talk there.`
+
+### 14.5 Route 36's SSE + counts
+
+`goal_node` `updated` for the node (its `thread_ext` is now set) then `goal` (counts.`node_chats`). The goal card shows `💬 N` when `node_chats > 0` (§14.8).
+
+### 14.6 Cue routing — `cueTargetForNode(goalId, nodeId | null)` (exported from `src/goals.ts`)
+
+Walks `nodeId` → parent → … and returns the first `thread_ext` whose conversation exists; `null` node (goal-level) or no hit → `cockpit:goal-<g>`. Every cue firer uses it:
+- §11.3 `fireGoalReviewCue` and §13.5 `fireGoalStructureCue`: nodes in one request/burst are **grouped by target** and ONE cue per target is posted (text + correlation key unchanged, `externalId` = the target; the header still says `[goal #g — …]`). A node chat receives only its own branch's lines.
+- §12.6 `fireGuardCue`: target = `cueTargetForNode(goal_id, guard.node_id)` (root guards → goal chat).
+- Tree done/blocked (`src/tree-cue.ts`): when a goal node references the finished tree (`goal_nodes.tree_id`), the cue posts to `cueTargetForNode(goal_id, node_id)` instead of `hopper_trees.origin_thread_ext` (exported helper `cueTargetForTree(treeId)` → ext or `null` when no goal node owns the tree; dedupe/kill-switch/foundry rules unchanged). `goalsOnTreeStatus` (the state flip) is untouched.
+- Never both: a node chat existing means the goal chat does **not** get that node's cue. The goal chat's `<node_chats>` block is how the goal chat stays aware.
+
+### 14.7 Tool (§5 additions)
+
+| op | args | does | returns |
+|---|---|---|---|
+| `open_node_chat` | `node_id` | route 36 with `actor='jarvis'`, then the tool posts `seed_text` itself via the internal ingest when `created=true` (same tool-side exception as `promote`). **Only when Kevin asked for it in words** ("give #7 its own chat", "open a chat for this") — never on your own initiative. | `{ external_id, created, node }` |
+
+`list` trims gain `thread_ext`. Tool description gains: *"Kevin can give one node its own chat (💬, `cockpit:goal-<g>-node-<n>`): inside it you are PINNED to that node — shape only inside its branch; anything above it → say so, it happens in the goal chat. Call `open_node_chat` {node_id} only when Kevin asked for it in words."* Every scope refusal returns `{ error, code:'outside_pinned_scope' }` (not a throw), like every other precondition failure.
+
+### 14.8 Cockpit (§9 additions — what the UI lane builds against)
+
+- **Row action** `💬 Open a chat for this` in the `⋯` menu / expanded block on `ghost`, `set`, `planned`, `working` (and `check`) rows → route 36 (`POST`), then `sendThreadMessage(seed_text)` when `created=true`, then switch the LEFT pane to that thread (the tree stays).
+- **Chip** `💬` on any row with `thread_ext`: click = switch the left pane to that thread; `⧉` beside it = `window.open('/thread/<ext>')`. The left pane header in a node chat shows `↑ back to goal chat` (switches back to `cockpit:goal-<g>`), and the composer's focus chip reads `Pinned: #<n> <title>` plus the normal `Talking about:` chip when the goal focus is inside the branch.
+- **Goal card** (forest) shows `💬 N` from `counts.node_chats`.
+- Client fns (additive): `openGoalNodeThread(goalId, nodeId)`. SSE: `goal_node` `updated` carries `thread_ext`; patch in place. `GoalNodeRow.thread_ext` + `GoalCounts.node_chats` copied from §14.1.
+- Focus stays ONE pointer per goal (§3.5): clicking a row in either window sets the same focus; the node chat's injection clamps it (§14.4).
+
+### 14.9 Acceptance (sim checks `V03-1…`, run by `npm run goals:sim`)
+
+1. Route 36 on a set node → `200 created:true`, `external_id = cockpit:goal-<g>-node-<n>`, non-null `seed_text` in the §14.2 shape, `node.thread_ext` set, `node_thread_opened` event, conversation exists + labelled; the second call (GET or POST) → `created:false`, `seed_text:null`, same `external_id`; `counts.node_chats` = 1.
+2. Route 36 preconditions: discarded → `409 node_discarded`; promoted stub → `409 already_promoted`; other goal → `404 node_not_found`.
+3. Tool scope inside the node chat: `propose` with no `parent_id` lands under `n`; `propose`/`accept`/`propose_edit`/`move`/`focus`/`propose_guard` naming a node outside the subtree → `code:'outside_pinned_scope'`; `parent_id:null` → the same; `set_goal_done_means` / `verify {goal:true}` / `promote` of `n` → the same; a descendant is allowed.
+4. `focus {node_id:null}` inside the node chat → the goal focus row = `n` (`set_by='jarvis'`); `focus` on a descendant works; the goal chat's `list` shows the same focus (one pointer).
+5. Injection, node chat: `<goal_focus pinned="n">`, the `↑` line, the pinned node at depth 0, descendants beneath, NO sibling/ancestor node lines; injection, goal chat: ` 💬` on the node line + a `<node_chats count="…">` block with one line per node chat (`(no replies yet)` before any assistant turn; the latest assistant line ≤160 chars once one exists).
+6. Cue routing: Kevin edits + ✓s a ghost under `n` → the review cue's `externalId` = the node chat; the same on a node OUTSIDE the subtree → the goal chat; a structure burst spanning both → two cues, one per target, each listing only its own nodes; a guard health flip on a node under `n` → node chat; a root guard → goal chat; a finished hopper tree planted from a node under `n` → tree cue posts to the node chat, not `origin_thread_ext`.
+7. A goal with node chats on two different nodes → `counts.node_chats = 2`; discarding a node with a chat does not count it.
+8. All 121 v0/v0.1/v0.2/guards checks still pass.

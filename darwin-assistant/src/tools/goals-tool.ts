@@ -354,7 +354,11 @@ export const goals: ToolDef = {
       if (op === 'propose_guard') {
         return {
           guard: proposeGuard(goalId, {
-            node_id: 'node_id' in args ? (args.node_id === null ? null : Number(args.node_id)) : null,
+            // Omitted → the current focus (inside a goal thread), like `propose`;
+            // explicit null → a root guard (only once the goal is done).
+            node_id: 'node_id' in args && args.node_id !== undefined
+              ? (args.node_id === null ? null : Number(args.node_id))
+              : (inGoalThread ? getGoalFocus(goalId).node_id : null),
             mode: args.mode,
             title: str(args.title),
             sql: str(args.sql),

@@ -1116,6 +1116,7 @@ try {
     results: new Map<string, { status: string; value: number | null; summary: string | null; at: string } | null>(),
     next422OnPatch: false,
     next404OnDelete: false,
+    createDelayMs: 0, // review R-2: slow the create so two accepts overlap
     seq: 0,
   };
   function owSlug(name: string): string {
@@ -1141,7 +1142,8 @@ try {
         owState.createBodies.push(body);
         const k = `prompt.${owSlug(String(body.name ?? 'rule'))}-${(++owState.seq).toString(16).padStart(4, '0')}`;
         owState.results.set(k, null);
-        send(201, { ...body, key: k, dashboard_url: 'https://health.thedarwinhub.com/overwatch', last_result: null, created: true });
+        const reply = () => send(201, { ...body, key: k, dashboard_url: 'https://health.thedarwinhub.com/overwatch', last_result: null, created: true });
+        if (owState.createDelayMs > 0) setTimeout(reply, owState.createDelayMs); else reply();
         return;
       }
       if (httpReq.method === 'GET' && key) {
@@ -1476,6 +1478,59 @@ try {
     const r = await post(`/goals/${goalId}/guards/${guardId2}/discard`, {});
     assert.equal(r.status, 200, JSON.stringify(r.json));
     assert.equal(r.json.guard.state, 'discarded');
+  });
+
+  // ── review (node #479) additions ────────────────────────────────────────
+  await check('R-1', 'GET /goals/:id/guards carries overwatch_connected (additive) so the UI can show the banner on load', async () => {
+    setOverwatchConfigured(false);
+    let r = await get(`/goals/${goalId}/guards`);
+    assert.equal(r.status, 200);
+    assert.equal(r.json.overwatch_connected, false);
+    setOverwatchConfigured(true);
+    r = await get(`/goals/${goalId}/guards`);
+    assert.equal(r.json.overwatch_connected, true);
+  });
+
+  let guardId3 = -1;
+  await check('R-2', 'accept race: two concurrent accepts on one ghost -> exactly ONE set, the loser gets 409 invalid_transition and its Overwatch rule is deleted (never two live rules); create description = the NODE done_means, never the goal\'s', async () => {
+    const goalNow = await get(`/goals/${goalId}`);
+    const nodeRow = goalNow.json.nodes.find((n: any) => n.id === machineChildId);
+    const r0 = await post(`/goals/${goalId}/guards/propose`, {
+      node_id: machineChildId, mode: 'query', title: 'race guard', sql: 'select 1 as v', comparator: 'gte', threshold: 1,
+    });
+    assert.equal(r0.status, 201, JSON.stringify(r0.json));
+    guardId3 = r0.json.guard.id;
+    const createsBefore = owState.createBodies.length;
+    const deletesBefore = owState.deleteKeys.length;
+    owState.createDelayMs = 150;
+    const [a, b] = await Promise.all([
+      post(`/goals/${goalId}/guards/${guardId3}/accept`, {}),
+      post(`/goals/${goalId}/guards/${guardId3}/accept`, {}),
+    ]);
+    owState.createDelayMs = 0;
+    const codes = [a.status, b.status].sort();
+    assert.deepEqual(codes, [200, 409], `got ${a.status}/${b.status}: ${JSON.stringify(a.json)} ${JSON.stringify(b.json)}`);
+    const loser = a.status === 409 ? a : b;
+    assert.equal(loser.json.error.code, 'invalid_transition');
+    assert.equal(owState.createBodies.length, createsBefore + 2, 'both accepts reached Overwatch create');
+    await sleep(100); // the loser's compensating DELETE is fire-and-forget
+    assert.equal(owState.deleteKeys.length, deletesBefore + 1, 'the loser deleted its own rule');
+    const g = await get(`/goals/${goalId}/guards/${guardId3}`);
+    assert.equal(g.json.guard.state, 'set');
+    assert.ok(g.json.guard.overwatch_key);
+    assert.ok(!owState.deleteKeys.includes(g.json.guard.overwatch_key), 'the winner\'s rule was NOT deleted');
+    assert.equal(owState.createBodies[createsBefore].description, nodeRow.done_means, 'node guard description = node done_means');
+  });
+
+  await check('R-3', 'discard a SET guard while Overwatch is unconfigured -> discards locally, last_summary says the delete was skipped (rule may still exist)', async () => {
+    setOverwatchConfigured(false);
+    const deletesBefore = owState.deleteKeys.length;
+    const r = await post(`/goals/${goalId}/guards/${guardId3}/discard`, {});
+    setOverwatchConfigured(true);
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.guard.state, 'discarded');
+    assert.match(String(r.json.guard.last_summary), /delete skipped/);
+    assert.equal(owState.deleteKeys.length, deletesBefore, 'no Overwatch call while unconfigured');
   });
 
   await check('G-8a', 'SSE: the goal_guard event type reached the admin-scope stream across proposed/set/updated/health/discarded actions', async () => {

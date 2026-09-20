@@ -119,6 +119,7 @@ import {
   discardGuard,
   applyGuardHealthByKey,
   checkWebhookSecret,
+  overwatchConnected,
 } from '../goals-guards.js';
 import {
   DETAIL_EVENT_LIMIT,
@@ -2716,7 +2717,9 @@ export function createApiV1Router(): Router {
     const goalId = parseInt(String(req.params.id), 10);
     const includeDiscarded = req.query.include_discarded === '1';
     try {
-      res.json({ guards: listGuards(goalId, includeDiscarded) });
+      // overwatch_connected (additive, §12.4 route 31): the UI shows the
+      // "Overwatch not connected" banner on load instead of only after a ✓.
+      res.json({ guards: listGuards(goalId, includeDiscarded), overwatch_connected: overwatchConnected() });
     } catch (err) {
       sendCaughtGoalError(res, err);
     }

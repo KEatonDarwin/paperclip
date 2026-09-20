@@ -150,6 +150,11 @@ function emitGuard(action: 'proposed' | 'set' | 'updated' | 'discarded' | 'healt
 // Reads
 // ---------------------------------------------------------------------------
 
+/** For the list route: lets the UI show "Overwatch not connected" BEFORE Kevin clicks ✓. */
+export function overwatchConnected(): boolean {
+  return overwatch.isConfigured();
+}
+
 export function listGuards(goalId: number, includeDiscarded = false): GoalGuardRow[] {
   requireGoal(goalId);
   const rows = sqliteDb.prepare(`SELECT * FROM goal_guards WHERE goal_id = ? ORDER BY id`).all(goalId) as GuardDbRow[];
@@ -359,7 +364,11 @@ function ruleName(goalId: number, nodeId: number | null, title: string): string 
 function buildOverwatchPayload(row: GuardDbRow, opts?: { onlyChanged?: string[] }): Record<string, unknown> {
   const goal = getRawGoal(row.goal_id);
   const node = row.node_id != null ? getRawGoalNode(row.node_id) : null;
-  const description = (node?.done_means ?? goal?.done_means ?? row.title ?? '').slice(0, 500);
+  // A node guard describes the NODE's win condition; a root guard the goal's.
+  // Never let a node with no done_means borrow the goal's sentence.
+  const description = (row.node_id != null
+    ? (node?.done_means ?? row.title)
+    : (goal?.done_means ?? row.title)).slice(0, 500);
 
   const full: Record<string, unknown> = {
     name: ruleName(row.goal_id, row.node_id, row.title),
@@ -437,6 +446,15 @@ export async function acceptGuard(goalId: number, gid: number, actor?: unknown):
   const r = await overwatch.createRule(buildOverwatchPayload(row));
   if (!r.ok) throw mapOverwatchError(r, 'create');
 
+  // Re-check after the await: a concurrent accept (double-click / two tabs)
+  // or a discard may have landed while Overwatch was writing. Never leave a
+  // second live rule behind — undo ours and report the transition conflict.
+  const now = rawGuard(gid);
+  if (!now || now.state !== 'ghost') {
+    void overwatch.deleteRule(r.key);
+    throw new GoalError(409, 'invalid_transition', `guard is ${now?.state ?? 'gone'}, cannot accept`, { from: now?.state ?? 'gone', to: 'set' });
+  }
+
   sqliteDb.prepare(`
     UPDATE goal_guards SET state = 'set', overwatch_key = ?, health = 'unknown', updated_at = datetime('now') WHERE id = ?
   `).run(r.key, gid);
@@ -457,11 +475,17 @@ export async function discardGuard(goalId: number, gid: number, reason?: string,
   if (row.state === 'discarded') return toGuardRow(row);
 
   let deleteNote: string | null = null;
-  if (row.state === 'set' && row.overwatch_key && overwatch.isConfigured()) {
-    const r = await overwatch.deleteRule(row.overwatch_key);
-    if (!r.ok && r.status !== 404) {
-      // Don't strand the UI on a delete failure — discard locally, note it.
-      deleteNote = `overwatch delete failed: ${r.error}`;
+  if (row.state === 'set' && row.overwatch_key) {
+    if (!overwatch.isConfigured()) {
+      // Discard locally anyway (never strand the UI) but say the live rule may
+      // still exist — Kevin can remove it from the Overwatch dashboard.
+      deleteNote = 'overwatch delete skipped: Overwatch not configured (rule may still exist)';
+    } else {
+      const r = await overwatch.deleteRule(row.overwatch_key);
+      if (!r.ok && r.status !== 404) {
+        // Don't strand the UI on a delete failure — discard locally, note it.
+        deleteNote = `overwatch delete failed: ${r.error}`;
+      }
     }
   }
 

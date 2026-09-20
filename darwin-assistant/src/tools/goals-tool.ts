@@ -33,6 +33,7 @@ import {
   emitGoal,
   type GoalTree,
 } from '../goals.js';
+import { listGuards, proposeGuard, discardGuard } from '../goals-guards.js';
 
 // GOALS tool (CONTRACT.md §5) — the ONLY way a goal chat touches the tree.
 // Scope resolution: inside a `cockpit:goal-<id>` thread, goal_id is IMPLIED
@@ -89,7 +90,13 @@ export const goals: ToolDef = {
     'Kevin talk it through (that is the "watch it change until I am good with it" loop) — do NOT discard and re-propose. ' +
     'When KEVIN edits one of your ghosts and OKs it, it does NOT solidify until you weigh in (§11): `accept` {node_id} to agree ' +
     '(it sets), or `push_back` {node_id, note} with your reason to keep it a ghost and talk it out. Inside a goal thread ' +
-    '(cockpit:goal-<id>), goal_id and the default parent_id (the current focus) are inferred automatically — omit goal_id there.',
+    '(cockpit:goal-<id>), goal_id and the default parent_id (the current focus) are inferred automatically — omit goal_id there. ' +
+    'GUARDS (v0.2): when a node verifies done and its done_means is a measurable condition over Hub data worth watching ' +
+    '(a rate, a count, a reconciliation — NOT a one-off deliverable or an agreement), propose a Guard with `propose_guard`: ' +
+    'capture the SQL that PROVED the done_means during verify (don\'t re-derive it), pick the comparator so `value COMPARATOR ' +
+    'threshold` = the win condition holding, and write a plain-words `title`. Kevin ✓s it on the card; only then is it written ' +
+    'to Overwatch. Never accept your own guard proposal. If Overwatch isn\'t connected, the proposal still stands as a ghost ' +
+    'and writes the moment Kevin\'s key lands. When a guard fails, propose the fix under that node.',
   parameters: {
     type: 'object',
     properties: {
@@ -99,6 +106,7 @@ export const goals: ToolDef = {
           'list', 'set_goal_done_means', 'propose', 'set_from_kevin', 'accept', 'push_back', 'discard',
           'edit_ghost', 'propose_edit', 'propose_remove', 'set_leaf_kind', 'propose_plan', 'dispatch',
           'verify', 'human_done', 'park', 'unpark', 'log', 'promote', 'focus',
+          'list_guards', 'propose_guard', 'discard_guard',
         ],
         description: 'What to do.',
       },
@@ -122,6 +130,19 @@ export const goals: ToolDef = {
       reason: { type: 'string', description: 'Optional reason (discard, propose_remove).' },
       text: { type: 'string', description: 'Log line text, for the log op.' },
       goal: { type: 'boolean', description: 'For verify: true = verify the GOAL root (node_id omitted) rather than a node.' },
+      // v0.2 guards:
+      guard_id: { type: 'number', description: 'Target guard id (discard_guard).' },
+      mode: { type: 'string', enum: ['query', 'agent'], description: "Guard mode (propose_guard). Default 'query' (captured SQL, zero model calls); 'agent' only when the win condition needs judgment." },
+      sql: { type: 'string', description: 'query-mode guard SQL (the proven SELECT that measured the done_means).' },
+      comparator: { type: 'string', enum: ['gte', 'lte', 'gt', 'lt', 'eq'], description: 'query-mode: value COMPARATOR threshold = PASS.' },
+      threshold: { type: 'number', description: 'query-mode threshold.' },
+      value_column: { type: 'string', description: 'query-mode: which returned column holds the number (default first column).' },
+      sample_columns: { type: 'array', items: { type: 'string' }, description: 'query-mode: columns to surface on failure.' },
+      check_prompt: { type: 'string', description: 'agent-mode guard check prompt.' },
+      failure_prompt: { type: 'string', description: 'agent-mode guard failure prompt (optional).' },
+      cadence: { type: 'number', description: 'How often Overwatch runs the rule, in minutes (default 60).' },
+      severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'], description: 'Guard severity (default medium).' },
+      ow_group: { type: 'string', description: "Overwatch group (leads/email/queue/billing/revenue/system/custom/general); default custom." },
     },
     required: ['operation'],
   },
@@ -339,6 +360,41 @@ export const goals: ToolDef = {
         if (!('node_id' in args)) return { error: 'node_id is required (number or null)' };
         const nodeId = args.node_id === null ? null : Number(args.node_id);
         return { focus: setGoalFocus(goalId, nodeId, 'jarvis') };
+      }
+
+      // -- v0.2 guards -----------------------------------------------------
+      if (op === 'list_guards') {
+        return { guards: listGuards(goalId) };
+      }
+
+      if (op === 'propose_guard') {
+        return {
+          guard: proposeGuard(goalId, {
+            // Omitted → the current focus (inside a goal thread), like `propose`;
+            // explicit null → a root guard (only once the goal is done).
+            node_id: 'node_id' in args && args.node_id !== undefined
+              ? (args.node_id === null ? null : Number(args.node_id))
+              : (inGoalThread ? getGoalFocus(goalId).node_id : null),
+            mode: args.mode,
+            title: str(args.title),
+            sql: str(args.sql),
+            comparator: args.comparator,
+            threshold: typeof args.threshold === 'number' ? args.threshold : undefined,
+            value_column: str(args.value_column),
+            sample_columns: Array.isArray(args.sample_columns) ? args.sample_columns : undefined,
+            check_prompt: str(args.check_prompt),
+            failure_prompt: str(args.failure_prompt),
+            cadence: typeof args.cadence === 'number' ? args.cadence : undefined,
+            severity: args.severity,
+            ow_group: str(args.ow_group) ?? 'custom',
+            actor: 'jarvis',
+          }),
+        };
+      }
+
+      if (op === 'discard_guard') {
+        if (args.guard_id === undefined) return { error: 'guard_id is required' };
+        return { guard: await discardGuard(goalId, Number(args.guard_id), str(args.reason), 'jarvis') };
       }
 
       return { error: `unknown operation: ${op || '(none)'}` };

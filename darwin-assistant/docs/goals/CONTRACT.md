@@ -539,3 +539,207 @@ When it is a re-ask after push-back, add a line `you pushed back with: "<review_
 - **Batch bar `✓ all`:** result toast splits the outcome: "3 set · 2 sent to JARVIS to weigh in".
 - **Header card:** the goal's title/done_means no longer truncate silently — click expands + edits (PATCH /goals/:id), same textarea behaviour.
 - Collapsed rows keep single-line truncation but always carry the full text in `title=` tooltips.
+
+---
+
+## 12. Guards (v0.2) — every `done_means` can become a monitored Overwatch rule (added 2026-09-19, additive)
+
+**Why (Kevin, verbatim, 2026-09-19):** *"All of the leaves/branches in the goal system have a 'done' reasoning. Basically it's win condition. That is absolutely positively primed for reliable automation into a coded overwatch rule. Something that is checked with overwatch to make sure that it's still working (in the case that it makes sense that is)… I think that's one hell of a thing if it works like I hope it will."*
+
+Concept + loop = `docs/goals/GUARDS.md`. Overwatch API, read from source = `docs/goals/GUARDS-RECON.md` (**read it — it corrects two things GUARDS.md got wrong**). Optional push channel = `docs/goals/GUARDS-OVERWATCH-WEBHOOK.md`. This section is the binding contract; it is purely additive on Goals v0/v0.1 shapes.
+
+**Two recon facts that drive everything here (do not re-litigate — cited in GUARDS-RECON):**
+1. **The Overwatch rule key is server-generated** (`prompt.<slug>-<rand4>`); a client cannot choose it. → We put the goal/node identity in the rule **`name`**, and **store the returned `key`** in `goal_guards.overwatch_key`. `overwatch_rule_id` stays NULL (the API has no numeric id).
+2. **`GET /rules/{key}` already returns `last_result {status,value,summary,at}`.** → A **poller** is the health source; the webhook (§12.8) is OPTIONAL and off the critical path.
+
+**Namespace additions (hard):** table `goal_guards` · routes `/api/v1/goals/:id/guards*` + `/api/v1/goals/guards/webhook` · tool ops `propose_guard`/`discard_guard`/`list_guards` (on the existing `goals` tool) · SSE `goal_guard` · events `guard_*`. All Overwatch traffic goes through one module-internal client `src/goals-overwatch.ts` (create/get/patch/delete) so the key/auth/degrade logic lives in exactly one place.
+
+### 12.1 SQLite DDL (jarvis.db, in `src/goals.ts` — new table, idempotent `CREATE TABLE IF NOT EXISTS`)
+
+```sql
+CREATE TABLE IF NOT EXISTS goal_guards (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  goal_id           INTEGER NOT NULL REFERENCES goals(id),
+  node_id           INTEGER REFERENCES goal_nodes(id),        -- NULL = guard on the goal root
+  state             TEXT    NOT NULL DEFAULT 'ghost'
+                    CHECK (state IN ('ghost','set','discarded')),
+  mode              TEXT    NOT NULL DEFAULT 'query'
+                    CHECK (mode IN ('query','agent')),
+  title             TEXT    NOT NULL,                          -- plain-words label ("first paid-lead send inside 4h")
+  -- query mode:
+  sql               TEXT,
+  comparator        TEXT    CHECK (comparator IN ('gte','lte','gt','lt','eq') OR comparator IS NULL),
+  threshold         REAL,
+  value_column      TEXT,
+  sample_columns    TEXT,                                     -- JSON array of column names or NULL
+  -- agent mode:
+  check_prompt      TEXT,
+  failure_prompt    TEXT,
+  -- overwatch rule knobs:
+  cadence           INTEGER NOT NULL DEFAULT 60,              -- cadence_minutes we ask Overwatch to run at
+  severity          TEXT    NOT NULL DEFAULT 'medium'
+                    CHECK (severity IN ('critical','high','medium','low')),
+  ow_group          TEXT    NOT NULL DEFAULT 'custom',        -- must be a whitelisted Overwatch group (recon §2)
+  window_minutes    INTEGER NOT NULL DEFAULT 60,
+  -- linkage to the live rule (filled on accept):
+  overwatch_key     TEXT,                                     -- the server-generated key; NULL while ghost / unwritten
+  overwatch_rule_id TEXT,                                     -- reserved; stays NULL (API keys by string)
+  -- health (from the poller / webhook):
+  health            TEXT    NOT NULL DEFAULT 'unknown'
+                    CHECK (health IN ('unknown','passing','failing','error')),
+  last_checked_at   TEXT,
+  last_value        REAL,
+  last_summary      TEXT,
+  authored_by       TEXT    NOT NULL DEFAULT 'jarvis'
+                    CHECK (authored_by IN ('kevin','jarvis')),
+  created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at        TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_goal_guards_goal ON goal_guards(goal_id, node_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_guards_owkey ON goal_guards(overwatch_key) WHERE overwatch_key IS NOT NULL;
+-- one ACTIVE guard per node (v0): enforce in code, not by index, because discarded rows must be allowed to pile up.
+```
+
+Column rules the code enforces:
+- **One non-discarded guard per node** (v0). A `propose_guard` on a node that already has a `ghost`/`set` guard → `409 guard_exists`.
+- A guard may be proposed only on a node whose `state ∈ {check, done}` (`409 node_not_verifiable`), or on the goal root when `goal.status='done'` (all nodes done). The win condition must be real before we monitor it (GUARDS.md).
+- `mode='query'` requires `sql`, `comparator`, `threshold` non-null before `accept` (`409 guard_incomplete`, `extra.missing`). `mode='agent'` requires `check_prompt`.
+- `ow_group` must be one of the whitelisted Overwatch groups (recon §2: `leads,email,queue,billing,revenue,system,custom,general`); default `custom`. Not validated by us at write time (Overwatch 422s a bad group on accept); the tool guidance defaults it to `custom`.
+- `updated_at` bumps on every write; the parent `goals.updated_at` bumps too (guards affect the forest card's `guards_failing`).
+
+### 12.2 State machine (server-enforced; other transitions → `409 invalid_transition {from,to}`)
+
+**Lifecycle `state`:** `ghost` (proposed, not written to Overwatch) → `set` (Kevin ✓, rule written, `overwatch_key` stored) → `discarded` (removed; if it was `set`, the Overwatch rule is DELETEd first). `discarded` is terminal. Kevin may edit a ghost's sql/threshold/etc inline before ✓ (route 33 PATCH, actor kevin) exactly like a ghost node; a set guard's knobs may still be PATCHed (route 33) → the change is pushed to Overwatch via `PATCH /rules/{key}` in the same transaction.
+
+**Health (independent axis, only meaningful when `state='set'`):** `unknown` (created, Overwatch hasn't run it yet, or Overwatch unreachable) → `passing` / `failing` / `error`, driven by the poller/webhook per the recon §5 mapping:
+
+| Overwatch `last_result` | `goal_guards.health` |
+|---|---|
+| `null` (never run) / API unreachable / no key | `unknown` |
+| `status='ok'` | `passing` |
+| `status='fail'` or `status='warn'` | `failing` |
+| `status='error'`, or `at` older than `max(3×cadence, 60m)` | `error` |
+
+Ghost/discarded guards are always reported `health='unknown'` regardless.
+
+### 12.3 The loop (verify → propose → accept → watch → cue)
+
+1. **Verify → propose.** When a node reaches `done` (via §3 route 25 verify, or a human leaf's `human_done`+verify) AND the `done_means` is a measurable condition over Hub data worth checking on a cadence (JARVIS's judgment — GUARDS.md "guardable"), the goal chat calls `goals` op `propose_guard`. Not every done node gets one; one-offs and agreements don't.
+2. **Kevin ✓ (Shape).** `POST /goals/:id/guards/:gid/accept` → server writes the rule to Overwatch via `src/goals-overwatch.ts` create, stores `overwatch_key`, `state='set'`, `health='unknown'`, event `guard_set`. ✕ = `discard`.
+3. **Watch.** The poller (§12.7) reads each `set` guard's `GET /rules/{key}` every `goal_guard_poll_min`, maps `last_result.status` (§12.2), stores `last_value/last_summary/last_checked_at`, flips `health` **only on change**, emits `goal_guard` + the matching `guard_*` event.
+4. **Fail → cue.** On `passing → failing` (state CHANGE only): event `guard_failed`, cue into the goal chat (§12.6), UI shows the node's red shield + the goal card's failing count. JARVIS then proposes the fix under that node (a child or a Plan) — the tree grows where it broke. `failing → passing` → `guard_recovered` + a one-line cue. `* → error` → `guard_error` + cue (distinct wording: the check itself broke, not necessarily the goal).
+
+### 12.4 HTTP routes — under `/api/v1/goals`, bearer `JARVIS_COCKPIT_KEY` (the webhook, route 35, is the ONE exception — its own secret)
+
+| # | Route | Body | 2xx response | Event |
+|---|---|---|---|---|
+| 31 | `GET /goals/:id/guards` | — | `{ guards: GoalGuardRow[], overwatch_connected: boolean }` (all non-discarded for the goal; `?include_discarded=1` to include; `overwatch_connected` = both env vars present, so the UI can show "Overwatch not connected" on load — review #479) | — |
+| 32 | `POST /goals/:id/guards/propose` | `{ node_id (null=root), mode ('query'\|'agent'), title, sql?, comparator?, threshold?, value_column?, sample_columns?, check_prompt?, failure_prompt?, cadence?, severity?, ow_group?, window_minutes?, actor:'jarvis' }` | `201 { guard: GoalGuardRow }` — `state='ghost'`, nothing written to Overwatch yet. Preconditions §12.1 (`409 node_not_verifiable`/`guard_exists`). | `guard_proposed` |
+| 33 | `PATCH /goals/:id/guards/:gid` | any of the query/agent/knob fields + `title`, `actor?` | `{ guard }` — direct edit. `actor='kevin'` on ghost OR set. `actor='jarvis'` only on ghost (its own proposal morphing; on a set guard → `403 jarvis_must_propose` — v0 has no guard propose_edit, JARVIS discards+re-proposes or asks Kevin to edit). **If the guard is `set`, the change is pushed to Overwatch (`PATCH /rules/{overwatch_key}`) inside the same write; a `422` from Overwatch → `422 overwatch_rejected {extra.reason}` and the local row is NOT changed.** | `guard_updated` |
+| 34 | `POST /goals/:id/guards/:gid/accept` | `{ actor? }` | `{ guard }` — ghost→set. Server calls Overwatch create (recon §2), stores `overwatch_key`, `health='unknown'`. `409 guard_incomplete {extra.missing}` if required mode fields absent. **If Overwatch is not configured (`503`/no key) → `503 overwatch_not_connected`, guard stays ghost** (nothing lost; re-accept when the key lands). Overwatch `422` → `422 overwatch_rejected {extra.reason}`. | `guard_set` |
+| — | `POST /goals/:id/guards/:gid/discard` | `{ reason?, actor? }` | `{ guard }` — →discarded. If it was `set`, DELETE the Overwatch rule first (`DELETE /rules/{key}`); a `404` from Overwatch (already gone) is tolerated; any other Overwatch error still discards locally but sets `last_summary='overwatch delete failed: …'` (don't strand the UI). | `guard_discarded` |
+| — | `GET /goals/:id/guards/:gid` | — | `{ guard: GoalGuardRow }`; `404 guard_not_found` if not in this goal. | — |
+| 35 | `POST /goals/guards/webhook` (GLOBAL, not under `:id`) | `{ key, status, value?, summary?, ran_at? }` | `{ ok: true }` — OPTIONAL push path (§12.8). **NOT bearer-authed:** header `X-Goals-Guard-Secret` compared constant-time to `GOALS_GUARD_WEBHOOK_SECRET`; unset → `503`, wrong → `401`. Looks up guard by `overwatch_key`; unknown key → `404 no_guard_for_key` (ignored, not alarmed). Applies the SAME `applyGuardHealth()` as the poller. | `guard_failed`/`guard_recovered`/`guard_error` on change only |
+
+`GoalGuardRow` (returned on every guard read; add to §3.0 types):
+```ts
+type GoalGuardRow = {
+  id: number; goal_id: number; node_id: number | null;
+  state: 'ghost'|'set'|'discarded';
+  mode: 'query'|'agent'; title: string;
+  sql: string | null; comparator: 'gte'|'lte'|'gt'|'lt'|'eq'|null; threshold: number | null;
+  value_column: string | null; sample_columns: string[] | null;
+  check_prompt: string | null; failure_prompt: string | null;
+  cadence: number; severity: 'critical'|'high'|'medium'|'low'; ow_group: string; window_minutes: number;
+  overwatch_key: string | null; overwatch_rule_id: string | null;
+  health: 'unknown'|'passing'|'failing'|'error';
+  last_checked_at: string | null; last_value: number | null; last_summary: string | null;
+  authored_by: 'kevin'|'jarvis'; created_at: string; updated_at: string;
+  // derived on reads:
+  node_title: string | null;     // for cue/UI labels; null when guard is on the goal root
+  dashboard_url: string | null;  // Overwatch dashboard link once set
+};
+```
+
+### 12.5 `goals` tool ops (added to §5's op table; scope-resolution + actor rules identical to §5)
+
+| op | args | does (route) | returns |
+|---|---|---|---|
+| `list_guards` | `goal_id?` (implied in a goal thread) | GET /goals/:id/guards | `{ guards }` |
+| `propose_guard` | `node_id?` (omitted = the current focus inside a goal thread, like `propose`'s `parent_id`; explicit `null` = root), `mode` (`'query'` default), `title`, `sql?`,`comparator?`,`threshold?`,`value_column?`,`sample_columns?`, `check_prompt?`,`failure_prompt?`, `cadence?`,`severity?`,`ow_group?` — the tool fills `ow_group:'custom'` when omitted, and prefers `mode='query'` (captured proven SQL) over `agent` | route 32 | `{ guard }` (ghost) |
+| `discard_guard` | `guard_id` | route …/discard | `{ guard }` |
+
+Guidance in the tool description (verbatim intent): *"When a node verifies done and its done_means is a measurable condition over Hub data worth watching (a rate, a count, a reconciliation — NOT a one-off deliverable or an agreement), propose a Guard: capture the SQL that PROVED the done_means during verify (don't re-derive it — recon §0.1), pick the comparator so `value COMPARATOR threshold` = the win condition holding, and write a plain-words `title`. Kevin ✓s it on the card; only then is it written to Overwatch. Never accept your own guard proposal. If Overwatch isn't connected, the proposal still stands as a ghost and writes the moment Kevin's key lands."*
+
+(There is no guard `accept`/`verify` tool op — accept is Kevin's click, route 34; a guard is not a node in the node state machine.)
+
+### 12.6 The cue (backend → goal chat) — same seam as §11.3 (`processMessage` / `enqueueMessage`, id `goal-guard:<goalId>:<guardId>:<eventId>`)
+
+Fired once per `health` transition (never per poll). Exact shapes:
+
+```
+[goal #12 — guard on #87 "Create monitoring" is FAILING: revenue -7.4% vs 7-day avg]
+Propose the fix under that node (a child or a Plan) — the win condition it protects has broken. Don't restate the rest of the tree.
+```
+```
+[goal #12 — guard on #87 "Create monitoring" RECOVERED: revenue +1.2% vs 7-day avg]
+```
+```
+[goal #12 — guard on #87 "Create monitoring" ERRORED: the check itself failed (bad SQL or Hub unreachable) — <summary>. This is the guard, not necessarily the goal; fix the rule or tell me to discard it.]
+```
+Root-goal guards read `guard on this goal "<goal title>"` instead of `on #<node> "<title>"`.
+
+### 12.7 The poller (`src/goals.ts` interval, started at module load like the watchdog cadence)
+
+- Interval = settings-KV **`goal_guard_poll_min`** (default **10**, floored at 1). Read via the uncached `getSetting` so a live change takes effect next tick.
+- Each tick: for every `state='set'` guard with a non-null `overwatch_key`, `GET /rules/{key}` via `src/goals-overwatch.ts`. Map `last_result` → health (§12.2). Store `last_value/last_summary/last_checked_at` always; flip `health` and emit `goal_guard` + `guard_*` + cue **only on change** (compare to the row's current `health`). One in-flight guard per tick is fine; batch sequentially, don't hammer.
+- **Degrade:** if Overwatch is unconfigured (no `OVERWATCH_API_URL`/`OVERWATCH_API_KEY`) the poller is a no-op (guards sit `unknown`). If a single `GET` throws/times out, that guard → `health` unchanged this tick (transient), but if `last_checked_at` goes older than `max(3×cadence,60m)` it flips to `error` with `last_summary='guard stale — Overwatch not reporting'`.
+- **One code path** `applyGuardHealth(guardId, {status,value,summary,at})` is shared by the poller and the webhook (route 35) so push and poll can never diverge; it is idempotent (unchanged health = no event, no cue).
+
+### 12.8 Optional webhook (push) — see `docs/goals/GUARDS-OVERWATCH-WEBHOOK.md`
+Route 35 above is the Goals-side receiver (safe to build now, dormant until `GOALS_GUARD_WEBHOOK_SECRET` is set and Kevin adds the `webhook` notify channel on the darwin-dashboard box). The poller stays on as the safety net even when the webhook is live. Not required for v0.2 correctness.
+
+### 12.9 SSE (add `'goal_guard'` to the `FORWARD` set in `api-v1.ts`, the union in `sse-bus.ts`, and `sse-worker.ts` `EVENT_TYPES`; global, like `goal`/`goal_node`)
+
+```ts
+export interface GoalGuardEvent {          // 'goal_guard'
+  type: 'goal_guard';
+  action: 'proposed' | 'set' | 'updated' | 'discarded' | 'health';  // 'health' = passing/failing/error change
+  goal_id: number;
+  guard: GoalGuardRow;                      // includes derived node_title/dashboard_url + current health
+}
+```
+A `goal` event is ALSO emitted after any guard write that changes `GoalCounts` (i.e. when `guards`/`guards_failing` move — §12.11), so the forest card stays live.
+
+### 12.10 `goal_events.kind` additions (closed list §1.3 gains):
+`guard_proposed` · `guard_set` · `guard_discarded` · `guard_updated` · `guard_failed` · `guard_recovered` · `guard_error`.
+Each guard write/health-change writes exactly one such event (actor: `jarvis` for propose/discard via tool, `kevin` for accept/HTTP edits, `system` for poller/webhook health flips).
+
+### 12.11 Focus injection (§6 additions) + counts (§3.0 additions)
+
+- **`GoalCounts` gains:** `guards: number` (count of `state='set'` guards in the goal) and `guards_failing: number` (`state='set'` AND `health IN ('failing','error')`). `need_you` is UNCHANGED (a failing guard cues the chat; it is not a fresh approval the way a ghost/plan is — the fix it prompts becomes a new ghost, which already counts).
+- **`<goal_tree …>` attribute:** add `guards_failing="N"` when > 0 (omit when 0).
+- **Node line suffix** in the §6 snapshot, for a node carrying a `set` guard: ` 🛡` (passing/unknown) or ` 🛡✗ "<last_summary>"` (failing/error). Placed after any existing markers, before the focus `▶`. Root guard: append ` 🛡✗ "<summary>"` to the `#` root line.
+- **Seed text (§8):** no change required; SKILL.md (docs node) teaches JARVIS the guard loop and when a done node is "guardable".
+
+### 12.12 Env contract (darwin-assistant `.env`; all optional — Guards degrade cleanly without them)
+
+| var | meaning | absent behavior |
+|---|---|---|
+| `OVERWATCH_API_URL` | e.g. `https://health.thedarwinhub.com` (the `src/goals-overwatch.ts` client prefixes `/api/v1/overwatch/rules`) | Guards UI shows "Overwatch not connected"; `accept` → `503 overwatch_not_connected` (proposal stays ghost); poller no-op |
+| `OVERWATCH_API_KEY` | bearer for the Overwatch rule API (recon §1) | same as above |
+| `GOALS_GUARD_WEBHOOK_SECRET` | shared secret for route 35 (OPTIONAL push) | route 35 → `503`; polling still covers health fully |
+
+Kevin supplies `OVERWATCH_API_URL` + `OVERWATCH_API_KEY` once (GUARDS.md "what Kevin has to supply"). Until then everything works except the actual write/read to Overwatch — proposals accumulate as ghosts and are written the moment the key lands. **No API key is ever used for a model call** (this is a monitoring API key, the allowed read/write-a-rule exception — it never authenticates a model).
+
+### 12.13 Acceptance (guards; sim node runs these against a scratch DB with a stubbed Overwatch client)
+
+1. `propose_guard` on a `done` node (query mode, sql+comparator+threshold) → `ghost`; on a `set` (unverified) node → `409 node_not_verifiable`; a second propose on a node that already has a guard → `409 guard_exists`.
+2. `accept` with Overwatch stub returning a key → `state='set'`, `overwatch_key` stored, `health='unknown'`, event `guard_set`. Accept with the stub unconfigured → `503 overwatch_not_connected`, guard stays ghost.
+3. Poller tick with stub `last_result.status='ok'` → `health='passing'` (event on the flip from unknown); flip stub to `'fail'` → `health='failing'`, `guard_failed` event + cue fired once; a second identical tick → NO event, NO cue. `'fail'→'ok'` → `guard_recovered`. `status='error'` → `guard_error`.
+4. `PATCH` a set guard's threshold → Overwatch stub `PATCH /rules/{key}` called; stub `422` → `422 overwatch_rejected`, local row unchanged.
+5. `discard` a set guard → Overwatch stub `DELETE /rules/{key}` called, `state='discarded'`; stub `404` tolerated.
+6. Route 35 webhook with a valid secret + known key → same `applyGuardHealth` path as the poller (health flips, cue fires once); wrong secret → `401`; unset secret → `503`; unknown key → `404 no_guard_for_key`.
+7. `GoalCounts.guards`/`guards_failing` reflect set/failing guards; `<goal_tree>` shows `guards_failing="N"` and the node ` 🛡✗ "…"` suffix; `need_you` unchanged by guard state.
+8. `goal_guard` SSE reaches an admin key; `tsc` clean.
+

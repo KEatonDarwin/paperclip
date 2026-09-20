@@ -113,6 +113,17 @@ import {
   getOrCreateGoalThread,
 } from '../goals.js';
 import {
+  listGuards,
+  getGuard,
+  proposeGuard,
+  patchGuard,
+  acceptGuard,
+  discardGuard,
+  applyGuardHealthByKey,
+  checkWebhookSecret,
+  overwatchConnected,
+} from '../goals-guards.js';
+import {
   DETAIL_EVENT_LIMIT,
   attachWorkstreamLink,
   completeWorkstreamStep,
@@ -985,7 +996,16 @@ function findConversationForCaller(caller: ApiKeyRow, externalId: string): Conve
   return conv;
 }
 
+// Routes that carry their OWN authentication and must bypass the bearer gate.
+// The Guards webhook (CONTRACT §12.4 route 35) verifies X-Goals-Guard-Secret
+// itself (fails closed: 503 when the secret is unset) — see its handler.
+const AUTH_EXEMPT_PATHS = new Set(['/goals/guards/webhook']);
+
 function bearerAuth(req: AuthedRequest, res: Response, next: NextFunction): void {
+  if (req.method === 'POST' && AUTH_EXEMPT_PATHS.has(req.path)) {
+    next();
+    return;
+  }
   const header = req.get('authorization') ?? '';
   const match = header.match(/^Bearer\s+(.+)$/i);
   if (!match) {
@@ -2652,6 +2672,128 @@ export function createApiV1Router(): Router {
     const nodeId = parseInt(String(req.params.nodeId), 10);
     try {
       res.json(getNodeTreeOverlay(goalId, nodeId));
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  // -- Guards (v0.2, CONTRACT §12) --------------------------------------------
+  // Every done_means can become a monitored Overwatch rule. Propose (ghost) →
+  // Kevin ✓ (accept: written to Overwatch, key stored) → poller/webhook drive
+  // health → a failing guard cues the goal chat. Overwatch traffic + the poller
+  // + the cue all live in src/goals-guards.ts.
+
+  // The webhook is registered FIRST so `/goals/guards/webhook` can never be
+  // shadowed by the `/goals/:id/...` param routes (it is auth-exempt — it does
+  // its own X-Goals-Guard-Secret check; see AUTH_EXEMPT_PATHS + bearerAuth).
+  router.post('/goals/guards/webhook', (req: AuthedRequest, res) => {
+    const secretCheck = checkWebhookSecret(req.get('x-goals-guard-secret'));
+    if (secretCheck === 'unset') {
+      sendError(res, 503, 'webhook_secret_unset', 'GOALS_GUARD_WEBHOOK_SECRET is not configured; webhook disabled');
+      return;
+    }
+    if (secretCheck === 'wrong') {
+      sendError(res, 401, 'invalid_webhook_secret', 'invalid X-Goals-Guard-Secret');
+      return;
+    }
+    const body = (req.body ?? {}) as { key?: unknown; status?: unknown; value?: unknown; summary?: unknown; ran_at?: unknown };
+    const key = typeof body.key === 'string' ? body.key.trim() : '';
+    if (!key) {
+      sendError(res, 400, 'invalid_request', 'key is required');
+      return;
+    }
+    const found = applyGuardHealthByKey(key, {
+      status: typeof body.status === 'string' ? body.status : null,
+      value: typeof body.value === 'number' ? body.value : null,
+      summary: typeof body.summary === 'string' ? body.summary : null,
+      at: typeof body.ran_at === 'string' ? body.ran_at : null,
+    });
+    if (!found) {
+      // Unknown key is ignored, not alarmed (§12.4).
+      sendError(res, 404, 'no_guard_for_key', 'no set guard owns this Overwatch key');
+      return;
+    }
+    res.json({ ok: true });
+  });
+
+  router.get('/goals/:id/guards', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const includeDiscarded = req.query.include_discarded === '1';
+    try {
+      // overwatch_connected (additive, §12.4 route 31): the UI shows the
+      // "Overwatch not connected" banner on load instead of only after a ✓.
+      res.json({ guards: listGuards(goalId, includeDiscarded), overwatch_connected: overwatchConnected() });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.get('/goals/:id/guards/:gid', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const gid = parseInt(String(req.params.gid), 10);
+    try {
+      res.json({ guard: getGuard(goalId, gid) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/guards/propose', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    try {
+      res.status(201).json({
+        guard: proposeGuard(goalId, {
+          node_id: body.node_id === undefined ? null : (body.node_id === null ? null : Number(body.node_id)),
+          mode: body.mode,
+          title: body.title,
+          sql: body.sql,
+          comparator: body.comparator,
+          threshold: body.threshold,
+          value_column: body.value_column,
+          sample_columns: body.sample_columns,
+          check_prompt: body.check_prompt,
+          failure_prompt: body.failure_prompt,
+          cadence: body.cadence,
+          severity: body.severity,
+          ow_group: body.ow_group,
+          window_minutes: body.window_minutes,
+          actor: body.actor,
+        }),
+      });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.patch('/goals/:id/guards/:gid', async (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const gid = parseInt(String(req.params.gid), 10);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    try {
+      res.json({ guard: await patchGuard(goalId, gid, { ...body, actor: body.actor }) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/guards/:gid/accept', async (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const gid = parseInt(String(req.params.gid), 10);
+    const body = (req.body ?? {}) as { actor?: unknown };
+    try {
+      res.json({ guard: await acceptGuard(goalId, gid, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.post('/goals/:id/guards/:gid/discard', async (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const gid = parseInt(String(req.params.gid), 10);
+    const body = (req.body ?? {}) as { reason?: unknown; actor?: unknown };
+    try {
+      res.json({ guard: await discardGuard(goalId, gid, typeof body.reason === 'string' ? body.reason : undefined, body.actor) });
     } catch (err) {
       sendCaughtGoalError(res, err);
     }
@@ -5163,7 +5305,7 @@ export function createApiV1Router(): Router {
       'dispatch', 'dispatch_cue', 'hopper_item', 'hopper_node', 'smart_todo',
       'workstream', 'monitor', 'monitor_run', 'foundry_project', 'foundry_module',
       'intel_run', 'intel_item', 'workbench_proposal',
-      'goal', 'goal_node', 'goal_focus',
+      'goal', 'goal_node', 'goal_focus', 'goal_guard',
     ]);
 
     res.writeHead(200, {

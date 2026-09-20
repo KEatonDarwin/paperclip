@@ -1486,6 +1486,100 @@ try {
     },
   );
 
+  // ── REVIEW FIXES (node #483) ──────────────────────────────────────────────
+  await check(
+    'V02-11',
+    'REVIEW FIX: a same-parent REORDER (the cockpit drag-before/after) writes sort_order + logs node_moved but is NOT a restructure — no review flag, no cue',
+    async () => {
+      // two siblings under BI so there is something to reorder against
+      const mk = async (title: string, parent: number | null) => {
+        const r = await post(`/goals/${v02GoalId}/nodes`, { title, done_means: `${title} is done`, parent_id: parent, authored_by: 'kevin', actor: 'jarvis' });
+        assert.equal(r.status, 201, JSON.stringify(r.json));
+        return r.json.node as any;
+      };
+      const first = await mk('Reorder A', biId);
+      const second = await mk('Reorder B', biId);
+      const before = cueCountAt(v02GoalId);
+      const evBefore = ((await get(`/goals/${v02GoalId}/events?limit=200`)).json.events as any[]).length;
+
+      const moved = await post(`/goals/${v02GoalId}/nodes/${second.id}/move`, { parent_id: biId, sort_order: first.sort_order - 0.5 });
+      assert.equal(moved.status, 200, JSON.stringify(moved.json));
+      assert.equal(moved.json.node.parent_id, biId);
+      assert.equal(moved.json.node.sort_order, first.sort_order - 0.5, 'the reorder was applied');
+      assert.equal(moved.json.node.review_state, 'none', 'a pure reorder does NOT open a weigh-in round');
+      assert.equal(moved.json.node.kevin_moved_at, null, 'a pure reorder does NOT stamp kevin_moved_at');
+      assert.equal(moved.json.node.last_edited_by, null, 'a pure reorder does not hand anyone the last word');
+
+      const events = (await get(`/goals/${v02GoalId}/events?limit=200`)).json.events as any[];
+      assert.ok(events.length > evBefore, 'the reorder is still logged');
+      assert.ok(
+        events.some((e) => e.kind === 'node_moved' && e.node_id === second.id),
+        'node_moved is still written for a reorder (§13.2)',
+      );
+
+      await sleep(250);
+      assert.equal(cueCountAt(v02GoalId), before, 'a pure reorder fires NO structure cue');
+
+      // ...but a genuine RE-PARENT of the same node still does both
+      const reparent = await post(`/goals/${v02GoalId}/nodes/${second.id}/move`, { parent_id: mbiId });
+      assert.equal(reparent.status, 200, JSON.stringify(reparent.json));
+      assert.equal(reparent.json.node.review_state, 'awaiting_jarvis', 'a re-parent IS a restructure');
+      assert.equal(reparent.json.node.kevin_move_from, biId);
+      await waitFor('reorder-vs-reparent cue', async () => cueCountAt(v02GoalId) === before + 1);
+      assert.match(lastCueCall().text, /moved "Reorder B" under "MBI"/);
+
+      // tidy: close the round so V02-2's awaiting_jarvis === 0 still holds
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${second.id}/accept`, { actor: 'jarvis' })).status, 200);
+    },
+  );
+
+  await check(
+    'V02-12',
+    'REVIEW FIX: the dispatched-leaf rule is a PRECONDITION — propose_move onto a working/planned leaf 409s up front, so Kevin\'s ✓ can never half-apply (edit written, move silently dropped)',
+    async () => {
+      // `leafId` sits under Docs; drive it to a dispatched machine leaf.
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${leafId}/leaf_kind`, { leaf_kind: 'machine', actor: 'jarvis' })).status, 200);
+      const plan = { what: 'probe', deliverable: 'probe', model: 'claude-sonnet-5', nodes: [{ title: 'n1', spec: 's' }] };
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${leafId}/propose_plan`, { plan, actor: 'jarvis' })).status, 200);
+      const approved = await post(`/goals/${v02GoalId}/nodes/${leafId}/approve_plan`, { actor: 'kevin' });
+      assert.equal(approved.status, 200, JSON.stringify(approved.json));
+      assert.ok(['planned', 'working'].includes(approved.json.node.state), `leaf is dispatched (${approved.json.node.state})`);
+
+      // a direct Kevin move onto it 409s (unchanged v0.2 behaviour)...
+      const direct = await post(`/goals/${v02GoalId}/nodes/${biId}/move`, { parent_id: leafId });
+      assert.equal(direct.status, 409);
+      assert.equal(direct.json.error.code, 'leaf_already_dispatched');
+
+      // ...and so does the PROPOSAL, instead of being accepted now and blowing
+      // up mid-resolve after the text edit had already been written.
+      const editP = await post(`/goals/${v02GoalId}/nodes/${biId}/propose_edit`, { title: 'BI (renamed)', actor: 'jarvis' });
+      assert.equal(editP.status, 200, JSON.stringify(editP.json));
+      const moveP = await post(`/goals/${v02GoalId}/nodes/${biId}/propose_move`, { parent_id: leafId, actor: 'jarvis' });
+      assert.equal(moveP.status, 409, JSON.stringify(moveP.json));
+      assert.equal(moveP.json.error.code, 'leaf_already_dispatched');
+
+      // the pending text edit is untouched and still resolvable on its own
+      const resolved = await post(`/goals/${v02GoalId}/nodes/${biId}/resolve_pending`, { accept: true });
+      assert.equal(resolved.status, 200, JSON.stringify(resolved.json));
+      assert.equal(resolved.json.node.title, 'BI (renamed)');
+      assert.equal(resolved.json.node.pending_parent_id, null);
+      assert.equal(resolved.json.node.parent_id, null, 'BI stayed at root — no half-applied move');
+    },
+  );
+
+  await check(
+    'V02-13',
+    'REVIEW FIX: a non-finite sort_order (NaN/Infinity) is ignored rather than silently parking the row at 0',
+    async () => {
+      const row = (await get(`/goals/${v02GoalId}`)).json.nodes.find((n: any) => n.id === v02DocsId);
+      assert.ok(row.sort_order !== 0, `Docs has a non-zero sort_order to notice a clobber (${row.sort_order})`);
+      const r = await post(`/goals/${v02GoalId}/nodes/${v02DocsId}/move`, { parent_id: row.parent_id, sort_order: Number.NaN });
+      assert.equal(r.status, 200, JSON.stringify(r.json));
+      assert.equal(r.json.node.sort_order, row.sort_order, 'NaN did not clobber sort_order');
+      assert.equal(r.json.node.review_state, 'none', 'and it stayed a no-op');
+    },
+  );
+
   await check('V02-2', 'V01 regressions intact: ghost round still needs Kevin ✓; sort_order-only ghost PATCH untouched (checked above); counts', async () => {
     const tree = (await get(`/goals/${v02GoalId}`)).json;
     assert.equal(tree.goal.counts.awaiting_jarvis, 0, 'every round closed');

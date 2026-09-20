@@ -1406,6 +1406,14 @@ function validateMoveTarget(goalId: number, node: GoalNodeDbRow, newParentId: nu
   }
   // parent must be in this goal + in a state that takes children (or root when the goal is set)
   const parent = validateParentForNewChild(goalId, newParentId);
+  // REVIEW FIX (node #483): the dispatched-leaf rule is a PRECONDITION, not an
+  // apply-time surprise. Hoisted out of resetParentLeafIfNeeded so propose_move
+  // refuses up front and resolve_pending's pre-validation catches it BEFORE the
+  // text-edit write (a 409 mid-accept used to leave the edit applied and the
+  // pending move silently dropped).
+  if (parent && parent.leaf_kind !== 'none' && ['planned', 'working', 'check', 'done'].includes(parent.state)) {
+    throw new GoalError(409, 'leaf_already_dispatched', `parent node ${parent.id} already has a dispatched leaf (${parent.state})`);
+  }
   if (newParentId != null) {
     if (newParentId === node.id) throw new GoalError(409, 'move_cycle', 'a node cannot be its own parent');
     let cur = parent;
@@ -1474,9 +1482,16 @@ export function moveGoalNode(goalId: number, nodeId: number, args: { parent_id: 
     throw new GoalError(403, 'jarvis_must_propose', 'JARVIS may only move its own ghost proposals directly; use propose_move (tool op `move`) on a set node');
   }
   const newParentId = args.parent_id ?? null;
+  const oldParentId = node.parent_id ?? null;
   const result = applyMove(goalId, node, newParentId, args.sort_order, actor);
-  if (result.changed && actor === 'kevin') {
-    flagKevinStructureChange(goalId, nodeId, 'moved', node.parent_id ?? -1, newParentId);
+  // REVIEW FIX (node #483): a RE-PARENT is a restructure JARVIS weighs in on; a
+  // pure reorder among the same siblings is not (§13.8 routes Alt+↑/↓ reorders
+  // through route 16 precisely because they are not flagged). The cockpit's
+  // drag-before/after within one parent lands here, so keying the flag on
+  // `changed` alone fired a bogus 'moved X under A → now A' cue and parked the
+  // row in awaiting_jarvis for every little nudge.
+  if (result.changed && actor === 'kevin' && oldParentId !== newParentId) {
+    flagKevinStructureChange(goalId, nodeId, 'moved', oldParentId ?? -1, newParentId);
   }
   return deriveSingleNode(getRawNodeStmt.get(nodeId) as GoalNodeDbRow);
 }

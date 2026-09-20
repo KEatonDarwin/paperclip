@@ -2486,7 +2486,9 @@ export function createApiV1Router(): Router {
       res.json({
         node: moveGoalNode(goalId, nodeId, {
           parent_id: body.parent_id as number | null,
-          sort_order: typeof body.sort_order === 'number' ? body.sort_order : undefined,
+          // REVIEW FIX (node #483): NaN/Infinity are `typeof 'number'` and used to
+          // sail through, landing the row at sort_order 0. Finite numbers only.
+          sort_order: typeof body.sort_order === 'number' && Number.isFinite(body.sort_order) ? body.sort_order : undefined,
           actor: body.actor,
         }),
       });

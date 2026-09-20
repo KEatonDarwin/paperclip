@@ -1,3 +1,4 @@
+import { listCommitments } from '../commitments.js';
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -1370,6 +1371,13 @@ export function createApiV1Router(): Router {
   // direct/external callers and drives read-state from the cockpit UI.
 
   const VALID_SEVERITIES: NotificationSeverity[] = ['info', 'success', 'warning', 'error'];
+
+  // Watchdog promise registry — read-only roster for the cockpit (Flight Deck).
+  router.get('/commitments', (req: AuthedRequest, res) => {
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const limit = parseInt(String(req.query.limit ?? '50'), 10) || 50;
+    res.json({ commitments: listCommitments({ status, limit }) });
+  });
 
   router.get('/notifications', (req: AuthedRequest, res) => {
     const limit = Math.max(1, Math.min(500, parseInt(String(req.query.limit ?? '100'), 10) || 100));

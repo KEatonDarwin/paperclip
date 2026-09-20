@@ -15,6 +15,7 @@ import { startHopperEngine } from './hopper-engine.js';
 import './tree-cue.js';
 import { startFoundry } from './foundry.js';
 import { startMonitorScheduler } from './monitors.js';
+import { startSharedNowMirror } from './shared-context.js';
 
 const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT ?? '3200', 10);
 const SLACK_ENABLED = !!(process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN);
@@ -119,6 +120,11 @@ async function main() {
   // fire on node state writes); the 60s interval inside is only the safety net.
   startHopperEngine(processMessage);
   startFoundry();
+
+  // Shared Context v0 — mirror the "Shared Now" digest to the wiki
+  // (agent-memory/jarvis/now.md) every shared_now_mirror_min minutes so foreign
+  // chats (claude.ai desktop, codex CLI, augment) can read it via BOOT.md.
+  startSharedNowMirror();
 
   // Cockpit Monitors — cheap scheduled prompt-check agents. Runs through the
   // same processMessage/local-CLI adapter seam as normal cockpit threads.

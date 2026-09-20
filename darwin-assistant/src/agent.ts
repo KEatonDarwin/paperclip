@@ -30,6 +30,7 @@ import { buildGroupChatContext } from './group-chat-context.js';
 import { buildQuickChatContext } from './quick-chat-profiles.js';
 import { buildWorkbenchThreadContext } from './workbench.js';
 import { buildGoalThreadContext } from './goals.js';
+import { sharedNowInjectionBlock } from './shared-context.js';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getOrCreateInternalMcpKey } from './api-keys.js';
@@ -1471,7 +1472,16 @@ async function runConversationTurn(
     ? `<attached_images>\nThe user attached ${images.length} image(s) to this message. Open and look at each one now before responding — absolute paths:\n${images.map((img) => `- ${img.absPath}`).join('\n')}\n</attached_images>\n\n`
     : '';
 
-  const perTurnContextPrefix = threadContextLine + autonomyDialLine + groupContextBlock + quickChatContextBlock + workbenchContextBlock + goalContextBlock + imageBlock;
+  // SHARED CONTEXT v0 (docs/shared-context/CONTRACT.md §1) — the "Shared Now"
+  // digest: deterministic snapshot of workstreams / trees / goals / commitments /
+  // recent thread summaries, injected as prompt text (so EVERY adapter sees it)
+  // on a conversation's first turn and again after an idle gap ≥
+  // shared_now_reinject_min — never on the turns in between (token cost). ''
+  // for hopper-node workers / quick chats unless shared_now_workers=1, and
+  // when shared_now_enabled=0. Zero model calls in here.
+  const sharedNowBlock = sharedNowInjectionBlock({ externalId: conv.external_id, turns });
+
+  const perTurnContextPrefix = threadContextLine + autonomyDialLine + sharedNowBlock + groupContextBlock + quickChatContextBlock + workbenchContextBlock + goalContextBlock + imageBlock;
 
   // The resume path re-injects memory on EVERY turn that has a live sessionId
   // (the common case), so an uncapped loadMemoryBlock() here was the dominant

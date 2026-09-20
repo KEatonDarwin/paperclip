@@ -266,6 +266,7 @@ import {
 import { autoNameThreadFromFirstMessage } from '../thread-autoname.js';
 import { autoGroupThreadFromFirstMessage } from '../thread-autogroup.js';
 import { generateThreadSummary } from '../thread-summarize.js';
+import { getSharedNowSnapshot, sharedNowSettings } from '../shared-context.js';
 import { condenseThread, buildSmartForkMessage } from '../thread-condense.js';
 import { listThreadSummaries, getLatestThreadSummary } from '../thread-summaries.js';
 import { searchThreadsByQuery } from '../thread-search.js';
@@ -2970,6 +2971,19 @@ export function createApiV1Router(): Router {
   router.get('/hopper-engine/governor', (req: AuthedRequest, res) => {
     const adapter = typeof req.query.adapter === 'string' ? req.query.adapter : undefined;
     res.json({ ...governorStatus(adapter), providers: governorStatusAll() });
+  });
+
+  // SHARED CONTEXT v0 (docs/shared-context/CONTRACT.md §1.6) — the exact
+  // "Shared Now" digest injected into fresh conversations, plus its JSON form.
+  // Admin-scoped; ?refresh=1 bypasses the in-process cache.
+  router.get('/shared-context/now', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Reading the shared-context digest requires an admin-scoped key');
+      return;
+    }
+    const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const snap = getSharedNowSnapshot({ force: refresh });
+    res.json({ as_of: snap.as_of, cached: snap.cached, settings: sharedNowSettings(), text: snap.text, data: snap.data });
   });
 
   // Governor settings-KV — the machine/governor knobs Kevin asked for

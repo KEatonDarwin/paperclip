@@ -10,6 +10,9 @@ import { reconcileInterruptedRuns, autoHideStaleThreads } from './conversation-d
 import { getSetting } from './conversation-db.js';
 import { shutdownActiveRuns, processMessage, abortConversationRun } from './agent.js';
 import { startHopperEngine } from './hopper-engine.js';
+// Side-effect import: registers the tree-status listener that cues JARVIS in a
+// tree's origin thread on done/blocked (see src/tree-cue.ts).
+import './tree-cue.js';
 import { startFoundry } from './foundry.js';
 import { startMonitorScheduler } from './monitors.js';
 

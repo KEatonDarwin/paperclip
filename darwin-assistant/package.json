@@ -22,7 +22,8 @@
     "goals:sim": "npm run build && JARVIS_DB_PATH=/tmp/goals-sim.db npx tsx scripts/goals-sim.ts",
     "goals:review-checks": "npm run build && JARVIS_DB_PATH=/tmp/goals-review.db npx tsx scripts/goals-review-checks.ts",
     "persona-mcp:sim": "npm run build && JARVIS_DB_PATH=/tmp/persona-mcp-sim.db npx tsx scripts/persona-mcp-sim.ts",
-    "persona-mcp:review-checks": "npm run build && JARVIS_DB_PATH=/tmp/persona-mcp-review.db npx tsx scripts/persona-mcp-review-checks.ts"
+    "persona-mcp:review-checks": "npm run build && JARVIS_DB_PATH=/tmp/persona-mcp-review.db npx tsx scripts/persona-mcp-review-checks.ts",
+    "tree-cue:check": "npm run build && JARVIS_DB_PATH=/tmp/tree-cue-check.db node --import ./scripts/tree-cue-check.hooks.mjs scripts/tree-cue-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

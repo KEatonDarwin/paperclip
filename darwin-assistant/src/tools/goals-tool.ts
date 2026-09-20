@@ -135,7 +135,23 @@ export const goals: ToolDef = {
       if ('parent_id' in args && args.parent_id !== undefined) {
         return args.parent_id === null ? null : Number(args.parent_id);
       }
-      return inGoalThread ? getGoalFocus(goalId).node_id : null;
+      if (!inGoalThread) return null;
+      // Default = the focused node, but never a node that cannot take children
+      // (ghost/discarded/parked/done): walk up to the nearest set-ish ancestor,
+      // else the goal root. Prevents the "parent node is discarded" 409 when
+      // Kevin's focus is still parked on a ghost he just discarded.
+      const ok = new Set(['set', 'planned', 'working', 'check']);
+      let cur = getGoalFocus(goalId).node_id;
+      const tree = getGoalTree(goalId, true);
+      if (!tree) return null;
+      const byId = new Map(tree.nodes.map((n) => [n.id, n]));
+      while (cur != null) {
+        const n = byId.get(cur);
+        if (!n) return null;
+        if (ok.has(n.state)) return cur;
+        cur = n.parent_id;
+      }
+      return null;
     };
 
     // -- list: only op that works with no goal_id at all (outside a thread) ---

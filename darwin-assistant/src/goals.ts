@@ -779,7 +779,7 @@ function validateParentForNewChild(goalId: number, parentId: number | null): Goa
   const parent = getRawNodeStmt.get(parentId) as GoalNodeDbRow | undefined;
   if (!parent || parent.goal_id !== goalId) throw new GoalError(400, 'parent_goal_mismatch', 'parent node does not belong to this goal');
   if (!['set', 'planned', 'working', 'check'].includes(parent.state)) {
-    throw new GoalError(409, 'parent_not_set', `parent node is ${parent.state}, must be set/planned/working/check`);
+    throw new GoalError(409, 'parent_not_set', `parent node ${parent.id} is ${parent.state}, must be set/planned/working/check — pass parent_id explicitly (null = goal root) or focus a set node`, { parent_id: parent.id, parent_state: parent.state, grandparent_id: parent.parent_id });
   }
   return parent;
 }
@@ -1090,6 +1090,25 @@ export function fireGoalReviewCue(goalId: number, nodes: GoalNodeRow[], reask = 
     .catch((err) => console.error('[goals] review cue import failed', err));
 }
 
+/** If the goal's focus points at `nodeId` (which just became discarded), move it
+ *  to the node's parent (or the goal root). Otherwise a later `propose` that
+ *  defaults its parent to the focus lands on a dead node → 409 parent_not_set,
+ *  which is exactly what confused the goal-1 chat on 2026-09-19. */
+function resetFocusIfNode(goalId: number, nodeId: number): void {
+  const focus = getFocusRaw(goalId);
+  if (focus.node_id !== nodeId) return;
+  const node = getRawNodeStmt.get(nodeId) as GoalNodeDbRow | undefined;
+  let next: number | null = node?.parent_id ?? null;
+  // walk up past any ancestor that is itself discarded
+  while (next != null) {
+    const anc = getRawNodeStmt.get(next) as GoalNodeDbRow | undefined;
+    if (!anc || anc.state === 'discarded') next = anc?.parent_id ?? null; else break;
+  }
+  sqliteDb.prepare(`UPDATE goal_focus SET node_id = ?, set_by = 'system', updated_at = datetime('now') WHERE goal_id = ?`).run(next, goalId);
+  insertEvent(goalId, next, 'system', 'focus_set', next != null ? `Focus moved to node ${next} (previous focus was discarded).` : 'Focus cleared (focused node was discarded).');
+  sseBus.emit('sse', { type: 'goal_focus', goal_id: goalId, focus: toFocusRow(goalId, getFocusRaw(goalId)) } satisfies GoalFocusEvent);
+}
+
 export function discardGoalNode(goalId: number, nodeId: number, reason?: string, actor?: unknown): GoalNodeRow {
   const node = requireNode(goalId, nodeId);
   if (node.state !== 'ghost') {
@@ -1101,6 +1120,7 @@ export function discardGoalNode(goalId: number, nodeId: number, reason?: string,
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
   maybeSettleParent(nodeId);
+  resetFocusIfNode(goalId, nodeId);
   return deriveSingleNode(getRawNodeStmt.get(nodeId) as GoalNodeDbRow);
 }
 
@@ -1119,6 +1139,7 @@ export function discardGoalBatch(goalId: number, batchId: string, ids?: number[]
     insertEvent(goalId, r.id, act, 'node_discarded', `Discarded: ${r.title}`);
     emitNode('updated', getRawNodeStmt.get(r.id) as GoalNodeDbRow);
     maybeSettleParent(r.id);
+    resetFocusIfNode(goalId, r.id);
     out.push(deriveSingleNode(getRawNodeStmt.get(r.id) as GoalNodeDbRow));
   }
   return out;
@@ -1251,6 +1272,7 @@ export function resolvePending(goalId: number, nodeId: number, accept: boolean, 
       WHERE id = ?
     `).run(nodeId);
     insertEvent(goalId, nodeId, act, 'removal_accepted', `Removed: ${node.title}`);
+    resetFocusIfNode(goalId, nodeId);
   } else if (accept) {
     const title = node.pending_title ?? node.title;
     const doneMeans = node.pending_done_means ?? node.done_means;

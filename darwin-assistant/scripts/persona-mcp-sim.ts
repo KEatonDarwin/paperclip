@@ -55,7 +55,7 @@ const { TOOL_MAP } = await import(path.join(distDir, 'tools', 'index.js'));
 const { listThreadTodos } = await import(path.join(distDir, 'thread-todos.js'));
 const { sseBus } = await import(path.join(distDir, 'sse-bus.js'));
 const { withToolExecutionContext } = await import(path.join(distDir, 'autonomy-ledger.js'));
-const { runClaude, getAdapters } = await import(path.join(distDir, 'agent.js'));
+const { runClaude, getAdapters, buildInitialPrompt } = await import(path.join(distDir, 'agent.js'));
 const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
 const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
 
@@ -215,7 +215,12 @@ await check('a4', 'unit: the loopback route emitted an SSE tool_call event for t
 
 const adapters = getAdapters();
 const claudeAdapter = adapters['claude'];
-const HAIKU_MODEL = 'claude-haiku-4-5-20251001';
+// Default tier is haiku (cheapest). The model-facing halves of this sim (b: a
+// native mcp__jarvis__* call, c: the <tool_call> text fallback) are real model
+// behaviour, so they are inherently nondeterministic — haiku in particular will
+// sometimes refuse a deferred MCP tool ("I cannot invoke MCP tools directly").
+// Override with PERSONA_SIM_MODEL to re-run at the tier real workers use.
+const HAIKU_MODEL = process.env.PERSONA_SIM_MODEL ?? 'claude-haiku-4-5-20251001';
 
 let integrationConvId = -1;
 let integrationTodoContent = '';
@@ -302,12 +307,21 @@ await check('c1', 'fallback: real claude-haiku-4-5 turn with NO toolContext emit
   const conv = getOrCreateConversation('persona-mcp-sim:fallback');
   fallbackConvId = conv.id;
 
+  // Use the REAL system-prompt tools block (buildToolsBlock), not a hand-rolled
+  // one: this feature rewrote that block to describe the tools as native-first,
+  // and every non-MCP spawn (auggie/devin/codex, or a claude spawn whose MCP
+  // server failed to start) still sees exactly this text with no native tools
+  // behind it. If the block's new wording makes a model give up instead of
+  // emitting the text block, that IS the regression — so test it verbatim.
+  // Compose with the REAL production prompt builder (system prompt + the real
+  // tools block + `Human:` turn). This feature rewrote that tools block to
+  // describe the tools as native-first, and every non-MCP spawn (auggie /
+  // devin / codex, or a claude spawn whose MCP server failed to start) sees
+  // exactly this text with no native tools behind it — if the new wording makes
+  // a model give up instead of emitting the text block, THAT is the regression.
   const prompt =
-    'When you need to call a tool, output EXACTLY this format then STOP — do not write anything after the closing tag:\n' +
-    '<tool_call>\n{"name": "tool_name", "arguments": {"param": "value"}}\n</tool_call>\n\n' +
-    'The only tool you have is thread_todos, operations: list, create (needs content), set_status, edit. ' +
-    'You do not have any native tools. Call thread_todos now with operation "create" and content ' +
-    '"SIM-FALLBACK-PROBE" using the text format above.';
+    `<jarvis_thread external_id="${conv.external_id}" conversation_id="${conv.id}"/>\n\n` +
+    buildInitialPrompt('Call the thread_todos tool now with operation "create" and content "SIM-FALLBACK-PROBE".');
 
   // Deliberately NO toolContext argument here — mirrors a one-shot utility
   // caller (search/summarize/briefing) that gets byte-identical pre-feature

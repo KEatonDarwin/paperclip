@@ -116,7 +116,7 @@ export function callerOwnsExternalId(callerKeyId: number, externalId: string): b
   return externalId.startsWith(`api:${callerKeyId}:`);
 }
 
-const INTERNAL_MCP_KEY_SETTING = 'internal_mcp_key_plaintext';
+export const INTERNAL_MCP_KEY_SETTING = 'internal_mcp_key_plaintext';
 
 /**
  * Self-minted admin-scope key used ONLY for the loopback call from the
@@ -126,7 +126,10 @@ const INTERNAL_MCP_KEY_SETTING = 'internal_mcp_key_plaintext';
  */
 export function getOrCreateInternalMcpKey(): string {
   const cached = getSetting(INTERNAL_MCP_KEY_SETTING);
-  if (cached) return cached;
+  // Re-validate, don't just trust the cache: if this key was revoked from the
+  // keys UI, every native mcp__jarvis__* call would 401 forever and the only
+  // symptom would be tools silently "not working" again. Re-mint instead.
+  if (cached && authenticateBearer(cached)) return cached;
   const { plaintext } = mintApiKey('internal-mcp-loopback', 'cockpit');
   setSetting(INTERNAL_MCP_KEY_SETTING, plaintext);
   return plaintext;

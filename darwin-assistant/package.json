@@ -1,7 +1,7 @@
 {
   "name": "darwin-assistant",
   "version": "0.1.0",
-  "description": "External Darwin AI assistant — voice intake, Slack bot, full Paperclip access",
+  "description": "External Darwin AI assistant \u2014 voice intake, Slack bot, full Paperclip access",
   "private": true,
   "type": "module",
   "scripts": {
@@ -21,7 +21,8 @@
     "claude-session-account:test": "JARVIS_DB_PATH=/tmp/claude-session-account-test.db node scripts/claude-session-account-test.mjs",
     "goals:sim": "npm run build && JARVIS_DB_PATH=/tmp/goals-sim.db npx tsx scripts/goals-sim.ts",
     "goals:review-checks": "npm run build && JARVIS_DB_PATH=/tmp/goals-review.db npx tsx scripts/goals-review-checks.ts",
-    "persona-mcp:sim": "npm run build && JARVIS_DB_PATH=/tmp/persona-mcp-sim.db npx tsx scripts/persona-mcp-sim.ts"
+    "persona-mcp:sim": "npm run build && JARVIS_DB_PATH=/tmp/persona-mcp-sim.db npx tsx scripts/persona-mcp-sim.ts",
+    "persona-mcp:review-checks": "npm run build && JARVIS_DB_PATH=/tmp/persona-mcp-review.db npx tsx scripts/persona-mcp-review-checks.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

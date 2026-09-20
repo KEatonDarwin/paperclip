@@ -49,7 +49,7 @@ import {
   deleteGroup,
 } from '../conversation-groups.js';
 import { listAutonomyLedger, withToolExecutionContext, type ToolExecutionContext } from '../autonomy-ledger.js';
-import { TOOL_MAP } from '../tools/index.js';
+import { TOOL_MAP, ALL_TOOLS } from '../tools/index.js';
 import { listMcpServers, refreshMcpServers } from '../mcp-registry.js';
 import { resolveNativeServer, nativeListTools } from '../tools/mcp-native.js';
 import { listNotes, createNote } from '../notes-db.js';
@@ -360,6 +360,7 @@ import {
   callerExternalIdPrefix,
   callerOwnsExternalId,
   isAdminScope,
+  INTERNAL_MCP_KEY_SETTING,
   type ApiKeyRow,
 } from '../api-keys.js';
 
@@ -4630,6 +4631,23 @@ export function createApiV1Router(): Router {
     res.json({ reminder: null });
   });
 
+  // -- GET /internal/tools: persona-tool manifest for the native-MCP server --
+  // The per-spawn persona-tools-server (src/mcp/persona-tools-server.ts) reads
+  // its tools/list surface from HERE rather than importing ../tools/index.js
+  // itself: that import transitively pulls in conversation-db.ts, whose module
+  // scope opens jarvis.db and runs the whole CREATE TABLE / ALTER TABLE block —
+  // i.e. every single claude spawn would open a second writer on the live DB
+  // (the exact sqlite contention the loopback design exists to avoid).
+  router.get('/internal/tools', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'forbidden', 'internal tool manifest requires an admin-scoped key');
+      return;
+    }
+    res.json({
+      tools: ALL_TOOLS.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })),
+    });
+  });
+
   // -- POST /internal/tool-exec: native-MCP loopback for persona tools ------
   // Called ONLY by the per-spawn persona-tools-server (src/mcp/persona-tools-
   // server.ts), authenticated with a self-minted internal key (api-keys.ts
@@ -5352,8 +5370,14 @@ export function createApiV1Router(): Router {
 
   router.get('/settings', async (_req: AuthedRequest, res) => {
     const info = getActiveAdapterInfo();
+    // This route is readable by ANY authenticated key (not just admin), so the
+    // settings dump must never carry a secret: internal_mcp_key_plaintext is a
+    // full admin-scope API key (persona-tools MCP loopback) and returning it
+    // here would let any low-scope caller escalate to admin.
+    const settings = getAllSettings();
+    delete settings[INTERNAL_MCP_KEY_SETTING];
     res.json({
-      settings: getAllSettings(),
+      settings,
       active_adapter: info.adapter,
       active_model: info.model,
       active_runtime: getActiveRuntimeDescriptor(),

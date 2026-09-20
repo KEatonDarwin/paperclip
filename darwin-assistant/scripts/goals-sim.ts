@@ -14,10 +14,19 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { register } from 'node:module';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
+
+// v0.1 §11.3 — fireGoalReviewCue dynamically imports dist/agent.js to post the
+// review cue as a real JARVIS turn. Intercept that specific import (same hook
+// script node #469 wrote for scripts/goals-v01-cue-check.mjs) so accepting a
+// Kevin-edited ghost through the real HTTP path never spawns a real claude CLI
+// turn — it just records the call on globalThis.__goalsCueCalls (NO API KEYS /
+// no live model calls anywhere in this file).
+register(pathToFileURL(path.join(__dirname, 'goals-v01-cue-check.hooks.mjs')), import.meta.url);
 
 // ── scratch DB guard (must run before any dist/ module is imported — ──────
 // conversation-db.js opens the sqlite handle at import time) ──────────────
@@ -96,6 +105,24 @@ function put(p: string, body: unknown = {}, token = cockpitKey) {
 
 async function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ── v0.1 §11.3 cue capture (populated by the stubbed dist/agent.js, see the ──
+// register() call above) ────────────────────────────────────────────────────
+type CueCall = { text: string; externalId: string; correlationKey?: string };
+function cueCalls(): CueCall[] {
+  return ((globalThis as unknown as { __goalsCueCalls?: CueCall[] }).__goalsCueCalls) ?? [];
+}
+function cueCallCount(): number {
+  return cueCalls().length;
+}
+function lastCueCall(): CueCall {
+  const calls = cueCalls();
+  return calls[calls.length - 1];
+}
+async function waitForCueCalls(n: number, timeoutMs = 2000, stepMs = 30): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (cueCallCount() < n && Date.now() < deadline) await sleep(stepMs);
 }
 
 // Poll a condition (used to let dispatchTick's queueMicrotask + async claim
@@ -797,6 +824,208 @@ try {
   await check('14a', 'GET /goals with no Authorization header -> 401', async () => {
     const res = await fetch(`${base}/goals`);
     assert.equal(res.status, 401);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // v0.1 §11 — Kevin edits a ghost -> JARVIS weighs in (agree / push_back).
+  // CONTRACT.md §11, checks V01-1..V01-9 (node #471). Drives the same real
+  // HTTP path as every check above; the only new machinery is the agent.js
+  // stub registered at the top of this file, which lets fireGoalReviewCue run
+  // for real (composes + "sends" the cue) without a live model call.
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[15] v0.1 §11: Kevin edits a ghost -> JARVIS weighs in (accept / push_back)');
+  let v01GoalId = -1;
+  let v01NodeId = -1;
+  await check('V01-0', 'setup: fresh set goal + one jarvis-proposed ghost, focused on it', async () => {
+    const g = await post('/goals', { title: 'v0.1 weigh-in drill', done_means: 'prove the edit-review loop end to end' });
+    assert.equal(g.status, 201, JSON.stringify(g.json));
+    v01GoalId = g.json.goal.id;
+    const p = await post(`/goals/${v01GoalId}/nodes/propose`, {
+      parent_id: null,
+      items: [{ title: 'Ship the thing', done_means: 'thing is shipped and verified' }],
+      actor: 'jarvis',
+    });
+    assert.equal(p.status, 201);
+    v01NodeId = p.json.nodes[0].id;
+    const f = await put(`/goals/${v01GoalId}/focus`, { node_id: v01NodeId });
+    assert.equal(f.status, 200);
+  });
+
+  await check('V01-1', "Kevin PATCH on the ghost -> last_edited_by=kevin, kevin_edit_original snapshots the JARVIS wording, event ghost_edited_by_kevin", async () => {
+    const before = await get(`/goals/${v01GoalId}`).then((r) => r.json.nodes.find((n: any) => n.id === v01NodeId));
+    const r = await patch(`/goals/${v01GoalId}/nodes/${v01NodeId}`, {
+      title: 'Ship the thing FAST',
+      done_means: 'thing is shipped, verified, and fast',
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.last_edited_by, 'kevin');
+    assert.ok(r.json.node.kevin_edit_original, 'expected a kevin_edit_original snapshot');
+    const orig = JSON.parse(r.json.node.kevin_edit_original);
+    assert.equal(orig.title, before.title, 'snapshot must capture the JARVIS wording from BEFORE this edit');
+    assert.equal(orig.done_means, before.done_means);
+    const events = await get(`/goals/${v01GoalId}/events`);
+    assert.ok(
+      events.json.events.some((e: any) => e.kind === 'ghost_edited_by_kevin' && e.node_id === v01NodeId),
+      'expected a ghost_edited_by_kevin event',
+    );
+  });
+
+  await check('V01-2', 'a SECOND Kevin PATCH does not overwrite the original snapshot', async () => {
+    const firstSnapshot = await get(`/goals/${v01GoalId}`).then(
+      (r) => r.json.nodes.find((n: any) => n.id === v01NodeId).kevin_edit_original,
+    );
+    const r = await patch(`/goals/${v01GoalId}/nodes/${v01NodeId}`, { title: 'Ship the thing FASTER STILL' });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.kevin_edit_original, firstSnapshot, "the original JARVIS wording must survive a second Kevin edit");
+    assert.equal(r.json.node.last_edited_by, 'kevin');
+  });
+
+  let v01CueEventId = -1;
+  await check('V01-3', "Kevin accept -> stays ghost, review_state=awaiting_jarvis, event kevin_okd_edit, exactly ONE cue matching §11.3 (now/was + correlationKey)", async () => {
+    const before = cueCallCount();
+    const r = await post(`/goals/${v01GoalId}/nodes/${v01NodeId}/accept`, {});
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.node.state, 'ghost', "a Kevin-edited ghost must NOT solidify on Kevin's own accept");
+    assert.equal(r.json.node.review_state, 'awaiting_jarvis');
+    const events = await get(`/goals/${v01GoalId}/events`);
+    const ev = events.json.events.filter((e: any) => e.kind === 'kevin_okd_edit' && e.node_id === v01NodeId);
+    assert.equal(ev.length, 1);
+    v01CueEventId = ev[0].id;
+    await waitForCueCalls(before + 1);
+    assert.equal(cueCallCount(), before + 1, 'expected exactly ONE cue call for this accept');
+    const cue = lastCueCall();
+    assert.equal(cue.externalId, `cockpit:goal-${v01GoalId}`);
+    assert.match(cue.text, /now: "Ship the thing FASTER STILL"/);
+    assert.match(cue.text, /was \(yours\): "Ship the thing"/);
+    assert.equal(cue.correlationKey, `goal-cue:${v01GoalId}:${v01CueEventId}`);
+  });
+
+  await check('V01-4', 'Kevin accept AGAIN while awaiting -> 409 awaiting_jarvis, no extra cue', async () => {
+    const before = cueCallCount();
+    const r = await post(`/goals/${v01GoalId}/nodes/${v01NodeId}/accept`, {});
+    assert.equal(r.status, 409);
+    assert.equal(r.json.error.code, 'awaiting_jarvis');
+    await sleep(150);
+    assert.equal(cueCallCount(), before, 're-click while awaiting must not fire a second cue');
+  });
+
+  await check('V01-5', "JARVIS push_back -> stays ghost, review_state=pushed_back, review_note set, event jarvis_pushed_back", async () => {
+    const note = 'Let\'s not promise "fast" until we\'ve actually measured it.';
+    const r = await post(`/goals/${v01GoalId}/nodes/${v01NodeId}/push_back`, { note });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.node.state, 'ghost');
+    assert.equal(r.json.node.review_state, 'pushed_back');
+    assert.equal(r.json.node.review_note, note);
+    const events = await get(`/goals/${v01GoalId}/events`);
+    assert.ok(events.json.events.some((e: any) => e.kind === 'jarvis_pushed_back' && e.node_id === v01NodeId));
+  });
+
+  await check('V01-6', 'Kevin accept AGAIN (re-ask, no further edit) -> awaiting_jarvis, cue quotes the push-back note', async () => {
+    const before = cueCallCount();
+    const r = await post(`/goals/${v01GoalId}/nodes/${v01NodeId}/accept`, {});
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.state, 'ghost');
+    assert.equal(r.json.node.review_state, 'awaiting_jarvis');
+    await waitForCueCalls(before + 1);
+    assert.equal(cueCallCount(), before + 1);
+    const cue = lastCueCall();
+    assert.match(cue.text, /you pushed back with:/);
+  });
+
+  await check('V01-7', 'JARVIS accept -> set, all four review fields cleared, event node_agreed', async () => {
+    const r = await post(`/goals/${v01GoalId}/nodes/${v01NodeId}/accept`, { actor: 'jarvis' });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.state, 'set');
+    assert.equal(r.json.node.review_state, 'none');
+    assert.equal(r.json.node.review_note, null);
+    assert.equal(r.json.node.last_edited_by, null);
+    assert.equal(r.json.node.kevin_edit_original, null);
+    const events = await get(`/goals/${v01GoalId}/events`);
+    assert.ok(events.json.events.some((e: any) => e.kind === 'node_agreed' && e.node_id === v01NodeId));
+  });
+
+  let v01Node2Id = -1;
+  await check('V01-8a', 'setup: a second ghost, Kevin edits it', async () => {
+    const p = await post(`/goals/${v01GoalId}/nodes/propose`, {
+      parent_id: null,
+      items: [{ title: 'Second thing', done_means: 'second thing is done' }],
+      actor: 'jarvis',
+    });
+    assert.equal(p.status, 201);
+    v01Node2Id = p.json.nodes[0].id;
+    const patched = await patch(`/goals/${v01GoalId}/nodes/${v01Node2Id}`, { title: 'Second thing (Kevin edit)' });
+    assert.equal(patched.status, 200);
+    assert.equal(patched.json.node.last_edited_by, 'kevin');
+  });
+
+  await check('V01-8b', "JARVIS edit_ghost (PATCH as actor=jarvis) on the Kevin-edited ghost -> last_edited_by=jarvis, review_state=none (JARVIS takes the last word)", async () => {
+    const r = await patch(`/goals/${v01GoalId}/nodes/${v01Node2Id}`, { title: 'Second thing (JARVIS reworded)', actor: 'jarvis' });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.node.last_edited_by, 'jarvis');
+    assert.equal(r.json.node.review_state, 'none');
+  });
+
+  await check('V01-8c', 'Kevin accept -> sets directly, v0 path, no awaiting round, no cue', async () => {
+    const before = cueCallCount();
+    const r = await post(`/goals/${v01GoalId}/nodes/${v01Node2Id}/accept`, {});
+    assert.equal(r.status, 200);
+    assert.equal(r.json.node.state, 'set');
+    await sleep(150);
+    assert.equal(cueCallCount(), before, 'the v0 accept path must not fire a review cue');
+  });
+
+  let v01BatchId = '';
+  let v01MixIds: number[] = [];
+  await check('V01-9a', 'setup: propose 3 ghosts in one batch; Kevin edits 2 of them, leaves 1 untouched', async () => {
+    const p = await post(`/goals/${v01GoalId}/nodes/propose`, {
+      parent_id: null,
+      items: [
+        { title: 'Batch A', done_means: 'A done' },
+        { title: 'Batch B', done_means: 'B done' },
+        { title: 'Batch C', done_means: 'C done' },
+      ],
+      actor: 'jarvis',
+    });
+    assert.equal(p.status, 201);
+    v01BatchId = p.json.batch_id;
+    v01MixIds = p.json.nodes.map((n: any) => n.id);
+    const [aId, bId] = v01MixIds;
+    const pa = await patch(`/goals/${v01GoalId}/nodes/${aId}`, { title: 'Batch A (Kevin edit)' });
+    assert.equal(pa.status, 200);
+    const pb = await patch(`/goals/${v01GoalId}/nodes/${bId}`, { title: 'Batch B (Kevin edit)' });
+    assert.equal(pb.status, 200);
+  });
+
+  await check('V01-9b', 'batch accept -> the 2 kevin-edited nodes stay ghost/awaiting, the untouched one sets; ONE cue listing only the awaiting ones; counts.awaiting_jarvis correct', async () => {
+    const before = cueCallCount();
+    const r = await post(`/goals/${v01GoalId}/batches/${v01BatchId}/accept`, {});
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    const [aId, bId, cId] = v01MixIds;
+    const byId = new Map(r.json.nodes.map((n: any) => [n.id, n]));
+    assert.equal(byId.get(aId).state, 'ghost');
+    assert.equal(byId.get(aId).review_state, 'awaiting_jarvis');
+    assert.equal(byId.get(bId).state, 'ghost');
+    assert.equal(byId.get(bId).review_state, 'awaiting_jarvis');
+    assert.equal(byId.get(cId).state, 'set', 'the untouched-by-Kevin ghost must set normally in the same batch call');
+
+    await waitForCueCalls(before + 1);
+    assert.equal(cueCallCount(), before + 1, 'expected exactly ONE cue for the whole batch accept request');
+    const cue = lastCueCall();
+    assert.match(cue.text, /Kevin edited 2 of your proposals/);
+    assert.ok(cue.text.includes(`#${aId}`), 'cue must list the first awaiting node');
+    assert.ok(cue.text.includes(`#${bId}`), 'cue must list the second awaiting node');
+    assert.ok(!cue.text.includes(`#${cId} now:`), 'the untouched-and-set node must NOT appear in the cue');
+
+    const tree = await get(`/goals/${v01GoalId}`);
+    assert.equal(tree.json.goal.counts.awaiting_jarvis, 2, 'GoalCounts.awaiting_jarvis must count exactly the 2 awaiting nodes');
+  });
+
+  await check('V01-9c', 'focus-injection snapshot on an awaiting node shows the ✎K marker + AWAITING YOUR TAKE suffix', async () => {
+    const [aId] = v01MixIds;
+    await put(`/goals/${v01GoalId}/focus`, { node_id: aId });
+    const block: string = goalsModule.buildGoalThreadContext(`cockpit:goal-${v01GoalId}`);
+    assert.match(block, /✎K/);
+    assert.match(block, /AWAITING YOUR TAKE/);
   });
 } finally {
   server.close();

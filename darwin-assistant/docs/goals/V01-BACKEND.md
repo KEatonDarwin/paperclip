@@ -123,3 +123,66 @@ For each node: acknowledge the change in a sentence, then either agree → `goal
 
 ### Out of scope for this node
 §11.5 cockpit UI (click-to-expand, inline edit, review chips) — separate `hopper/goals-ui-v01` node.
+
+---
+
+## Node #471 — SIM: extend `scripts/goals-sim.ts` with the edit → ✓ → weigh-in → agree / push-back flows
+
+Extends the acceptance sim (CONTRACT §10, node #459) with a new section `[15]` covering
+CONTRACT §11's checks V01-1..V01-9, driving the real `createApiV1Router()` over real HTTP
+on a throwaway port against a scratch sqlite DB — same harness as every other section,
+zero live model calls anywhere in the file.
+
+### The one wiring problem, and the fix
+
+`fireGoalReviewCue` dynamically imports `dist/agent.js` to post the review cue as a real
+JARVIS turn. Node #469's `goals-v01-cue-check.hooks.mjs` (an ESM loader `resolve()` hook)
+already stubs that import for its own minimal standalone script, but its original form
+intercepted **every** import of `dist/agent.js` unconditionally. `goals-sim.ts` boots the
+full `createApiV1Router()` module graph, where unrelated modules (`notes.ts`,
+`dispatch-gate.ts`, …) *statically* import other real exports (`runClaude`, etc.) from
+`dist/agent.js` — the unscoped stub broke those imports with `SyntaxError: ... does not
+provide an export named 'runClaude'`.
+
+Fix (in the shared hook file, additive): scope the interception to
+`context.parentURL === '.../dist/goals.js'` — `goals.ts` never statically imports
+`agent.js`, only the one dynamic `import('./agent.js')` inside `fireGoalReviewCue` does, so
+this is a precise, zero-side-effect scope. Re-ran `node scripts/goals-v01-cue-check.mjs`
+after the change — still all-green, unaffected by the extra scoping.
+
+`goals-sim.ts` registers the same hook file via `node:module`'s `register()` at the top
+(mirrors the standalone script's pattern) and adds `cueCalls()` / `cueCallCount()` /
+`lastCueCall()` / `waitForCueCalls()` helpers reading `globalThis.__goalsCueCalls`.
+
+### New checks — section `[15]`, `V01-0`..`V01-9c` (15 checks)
+
+| id | proves |
+|---|---|
+| V01-0 | setup: fresh `set` goal + one jarvis-proposed ghost, focused |
+| V01-1 | Kevin PATCH on the ghost → `last_edited_by='kevin'`, `kevin_edit_original` snapshots the pre-edit JARVIS wording, event `ghost_edited_by_kevin` |
+| V01-2 | a SECOND Kevin PATCH does NOT overwrite the original snapshot |
+| V01-3 | Kevin `accept` → stays `ghost`, `review_state='awaiting_jarvis'`, event `kevin_okd_edit`, exactly ONE cue fires whose `text` matches §11.3's now/was shape and whose `correlationKey` is exactly `goal-cue:<goalId>:<eventId>` (the real event id read back from `GET /events`) |
+| V01-4 | Kevin `accept` again while awaiting → `409 awaiting_jarvis`, no second cue |
+| V01-5 | JARVIS `push_back` → stays `ghost`, `review_state='pushed_back'`, `review_note` set, event `jarvis_pushed_back` |
+| V01-6 | Kevin re-`accept` (re-ask, no further edit) → `awaiting_jarvis` again, the cue quotes `you pushed back with:` |
+| V01-7 | JARVIS `accept` → `set`, all four review columns (`review_state`, `review_note`, `last_edited_by`, `kevin_edit_original`) cleared, event `node_agreed` |
+| V01-8a/b/c | JARVIS `edit_ghost` (PATCH as `actor=jarvis`) on a Kevin-edited ghost → `last_edited_by='jarvis'`, `review_state='none'` (JARVIS took the last word); Kevin's next `accept` sets it directly — the v0 path, no awaiting round, no cue |
+| V01-9a/b | a 3-ghost batch where Kevin edits 2 of 3, then batch-`accept`: the 2 edited ones stay `ghost`/`awaiting_jarvis`, the untouched one goes `set` in the same response; exactly ONE cue for the whole request, listing only the two awaiting node ids (`#<id>`) and NOT the set one; `GET /goals/:id`'s `goal.counts.awaiting_jarvis === 2` |
+| V01-9c | focus-injection snapshot (`buildGoalThreadContext`) on an awaiting node shows the `✎K` marker and `AWAITING YOUR TAKE` suffix |
+
+### Result
+
+```
+npm run build && npm run goals:sim
+```
+`[goals-sim] 77/77 checks passed ✅` (62 pre-existing §10 checks + 15 new §11 checks).
+Report written to `outbox/goals/sim-report.md`. `node scripts/goals-v01-cue-check.mjs` still
+passes standalone after the hook scoping fix.
+
+### Files touched
+- `scripts/goals-sim.ts` — new imports (`pathToFileURL`, `register`), hook registration,
+  cue-capture helpers, new section `[15]` (V01-0..V01-9c).
+- `scripts/goals-v01-cue-check.hooks.mjs` — scoped the stub to `parentURL` ending in
+  `/dist/goals.js` (additive fix, backward compatible with node #469's own script).
+
+No `src/` changes — this node is sim-only, per its brief.

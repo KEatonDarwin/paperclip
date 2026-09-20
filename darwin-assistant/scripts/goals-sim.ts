@@ -2412,6 +2412,57 @@ try {
     // close the round the rename opened so the goal ends clean
     assert.ok((await tool({ operation: 'accept', node_id: nA1 }, nodeExt)).node);
   });
+
+  await check('V03-9', 'REVIEW (node #491): the ops V03-3b skipped — discard {batch_id} spanning the boundary is refused while an in-branch batch works; log defaults to the pinned node; open_node_chat on the pin itself is refused; a node chat can never write outside its branch through any op', async () => {
+    // a batch proposed from the GOAL chat under C (outside A1) vs one from the NODE chat under A1
+    const outside = await tool({ operation: 'propose', parent_id: nB, items: [{ title: 'C-x', done_means: 'x' }, { title: 'C-y', done_means: 'y' }] }, goalExt);
+    assert.ok(outside.nodes?.length === 2, JSON.stringify(outside));
+    const inside = await tool({ operation: 'propose', items: [{ title: 'A1-z', done_means: 'z' }] }, nodeExt);
+    assert.ok(inside.nodes?.length === 1, JSON.stringify(inside));
+    assert.equal(inside.nodes[0].parent_id, nA1, 'no parent_id -> under the pinned node');
+    const rOut = await tool({ operation: 'discard', batch_id: outside.batch_id ?? outside.nodes[0].proposal_batch }, nodeExt);
+    assert.equal(rOut.code, 'outside_pinned_scope', JSON.stringify(rOut));
+    const rAcc = await tool({ operation: 'accept', batch_id: outside.batch_id ?? outside.nodes[0].proposal_batch }, nodeExt);
+    assert.equal(rAcc.code, 'outside_pinned_scope', JSON.stringify(rAcc));
+    const rIn = await tool({ operation: 'discard', batch_id: inside.batch_id ?? inside.nodes[0].proposal_batch }, nodeExt);
+    assert.ok(Array.isArray(rIn.nodes) && rIn.nodes.length === 1, JSON.stringify(rIn));
+    // the outside batch is untouched by the refusals
+    const tree = (await get(`/goals/${v03GoalId}`)).json;
+    const cx = tree.nodes.find((n: any) => n.title === 'C-x');
+    assert.equal(cx?.state, 'ghost', 'outside ghosts survived the refused discard/accept');
+    // log without node_id -> the pinned node's timeline
+    const lg = await tool({ operation: 'log', text: "That's above this branch — tell me in the goal chat." }, nodeExt);
+    assert.equal(lg.event?.node_id, nA1, JSON.stringify(lg));
+    const lgOut = await tool({ operation: 'log', text: 'x', node_id: nB }, nodeExt);
+    assert.equal(lgOut.code, 'outside_pinned_scope');
+    // open_node_chat on the pin itself / on an outside ghost
+    assert.equal((await tool({ operation: 'open_node_chat', node_id: nA1 }, nodeExt)).code, 'outside_pinned_scope');
+    assert.equal((await tool({ operation: 'open_node_chat', node_id: cx.id }, nodeExt)).code, 'outside_pinned_scope');
+    // the remaining write ops named against an outside node
+    for (const args of [
+      { operation: 'push_back', node_id: cx.id, note: 'no' },
+      { operation: 'edit_ghost', node_id: cx.id, title: 'C-x!' },
+      { operation: 'propose_remove', node_id: nB },
+      { operation: 'set_leaf_kind', node_id: nB, leaf_kind: 'human' },
+      { operation: 'dispatch', node_id: nB },
+      { operation: 'verify', node_id: nB, passed: true },
+      { operation: 'human_done', node_id: nB },
+      { operation: 'park', node_id: nB },
+      { operation: 'unpark', node_id: nB },
+      { operation: 'unpark' },
+      { operation: 'set_from_kevin', title: 'k', done_means: 'k', parent_id: nB },
+      { operation: 'set_from_kevin', title: 'k', done_means: 'k', parent_id: null },
+      { operation: 'accept', all: true, parent_id: nB },
+      { operation: 'accept', all: true, parent_id: null },
+    ] as Record<string, unknown>[]) {
+      const r = await tool(args, nodeExt);
+      assert.equal(r.code, 'outside_pinned_scope', `${JSON.stringify(args)} -> ${JSON.stringify(r)}`);
+    }
+    // clean up the outside batch so the goal ends where V03-8 left it
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${cx.id}/discard`, {})).status, 200);
+    const cy = tree.nodes.find((n: any) => n.title === 'C-y');
+    assert.equal((await post(`/goals/${v03GoalId}/nodes/${cy.id}/discard`, {})).status, 200);
+  });
 } finally {
   server.close();
   owServer?.close();

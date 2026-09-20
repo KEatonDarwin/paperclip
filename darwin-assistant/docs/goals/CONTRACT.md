@@ -1006,3 +1006,10 @@ Walks `nodeId` → parent → … and returns the first `thread_ext` whose conve
 6. Cue routing: Kevin edits + ✓s a ghost under `n` → the review cue's `externalId` = the node chat; the same on a node OUTSIDE the subtree → the goal chat; a structure burst spanning both → two cues, one per target, each listing only its own nodes; a guard health flip on a node under `n` → node chat; a root guard → goal chat; a finished hopper tree planted from a node under `n` → tree cue posts to the node chat, not `origin_thread_ext`.
 7. A goal with node chats on two different nodes → `counts.node_chats = 2`; discarding a node with a chat does not count it.
 8. All 121 v0/v0.1/v0.2/guards checks still pass.
+9. (review, node #491) `V03-9`: a `discard`/`accept {batch_id}` whose batch lives outside the branch → `outside_pinned_scope` (the outside ghosts are untouched); an in-branch batch discards; `log` with no `node_id` lands on the pinned node; `open_node_chat` on the pin itself → refused; every remaining write op (`push_back`, `edit_ghost`, `propose_remove`, `set_leaf_kind`, `dispatch`, `verify`, `human_done`, `park`/`unpark` with or without a node, `set_from_kevin` with an outside/null parent, `accept all` with an outside/null parent) → `outside_pinned_scope`.
+
+### 14.10 Review fixes (node #491, 2026-09-20) — cockpit only; backend passed as built
+
+1. `writeChatParam` preserved the router's `history.state` (it was `replaceState(null, …)`, which wiped TanStack's `__TSR_index` and could break back/forward after a chat switch).
+2. The composer chip's relative path under the pin is sliced by position (`path.slice(depth + 2)`), not by `indexOf(title)` — two nodes may share a title.
+3. If the pinned node is discarded/deleted from the other window (its `goal_node` SSE drops it from the page's node list), the left pane bounces back to the goal chat with a toast instead of sitting on a dead thread (the tool would only answer `pinned_node_gone`).

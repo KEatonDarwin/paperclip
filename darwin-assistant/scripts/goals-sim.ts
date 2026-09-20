@@ -49,6 +49,9 @@ console.log(`[goals-sim] scratch DB: ${DB_PATH}`);
 // No real model calls anywhere in this file's checks. Governor disabled +
 // generous slots so dispatchTick claims ready hopper leaves immediately.
 process.env.HOPPER_GOV_ENABLED = '0';
+// v0.2 §13.5 — the structure digest is debounced 20s per goal in production;
+// collapse it so the V02 checks can observe ONE cue per burst quickly.
+process.env.GOALS_STRUCTURE_DEBOUNCE_MS = process.env.GOALS_STRUCTURE_DEBOUNCE_MS ?? '60';
 process.env.HOPPER_ENGINE_SLOTS = process.env.HOPPER_ENGINE_SLOTS ?? '8';
 delete process.env.ANTHROPIC_API_KEY;
 // v0.2 §12.7/§12.12 guards: the poller auto-starts at module load of
@@ -1547,6 +1550,514 @@ try {
   await check('G-9a', 'need_you is UNCHANGED by guard proposals/health flips/discards (§12.11 — a failing guard cues the chat, it is not a fresh approval)', async () => {
     const tree = await get(`/goals/${goalId}`);
     assert.equal(tree.json.goal.counts.need_you, needYouBaseline, 'need_you must not move because of any guard event in this section');
+  // v0.2 §13 — Kevin restructures the tree himself (add row / move / indent)
+  // -> JARVIS weighs in on his next turn. CONTRACT.md §13.9, checks V02-*.
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[16] v0.2 §13: Kevin restructures the tree himself -> JARVIS weighs in');
+  let v02GoalId = -1;
+  let mbiId = -1;   // set, root-level (Kevin authored via jarvis actor = no flag)
+  let biId = -1;    // set, root-level
+  let v02DocsId = -1;  // set, under MBI
+  let leafId = -1;  // set, under Docs (so Docs has a subtree)
+  let doneId = -1;  // done, under MBI
+  let v02AddedId = -1;
+  const sseV02 = captureSSE(cockpitKey); // the earlier streams were closed after [14]
+  await sleep(150);
+  const cueCountAt = (n: number) => cueCalls().filter((c) => c.correlationKey?.startsWith(`goal-structure:${n}:`)).length;
+
+  await check('V02-0', 'setup: set goal with MBI{Docs{leaf}, done-child}, BI; no review flags on tool-transcribed nodes', async () => {
+    const g = await post('/goals', { title: 'v0.2 restructure drill', done_means: 'prove the structure weigh-in loop' });
+    assert.equal(g.status, 201, JSON.stringify(g.json));
+    v02GoalId = g.json.goal.id;
+    const mk = async (title: string, parent: number | null) => {
+      // actor='jarvis' + authored_by='kevin' = the tool's set_from_kevin (JARVIS transcribing) → born set, NOT flagged
+      const r = await post(`/goals/${v02GoalId}/nodes`, { title, done_means: `${title} is done`, parent_id: parent, authored_by: 'kevin', actor: 'jarvis' });
+      assert.equal(r.status, 201, JSON.stringify(r.json));
+      assert.equal(r.json.node.state, 'set');
+      assert.equal(r.json.node.review_state, 'none', 'tool-transcribed nodes are not flagged');
+      return r.json.node.id as number;
+    };
+    mbiId = await mk('MBI', null);
+    biId = await mk('BI', null);
+    v02DocsId = await mk('Docs', mbiId);
+    leafId = await mk('Docs leaf', v02DocsId);
+    doneId = await mk('Already done', mbiId);
+    // drive doneId to done: human leaf → human_done → verify
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${doneId}/leaf_kind`, { leaf_kind: 'human' })).status, 200);
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${doneId}/human_done`, {})).status, 200);
+    const v = await post(`/goals/${v02GoalId}/nodes/${doneId}/verify`, { passed: true });
+    assert.equal(v.status, 200, JSON.stringify(v.json));
+    assert.equal(v.json.node.state, 'done');
+    // MBI must NOT have settled: Docs is still set
+    const mbi = (await get(`/goals/${v02GoalId}`)).json.nodes.find((n: any) => n.id === mbiId);
+    assert.equal(mbi.state, 'set');
+    await sleep(150);
+    assert.equal(cueCountAt(v02GoalId), 0, 'no structure cue during setup');
+  });
+
+  await check('V02-1', 'Kevin move re-parents Docs (subtree) MBI -> BI: node_moved, awaiting_jarvis, kevin_moved_at/from, children carried', async () => {
+    const before = sseV02.events.length;
+    const r = await post(`/goals/${v02GoalId}/nodes/${v02DocsId}/move`, { parent_id: biId });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.node.parent_id, biId);
+    assert.equal(r.json.node.state, 'set', 'a move never changes state');
+    assert.equal(r.json.node.review_state, 'awaiting_jarvis');
+    assert.equal(r.json.node.last_edited_by, 'kevin');
+    assert.ok(r.json.node.kevin_moved_at, 'kevin_moved_at set');
+    assert.equal(r.json.node.kevin_move_from, mbiId);
+    assert.deepEqual(r.json.node.path, ['v0.2 restructure drill', 'BI', 'Docs']);
+    const tree = (await get(`/goals/${v02GoalId}`)).json;
+    const leaf = tree.nodes.find((n: any) => n.id === leafId);
+    assert.equal(leaf.parent_id, v02DocsId, 'subtree intact');
+    assert.deepEqual(leaf.path, ['v0.2 restructure drill', 'BI', 'Docs', 'Docs leaf'], 'descendant path re-derived');
+    assert.equal(leaf.depth, 2);
+    const ev = (await get(`/goals/${v02GoalId}/events?limit=500`)).json.events.find((e: any) => e.kind === 'node_moved' && e.node_id === v02DocsId);
+    assert.ok(ev, 'node_moved event');
+    assert.equal(ev.data.old_parent_id, mbiId);
+    assert.equal(ev.data.new_parent_id, biId);
+    assert.equal(ev.actor, 'kevin');
+    await sleep(80);
+    const nodeEvents = sseV02.events.slice(before).filter((e: any) => e.type === 'goal_node' && e.goal_id === v02GoalId) as any[];
+    assert.ok(nodeEvents.some((e) => e.node.id === v02DocsId), 'goal_node SSE for the moved node');
+    assert.ok(nodeEvents.some((e) => e.node.id === leafId && e.node.depth === 2), 'goal_node SSE for the descendant with refreshed depth');
+    assert.equal(tree.goal.counts.awaiting_jarvis, 1, 'counts.awaiting_jarvis includes set nodes');
+  });
+
+  await check('V02-8', "old parent MBI left with only a done child -> check (§2.4(1)); parent left empty stays set", async () => {
+    const tree = (await get(`/goals/${v02GoalId}`)).json;
+    const mbi = tree.nodes.find((n: any) => n.id === mbiId);
+    assert.equal(mbi.state, 'check', 'MBI: remaining children all done → check');
+    // BI has Docs; move Docs back out under root → BI has zero children → stays set (never vacuously complete)
+    const r = await post(`/goals/${v02GoalId}/nodes/${v02DocsId}/move`, { parent_id: null });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.node.kevin_move_from, biId);
+    const bi = (await get(`/goals/${v02GoalId}`)).json.nodes.find((n: any) => n.id === biId);
+    assert.equal(bi.state, 'set', 'an emptied parent never vacuously completes');
+    // put it back under BI for the rest of the drill (still one open round, refreshed)
+    const r2 = await post(`/goals/${v02GoalId}/nodes/${v02DocsId}/move`, { parent_id: biId });
+    assert.equal(r2.status, 200);
+    assert.equal(r2.json.node.review_state, 'awaiting_jarvis');
+    assert.equal(r2.json.node.kevin_move_from, -1, '-1 = it came from root');
+  });
+
+  await check('V02-3', 'cycle -> 409 move_cycle; done node -> 409 invalid_transition; ghost parent -> 409 parent_not_set; foreign node -> 400', async () => {
+    const cyc = await post(`/goals/${v02GoalId}/nodes/${biId}/move`, { parent_id: leafId });
+    assert.equal(cyc.status, 409, JSON.stringify(cyc.json));
+    assert.equal(cyc.json.error.code, 'move_cycle');
+    const self = await post(`/goals/${v02GoalId}/nodes/${biId}/move`, { parent_id: biId });
+    assert.equal(self.json.error.code, 'move_cycle');
+    const dn = await post(`/goals/${v02GoalId}/nodes/${doneId}/move`, { parent_id: biId });
+    assert.equal(dn.status, 409);
+    assert.equal(dn.json.error.code, 'invalid_transition');
+    const gh = await post(`/goals/${v02GoalId}/nodes/propose`, { parent_id: null, items: [{ title: 'ghost parent', done_means: 'x' }], actor: 'jarvis' });
+    assert.equal(gh.status, 201);
+    const ghostId = gh.json.nodes[0].id;
+    const gp = await post(`/goals/${v02GoalId}/nodes/${leafId}/move`, { parent_id: ghostId });
+    assert.equal(gp.status, 409);
+    assert.equal(gp.json.error.code, 'parent_not_set');
+    const foreign = await post(`/goals/${v02GoalId}/nodes/${leafId}/move`, { parent_id: v01NodeId });
+    assert.equal(foreign.status, 400);
+    assert.equal(foreign.json.error.code, 'parent_goal_mismatch');
+    const bad = await post(`/goals/${v02GoalId}/nodes/${leafId}/move`, {});
+    assert.equal(bad.status, 400, 'parent_id is required');
+    // tidy: discard the ghost
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${ghostId}/discard`, {})).status, 200);
+  });
+
+  await check('V02-7', 'sort_order-only PATCH on a set node and a no-op move -> no flag, no cue', async () => {
+    const r = await patch(`/goals/${v02GoalId}/nodes/${biId}`, { sort_order: 9 });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.node.review_state, 'none');
+    assert.equal(r.json.node.last_edited_by, null);
+    const noop = await post(`/goals/${v02GoalId}/nodes/${biId}/move`, { parent_id: null });
+    assert.equal(noop.status, 200);
+    assert.equal(noop.json.node.review_state, 'none', 'no-op move does not flag');
+    const events = (await get(`/goals/${v02GoalId}/events?limit=500`)).json.events;
+    assert.ok(!events.some((e: any) => e.kind === 'node_moved' && e.node_id === biId), 'no node_moved event for a no-op');
+  });
+
+  await check('V02-4', 'debounced digest: move + add + set-node edit in one burst -> exactly ONE cue listing all three (an already-agreed node is dropped)', async () => {
+    const before = cueCountAt(v02GoalId);
+    const eventsBefore = (await get(`/goals/${v02GoalId}/events?limit=500`)).json.events.filter((e: any) => e.kind === 'kevin_restructured').length;
+    // Docs is already awaiting from V02-1/V02-8 (its own digest fired already — the
+    // 60ms sim debounce elapsed). Re-move it inside THIS burst, add a Kevin-typed
+    // row, edit BI: three changes, one cue.
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${v02DocsId}/move`, { parent_id: null })).status, 200);
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${v02DocsId}/move`, { parent_id: biId })).status, 200);
+    const add = await post(`/goals/${v02GoalId}/nodes`, { title: 'Kevin typed this', done_means: 'row exists', parent_id: biId });
+    assert.equal(add.status, 201, JSON.stringify(add.json));
+    v02AddedId = add.json.node.id;
+    assert.equal(add.json.node.state, 'set', 'Kevin-authored → born set (pin)');
+    assert.equal(add.json.node.review_state, 'awaiting_jarvis');
+    assert.equal(add.json.node.last_edited_by, 'kevin');
+    const ed = await patch(`/goals/${v02GoalId}/nodes/${biId}`, { title: 'BI (business intelligence)' });
+    assert.equal(ed.status, 200);
+    assert.equal(ed.json.node.state, 'set');
+    assert.equal(ed.json.node.review_state, 'awaiting_jarvis');
+    assert.ok(ed.json.node.kevin_edit_original, 'set-node edit snapshots the pre-edit text');
+    assert.equal(JSON.parse(ed.json.node.kevin_edit_original).title, 'BI');
+    // a 4th change JARVIS agrees to BEFORE the timer fires must not be listed
+    const extra = await post(`/goals/${v02GoalId}/nodes`, { title: 'Agreed early', done_means: 'x', parent_id: null });
+    assert.equal(extra.status, 201);
+    const agreed = await post(`/goals/${v02GoalId}/nodes/${extra.json.node.id}/accept`, { actor: 'jarvis' });
+    assert.equal(agreed.status, 200, JSON.stringify(agreed.json));
+    assert.equal(agreed.json.node.review_state, 'none');
+    await waitForCueCalls(cueCallCount() + 1, 1500);
+    await sleep(200); // a second cue would land here if the debounce were broken
+    assert.equal(cueCountAt(v02GoalId) - before, 1, 'exactly one structure cue for the burst');
+    const cue = cueCalls().filter((c) => c.correlationKey?.startsWith(`goal-structure:${v02GoalId}:`)).pop()!;
+    assert.equal(cue.externalId, `cockpit:goal-${v02GoalId}`);
+    if (process.env.GOALS_SIM_VERBOSE) console.log('---- structure cue ----\n' + cue.text + '\n-----------------------');
+    assert.match(cue.text, /^\[goal #\d+ — Kevin restructured the tree: /);
+    assert.match(cue.text, new RegExp(`#${v02DocsId} moved: "Docs" — from: .*\\(root\\) → now: v0.2 restructure drill › BI \\(business intelligence\\)`));
+    assert.match(cue.text, new RegExp(`#${add.json.node.id} added: "Kevin typed this" under `));
+    assert.match(cue.text, new RegExp(`#${biId} edited: "BI" now: "BI \\(business intelligence\\)"`));
+    assert.match(cue.text, /was: "BI"/);
+    assert.ok(!cue.text.includes('Agreed early'), 'a node JARVIS already agreed to is not in the digest');
+    assert.match(cue.text, /`accept` \{node_id\}/);
+    const ev = (await get(`/goals/${v02GoalId}/events?limit=500`)).json.events.filter((e: any) => e.kind === 'kevin_restructured');
+    assert.equal(ev.length - eventsBefore, 1, 'one kevin_restructured event per burst');
+    const last = ev[ev.length - 1];
+    assert.equal(last.data.entries.length, 3);
+    assert.equal(cue.correlationKey, `goal-structure:${v02GoalId}:${last.id}`);
+  });
+
+  await check('V02-5', 'JARVIS accept on a set node awaiting -> stays set, round cleared, node_agreed; push_back -> pushed_back, still set', async () => {
+    const acc = await post(`/goals/${v02GoalId}/nodes/${v02DocsId}/accept`, { actor: 'jarvis' });
+    assert.equal(acc.status, 200, JSON.stringify(acc.json));
+    assert.equal(acc.json.node.state, 'set');
+    assert.equal(acc.json.node.review_state, 'none');
+    assert.equal(acc.json.node.last_edited_by, null);
+    assert.equal(acc.json.node.kevin_moved_at, null);
+    assert.equal(acc.json.node.kevin_move_from, null);
+    assert.equal(acc.json.node.parent_id, biId, 'agreeing does not undo the move');
+    const events = (await get(`/goals/${v02GoalId}/events?limit=500`)).json.events;
+    assert.ok(events.some((e: any) => e.kind === 'node_agreed' && e.node_id === v02DocsId));
+    const pb = await post(`/goals/${v02GoalId}/nodes/${biId}/push_back`, { note: 'BI is too broad a bucket — split it by module?' });
+    assert.equal(pb.status, 200, JSON.stringify(pb.json));
+    assert.equal(pb.json.node.state, 'set', 'push_back NEVER un-sets a set node');
+    assert.equal(pb.json.node.review_state, 'pushed_back');
+    assert.equal(pb.json.node.review_note, 'BI is too broad a bucket — split it by module?');
+    // Kevin ✓ on a set row is not a thing → 409 (v0 rule unchanged)
+    const kev = await post(`/goals/${v02GoalId}/nodes/${v02AddedId}/accept`, {});
+    assert.equal(kev.status, 409);
+    // JARVIS accept with no open round → 409 invalid_transition (v0 rule unchanged)
+    const none = await post(`/goals/${v02GoalId}/nodes/${v02DocsId}/accept`, { actor: 'jarvis' });
+    assert.equal(none.status, 409);
+    assert.equal(none.json.error.code, 'invalid_transition');
+    // Kevin edits the pushed-back node again → fresh round, note cleared, new digest
+    const before = cueCountAt(v02GoalId);
+    const ed = await patch(`/goals/${v02GoalId}/nodes/${biId}`, { title: 'BI' });
+    assert.equal(ed.json.node.review_state, 'awaiting_jarvis');
+    assert.equal(ed.json.node.review_note, null);
+    await waitForCueCalls(cueCallCount() + 1, 1500);
+    assert.equal(cueCountAt(v02GoalId) - before, 1, 'a fresh Kevin change re-cues');
+    // close the rounds so the goal is clean for V02-6
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${biId}/accept`, { actor: 'jarvis' })).status, 200);
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${v02AddedId}/accept`, { actor: 'jarvis' })).status, 200);
+  });
+
+  await check('V02-6', 'JARVIS move on a set node -> 403; propose_move sets pending_parent_id; resolve accept performs it (no flag); reject clears', async () => {
+    const direct = await post(`/goals/${v02GoalId}/nodes/${leafId}/move`, { parent_id: mbiId, actor: 'jarvis' });
+    assert.equal(direct.status, 403, JSON.stringify(direct.json));
+    assert.equal(direct.json.error.code, 'jarvis_must_propose');
+    // tool op semantics: a JARVIS ghost moves directly
+    const gh = await post(`/goals/${v02GoalId}/nodes/propose`, { parent_id: biId, items: [{ title: 'ghost to move', done_means: 'x' }], actor: 'jarvis' });
+    const ghostId = gh.json.nodes[0].id;
+    const gm = await post(`/goals/${v02GoalId}/nodes/${ghostId}/move`, { parent_id: null, actor: 'jarvis' });
+    assert.equal(gm.status, 200, JSON.stringify(gm.json));
+    assert.equal(gm.json.node.parent_id, null);
+    assert.equal(gm.json.node.review_state, 'none', 'JARVIS moving its own ghost is not flagged');
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${ghostId}/discard`, {})).status, 200);
+    // propose_move: leaf (under Docs) → under root
+    const same = await post(`/goals/${v02GoalId}/nodes/${leafId}/propose_move`, { parent_id: v02DocsId });
+    assert.equal(same.status, 409);
+    assert.equal(same.json.error.code, 'nothing_to_move');
+    const pm = await post(`/goals/${v02GoalId}/nodes/${leafId}/propose_move`, { parent_id: null });
+    assert.equal(pm.status, 200, JSON.stringify(pm.json));
+    assert.equal(pm.json.node.pending_parent_id, -1, '-1 = to root');
+    assert.equal(pm.json.node.pending_by, 'jarvis');
+    assert.equal(pm.json.node.parent_id, v02DocsId, 'not moved yet');
+    // reject → cleared
+    const rj = await post(`/goals/${v02GoalId}/nodes/${leafId}/resolve_pending`, { accept: false });
+    assert.equal(rj.status, 200, JSON.stringify(rj.json));
+    assert.equal(rj.json.node.pending_parent_id, null);
+    assert.equal(rj.json.node.parent_id, v02DocsId);
+    let events = (await get(`/goals/${v02GoalId}/events?limit=500`)).json.events;
+    assert.ok(events.some((e: any) => e.kind === 'move_rejected' && e.node_id === leafId));
+    // propose again (+ a coexisting pending edit) → accept performs both, no review flag
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${leafId}/propose_move`, { parent_id: mbiId })).status, 200);
+    const pe = await post(`/goals/${v02GoalId}/nodes/${leafId}/propose_edit`, { title: 'Docs leaf (moved)' });
+    assert.equal(pe.status, 200);
+    assert.equal(pe.json.node.pending_parent_id, mbiId, 'a pending edit coexists with a pending move');
+    const before = cueCountAt(v02GoalId);
+    const ac = await post(`/goals/${v02GoalId}/nodes/${leafId}/resolve_pending`, { accept: true });
+    assert.equal(ac.status, 200, JSON.stringify(ac.json));
+    assert.equal(ac.json.node.parent_id, mbiId);
+    assert.equal(ac.json.node.title, 'Docs leaf (moved)');
+    assert.equal(ac.json.node.pending_parent_id, null);
+    assert.equal(ac.json.node.review_state, 'none', 'Kevin accepting a JARVIS proposal is not flagged for JARVIS');
+    assert.equal(ac.json.node.kevin_moved_at, null);
+    events = (await get(`/goals/${v02GoalId}/events?limit=500`)).json.events;
+    assert.ok(events.some((e: any) => e.kind === 'move_accepted' && e.node_id === leafId));
+    assert.ok(events.some((e: any) => e.kind === 'edit_accepted' && e.node_id === leafId));
+    assert.ok(events.some((e: any) => e.kind === 'node_moved' && e.node_id === leafId && e.data.new_parent_id === mbiId));
+    // MBI was 'check' (V02-8) — a child moving under a check parent does not un-check it (consistent with route 9)
+    const mbi = (await get(`/goals/${v02GoalId}`)).json.nodes.find((n: any) => n.id === mbiId);
+    assert.equal(mbi.state, 'check');
+    await sleep(200);
+    assert.equal(cueCountAt(v02GoalId), before, 'no structure cue for a resolve_pending');
+    // removal supersedes a pending move
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${leafId}/propose_move`, { parent_id: biId })).status, 200);
+    const rm = await post(`/goals/${v02GoalId}/nodes/${leafId}/propose_removal`, {});
+    assert.equal(rm.status, 200);
+    assert.equal(rm.json.node.pending_parent_id, null, 'removal clears the pending move');
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${leafId}/resolve_pending`, { accept: false })).status, 200);
+  });
+
+  await check('V02-9', 'focus injection: ↕K / ✎K markers, AWAITING suffixes, ↕pending label; working leaf may move with tree_id', async () => {
+    // Kevin moves Docs (set) → ↕K ; adds a row → ✎K (Kevin added this)
+    const mv = await post(`/goals/${v02GoalId}/nodes/${v02DocsId}/move`, { parent_id: null });
+    assert.equal(mv.status, 200);
+    const added = await post(`/goals/${v02GoalId}/nodes`, { title: 'Fresh row', done_means: 'exists', parent_id: null });
+    assert.equal(added.status, 201);
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${v02AddedId}/propose_move`, { parent_id: null })).status, 200);
+    await put(`/goals/${v02GoalId}/focus`, { node_id: null });
+    const ctx: string = goalsModule.buildGoalThreadContext(`cockpit:goal-${v02GoalId}`);
+    assert.match(ctx, new RegExp(`\\[set ↕K\\] #${v02DocsId} Docs — done: .* — AWAITING YOUR TAKE \\(moved from: "BI"\\)`));
+    assert.match(ctx, new RegExp(`\\[set ✎K\\] #${added.json.node.id} Fresh row — done: .* — AWAITING YOUR TAKE \\(Kevin added this\\)`));
+    assert.match(ctx, /awaiting_you="2"/);
+    // the pending JARVIS move under BI is collapsed (no focus → root + direct children only), so focus it to see the marker
+    await put(`/goals/${v02GoalId}/focus`, { node_id: v02AddedId });
+    const ctx2: string = goalsModule.buildGoalThreadContext(`cockpit:goal-${v02GoalId}`);
+    assert.match(ctx2, new RegExp(`\\[set ↕pending ▶\\] #${v02AddedId} `));
+    assert.match(ctx2, /pending="move"/);
+    await waitForCueCalls(cueCallCount() + 1, 1500);
+    // tidy: close rounds + reject the pending move
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${v02DocsId}/accept`, { actor: 'jarvis' })).status, 200);
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${added.json.node.id}/accept`, { actor: 'jarvis' })).status, 200);
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${v02AddedId}/resolve_pending`, { accept: false })).status, 200);
+    // working leaf may move: machine leaf + plan + approve → working → Kevin moves it, tree_id rides along
+    const w = await post(`/goals/${v02GoalId}/nodes`, { title: 'Build it', done_means: 'built', parent_id: v02DocsId, authored_by: 'kevin', actor: 'jarvis' });
+    assert.equal(w.status, 201);
+    const wId = w.json.node.id;
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${wId}/leaf_kind`, { leaf_kind: 'machine' })).status, 200);
+    const plan = { what: 'build', deliverable: 'branch', model: 'claude-sonnet-5', adapter: 'claude', nodes: [{ title: 'do it', spec: 'x', adapter: 'claude', model: 'claude-sonnet-5' }] };
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${wId}/propose_plan`, { plan, actor: 'jarvis' })).status, 200);
+    const ap = await post(`/goals/${v02GoalId}/nodes/${wId}/approve_plan`, {});
+    assert.equal(ap.status, 200, JSON.stringify(ap.json));
+    assert.equal(ap.json.node.state, 'working');
+    const treeId = ap.json.node.tree_id;
+    const wm = await post(`/goals/${v02GoalId}/nodes/${wId}/move`, { parent_id: biId });
+    assert.equal(wm.status, 200, JSON.stringify(wm.json));
+    assert.equal(wm.json.node.state, 'working');
+    assert.equal(wm.json.node.tree_id, treeId, 'tree_id rides along');
+    assert.equal(wm.json.node.parent_id, biId);
+    // ...but JARVIS may not PROPOSE moving a working leaf
+    const pw = await post(`/goals/${v02GoalId}/nodes/${wId}/propose_move`, { parent_id: null });
+    assert.equal(pw.status, 409);
+    assert.equal(pw.json.error.code, 'leaf_already_dispatched');
+    await waitForCueCalls(cueCallCount() + 1, 1500);
+    assert.equal((await post(`/goals/${v02GoalId}/nodes/${wId}/accept`, { actor: 'jarvis' })).status, 200);
+  });
+
+  await check(
+    'V02-10',
+    'FOCUS SURVIVES A MOVE: moving the focused node (or an ancestor of the focused node) refreshes its path via a ' +
+      'goal_focus SSE, WITHOUT changing focus.node_id and WITHOUT a focus_set event; an unrelated move fires no goal_focus at all',
+    async () => {
+      // -- direct case: focus IS the node being moved --------------------------
+      const target = await post(`/goals/${v02GoalId}/nodes`, {
+        title: 'Focus target', done_means: 'x', parent_id: null, authored_by: 'kevin', actor: 'jarvis',
+      });
+      assert.equal(target.status, 201, JSON.stringify(target.json));
+      const targetId = target.json.node.id;
+      await put(`/goals/${v02GoalId}/focus`, { node_id: targetId });
+      await waitFor('goal_focus SSE after focusing the target', async () =>
+        sseV02.events.some((e: any) => e.type === 'goal_focus' && e.goal_id === v02GoalId && e.focus.node_id === targetId));
+
+      const eventsBefore = (await get(`/goals/${v02GoalId}/events?limit=500`)).json.events.length;
+      const sseBefore = sseV02.events.length;
+      const mv = await post(`/goals/${v02GoalId}/nodes/${targetId}/move`, { parent_id: mbiId });
+      assert.equal(mv.status, 200, JSON.stringify(mv.json));
+      assert.equal(mv.json.node.parent_id, mbiId);
+      assert.deepEqual(mv.json.node.path, ['v0.2 restructure drill', 'MBI', 'Focus target'], 'moved node\'s own path refreshed in the move response');
+
+      await sleep(150);
+      const focusEvents = sseV02.events.slice(sseBefore).filter((e: any) => e.type === 'goal_focus' && e.goal_id === v02GoalId) as any[];
+      assert.equal(focusEvents.length, 1, 'exactly one goal_focus SSE for the move of the focused node itself');
+      assert.equal(focusEvents[0].focus.node_id, targetId, 'focus.node_id UNCHANGED — the focus row itself is untouched');
+      assert.deepEqual(focusEvents[0].focus.path, ['MBI', 'Focus target'], 'focus.path refreshed to reflect the new parent chain');
+
+      const tree = (await get(`/goals/${v02GoalId}`)).json;
+      assert.equal(tree.focus.node_id, targetId, 'GET /goals/:id focus still points at the same node after the move');
+      assert.deepEqual(tree.focus.path, ['MBI', 'Focus target'], 'GET /goals/:id focus.path reflects the move');
+
+      // The move itself logs exactly one node_moved event; the debounced structure
+      // digest (§13.5, 60ms in the sim) ALSO lands within this window and logs its
+      // own kevin_restructured event — that's expected (V02-4 covers the digest's
+      // shape directly). The thing THIS check cares about: no focus_set event, i.e.
+      // the focus row itself never changed, only its derived path was re-emitted.
+      const eventsAfter = (await get(`/goals/${v02GoalId}/events?limit=500`)).json.events;
+      const newEvents = eventsAfter.slice(eventsBefore);
+      assert.ok(newEvents.some((e: any) => e.kind === 'node_moved'), 'expected a node_moved event');
+      assert.ok(!newEvents.some((e: any) => e.kind === 'focus_set'), 'no focus_set event — the focus row did not change, only its derived path');
+
+      // close the review round this move opened, so V02-2's awaiting_jarvis=0 still holds
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${targetId}/accept`, { actor: 'jarvis' })).status, 200);
+
+      // -- descendant case: focus is a CHILD of the node being moved ------------
+      const child = await post(`/goals/${v02GoalId}/nodes`, {
+        title: 'Focus target child', done_means: 'x', parent_id: targetId, authored_by: 'kevin', actor: 'jarvis',
+      });
+      assert.equal(child.status, 201);
+      const childId = child.json.node.id;
+      await put(`/goals/${v02GoalId}/focus`, { node_id: childId });
+      // let the focus-change's own goal_focus SSE land before we baseline the
+      // window for the move below (the SSE reader runs on its own async loop and
+      // can lag the HTTP response by a beat).
+      await waitFor('goal_focus SSE after focusing the child', async () =>
+        sseV02.events.some((e: any) => e.type === 'goal_focus' && e.goal_id === v02GoalId && e.focus.node_id === childId));
+
+      const sseBefore2 = sseV02.events.length;
+      const mv2 = await post(`/goals/${v02GoalId}/nodes/${targetId}/move`, { parent_id: biId });
+      assert.equal(mv2.status, 200, JSON.stringify(mv2.json));
+      await sleep(150);
+      const focusEvents2 = sseV02.events.slice(sseBefore2).filter((e: any) => e.type === 'goal_focus' && e.goal_id === v02GoalId) as any[];
+      assert.equal(focusEvents2.length, 1, 'moving an ANCESTOR of the focused node also emits exactly one goal_focus');
+      assert.equal(focusEvents2[0].focus.node_id, childId, 'focus.node_id still the descendant, unchanged');
+      assert.deepEqual(
+        focusEvents2[0].focus.path,
+        ['BI', 'Focus target', 'Focus target child'],
+        'focus.path re-derived through the moved ancestor\'s new location',
+      );
+      const tree2 = (await get(`/goals/${v02GoalId}`)).json;
+      assert.deepEqual(tree2.focus.path, ['BI', 'Focus target', 'Focus target child']);
+
+      // close the review round the second move opened
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${targetId}/accept`, { actor: 'jarvis' })).status, 200);
+
+      // -- negative control: moving something unrelated to the focus fires no goal_focus --
+      const sseBefore3 = sseV02.events.length;
+      const unrelated = await post(`/goals/${v02GoalId}/nodes`, {
+        title: 'Unrelated', done_means: 'x', parent_id: null, authored_by: 'kevin', actor: 'jarvis',
+      });
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${unrelated.json.node.id}/move`, { parent_id: mbiId })).status, 200);
+      await sleep(150);
+      assert.equal(
+        sseV02.events.slice(sseBefore3).filter((e: any) => e.type === 'goal_focus' && e.goal_id === v02GoalId).length,
+        0,
+        'a move that touches neither the focused node nor its ancestor fires no goal_focus event',
+      );
+
+      // tidy: close the round this last move opened (targetId's round was already
+      // closed after the descendant-case move above)
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${unrelated.json.node.id}/accept`, { actor: 'jarvis' })).status, 200);
+    },
+  );
+
+  // ── REVIEW FIXES (node #483) ──────────────────────────────────────────────
+  await check(
+    'V02-11',
+    'REVIEW FIX: a same-parent REORDER (the cockpit drag-before/after) writes sort_order + logs node_moved but is NOT a restructure — no review flag, no cue',
+    async () => {
+      // two siblings under BI so there is something to reorder against
+      const mk = async (title: string, parent: number | null) => {
+        const r = await post(`/goals/${v02GoalId}/nodes`, { title, done_means: `${title} is done`, parent_id: parent, authored_by: 'kevin', actor: 'jarvis' });
+        assert.equal(r.status, 201, JSON.stringify(r.json));
+        return r.json.node as any;
+      };
+      const first = await mk('Reorder A', biId);
+      const second = await mk('Reorder B', biId);
+      const before = cueCountAt(v02GoalId);
+      const evBefore = ((await get(`/goals/${v02GoalId}/events?limit=200`)).json.events as any[]).length;
+
+      const moved = await post(`/goals/${v02GoalId}/nodes/${second.id}/move`, { parent_id: biId, sort_order: first.sort_order - 0.5 });
+      assert.equal(moved.status, 200, JSON.stringify(moved.json));
+      assert.equal(moved.json.node.parent_id, biId);
+      assert.equal(moved.json.node.sort_order, first.sort_order - 0.5, 'the reorder was applied');
+      assert.equal(moved.json.node.review_state, 'none', 'a pure reorder does NOT open a weigh-in round');
+      assert.equal(moved.json.node.kevin_moved_at, null, 'a pure reorder does NOT stamp kevin_moved_at');
+      assert.equal(moved.json.node.last_edited_by, null, 'a pure reorder does not hand anyone the last word');
+
+      const events = (await get(`/goals/${v02GoalId}/events?limit=200`)).json.events as any[];
+      assert.ok(events.length > evBefore, 'the reorder is still logged');
+      assert.ok(
+        events.some((e) => e.kind === 'node_moved' && e.node_id === second.id),
+        'node_moved is still written for a reorder (§13.2)',
+      );
+
+      await sleep(250);
+      assert.equal(cueCountAt(v02GoalId), before, 'a pure reorder fires NO structure cue');
+
+      // ...but a genuine RE-PARENT of the same node still does both
+      const reparent = await post(`/goals/${v02GoalId}/nodes/${second.id}/move`, { parent_id: mbiId });
+      assert.equal(reparent.status, 200, JSON.stringify(reparent.json));
+      assert.equal(reparent.json.node.review_state, 'awaiting_jarvis', 'a re-parent IS a restructure');
+      assert.equal(reparent.json.node.kevin_move_from, biId);
+      await waitFor('reorder-vs-reparent cue', async () => cueCountAt(v02GoalId) === before + 1);
+      assert.match(lastCueCall().text, /moved "Reorder B" under "MBI"/);
+
+      // tidy: close the round so V02-2's awaiting_jarvis === 0 still holds
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${second.id}/accept`, { actor: 'jarvis' })).status, 200);
+    },
+  );
+
+  await check(
+    'V02-12',
+    'REVIEW FIX: the dispatched-leaf rule is a PRECONDITION — propose_move onto a working/planned leaf 409s up front, so Kevin\'s ✓ can never half-apply (edit written, move silently dropped)',
+    async () => {
+      // `leafId` sits under Docs; drive it to a dispatched machine leaf.
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${leafId}/leaf_kind`, { leaf_kind: 'machine', actor: 'jarvis' })).status, 200);
+      const plan = { what: 'probe', deliverable: 'probe', model: 'claude-sonnet-5', nodes: [{ title: 'n1', spec: 's' }] };
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${leafId}/propose_plan`, { plan, actor: 'jarvis' })).status, 200);
+      const approved = await post(`/goals/${v02GoalId}/nodes/${leafId}/approve_plan`, { actor: 'kevin' });
+      assert.equal(approved.status, 200, JSON.stringify(approved.json));
+      assert.ok(['planned', 'working'].includes(approved.json.node.state), `leaf is dispatched (${approved.json.node.state})`);
+
+      // a direct Kevin move onto it 409s (unchanged v0.2 behaviour)...
+      const direct = await post(`/goals/${v02GoalId}/nodes/${biId}/move`, { parent_id: leafId });
+      assert.equal(direct.status, 409);
+      assert.equal(direct.json.error.code, 'leaf_already_dispatched');
+
+      // ...and so does the PROPOSAL, instead of being accepted now and blowing
+      // up mid-resolve after the text edit had already been written.
+      const editP = await post(`/goals/${v02GoalId}/nodes/${biId}/propose_edit`, { title: 'BI (renamed)', actor: 'jarvis' });
+      assert.equal(editP.status, 200, JSON.stringify(editP.json));
+      const moveP = await post(`/goals/${v02GoalId}/nodes/${biId}/propose_move`, { parent_id: leafId, actor: 'jarvis' });
+      assert.equal(moveP.status, 409, JSON.stringify(moveP.json));
+      assert.equal(moveP.json.error.code, 'leaf_already_dispatched');
+
+      // the pending text edit is untouched and still resolvable on its own
+      const resolved = await post(`/goals/${v02GoalId}/nodes/${biId}/resolve_pending`, { accept: true });
+      assert.equal(resolved.status, 200, JSON.stringify(resolved.json));
+      assert.equal(resolved.json.node.title, 'BI (renamed)');
+      assert.equal(resolved.json.node.pending_parent_id, null);
+      assert.equal(resolved.json.node.parent_id, null, 'BI stayed at root — no half-applied move');
+    },
+  );
+
+  await check(
+    'V02-13',
+    'REVIEW FIX: a non-finite sort_order (NaN/Infinity) is ignored rather than silently parking the row at 0',
+    async () => {
+      const row = (await get(`/goals/${v02GoalId}`)).json.nodes.find((n: any) => n.id === v02DocsId);
+      assert.ok(row.sort_order !== 0, `Docs has a non-zero sort_order to notice a clobber (${row.sort_order})`);
+      const r = await post(`/goals/${v02GoalId}/nodes/${v02DocsId}/move`, { parent_id: row.parent_id, sort_order: Number.NaN });
+      assert.equal(r.status, 200, JSON.stringify(r.json));
+      assert.equal(r.json.node.sort_order, row.sort_order, 'NaN did not clobber sort_order');
+      assert.equal(r.json.node.review_state, 'none', 'and it stayed a no-op');
+    },
+  );
+
+  await check('V02-2', 'V01 regressions intact: ghost round still needs Kevin ✓; sort_order-only ghost PATCH untouched (checked above); counts', async () => {
+    const tree = (await get(`/goals/${v02GoalId}`)).json;
+    assert.equal(tree.goal.counts.awaiting_jarvis, 0, 'every round closed');
+    for (const n of tree.nodes) {
+      assert.equal(n.pending_parent_id, null, `no stray pending move on #${n.id}`);
+      assert.ok('kevin_moved_at' in n && 'kevin_move_from' in n, 'new columns present on every read');
+    }
+    sseV02.close();
   });
 } finally {
   server.close();

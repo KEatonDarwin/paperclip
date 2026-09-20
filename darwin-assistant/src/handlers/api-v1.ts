@@ -98,6 +98,8 @@ import {
   proposeEdit,
   proposeRemoval,
   resolvePending,
+  moveGoalNode,
+  proposeMove,
   humanDoneNode,
   verifyGoalNode,
   parkGoalNode,
@@ -2484,6 +2486,48 @@ export function createApiV1Router(): Router {
         actor: body.actor,
       });
       res.json({ node });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  // v0.2 §13.2 route 31 — Kevin (default actor) re-parents / reorders a node
+  // himself; the change is real immediately and flagged awaiting JARVIS.
+  // actor='jarvis' is allowed on ghosts only (403 jarvis_must_propose otherwise).
+  router.post('/goals/:id/nodes/:nodeId/move', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { parent_id?: unknown; sort_order?: unknown; actor?: unknown };
+    if (!('parent_id' in body) || (body.parent_id !== null && typeof body.parent_id !== 'number')) {
+      sendError(res, 400, 'invalid_request', 'parent_id is required: a node id or null (root-level)');
+      return;
+    }
+    try {
+      res.json({
+        node: moveGoalNode(goalId, nodeId, {
+          parent_id: body.parent_id as number | null,
+          // REVIEW FIX (node #483): NaN/Infinity are `typeof 'number'` and used to
+          // sail through, landing the row at sort_order 0. Finite numbers only.
+          sort_order: typeof body.sort_order === 'number' && Number.isFinite(body.sort_order) ? body.sort_order : undefined,
+          actor: body.actor,
+        }),
+      });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  // v0.2 §13.3 route 32 — JARVIS proposes re-parenting a set node (pending_parent_id, -1 = root); Kevin resolves via route 19.
+  router.post('/goals/:id/nodes/:nodeId/propose_move', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { parent_id?: unknown; actor?: unknown };
+    if (!('parent_id' in body) || (body.parent_id !== null && typeof body.parent_id !== 'number')) {
+      sendError(res, 400, 'invalid_request', 'parent_id is required: a node id or null (root-level)');
+      return;
+    }
+    try {
+      res.json({ node: proposeMove(goalId, nodeId, body.parent_id as number | null, body.actor ?? 'jarvis') });
     } catch (err) {
       sendCaughtGoalError(res, err);
     }

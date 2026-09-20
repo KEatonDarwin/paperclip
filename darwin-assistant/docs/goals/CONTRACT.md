@@ -141,7 +141,8 @@ CREATE TABLE IF NOT EXISTS goal_focus (
 `edit_proposed` · `edit_accepted` · `edit_rejected` · `removal_proposed` · `removal_accepted` · `removal_rejected` ·
 `leaf_kind_set` · `plan_proposed` · `plan_approved` · `plan_rejected` · `tree_planted` · `tree_done` · `tree_blocked` ·
 `node_check` (auto-flip) · `node_verified` · `node_parked` · `node_unparked` · `node_promoted` · `human_done` · `focus_set` · `log` ·
-`ghost_edited_by_kevin` · `kevin_okd_edit` · `node_agreed` · `jarvis_pushed_back` (all four v0.1 §11.2).
+`ghost_edited_by_kevin` · `kevin_okd_edit` · `node_agreed` · `jarvis_pushed_back` (all four v0.1 §11.2) ·
+`node_moved` · `move_proposed` · `move_accepted` · `move_rejected` · `kevin_restructured` (all five v0.2 §13).
 
 Every state-changing route/tool op in §3/§5 writes exactly one event (listed per route). `focus_set` is written on focus PUT only when the node actually changes (no spam on re-clicks).
 
@@ -234,6 +235,9 @@ type GoalNodeRow = {
   kevin_edit_original: string | null;         // JSON {title,done_means,notes} snapshot of the JARVIS wording at Kevin's FIRST edit
   review_state: 'none'|'awaiting_jarvis'|'pushed_back';
   review_note: string | null;                 // JARVIS's push-back note
+  // v0.2 §13.1 — Kevin structure changes + JARVIS pending move:
+  kevin_moved_at: string | null; kevin_move_from: number | null;   // Kevin's last move of this node (from parent id, -1 = root); NULL once the round closes
+  pending_parent_id: number | null;           // JARVIS-proposed re-parent awaiting ✓/✕ (-1 = to root); resolved by route 19
   sort_order: number; verified_at: string | null; created_at: string; updated_at: string;
   // derived, always present on reads:
   depth: number;             // 0 = direct child of root
@@ -354,6 +358,7 @@ Emission rules: one `goal_node` per affected node row (a batch of 6 ghosts = 6 e
 | `edit_ghost` | `node_id`, `title?`, `done_means?`, `notes?` | route 16 PATCH with `actor='jarvis'` — reword YOUR OWN still-ghost proposal in place while Kevin talks it through (DESIGN: "we'd talk about it a little bit more and watch it change"). The server 403s `jarvis_must_propose` on anything already set, so this cannot write real content. Do NOT discard + re-propose to reword — that loses the row and its batch bracket. | `{ node }` |
 | `propose_edit` | `node_id`, `title?`, `done_means?` | route 17 | `{ node }` |
 | `propose_remove` | `node_id`, `reason?` | route 18 | `{ node }` |
+| `move` | `node_id`, `parent_id` (number \| null) | v0.2 §13.6 — ghost → route 31 direct (actor jarvis); non-ghost → route 32 `propose_move` (pending move Kevin ✓s via route 19) | `{ node, moved:true }` / `{ node, proposed:true }` |
 | `set_leaf_kind` | `node_id`, `leaf_kind` | route 20 | `{ node }` |
 | `propose_plan` | `node_id`, `plan: PlanJson` (§1.2; the tool fills `adapter:'claude'` on every node if omitted and rejects fable/non-claude before hitting the server) | route 21 | `{ node }` |
 | `dispatch` | `node_id` | route 23 approve_plan — **only when Kevin approved the plan in conversation** (the normal path is his click on the Plan card; this exists so "yeah go build it" typed in chat works) | `{ node, tree }` |
@@ -743,3 +748,119 @@ Kevin supplies `OVERWATCH_API_URL` + `OVERWATCH_API_KEY` once (GUARDS.md "what K
 7. `GoalCounts.guards`/`guards_failing` reflect set/failing guards; `<goal_tree>` shows `guards_failing="N"` and the node ` 🛡✗ "…"` suffix; `need_you` unchanged by guard state.
 8. `goal_guard` SSE reaches an admin key; `tsc` clean.
 
+## 13. v0.2 — Kevin restructures the tree himself (add row / move / indent) → JARVIS weighs in on his next turn (added 2026-09-19, additive)
+
+**Why (Kevin, verbatim, 2026-09-19, thread cockpit:fff28b3e-…):** *"I just had Jarvis clear out the 5 items it wrote in response to my initial request and create a new layer of top levels (like MBI, BI, etc) so that way we can keep the todo items grouped together as we go forward. Technically, if I had a way to add a row and indent things into that row, I wouldn't need to say anything to jarvis and waste a turn. I could just move them around and then you would check me after i do it during one of your replies, letting me know if you agree or not, etc."*
+
+**THE PIN this builds (DESIGN.md):** Kevin's own nodes are born SET, but JARVIS gets to weigh in afterwards — *"maybe we both agree and it locks in."* v0.1 (§11) built that loop for **text edits to JARVIS ghosts**. This section builds it for **structure**: Kevin adds a row, edits a set row, or drags a row under a new parent — the tree changes **immediately** (no ghost, no turn), the node is flagged `awaiting_jarvis`, and ONE debounced cue lands in the goal chat so JARVIS reviews the whole burst on its next turn and either agrees (flag clears) or pushes back (flag becomes a conversation marker; the node is NEVER un-set).
+
+**Two rules this section adds:**
+1. **A Kevin structure change is real the moment he makes it.** Kevin-actor `POST /nodes` (route 9), `PATCH /nodes/:id` on a set node (route 16, text changed), and the new `move` route (31) write the tree directly AND mark the node `review_state='awaiting_jarvis'`, `last_edited_by='kevin'`. Pushing back on a set node never changes its state — `pushed_back` on a non-ghost is a flag for the conversation, nothing more.
+2. **JARVIS still proposes structure.** JARVIS may `move` only its own ghosts directly. Moving a set node goes through a pending move (`pending_parent_id`) that Kevin ✓s via route 19 — exactly the `propose_edit` shape.
+
+### 13.1 DDL (additive `ALTER TABLE goal_nodes ADD COLUMN …`, idempotent, guarded by PRAGMA table_info — same `ensureGoalNodeColumn` helper as §11.1)
+
+```
+kevin_moved_at     TEXT      -- ISO datetime of Kevin's most recent move of this node; NULL when the move round closed (accept) or never moved
+kevin_move_from    INTEGER   -- parent id the node was moved FROM in that move; -1 = it was root-level; NULL with kevin_moved_at
+pending_parent_id  INTEGER   -- JARVIS-proposed re-parent awaiting ✓/✕ (non-ghost nodes only); -1 = propose moving to root-level; NULL = no pending move
+```
+All three are returned on every `GoalNodeRow` read (add to §3.0 type). `kevin_edit_original` (§11.1) is REUSED for set nodes: on Kevin's first text edit of a **set** node in an open round it snapshots the pre-edit `{title, done_means, notes}` (so the cue can show was/now); it is cleared when the round closes (JARVIS `accept`). `GoalCounts.awaiting_jarvis` now counts **any** node with `review_state='awaiting_jarvis'` (ghost or not); `need_you` unchanged.
+
+`goal_events.kind` closed list gains: `node_moved` · `move_proposed` · `move_accepted` · `move_rejected` · `kevin_restructured` (the digest cue was posted; data = the burst).
+
+### 13.2 Route 31 — `POST /goals/:id/nodes/:nodeId/move`
+
+| Body | Response | Event |
+|---|---|---|
+| `{ parent_id: number \| null, sort_order?: number, actor? ('kevin' default) }` | `{ node: GoalNodeRow }` | `node_moved` (data `{old_parent_id, new_parent_id, old_sort_order, new_sort_order, actor}`; `null` = root) |
+
+Semantics (server-enforced in `goals.ts` `moveGoalNode`):
+- Re-parents **within the same goal**. `parent_id` must be a node of this goal (`400 parent_goal_mismatch`) with `state ∈ {set, planned, working, check}` (`409 parent_not_set`), or `null` for root-level (requires `goals.status='set'`, `409 goal_not_set` — same check as route 9).
+- The node must be non-terminal: `state ∉ {done, discarded}` (`409 invalid_transition`). A `working` leaf MAY move — its `tree_id`/plan ride along untouched. `ghost`/`parked`/`check`/`planned` may move.
+- **No cycles:** `parent_id` must not be the node itself or any descendant of it (`409 move_cycle`).
+- Moving a node with children moves the **whole subtree** (children keep `parent_id` → the node; only their derived `path`/`depth` change).
+- `sort_order`: must be a **finite** number (NaN/Infinity are ignored as if omitted — review fix node #483). When omitted and the parent changes → `max(sibling sort_order)+1` under the new parent; when omitted and the parent is unchanged → kept. A call that changes neither parent nor sort_order is a **no-op** (200, node returned, no event, no review flag).
+- **A same-parent REORDER is not a restructure (review fix, node #483).** When `parent_id` is unchanged and only `sort_order` moves (the cockpit's drag-before/after within one parent), the write happens and `node_moved` is logged, but **no review flag is set and no cue is scheduled** — §13.4 row 3 applies only when the parent actually changes. This matches §13.8, which deliberately routes `Alt+↑/↓` sibling reorders through route 16 as un-flagged. Ordering a list is not something JARVIS weighs in on; re-grouping it is.
+- New parent leaf reset: same as route 9 — moving anything under a parent with `leaf_kind != 'none'` resets that parent's `leaf_kind/plan_state/plan`. **`409 leaf_already_dispatched` if that parent is `planned/working/check/done` — and (review fix, node #483) this is a PRECONDITION checked inside `validateMoveTarget`, not an apply-time surprise**, so `propose_move` (route 32) refuses an impossible move up front and route 19's pre-validation catches it before any write. (Before the fix, ✓-ing a combined edit+move proposal onto a dispatched leaf wrote the text edit, cleared every `pending_*`, and *then* threw — the edit half-applied and the move silently lost.)
+- Old parent: after the move, §2.4(1) runs for the **old** parent (if its remaining non-parked children are all `done`, it flips `→ check`, event `node_check`). A parent left with zero children never vacuously completes. The NEW parent is never un-checked (consistent with route 9, which also allows a child under a `check` parent).
+- `actor='jarvis'` on a **non-ghost** node → `403 jarvis_must_propose` (use route 32). `actor='jarvis'` on its own ghost → direct move, no review flag.
+- **`actor='kevin'` (default) → the review flag** (§13.4): `review_state='awaiting_jarvis'`, `last_edited_by='kevin'`, `kevin_moved_at=now`, `kevin_move_from=<old parent id | -1>`, `review_note=NULL`; the digest cue is scheduled (§13.5). Any state — a ghost Kevin drags is also flagged (Kevin placing a JARVIS ghost is an implicit OK of its placement; JARVIS `accept` then sets it via the §11.2 `node_agreed` path).
+- SSE: `goal_node` `updated` for the node **and every descendant** (their derived `path`/`depth` changed — same treatment as promote), then `goal` (counts). If the focus points at the node or a descendant, a `goal_focus` event is emitted with the refreshed `path` — the focus row itself is untouched (no `focus_set` event).
+
+### 13.3 Route 32 — `POST /goals/:id/nodes/:nodeId/propose_move` (JARVIS → set node) + route 19 extension
+
+| Body | Response | Event |
+|---|---|---|
+| `{ parent_id: number \| null, actor:'jarvis' }` | `{ node }` with `pending_parent_id` set (`-1` when `parent_id` is null), `pending_by='jarvis'` | `move_proposed` (data `{parent_id}`) |
+
+- Only on `state ∈ {set, planned, check, parked}` (`409 invalid_transition`); never on `working` (`409 leaf_already_dispatched`). Preconditions of §13.2 (parent state, same goal, no cycle) are checked at proposal time AND again at resolve.
+- A pending move **coexists** with a pending text edit (both are diffs Kevin ✓s together); a pending **removal** supersedes both (`propose_removal` clears `pending_parent_id`; `propose_move`/`propose_edit` clear `pending_removal`). Proposing a move to the node's current parent is a `409 nothing_to_move`.
+- **Route 19 `resolve_pending`:** `hasPending` now also includes `pending_parent_id IS NOT NULL`. `accept:true` applies the text edit (if any) AND performs the move (same code path as route 31 with `actor='kevin'` but **without** the review flag — JARVIS proposed it, Kevin agreed, so the round is closed: the node's `review_state/review_note/last_edited_by/kevin_moved_at/kevin_move_from/kevin_edit_original` are cleared). Events: `edit_accepted` and/or `move_accepted` (+ `node_moved`, actor kevin). `accept:false` clears every pending_* incl. `pending_parent_id` (`edit_rejected`/`move_rejected`) and leaves review fields alone. Resolve re-validates the move; if it no longer applies (parent discarded, cycle) → `409` with the move's code and the pending fields are left for JARVIS to re-propose.
+
+### 13.4 The review flag on non-ghost nodes (extends §11.2)
+
+| Action | actor | Precondition | Effect | event kind |
+|---|---|---|---|---|
+| route 9 create (`authored_by='kevin'`, born set) | kevin | — | `review_state='awaiting_jarvis'`, `last_edited_by='kevin'`; digest scheduled (kind `added`) | `node_created` (unchanged) |
+| route 16 PATCH title/done_means/notes | kevin | `state='set'`, text actually changed (a bare re-save or a `sort_order`-only reorder is NOT an edit — §11.2 rule, unchanged) | `review_state='awaiting_jarvis'`, `last_edited_by='kevin'`, `review_note=NULL`; `kevin_edit_original` snapshots the pre-edit text if NULL; digest scheduled (kind `edited`) | `node_updated` (unchanged) |
+| route 31 move | kevin | §13.2 | as §13.2; digest scheduled (kind `moved`) | `node_moved` |
+| `accept` {node_id} (route 11 / tool op) | jarvis | `state != 'ghost'`, `review_state ∈ {awaiting_jarvis, pushed_back}` | **state unchanged**; `review_state='none'`, `review_note=NULL`, `last_edited_by=NULL`, `kevin_edit_original=NULL`, `kevin_moved_at=NULL`, `kevin_move_from=NULL` | `node_agreed` (text: "JARVIS agreed with Kevin's change: <title>") |
+| `accept` | jarvis | `state != 'ghost'`, `review_state='none'` | unchanged v0: `409 invalid_transition` (nothing to agree with) | — |
+| `accept` | kevin | `state != 'ghost'` | unchanged v0: `409 invalid_transition` (Kevin has no ✓ on a set row) | — |
+| `push_back` {note} | jarvis | `state != 'ghost'`, `review_state='awaiting_jarvis'` (or `'none'` with `last_edited_by='kevin'`) | `review_state='pushed_back'`, `review_note=note`. **The node stays set/planned/working/… — never un-set.** They talk it out; the round closes by JARVIS `accept`, by Kevin ✓-ing a JARVIS counter-proposal (route 19 accept), or by Kevin changing it again (a fresh edit/move re-opens `awaiting_jarvis`, note cleared) | `jarvis_pushed_back` |
+| node → `done` (route 25 passed) / `discarded` (route 14 / 19 removal) | — | — | review fields + `kevin_moved_at/kevin_move_from` cleared (terminal). A promoted subtree keeps its flags — they travel to the new goal, whose chat weighs in | (existing kinds) |
+
+Everything §11.2 says about **ghosts** is unchanged. Only ONE round is open per node at a time: a second Kevin change while `awaiting_jarvis` just refreshes the round (and the digest lists the node once, with its latest change).
+
+### 13.5 The structure digest cue (extends §11.3)
+
+Kevin drags several rows in a burst, so the cue is **debounced 20 s per goal** (env `GOALS_STRUCTURE_DEBOUNCE_MS`, default `20000`; the sim sets it low). Each Kevin structure change (§13.4 rows 1–3) adds `{node_id, kind: added|moved|edited, from, to}` to the goal's in-memory burst and (re)starts the timer. When it fires, the server re-reads every burst node, drops any that no longer awaits JARVIS (already agreed / discarded), writes ONE `kevin_restructured` event (data = the burst) and posts ONE cue through the §11.3 seam (`processMessage(text, 'cockpit:goal-<id>', 'goal-structure:<goalId>:<lastEventId>')`, `enqueueMessage` when busy). Text, exactly this shape:
+
+```
+[goal #7 — Kevin restructured the tree: moved "Docs" under "BI"; added "BI" under root; edited "MBI". Weigh in.]
+#12 moved: "Docs" — from: Goal › MBI → now: Goal › BI
+#15 added: "BI" under Goal (root) — done: "every BI module has a dashboard"
+#9 edited: "MBI" now: "MBI (media-buy intake)" — done: "…"
+    was: "MBI" — done: "…"
+For each node: acknowledge the change in a sentence, then either agree → `goals` op `accept` {node_id} (the flag clears; it stays set), or `push_back` {node_id, note} with your reason in one or two sentences and talk it out. Don't restate the rest of the tree.
+```
+- A node that was `pushed_back` and then changed again by Kevin is listed like any other change; the fresh change already cleared `review_note` (§13.4), so no "you pushed back with" line is added — JARVIS's earlier note is in the chat history.
+- The burst is process memory: if the service restarts inside the 20 s window no cue posts, but the nodes are still `awaiting_jarvis` and the §6 snapshot flags them (`↕K`/`✎K` + `AWAITING YOUR TAKE`), so JARVIS still weighs in on its next turn. Kevin-actor `move` of a ghost is included in the burst; JARVIS-actor changes never are. A goal with no conversation yet logs and skips (same as §11.3).
+
+### 13.6 Tool (§5 additions)
+
+| op | args | does | returns |
+|---|---|---|---|
+| `move` | `node_id`, `parent_id` (number \| null) | **ghost** node → route 31 with `actor='jarvis'` (direct, no flag). **Non-ghost** node → route 32 `propose_move` (a pending move Kevin ✓s; the tool never moves a set node directly) | `{ node, moved:true }` or `{ node, proposed:true }` |
+
+The op table's `accept` row now also closes a set-node round (§13.4). `push_back` works on non-ghost nodes (§13.4). `list` trims now include `kevin_moved_at`, `kevin_move_from`, `pending_parent_id`. Tool description gains one sentence: *"When Kevin restructures the tree himself (adds a row, edits a set row, drags a row under a new parent) the change is already real and flagged awaiting you: on your next turn `accept` {node_id} to agree or `push_back` {node_id, note} — never try to undo it; to move a set node yourself use `move` (it becomes a pending move he ✓s), your own ghosts move directly."*
+
+### 13.7 Focus injection (§6 additions)
+
+- Node marker gains ` ↕K` when `kevin_moved_at IS NOT NULL AND review_state='awaiting_jarvis'`, and ` ✎K` on a **non-ghost** node when `last_edited_by='kevin' AND review_state='awaiting_jarvis'` and it was not moved (added / text-edited). A pending JARVIS move renders `set ↕pending` (alongside `✎pending`/`✂pending`; `pending` attr on `<goal_focus>` gains the value `move`; when both an edit and a move are pending the label is `edit+move`).
+- Line suffix for `awaiting_jarvis`: ` — AWAITING YOUR TAKE (was: "<original title>")` when `kevin_edit_original` is present (unchanged), else ` — AWAITING YOUR TAKE (moved from: "<old parent title | root>")` when `kevin_moved_at` is set, else ` — AWAITING YOUR TAKE (Kevin added this)`.
+- `<goal_tree awaiting_you="N">` already counts these (shared `review_state`).
+
+### 13.8 Cockpit (§9 additions — what the UI lane builds against)
+
+- **Add row:** a `+` affordance on the root and on every set-ish row (`set/planned/working/check`) opens an inline row (title + done_means) → route 9 with `authored_by='kevin'` (born set, flagged). Enter saves, Esc cancels.
+- **Indent / outdent:** `Tab` = move under the previous sibling; `Shift+Tab` = move under the grandparent, after the current parent. Both = route 31 with the computed `parent_id` (+ `sort_order`). `Alt+↑/↓` = reorder among siblings (route 16 `sort_order` only — not flagged).
+- **Drag re-parent:** drag a row onto another row (drop = child, appended) or between rows (drop = sibling at that position) → route 31. Disallowed targets (ghost/done/discarded/parked parents, own subtree) render no drop zone. The subtree moves with the row.
+- **Chips:** the existing amber `JARVIS weighing in…` chip renders on set rows too (`review_state='awaiting_jarvis'`), with `↕` when `kevin_moved_at` is set; `JARVIS pushed back` (destructive tint) on set rows shows the note in the expanded block. A JARVIS pending move renders the row with a dashed `→ under "<parent title>"` diff line + the same ✓/✕ as a pending edit (route 19).
+- **SSE:** on `goal_node` for a moved node, patch it AND its descendants from the events (the server emits every one); re-sort children by `(sort_order, id)`.
+
+### 13.9 Acceptance (sim checks `V02-1…`, run by `npm run goals:sim`)
+
+1. Kevin move re-parents a set node under another set node → 200, `parent_id` updated, `node_moved` event, `review_state='awaiting_jarvis'`, `last_edited_by='kevin'`, `kevin_moved_at` set, `kevin_move_from` = old parent (`-1` for root).
+2. Moving a subtree carries the children (their `path` / `depth` change; `goal_node` SSE emitted for the node and each descendant).
+3. Cycle (`parent_id` = own descendant) → `409 move_cycle`; done/discarded node → `409 invalid_transition`; ghost parent → `409 parent_not_set`; other goal's node → `400 parent_goal_mismatch`.
+4. Debounced digest: three Kevin changes (move + add + set-node edit) inside the window → exactly ONE cue, correlation `goal-structure:<goalId>:<eventId>`, listing all three; a change JARVIS already agreed to before the timer fires is not listed.
+5. JARVIS `accept` on a set node awaiting → state still `set`, review fields + `kevin_moved_*` cleared, `node_agreed`; JARVIS `push_back` on a set node → `review_state='pushed_back'`, still `set`.
+6. JARVIS `move` on a set node (tool / route 31 actor jarvis) → `403 jarvis_must_propose`; route 32 sets `pending_parent_id`; route 19 accept performs the move (node ends under the proposed parent, no review flag, `move_accepted` + `node_moved`); route 19 reject clears `pending_parent_id`.
+7. Sort-order-only PATCH on a set node and a no-op move → no review flag, no cue.
+8. Old parent left with only `done` children after a move → `check` (§2.4(1)); old parent left empty → unchanged.
+9. All 80 v0/v0.1 checks still pass.
+10. (review fix) A same-parent reorder writes `sort_order` + logs `node_moved`, but leaves `review_state='none'` / `kevin_moved_at=NULL` and fires no cue; a genuine re-parent of the same node still does both.
+11. (review fix) `propose_move` onto a `planned`/`working` leaf → `409 leaf_already_dispatched` at proposal time; a pending text edit on that node is untouched and still resolves cleanly on its own.
+12. (review fix) A non-finite `sort_order` is ignored rather than clobbering the row to 0.

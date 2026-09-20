@@ -122,6 +122,10 @@ export interface GoalNodeDbRow {
   kevin_edit_original: string | null;   // JSON {title,done_means,notes} snapshot of the JARVIS wording at Kevin's FIRST edit
   review_state: ReviewState;
   review_note: string | null;           // JARVIS's push-back note
+  // v0.2 §13.1 — Kevin structure changes + JARVIS pending move.
+  kevin_moved_at: string | null;        // ISO datetime of Kevin's last move of this node; NULL once the round closes
+  kevin_move_from: number | null;       // parent id it was moved FROM (-1 = root); NULL with kevin_moved_at
+  pending_parent_id: number | null;     // JARVIS-proposed re-parent awaiting ✓/✕ (-1 = to root); NULL = none
   sort_order: number;
   verified_at: string | null;
   created_at: string;
@@ -302,6 +306,10 @@ ensureGoalNodeColumn('last_edited_by', `last_edited_by TEXT CHECK (last_edited_b
 ensureGoalNodeColumn('kevin_edit_original', `kevin_edit_original TEXT`);
 ensureGoalNodeColumn('review_state', `review_state TEXT NOT NULL DEFAULT 'none' CHECK (review_state IN ('none','awaiting_jarvis','pushed_back'))`);
 ensureGoalNodeColumn('review_note', `review_note TEXT`);
+// v0.2 (CONTRACT §13.1) — Kevin restructures the tree himself + JARVIS pending move.
+ensureGoalNodeColumn('kevin_moved_at', `kevin_moved_at TEXT`);
+ensureGoalNodeColumn('kevin_move_from', `kevin_move_from INTEGER`);
+ensureGoalNodeColumn('pending_parent_id', `pending_parent_id INTEGER`);
 
 // ---------------------------------------------------------------------------
 // Low-level accessors
@@ -599,7 +607,13 @@ export function setGoalFocus(goalId: number, nodeId: number | null, setBy?: unkn
 function maybeSettleParent(nodeId: number): void {
   const node = getRawNodeStmt.get(nodeId) as GoalNodeDbRow | undefined;
   if (!node || node.parent_id == null) return;
-  const parent = getRawNodeStmt.get(node.parent_id) as GoalNodeDbRow | undefined;
+  settleParentIfComplete(node.parent_id);
+}
+
+/** Same §2.4(1) rule keyed by the PARENT id — v0.2 §13.2 runs it for the OLD
+ *  parent after a move (the moved node no longer points at it). */
+function settleParentIfComplete(parentId: number): void {
+  const parent = getRawNodeStmt.get(parentId) as GoalNodeDbRow | undefined;
   if (!parent || parent.state !== 'set') return;
   const children = sqliteDb.prepare(`SELECT * FROM goal_nodes WHERE parent_id = ?`).all(parent.id) as GoalNodeDbRow[];
   const nonDiscarded = children.filter((c) => c.state !== 'discarded');
@@ -894,7 +908,13 @@ export function createGoalNode(goalId: number, args: {
     batch ? { batch_id: batch } : undefined,
   );
   emitNode('created', row, batch);
-  return deriveSingleNode(row);
+  // v0.2 §13.4 row 1 — a SET node Kevin typed himself (cockpit "add row") is real
+  // immediately but flagged for JARVIS's weigh-in on his next turn. The tool's
+  // set_from_kevin (actor='jarvis' transcribing Kevin's words) is NOT flagged.
+  if (actor === 'kevin' && authoredBy === 'kevin') {
+    flagKevinStructureChange(goalId, id, 'added', null, parentId);
+  }
+  return deriveSingleNode(getRawNodeStmt.get(id) as GoalNodeDbRow);
 }
 
 export function proposeGoalNodes(goalId: number, args: {
@@ -947,6 +967,7 @@ function setGhostToSet(goalId: number, nodeId: number, actor: GoalActor, eventKi
   sqliteDb.prepare(`
     UPDATE goal_nodes SET state = 'set', proposal_batch = NULL,
       review_state = 'none', review_note = NULL, kevin_edit_original = NULL, last_edited_by = NULL,
+      kevin_moved_at = NULL, kevin_move_from = NULL,
       updated_at = datetime('now')
     WHERE id = ?
   `).run(nodeId);
@@ -964,6 +985,15 @@ type AcceptOutcome = { row: GoalNodeDbRow; outcome: 'set' | 'awaiting' | 'agreed
  *  per HTTP request. */
 function applyAcceptToNode(goalId: number, node: GoalNodeDbRow, actor: GoalActor): AcceptOutcome {
   if (node.state !== 'ghost') {
+    // v0.2 §13.4 — JARVIS agreeing with a Kevin structure change / set-node edit:
+    // the node's state is untouched, only the review round closes.
+    if (actor !== 'kevin' && (node.review_state === 'awaiting_jarvis' || node.review_state === 'pushed_back')) {
+      clearReviewRound(node.id);
+      insertEvent(goalId, node.id, actor, 'node_agreed', `JARVIS agreed with Kevin's change: ${node.title}`);
+      const fresh = getRawNodeStmt.get(node.id) as GoalNodeDbRow;
+      emitNode('updated', fresh);
+      return { row: fresh, outcome: 'agreed', reask: false };
+    }
     throw new GoalError(409, 'invalid_transition', `node is ${node.state}, not ghost`, { from: node.state, to: 'set' });
   }
   if (!node.done_means?.trim()) {
@@ -1072,14 +1102,16 @@ export function pushBackGhost(goalId: number, nodeId: number, note: string, acto
   if (act !== 'jarvis') {
     throw new GoalError(403, 'jarvis_only', 'only JARVIS can push back on an edit');
   }
-  if (node.state !== 'ghost') {
-    throw new GoalError(409, 'invalid_transition', `node is ${node.state}, not ghost`, { from: node.state, to: node.state });
+  if (node.state === 'done' || node.state === 'discarded') {
+    throw new GoalError(409, 'invalid_transition', `node is terminal (${node.state})`, { from: node.state, to: node.state });
   }
   // Allowed while awaiting a weigh-in, or straight from 'none' when Kevin made
-  // the last edit (JARVIS can pre-empt before Kevin even clicks ✓).
+  // the last edit (JARVIS can pre-empt before Kevin even clicks ✓). v0.2 §13.4:
+  // also on SET nodes Kevin restructured/edited — pushing back there NEVER
+  // un-sets the node; it is a conversation flag only.
   const allowed = node.review_state === 'awaiting_jarvis' || (node.review_state === 'none' && node.last_edited_by === 'kevin');
   if (!allowed) {
-    throw new GoalError(409, 'nothing_to_push_back', 'no Kevin edit is awaiting your weigh-in on this node');
+    throw new GoalError(409, 'nothing_to_push_back', 'no Kevin change is awaiting your weigh-in on this node');
   }
   const trimmed = (note ?? '').trim();
   if (!trimmed) throw new GoalError(400, 'invalid_request', 'push_back requires a non-empty note');
@@ -1167,7 +1199,7 @@ export function discardGoalNode(goalId: number, nodeId: number, reason?: string,
     throw new GoalError(409, 'invalid_transition', `node is ${node.state}, not ghost`, { from: node.state, to: 'discarded' });
   }
   const act = assertActor(actor, 'kevin');
-  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'discarded', proposal_batch = NULL, review_state = 'none', review_note = NULL, kevin_edit_original = NULL, last_edited_by = NULL, updated_at = datetime('now') WHERE id = ?`).run(nodeId);
+  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'discarded', proposal_batch = NULL, review_state = 'none', review_note = NULL, kevin_edit_original = NULL, last_edited_by = NULL, kevin_moved_at = NULL, kevin_move_from = NULL, updated_at = datetime('now') WHERE id = ?`).run(nodeId);
   insertEvent(goalId, nodeId, act, 'node_discarded', reason ? `Discarded: ${reason}` : `Discarded: ${node.title}`, reason ? { reason } : undefined);
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
@@ -1187,7 +1219,7 @@ export function discardGoalBatch(goalId: number, batchId: string, ids?: number[]
   const act = assertActor(actor, 'kevin');
   const out: GoalNodeRow[] = [];
   for (const r of rows) {
-    sqliteDb.prepare(`UPDATE goal_nodes SET state = 'discarded', proposal_batch = NULL, review_state = 'none', review_note = NULL, kevin_edit_original = NULL, last_edited_by = NULL, updated_at = datetime('now') WHERE id = ?`).run(r.id);
+    sqliteDb.prepare(`UPDATE goal_nodes SET state = 'discarded', proposal_batch = NULL, review_state = 'none', review_note = NULL, kevin_edit_original = NULL, last_edited_by = NULL, kevin_moved_at = NULL, kevin_move_from = NULL, updated_at = datetime('now') WHERE id = ?`).run(r.id);
     insertEvent(goalId, r.id, act, 'node_discarded', `Discarded: ${r.title}`);
     emitNode('updated', getRawNodeStmt.get(r.id) as GoalNodeDbRow);
     maybeSettleParent(r.id);
@@ -1233,6 +1265,9 @@ export function patchGoalNode(goalId: number, nodeId: number, patch: {
   // title/done_means/notes).
   const textChanged = title !== node.title || doneMeans !== node.done_means || notes !== node.notes;
   const ghostEdit = node.state === 'ghost' && textChanged;
+  // v0.2 §13.4 row 2 — Kevin edits a SET node: real immediately, flagged for
+  // JARVIS's weigh-in (same columns as the ghost round; the node stays set).
+  const setEdit = node.state === 'set' && textChanged && actor === 'kevin';
   let lastEditedBy = node.last_edited_by;
   let kevinOriginal = node.kevin_edit_original;
   let reviewState: ReviewState = node.review_state;
@@ -1250,6 +1285,13 @@ export function patchGoalNode(goalId: number, nodeId: number, patch: {
     lastEditedBy = 'jarvis';
     reviewState = 'none';
     reviewNote = null;
+  } else if (setEdit) {
+    lastEditedBy = 'kevin';
+    if (kevinOriginal == null) {
+      kevinOriginal = JSON.stringify({ title: node.title, done_means: node.done_means, notes: node.notes });
+    }
+    reviewState = 'awaiting_jarvis';
+    reviewNote = null;
   }
 
   sqliteDb.prepare(`
@@ -1263,6 +1305,7 @@ export function patchGoalNode(goalId: number, nodeId: number, patch: {
   });
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
+  if (setEdit) scheduleStructureDigest(goalId, { node_id: nodeId, kind: 'edited', from: null, to: null, at: new Date().toISOString() });
   return deriveSingleNode(fresh);
 }
 
@@ -1304,7 +1347,7 @@ export function proposeRemoval(goalId: number, nodeId: number, reason?: string, 
   if (childCount > 0) throw new GoalError(409, 'node_has_children', 'node has children and cannot be removed directly');
   const actor2 = assertActor(actor, 'jarvis');
   // Mirror of propose_edit: a removal supersedes any pending text edit.
-  sqliteDb.prepare(`UPDATE goal_nodes SET pending_removal = 1, pending_title = NULL, pending_done_means = NULL, pending_by = 'jarvis', updated_at = datetime('now') WHERE id = ?`).run(nodeId);
+  sqliteDb.prepare(`UPDATE goal_nodes SET pending_removal = 1, pending_title = NULL, pending_done_means = NULL, pending_parent_id = NULL, pending_by = 'jarvis', updated_at = datetime('now') WHERE id = ?`).run(nodeId);
   insertEvent(goalId, nodeId, actor2, 'removal_proposed', reason ? `Removal proposed: ${reason}` : 'Removal proposed.', reason ? { reason } : undefined);
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
@@ -1313,14 +1356,26 @@ export function proposeRemoval(goalId: number, nodeId: number, reason?: string, 
 
 export function resolvePending(goalId: number, nodeId: number, accept: boolean, actor?: unknown): GoalNodeRow {
   const node = requireNode(goalId, nodeId);
-  const hasPending = node.pending_title != null || node.pending_done_means != null || node.pending_removal === 1;
-  if (!hasPending) throw new GoalError(409, 'nothing_pending', 'node has no pending edit or removal');
-  const act = assertActor(actor, 'kevin');
+  const hasEdit = node.pending_title != null || node.pending_done_means != null;
   const isRemoval = node.pending_removal === 1;
+  // v0.2 §13.3 — a JARVIS-proposed re-parent is a pending diff too (-1 = to root).
+  const hasMove = !isRemoval && node.pending_parent_id != null;
+  const hasPending = hasEdit || isRemoval || hasMove;
+  if (!hasPending) throw new GoalError(409, 'nothing_pending', 'node has no pending edit, move, or removal');
+  const act = assertActor(actor, 'kevin');
+  const moveTarget: number | null = hasMove ? (node.pending_parent_id === -1 ? null : node.pending_parent_id) : null;
+
+  if (accept && hasMove) {
+    // Re-validate BEFORE any write: if the move no longer applies (parent gone,
+    // cycle) the 409 surfaces and every pending_* is left for JARVIS to re-propose.
+    validateMoveTarget(goalId, node, moveTarget);
+  }
 
   if (accept && isRemoval) {
     sqliteDb.prepare(`
-      UPDATE goal_nodes SET state = 'discarded', pending_title = NULL, pending_done_means = NULL, pending_removal = 0, pending_by = NULL, updated_at = datetime('now')
+      UPDATE goal_nodes SET state = 'discarded', pending_title = NULL, pending_done_means = NULL, pending_removal = 0, pending_parent_id = NULL, pending_by = NULL,
+        review_state = 'none', review_note = NULL, last_edited_by = NULL, kevin_edit_original = NULL, kevin_moved_at = NULL, kevin_move_from = NULL,
+        updated_at = datetime('now')
       WHERE id = ?
     `).run(nodeId);
     insertEvent(goalId, nodeId, act, 'removal_accepted', `Removed: ${node.title}`);
@@ -1329,22 +1384,330 @@ export function resolvePending(goalId: number, nodeId: number, accept: boolean, 
     const title = node.pending_title ?? node.title;
     const doneMeans = node.pending_done_means ?? node.done_means;
     sqliteDb.prepare(`
-      UPDATE goal_nodes SET title = ?, done_means = ?, pending_title = NULL, pending_done_means = NULL, pending_removal = 0, pending_by = NULL, updated_at = datetime('now')
+      UPDATE goal_nodes SET title = ?, done_means = ?, pending_title = NULL, pending_done_means = NULL, pending_removal = 0, pending_parent_id = NULL, pending_by = NULL, updated_at = datetime('now')
       WHERE id = ?
     `).run(title, doneMeans, nodeId);
-    insertEvent(goalId, nodeId, act, 'edit_accepted', `Edit accepted: ${title}`);
+    if (hasEdit) insertEvent(goalId, nodeId, act, 'edit_accepted', `Edit accepted: ${title}`);
+    if (hasMove) {
+      // Kevin ✓'d JARVIS's proposed move: perform it as Kevin WITHOUT the review
+      // flag (JARVIS proposed it, Kevin agreed — the round is closed).
+      applyMove(goalId, getRawNodeStmt.get(nodeId) as GoalNodeDbRow, moveTarget, undefined, act);
+      insertEvent(goalId, nodeId, act, 'move_accepted', `Move accepted: ${title}`, { parent_id: moveTarget });
+    }
+    // Kevin accepting a JARVIS counter-proposal closes any open round (§13.4).
+    clearReviewRound(nodeId);
   } else {
     sqliteDb.prepare(`
-      UPDATE goal_nodes SET pending_title = NULL, pending_done_means = NULL, pending_removal = 0, pending_by = NULL, updated_at = datetime('now')
+      UPDATE goal_nodes SET pending_title = NULL, pending_done_means = NULL, pending_removal = 0, pending_parent_id = NULL, pending_by = NULL, updated_at = datetime('now')
       WHERE id = ?
     `).run(nodeId);
-    insertEvent(goalId, nodeId, act, isRemoval ? 'removal_rejected' : 'edit_rejected', isRemoval ? 'Removal rejected.' : 'Edit rejected.');
+    if (isRemoval) insertEvent(goalId, nodeId, act, 'removal_rejected', 'Removal rejected.');
+    if (hasEdit) insertEvent(goalId, nodeId, act, 'edit_rejected', 'Edit rejected.');
+    if (hasMove) insertEvent(goalId, nodeId, act, 'move_rejected', 'Move rejected.', { parent_id: moveTarget });
   }
 
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
   if (accept && isRemoval) maybeSettleParent(nodeId);
   return deriveSingleNode(getRawNodeStmt.get(nodeId) as GoalNodeDbRow);
+}
+
+// ---------------------------------------------------------------------------
+// v0.2 §13 — Kevin restructures the tree himself (add row / move / indent) and
+// JARVIS weighs in on his next turn. Routes 31 (move) + 32 (propose_move), the
+// review flag on non-ghost nodes (§13.4) and the debounced structure digest
+// cue (§13.5). Everything here is additive on v0/v0.1.
+// ---------------------------------------------------------------------------
+
+/** Close a node's review round (JARVIS agreed / Kevin ✓'d a counter-proposal /
+ *  terminal). State is untouched. */
+function clearReviewRound(nodeId: number): void {
+  sqliteDb.prepare(`
+    UPDATE goal_nodes SET review_state = 'none', review_note = NULL, last_edited_by = NULL, kevin_edit_original = NULL,
+      kevin_moved_at = NULL, kevin_move_from = NULL, updated_at = datetime('now')
+    WHERE id = ?
+  `).run(nodeId);
+}
+
+/** Ids of EVERY descendant of `nodeId` within its goal (discarded included,
+ *  so SSE consumers that still hold them get the refreshed path/depth). */
+function collectDescendantIds(goalId: number, nodeId: number): number[] {
+  const all = listRawNodesForGoal(goalId, true);
+  const byParent = new Map<number, GoalNodeDbRow[]>();
+  for (const n of all) {
+    if (n.parent_id != null) {
+      if (!byParent.has(n.parent_id)) byParent.set(n.parent_id, []);
+      byParent.get(n.parent_id)!.push(n);
+    }
+  }
+  const out: number[] = [];
+  const stack = [...(byParent.get(nodeId) ?? [])];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    out.push(cur.id);
+    for (const child of byParent.get(cur.id) ?? []) stack.push(child);
+  }
+  return out;
+}
+
+/** §13.2 preconditions shared by move (route 31), propose_move (route 32) and
+ *  resolve_pending (route 19). Returns the new parent row (null = root). */
+function validateMoveTarget(goalId: number, node: GoalNodeDbRow, newParentId: number | null): GoalNodeDbRow | null {
+  if (node.state === 'done' || node.state === 'discarded') {
+    throw new GoalError(409, 'invalid_transition', `node is terminal (${node.state}) and cannot be moved`, { from: node.state, to: node.state });
+  }
+  // parent must be in this goal + in a state that takes children (or root when the goal is set)
+  const parent = validateParentForNewChild(goalId, newParentId);
+  // REVIEW FIX (node #483): the dispatched-leaf rule is a PRECONDITION, not an
+  // apply-time surprise. Hoisted out of resetParentLeafIfNeeded so propose_move
+  // refuses up front and resolve_pending's pre-validation catches it BEFORE the
+  // text-edit write (a 409 mid-accept used to leave the edit applied and the
+  // pending move silently dropped).
+  if (parent && parent.leaf_kind !== 'none' && ['planned', 'working', 'check', 'done'].includes(parent.state)) {
+    throw new GoalError(409, 'leaf_already_dispatched', `parent node ${parent.id} already has a dispatched leaf (${parent.state})`);
+  }
+  if (newParentId != null) {
+    if (newParentId === node.id) throw new GoalError(409, 'move_cycle', 'a node cannot be its own parent');
+    let cur = parent;
+    while (cur) {
+      if (cur.id === node.id) throw new GoalError(409, 'move_cycle', 'new parent is a descendant of the node being moved', { parent_id: newParentId });
+      cur = cur.parent_id != null ? (getRawNodeStmt.get(cur.parent_id) as GoalNodeDbRow | undefined) ?? null : null;
+    }
+  }
+  return parent;
+}
+
+/** The actual re-parent. No review flag here — callers decide (route 31 kevin =
+ *  flag; route 19 accept / jarvis ghost move = no flag). Returns whether
+ *  anything changed. */
+function applyMove(
+  goalId: number,
+  node: GoalNodeDbRow,
+  newParentId: number | null,
+  sortOrder: number | undefined,
+  actor: GoalActor,
+): { changed: boolean; row: GoalNodeDbRow } {
+  const parent = validateMoveTarget(goalId, node, newParentId);
+  const oldParentId = node.parent_id ?? null;
+  const parentChanged = oldParentId !== (newParentId ?? null);
+  const newSort = sortOrder !== undefined ? sortOrder : (parentChanged ? nextSortOrder(goalId, newParentId) : node.sort_order);
+  if (!parentChanged && newSort === node.sort_order) {
+    return { changed: false, row: node };
+  }
+  if (parentChanged) resetParentLeafIfNeeded(parent);
+
+  sqliteDb.prepare(`UPDATE goal_nodes SET parent_id = ?, sort_order = ?, updated_at = datetime('now') WHERE id = ?`)
+    .run(newParentId, newSort, node.id);
+  const parentTitle = parent ? parent.title : null;
+  const text = parentChanged
+    ? (parentTitle ? `Moved "${node.title}" under "${parentTitle}"` : `Moved "${node.title}" to top level`)
+    : `Reordered "${node.title}"`;
+  insertEvent(goalId, node.id, actor, 'node_moved', text, {
+    old_parent_id: oldParentId, new_parent_id: newParentId ?? null,
+    old_sort_order: node.sort_order, new_sort_order: newSort, actor,
+  });
+
+  // §2.4(1) for the OLD parent — the moved node no longer counts against it.
+  if (parentChanged && oldParentId != null) settleParentIfComplete(oldParentId);
+
+  // SSE: the node + every descendant (their derived path/depth changed).
+  const fresh = getRawNodeStmt.get(node.id) as GoalNodeDbRow;
+  emitNode('updated', fresh);
+  const descendantIds = collectDescendantIds(goalId, node.id);
+  for (const id of descendantIds) emitNode('updated', getRawNodeStmt.get(id) as GoalNodeDbRow);
+  // Focus is untouched; if it points into the moved subtree, re-emit so the
+  // focus chip's path is true (no focus_set event — the node didn't change).
+  const focus = getFocusRaw(goalId);
+  if (focus.node_id != null && (focus.node_id === node.id || descendantIds.includes(focus.node_id))) {
+    sseBus.emit('sse', { type: 'goal_focus', goal_id: goalId, focus: toFocusRow(goalId, focus) } satisfies GoalFocusEvent);
+  }
+  return { changed: true, row: fresh };
+}
+
+/** Route 31 — `POST /goals/:id/nodes/:nodeId/move`. Kevin (default actor)
+ *  moves anything non-terminal and the node is flagged for JARVIS's weigh-in;
+ *  JARVIS may only move its own ghosts directly (403 otherwise → propose_move). */
+export function moveGoalNode(goalId: number, nodeId: number, args: { parent_id: number | null; sort_order?: number; actor?: unknown }): GoalNodeRow {
+  const node = requireNode(goalId, nodeId);
+  const actor = assertActor(args.actor, 'kevin');
+  if (actor === 'jarvis' && node.state !== 'ghost') {
+    throw new GoalError(403, 'jarvis_must_propose', 'JARVIS may only move its own ghost proposals directly; use propose_move (tool op `move`) on a set node');
+  }
+  const newParentId = args.parent_id ?? null;
+  const oldParentId = node.parent_id ?? null;
+  const result = applyMove(goalId, node, newParentId, args.sort_order, actor);
+  // REVIEW FIX (node #483): a RE-PARENT is a restructure JARVIS weighs in on; a
+  // pure reorder among the same siblings is not (§13.8 routes Alt+↑/↓ reorders
+  // through route 16 precisely because they are not flagged). The cockpit's
+  // drag-before/after within one parent lands here, so keying the flag on
+  // `changed` alone fired a bogus 'moved X under A → now A' cue and parked the
+  // row in awaiting_jarvis for every little nudge.
+  if (result.changed && actor === 'kevin' && oldParentId !== newParentId) {
+    flagKevinStructureChange(goalId, nodeId, 'moved', oldParentId ?? -1, newParentId);
+  }
+  return deriveSingleNode(getRawNodeStmt.get(nodeId) as GoalNodeDbRow);
+}
+
+/** Route 32 — `POST /goals/:id/nodes/:nodeId/propose_move` (JARVIS → non-ghost
+ *  node). Stores `pending_parent_id` (-1 = to root); Kevin resolves via route 19. */
+export function proposeMove(goalId: number, nodeId: number, parentId: number | null, actor?: unknown): GoalNodeRow {
+  const node = requireNode(goalId, nodeId);
+  const act = assertActor(actor, 'jarvis');
+  if (node.state === 'working') {
+    throw new GoalError(409, 'leaf_already_dispatched', 'a working leaf cannot be re-parented by proposal while its tree runs');
+  }
+  if (!['set', 'planned', 'check', 'parked'].includes(node.state)) {
+    throw new GoalError(409, 'invalid_transition', `node is ${node.state}, must be set/planned/check/parked to propose a move`, { from: node.state, to: node.state });
+  }
+  const target = parentId ?? null;
+  if ((node.parent_id ?? null) === target) {
+    throw new GoalError(409, 'nothing_to_move', 'node is already under that parent');
+  }
+  validateMoveTarget(goalId, node, target);
+  // A pending move coexists with a pending text edit; a removal supersedes both.
+  sqliteDb.prepare(`UPDATE goal_nodes SET pending_parent_id = ?, pending_removal = 0, pending_by = 'jarvis', updated_at = datetime('now') WHERE id = ?`)
+    .run(target ?? -1, nodeId);
+  const parentTitle = target != null ? (getRawNodeStmt.get(target) as GoalNodeDbRow).title : null;
+  insertEvent(goalId, nodeId, act, 'move_proposed', parentTitle ? `Move proposed: under "${parentTitle}"` : 'Move proposed: to top level', { parent_id: target });
+  const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
+  emitNode('updated', fresh);
+  return deriveSingleNode(fresh);
+}
+
+// -- §13.4/§13.5 — the review flag + the debounced structure digest --------
+
+export type StructureChangeKind = 'added' | 'moved' | 'edited';
+export interface StructureChangeEntry {
+  node_id: number;
+  kind: StructureChangeKind;
+  from: number | null;   // moved: old parent id (-1 = root)
+  to: number | null;     // moved/added: new parent id (null = root)
+  at: string;
+}
+interface StructureBurst { timer: NodeJS.Timeout | null; entries: Map<number, StructureChangeEntry> }
+const structureBursts = new Map<number, StructureBurst>();
+
+/** 20 s per goal by default (Kevin drags several rows in a burst); the sim sets
+ *  GOALS_STRUCTURE_DEBOUNCE_MS low. */
+const STRUCTURE_DEBOUNCE_MS = (() => {
+  const n = Number(process.env.GOALS_STRUCTURE_DEBOUNCE_MS);
+  return Number.isFinite(n) && n >= 0 ? n : 20_000;
+})();
+
+/** Mark `nodeId` as a Kevin structure change awaiting JARVIS (§13.4 rows 1/3)
+ *  and add it to the goal's burst. (Row 2 — set-node text edit — sets the flag
+ *  inside patchGoalNode's own UPDATE and only schedules here.) */
+function flagKevinStructureChange(goalId: number, nodeId: number, kind: StructureChangeKind, from: number | null, to: number | null): void {
+  if (kind === 'moved') {
+    sqliteDb.prepare(`
+      UPDATE goal_nodes SET review_state = 'awaiting_jarvis', last_edited_by = 'kevin', review_note = NULL,
+        kevin_moved_at = datetime('now'), kevin_move_from = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `).run(from ?? -1, nodeId);
+  } else {
+    sqliteDb.prepare(`
+      UPDATE goal_nodes SET review_state = 'awaiting_jarvis', last_edited_by = 'kevin', review_note = NULL, updated_at = datetime('now')
+      WHERE id = ?
+    `).run(nodeId);
+  }
+  emitNode('updated', getRawNodeStmt.get(nodeId) as GoalNodeDbRow);
+  scheduleStructureDigest(goalId, { node_id: nodeId, kind, from, to, at: new Date().toISOString() });
+}
+
+function scheduleStructureDigest(goalId: number, entry: StructureChangeEntry): void {
+  let burst = structureBursts.get(goalId);
+  if (!burst) {
+    burst = { timer: null, entries: new Map() };
+    structureBursts.set(goalId, burst);
+  }
+  if (burst.timer) clearTimeout(burst.timer);
+  burst.entries.set(entry.node_id, entry); // latest change per node wins
+  burst.timer = setTimeout(() => fireGoalStructureCue(goalId), STRUCTURE_DEBOUNCE_MS);
+  burst.timer.unref?.();
+}
+
+function parentLabel(goal: GoalRow, parentId: number | null): string {
+  if (parentId == null || parentId === -1) return `${goal.title} (root)`;
+  const p = pathForNode(parentId);
+  return p ? p.join(' › ') : `${goal.title} › #${parentId}`;
+}
+
+/** §13.5 — fire the pending structure digest for a goal NOW (the debounce timer
+ *  calls this; exported for the sim / an explicit flush). ONE `kevin_restructured`
+ *  event + ONE cue via the §11.3 seam. Nodes that no longer await JARVIS
+ *  (already agreed / discarded) are dropped. */
+export function fireGoalStructureCue(goalId: number): void {
+  const burst = structureBursts.get(goalId);
+  structureBursts.delete(goalId);
+  if (!burst) return;
+  if (burst.timer) clearTimeout(burst.timer);
+  const goal = getGoalRowStmt.get(goalId) as GoalRow | undefined;
+  if (!goal) return;
+
+  const entries = [...burst.entries.values()].filter((e) => {
+    const n = getRawNodeStmt.get(e.node_id) as GoalNodeDbRow | undefined;
+    return !!n && n.goal_id === goalId && n.state !== 'discarded' && n.review_state === 'awaiting_jarvis' && n.last_edited_by === 'kevin';
+  });
+  if (!entries.length) return;
+
+  const summary: string[] = [];
+  const blocks: string[] = [];
+  for (const e of entries) {
+    const n = getRawNodeStmt.get(e.node_id) as GoalNodeDbRow;
+    const nowParent = parentLabel(goal, n.parent_id);
+    if (e.kind === 'moved') {
+      summary.push(`moved "${n.title}" under "${n.parent_id != null ? (getRawNodeStmt.get(n.parent_id) as GoalNodeDbRow | undefined)?.title ?? `#${n.parent_id}` : 'root'}"`);
+      blocks.push(`#${n.id} moved: "${n.title}" — from: ${parentLabel(goal, n.kevin_move_from ?? e.from)} → now: ${nowParent}`);
+    } else if (e.kind === 'added') {
+      summary.push(`added "${n.title}" under "${n.parent_id != null ? (getRawNodeStmt.get(n.parent_id) as GoalNodeDbRow | undefined)?.title ?? `#${n.parent_id}` : 'root'}"`);
+      blocks.push(`#${n.id} added: "${n.title}" under ${nowParent} — done: "${n.done_means ?? ''}"`);
+    } else {
+      let orig: { title?: string; done_means?: string } = {};
+      if (n.kevin_edit_original) {
+        try { orig = JSON.parse(n.kevin_edit_original) as { title?: string; done_means?: string }; } catch { /* keep {} */ }
+      }
+      summary.push(`edited "${orig.title ?? n.title}"`);
+      blocks.push(
+        `#${n.id} edited: "${orig.title ?? n.title}" now: "${n.title}" — done: "${n.done_means ?? ''}"\n` +
+        `    was: "${orig.title ?? ''}" — done: "${orig.done_means ?? ''}"`,
+      );
+    }
+  }
+  const header = `[goal #${goalId} — Kevin restructured the tree: ${summary.join('; ')}. Weigh in.]`;
+  const footer =
+    'For each node: acknowledge the change in a sentence, then either agree → `goals` op `accept` {node_id} (the flag clears; it stays set), ' +
+    'or `push_back` {node_id, note} with your reason in one or two sentences and talk it out. Don\'t restate the rest of the tree.';
+  const text = [header, ...blocks, footer].join('\n');
+
+  insertEvent(goalId, null, 'system', 'kevin_restructured', header, { entries });
+  emitGoal('updated', goalId);
+
+  const externalId = `cockpit:goal-${goalId}`;
+  const conv = getConversation(externalId);
+  if (!conv) {
+    console.warn(`[goals] structure cue skipped — no conversation for ${externalId}`);
+    return;
+  }
+  const eventId = (lastEventIdStmt.get(goalId) as { id: number } | undefined)?.id ?? 0;
+  const correlationKey = `goal-structure:${goalId}:${eventId}`;
+  const convId = conv.id;
+  Promise.all([import('./agent.js'), import('./thread-message-queue.js')])
+    .then(([agent, queue]) => {
+      if (agent.getInFlightMessageId(convId)) {
+        queue.enqueueMessage(convId, text);
+        return;
+      }
+      agent.processMessage(text, externalId, correlationKey).catch((err: unknown) => {
+        if (err instanceof agent.ConversationBusyError) queue.enqueueMessage(convId, text);
+        else console.error('[goals] structure cue post failed', err);
+      });
+    })
+    .catch((err) => console.error('[goals] structure cue import failed', err));
+}
+
+/** Test/ops helper: is a digest pending for this goal? */
+export function hasPendingStructureDigest(goalId: number): boolean {
+  return structureBursts.has(goalId);
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,7 +1738,12 @@ export function verifyGoalNode(goalId: number, nodeId: number, passed: boolean, 
   const act = assertActor(actor, 'kevin');
 
   if (passed) {
-    sqliteDb.prepare(`UPDATE goal_nodes SET state = 'done', verified_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`).run(nodeId);
+    sqliteDb.prepare(`
+      UPDATE goal_nodes SET state = 'done', verified_at = datetime('now'),
+        review_state = 'none', review_note = NULL, last_edited_by = NULL, kevin_edit_original = NULL, kevin_moved_at = NULL, kevin_move_from = NULL,
+        updated_at = datetime('now')
+      WHERE id = ?
+    `).run(nodeId);
     insertEvent(goalId, nodeId, act, 'node_verified', note ? `Verified: ${note}` : 'Verified.', { passed: true, note });
     emitNode('updated', getRawNodeStmt.get(nodeId) as GoalNodeDbRow);
     maybeSettleParent(nodeId);
@@ -1818,12 +2186,27 @@ export function promoteNode(goalId: number, nodeId: number, actor?: unknown): {
 // -- §6 per-turn focus injection (agent.ts, cockpit:goal-* threads only) --
 
 function nodeMarker(n: GoalNodeDbRow): string {
+  let marker = baseMarker(n);
+  // v0.2 §13.7 — Kevin restructured/edited this node himself; awaiting JARVIS.
+  if (n.review_state === 'awaiting_jarvis' && n.last_edited_by === 'kevin') {
+    if (n.kevin_moved_at) marker += ' ↕K';
+    else if (n.state !== 'ghost') marker += ' ✎K';
+  }
+  return marker;
+}
+
+function baseMarker(n: GoalNodeDbRow): string {
   if (n.state === 'ghost') {
     const base = `ghost b:${(n.proposal_batch ?? '').slice(0, 4)}`;
     return n.last_edited_by === 'kevin' ? `${base} ✎K` : base;
   }
   if (n.pending_removal) return 'set ✂pending';
-  if (n.pending_title != null || n.pending_done_means != null) return 'set ✎pending';
+  if (n.pending_title != null || n.pending_done_means != null || n.pending_parent_id != null) {
+    const parts: string[] = [];
+    if (n.pending_title != null || n.pending_done_means != null) parts.push('✎pending');
+    if (n.pending_parent_id != null) parts.push('↕pending');
+    return `set ${parts.join(' ')}`;
+  }
   if (n.state === 'set') {
     if (n.leaf_kind === 'human') return 'human';
     if (n.leaf_kind === 'machine') return n.plan_state === 'proposed' ? 'machine plan?' : 'machine';
@@ -1840,11 +2223,18 @@ function nodeMarker(n: GoalNodeDbRow): string {
 /** CONTRACT §11.4 — per-line suffix telling JARVIS a ghost needs its weigh-in. */
 function reviewLineSuffix(n: GoalNodeDbRow): string {
   if (n.review_state === 'awaiting_jarvis') {
-    let origTitle = '';
     if (n.kevin_edit_original) {
+      let origTitle = '';
       try { origTitle = (JSON.parse(n.kevin_edit_original) as { title?: string }).title ?? ''; } catch { /* keep '' */ }
+      return ` — AWAITING YOUR TAKE (was: "${origTitle}")`;
     }
-    return ` — AWAITING YOUR TAKE (was: "${origTitle}")`;
+    // v0.2 §13.7 — a structure change (no text snapshot): where it came from, or that it is new.
+    if (n.kevin_moved_at) {
+      const from = n.kevin_move_from;
+      const fromTitle = from == null || from === -1 ? 'root' : ((getRawNodeStmt.get(from) as GoalNodeDbRow | undefined)?.title ?? `#${from}`);
+      return ` — AWAITING YOUR TAKE (moved from: "${fromTitle}")`;
+    }
+    return ' — AWAITING YOUR TAKE (Kevin added this)';
   }
   if (n.review_state === 'pushed_back' && n.review_note) {
     return ` — you pushed back: "${n.review_note}"`;
@@ -1854,7 +2244,11 @@ function reviewLineSuffix(n: GoalNodeDbRow): string {
 
 function pendingLabel(n: GoalNodeDbRow): string {
   if (n.pending_removal) return 'removal';
-  if (n.pending_title != null || n.pending_done_means != null) return 'edit';
+  const edit = n.pending_title != null || n.pending_done_means != null;
+  const move = n.pending_parent_id != null;
+  if (edit && move) return 'edit+move';
+  if (edit) return 'edit';
+  if (move) return 'move';
   return 'none';
 }
 

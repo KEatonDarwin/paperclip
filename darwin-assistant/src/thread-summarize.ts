@@ -1,4 +1,4 @@
-import { runClaude } from './agent.js';
+import { getAdapters, runClaude } from './agent.js';
 import { getTurns, type ConversationRow, type TurnRow } from './conversation-db.js';
 import { createThreadSummary, type ThreadSummaryRow } from './thread-summaries.js';
 
@@ -37,11 +37,23 @@ Thread transcript so far:
 ${transcript}
 """`;
 
-export async function generateThreadSummary(conv: ConversationRow): Promise<ThreadSummaryRow> {
+// SHARED CONTEXT v0 §3 (docs/shared-context/CONTRACT.md): optional
+// adapter/model override so the summary refresher can route these one-shots
+// at a cheap tier (e.g. claude-haiku-4-5) without touching the default
+// caller (group-chat-context.ts, the manual "Summarize" button), which keeps
+// passing no opts and gets byte-identical behavior — active-adapter default,
+// null session.
+export async function generateThreadSummary(
+  conv: ConversationRow,
+  opts?: { adapter?: string; model?: string },
+): Promise<ThreadSummaryRow> {
   const turns = getTurns(conv.id);
   const lastTurn = turns[turns.length - 1] ?? null;
   const transcript = renderTranscript(turns);
-  const result = await runClaude(SUMMARY_PROMPT(transcript || '(no messages yet)'), null);
+  const runtime = opts?.model
+    ? { adapter: getAdapters()[opts.adapter ?? 'claude'] ?? getAdapters()['claude'], model: opts.model }
+    : undefined;
+  const result = await runClaude(SUMMARY_PROMPT(transcript || '(no messages yet)'), null, undefined, runtime);
   const content = result.text.trim() || '_Nothing to summarize yet._';
   return createThreadSummary(conv.id, content, lastTurn?.id ?? null, lastTurn?.turn_index ?? 0);
 }

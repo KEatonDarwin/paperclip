@@ -1,0 +1,11 @@
+[Unit]
+Description=JARVIS shared-context thread-summary refresher (one-shot)
+After=network.target jarvis.service
+
+[Service]
+Type=oneshot
+User=kevin
+WorkingDirectory=/home/kevin/paperclip/darwin-assistant
+EnvironmentFile=-/home/kevin/paperclip/darwin-assistant/.env
+Environment=PATH=/home/kevin/.local/bin:/home/kevin/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/npx tsx scripts/refresh-thread-summaries.ts

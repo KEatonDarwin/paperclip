@@ -1550,6 +1550,8 @@ try {
   await check('G-9a', 'need_you is UNCHANGED by guard proposals/health flips/discards (§12.11 — a failing guard cues the chat, it is not a fresh approval)', async () => {
     const tree = await get(`/goals/${goalId}`);
     assert.equal(tree.json.goal.counts.need_you, needYouBaseline, 'need_you must not move because of any guard event in this section');
+  });
+
   // v0.2 §13 — Kevin restructures the tree himself (add row / move / indent)
   // -> JARVIS weighs in on his next turn. CONTRACT.md §13.9, checks V02-*.
   // ─────────────────────────────────────────────────────────────────────────

@@ -1391,6 +1391,101 @@ try {
     assert.equal((await post(`/goals/${v02GoalId}/nodes/${wId}/accept`, { actor: 'jarvis' })).status, 200);
   });
 
+  await check(
+    'V02-10',
+    'FOCUS SURVIVES A MOVE: moving the focused node (or an ancestor of the focused node) refreshes its path via a ' +
+      'goal_focus SSE, WITHOUT changing focus.node_id and WITHOUT a focus_set event; an unrelated move fires no goal_focus at all',
+    async () => {
+      // -- direct case: focus IS the node being moved --------------------------
+      const target = await post(`/goals/${v02GoalId}/nodes`, {
+        title: 'Focus target', done_means: 'x', parent_id: null, authored_by: 'kevin', actor: 'jarvis',
+      });
+      assert.equal(target.status, 201, JSON.stringify(target.json));
+      const targetId = target.json.node.id;
+      await put(`/goals/${v02GoalId}/focus`, { node_id: targetId });
+      await waitFor('goal_focus SSE after focusing the target', async () =>
+        sseV02.events.some((e: any) => e.type === 'goal_focus' && e.goal_id === v02GoalId && e.focus.node_id === targetId));
+
+      const eventsBefore = (await get(`/goals/${v02GoalId}/events?limit=500`)).json.events.length;
+      const sseBefore = sseV02.events.length;
+      const mv = await post(`/goals/${v02GoalId}/nodes/${targetId}/move`, { parent_id: mbiId });
+      assert.equal(mv.status, 200, JSON.stringify(mv.json));
+      assert.equal(mv.json.node.parent_id, mbiId);
+      assert.deepEqual(mv.json.node.path, ['v0.2 restructure drill', 'MBI', 'Focus target'], 'moved node\'s own path refreshed in the move response');
+
+      await sleep(150);
+      const focusEvents = sseV02.events.slice(sseBefore).filter((e: any) => e.type === 'goal_focus' && e.goal_id === v02GoalId) as any[];
+      assert.equal(focusEvents.length, 1, 'exactly one goal_focus SSE for the move of the focused node itself');
+      assert.equal(focusEvents[0].focus.node_id, targetId, 'focus.node_id UNCHANGED — the focus row itself is untouched');
+      assert.deepEqual(focusEvents[0].focus.path, ['MBI', 'Focus target'], 'focus.path refreshed to reflect the new parent chain');
+
+      const tree = (await get(`/goals/${v02GoalId}`)).json;
+      assert.equal(tree.focus.node_id, targetId, 'GET /goals/:id focus still points at the same node after the move');
+      assert.deepEqual(tree.focus.path, ['MBI', 'Focus target'], 'GET /goals/:id focus.path reflects the move');
+
+      // The move itself logs exactly one node_moved event; the debounced structure
+      // digest (§13.5, 60ms in the sim) ALSO lands within this window and logs its
+      // own kevin_restructured event — that's expected (V02-4 covers the digest's
+      // shape directly). The thing THIS check cares about: no focus_set event, i.e.
+      // the focus row itself never changed, only its derived path was re-emitted.
+      const eventsAfter = (await get(`/goals/${v02GoalId}/events?limit=500`)).json.events;
+      const newEvents = eventsAfter.slice(eventsBefore);
+      assert.ok(newEvents.some((e: any) => e.kind === 'node_moved'), 'expected a node_moved event');
+      assert.ok(!newEvents.some((e: any) => e.kind === 'focus_set'), 'no focus_set event — the focus row did not change, only its derived path');
+
+      // close the review round this move opened, so V02-2's awaiting_jarvis=0 still holds
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${targetId}/accept`, { actor: 'jarvis' })).status, 200);
+
+      // -- descendant case: focus is a CHILD of the node being moved ------------
+      const child = await post(`/goals/${v02GoalId}/nodes`, {
+        title: 'Focus target child', done_means: 'x', parent_id: targetId, authored_by: 'kevin', actor: 'jarvis',
+      });
+      assert.equal(child.status, 201);
+      const childId = child.json.node.id;
+      await put(`/goals/${v02GoalId}/focus`, { node_id: childId });
+      // let the focus-change's own goal_focus SSE land before we baseline the
+      // window for the move below (the SSE reader runs on its own async loop and
+      // can lag the HTTP response by a beat).
+      await waitFor('goal_focus SSE after focusing the child', async () =>
+        sseV02.events.some((e: any) => e.type === 'goal_focus' && e.goal_id === v02GoalId && e.focus.node_id === childId));
+
+      const sseBefore2 = sseV02.events.length;
+      const mv2 = await post(`/goals/${v02GoalId}/nodes/${targetId}/move`, { parent_id: biId });
+      assert.equal(mv2.status, 200, JSON.stringify(mv2.json));
+      await sleep(150);
+      const focusEvents2 = sseV02.events.slice(sseBefore2).filter((e: any) => e.type === 'goal_focus' && e.goal_id === v02GoalId) as any[];
+      assert.equal(focusEvents2.length, 1, 'moving an ANCESTOR of the focused node also emits exactly one goal_focus');
+      assert.equal(focusEvents2[0].focus.node_id, childId, 'focus.node_id still the descendant, unchanged');
+      assert.deepEqual(
+        focusEvents2[0].focus.path,
+        ['BI', 'Focus target', 'Focus target child'],
+        'focus.path re-derived through the moved ancestor\'s new location',
+      );
+      const tree2 = (await get(`/goals/${v02GoalId}`)).json;
+      assert.deepEqual(tree2.focus.path, ['BI', 'Focus target', 'Focus target child']);
+
+      // close the review round the second move opened
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${targetId}/accept`, { actor: 'jarvis' })).status, 200);
+
+      // -- negative control: moving something unrelated to the focus fires no goal_focus --
+      const sseBefore3 = sseV02.events.length;
+      const unrelated = await post(`/goals/${v02GoalId}/nodes`, {
+        title: 'Unrelated', done_means: 'x', parent_id: null, authored_by: 'kevin', actor: 'jarvis',
+      });
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${unrelated.json.node.id}/move`, { parent_id: mbiId })).status, 200);
+      await sleep(150);
+      assert.equal(
+        sseV02.events.slice(sseBefore3).filter((e: any) => e.type === 'goal_focus' && e.goal_id === v02GoalId).length,
+        0,
+        'a move that touches neither the focused node nor its ancestor fires no goal_focus event',
+      );
+
+      // tidy: close the round this last move opened (targetId's round was already
+      // closed after the descendant-case move above)
+      assert.equal((await post(`/goals/${v02GoalId}/nodes/${unrelated.json.node.id}/accept`, { actor: 'jarvis' })).status, 200);
+    },
+  );
+
   await check('V02-2', 'V01 regressions intact: ghost round still needs Kevin ✓; sort_order-only ghost PATCH untouched (checked above); counts', async () => {
     const tree = (await get(`/goals/${v02GoalId}`)).json;
     assert.equal(tree.goal.counts.awaiting_jarvis, 0, 'every round closed');

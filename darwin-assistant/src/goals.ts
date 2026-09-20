@@ -944,7 +944,13 @@ function applyAcceptToNode(goalId: number, node: GoalNodeDbRow, actor: GoalActor
     // JARVIS agrees with Kevin's edit → it solidifies.
     return { row: setGhostToSet(goalId, node.id, actor, 'node_agreed', `JARVIS agreed with Kevin's edit: ${node.title}`), outcome: 'agreed', reask: false };
   }
-  // No Kevin edit awaiting → v0 rule (only when Kevin said yes in chat).
+  // No open round. If Kevin still made the last edit (he reworded it but hasn't
+  // clicked ✓ yet), JARVIS accepting IS the non-editing party agreeing — log it
+  // as such so the trail reads true. Otherwise it's the plain v0 rule (only when
+  // Kevin said yes in chat).
+  if (node.last_edited_by === 'kevin') {
+    return { row: setGhostToSet(goalId, node.id, actor, 'node_agreed', `JARVIS agreed with Kevin's edit: ${node.title}`), outcome: 'agreed', reask: false };
+  }
   return { row: setGhostToSet(goalId, node.id, actor, 'node_accepted', `Accepted: ${node.title}`), outcome: 'set', reask: false };
 }
 
@@ -958,14 +964,14 @@ export function acceptGoalNode(goalId: number, nodeId: number, actor?: unknown):
 }
 
 function acceptRows(goalId: number, rows: GoalNodeDbRow[], actor: GoalActor): GoalNodeRow[] {
-  const missing = rows.filter((r) => !r.done_means?.trim());
-  if (missing.length) {
-    throw new GoalError(409, 'done_means_required', 'some nodes are missing done_means', { node_ids: missing.map((r) => r.id) });
-  }
   // A "✓ all" / batch accept from Kevin should not error the whole batch just
   // because one node is mid-review — skip those (a re-click on a single node
   // still 409s via applyAcceptToNode, per CONTRACT §11.2).
   const toProcess = actor === 'kevin' ? rows.filter((r) => r.review_state !== 'awaiting_jarvis') : rows;
+  const missing = toProcess.filter((r) => !r.done_means?.trim());
+  if (missing.length) {
+    throw new GoalError(409, 'done_means_required', 'some nodes are missing done_means', { node_ids: missing.map((r) => r.id) });
+  }
   const out: GoalNodeRow[] = [];
   const awaiting: GoalNodeRow[] = [];
   for (const r of toProcess) {
@@ -1147,13 +1153,19 @@ export function patchGoalNode(goalId: number, nodeId: number, patch: {
   //  - JARVIS edits (edit_ghost) → last_edited_by='jarvis', review reset; JARVIS
   //    took the last word so Kevin's next ✓ sets it. kevin_edit_original is kept.
   // Non-ghost edits (Kevin only) never touch the review machinery.
-  const isGhost = node.state === 'ghost';
+  // A PATCH that doesn't actually change title/done_means/notes (a bare
+  // re-save, or a sort_order-only reorder) is NOT an edit — it must not hand
+  // the "last word" to anyone, and must not reset an open review round that
+  // JARVIS is mid-way through answering (CONTRACT §11.2 keys the transition on
+  // title/done_means/notes).
+  const textChanged = title !== node.title || doneMeans !== node.done_means || notes !== node.notes;
+  const ghostEdit = node.state === 'ghost' && textChanged;
   let lastEditedBy = node.last_edited_by;
   let kevinOriginal = node.kevin_edit_original;
   let reviewState: ReviewState = node.review_state;
   let reviewNote = node.review_note;
   let editEventKind = 'node_updated';
-  if (isGhost && actor === 'kevin') {
+  if (ghostEdit && actor === 'kevin') {
     lastEditedBy = 'kevin';
     if (kevinOriginal == null) {
       kevinOriginal = JSON.stringify({ title: node.title, done_means: node.done_means, notes: node.notes });
@@ -1161,7 +1173,7 @@ export function patchGoalNode(goalId: number, nodeId: number, patch: {
     reviewState = 'none';
     reviewNote = null;
     editEventKind = 'ghost_edited_by_kevin';
-  } else if (isGhost && actor === 'jarvis') {
+  } else if (ghostEdit && actor === 'jarvis') {
     lastEditedBy = 'jarvis';
     reviewState = 'none';
     reviewNote = null;

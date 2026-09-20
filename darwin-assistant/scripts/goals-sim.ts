@@ -1027,6 +1027,54 @@ try {
     assert.match(block, /✎K/);
     assert.match(block, /AWAITING YOUR TAKE/);
   });
+
+  // --- review-node additions (#472): a PATCH that changes no text is not an edit ---
+  await check('V01-10', 'a no-op Kevin PATCH (same text) does NOT flip last_edited_by / reset an open round', async () => {
+    const [aId] = v01MixIds;              // still ghost + awaiting_jarvis from V01-9b
+    const before = cueCallCount();
+    const node = (await get(`/goals/${v01GoalId}`)).json.nodes.find((n: any) => n.id === aId);
+    assert.equal(node.review_state, 'awaiting_jarvis', 'precondition: node is mid weigh-in');
+    const r = await patch(`/goals/${v01GoalId}/nodes/${aId}`, { title: node.title, done_means: node.done_means });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.node.review_state, 'awaiting_jarvis', 'a bare re-save must not cancel the round JARVIS is answering');
+    assert.equal(r.json.node.last_edited_by, 'kevin');
+    await sleep(120);
+    assert.equal(cueCallCount(), before, 'no-op PATCH fires no cue');
+  });
+
+  await check('V01-11', 'a sort_order-only PATCH does NOT mark a JARVIS ghost as Kevin-edited', async () => {
+    const p1 = await post(`/goals/${v01GoalId}/nodes`, {
+      title: 'Reorder me', done_means: 'it exists', authored_by: 'jarvis', actor: 'jarvis',
+    });
+    assert.equal(p1.status, 201, JSON.stringify(p1.json));
+    const id = p1.json.node.id;
+    assert.equal(p1.json.node.state, 'ghost');
+    const r = await patch(`/goals/${v01GoalId}/nodes/${id}`, { sort_order: 42 });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.node.sort_order, 42);
+    assert.equal(r.json.node.last_edited_by, null, 'a reorder is not an edit — the last word stays with JARVIS');
+    assert.equal(r.json.node.kevin_edit_original, null);
+    // ...so Kevin's ✓ still solidifies it directly (v0 path).
+    const acc = await post(`/goals/${v01GoalId}/nodes/${id}/accept`, {});
+    assert.equal(acc.status, 200, JSON.stringify(acc.json));
+    assert.equal(acc.json.node.state, 'set');
+  });
+
+  await check('V01-12', 'JARVIS accept on a ghost Kevin edited but has not OK\'d yet -> sets, logged as node_agreed', async () => {
+    const p1 = await post(`/goals/${v01GoalId}/nodes`, {
+      title: 'JARVIS wording', done_means: 'jarvis done', authored_by: 'jarvis', actor: 'jarvis',
+    });
+    const id = p1.json.node.id;
+    const ed = await patch(`/goals/${v01GoalId}/nodes/${id}`, { title: 'Kevin wording' });
+    assert.equal(ed.json.node.last_edited_by, 'kevin');
+    assert.equal(ed.json.node.review_state, 'none', 'Kevin has not clicked OK yet');
+    const acc = await post(`/goals/${v01GoalId}/nodes/${id}/accept`, { actor: 'jarvis' });
+    assert.equal(acc.status, 200, JSON.stringify(acc.json));
+    assert.equal(acc.json.node.state, 'set');
+    assert.equal(acc.json.node.last_edited_by, null);
+    const ev = (await get(`/goals/${v01GoalId}/events?limit=500`)).json.events.find((e: any) => e.node_id === id && e.kind === 'node_agreed');
+    assert.ok(ev, 'the non-editing party approving Kevin\'s wording is an agreement, not a bare accept');
+  });
 } finally {
   server.close();
 }

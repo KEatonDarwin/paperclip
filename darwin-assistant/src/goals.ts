@@ -599,6 +599,7 @@ export function composeGoalSeed(goal: GoalRow): string {
     "4. A node that can't split is a leaf: `set_leaf_kind` machine (you can spec it) or human (only Kevin can do it). Machine leaves get a `propose_plan`; Kevin approves on the card (or says go → `dispatch`).",
     "5. Push back when a branch doesn't serve the goal. Verify against done_means before anything becomes done (`verify`).",
     "6. Kevin never has to say which node he means — the focus line tells you. If he clearly means a different node, say which one you're taking it as.",
+    "7. A `[goal #N — Kevin edited ... Weigh in.]` message means Kevin reworded one of your ghosts and OK'd it — it does not solidify until you weigh in (SKILL.md has the full loop). For each node listed: read it, then either `accept` {node_id} if you agree, or `push_back` {node_id, note} with your reason if you don't. Don't restate the rest of the tree.",
     '',
     'Open with: if done_means is empty, your clarify questions; otherwise a two-line read of where this goal stands and what you\'d propose next under the current focus.',
   ].join('\n');
@@ -1731,7 +1732,10 @@ export function promoteNode(goalId: number, nodeId: number, actor?: unknown): {
 // -- §6 per-turn focus injection (agent.ts, cockpit:goal-* threads only) --
 
 function nodeMarker(n: GoalNodeDbRow): string {
-  if (n.state === 'ghost') return `ghost b:${(n.proposal_batch ?? '').slice(0, 4)}`;
+  if (n.state === 'ghost') {
+    const base = `ghost b:${(n.proposal_batch ?? '').slice(0, 4)}`;
+    return n.last_edited_by === 'kevin' ? `${base} ✎K` : base;
+  }
   if (n.pending_removal) return 'set ✂pending';
   if (n.pending_title != null || n.pending_done_means != null) return 'set ✎pending';
   if (n.state === 'set') {
@@ -1745,6 +1749,21 @@ function nodeMarker(n: GoalNodeDbRow): string {
   if (n.state === 'done') return 'done ✓';
   if (n.state === 'parked') return 'parked';
   return n.state;
+}
+
+/** CONTRACT §11.4 — per-line suffix telling JARVIS a ghost needs its weigh-in. */
+function reviewLineSuffix(n: GoalNodeDbRow): string {
+  if (n.review_state === 'awaiting_jarvis') {
+    let origTitle = '';
+    if (n.kevin_edit_original) {
+      try { origTitle = (JSON.parse(n.kevin_edit_original) as { title?: string }).title ?? ''; } catch { /* keep '' */ }
+    }
+    return ` — AWAITING YOUR TAKE (was: "${origTitle}")`;
+  }
+  if (n.review_state === 'pushed_back' && n.review_note) {
+    return ` — you pushed back: "${n.review_note}"`;
+  }
+  return '';
 }
 
 function pendingLabel(n: GoalNodeDbRow): string {
@@ -1813,7 +1832,8 @@ export function buildGoalThreadContext(externalId: string): string {
           && (focusNode ? (n.id === focusNode.id || ancestorIds.has(n.id)) : depth === 0);
         const hidden = children.length && !showChildren ? countDescendants(n.id) : 0;
         const collapsed = hidden > 0 ? ` (+${hidden})` : '';
-        lines.push(`${indent}- [${marker}] #${n.id} ${n.title}${stub} — done: ${doneMeans}${collapsed}`);
+        const reviewSuffix = reviewLineSuffix(n);
+        lines.push(`${indent}- [${marker}] #${n.id} ${n.title}${stub} — done: ${doneMeans}${collapsed}${reviewSuffix}`);
         if (showChildren) walk(n.id, depth + 1);
       }
     }
@@ -1825,7 +1845,7 @@ export function buildGoalThreadContext(externalId: string): string {
     }
 
     const header = `# ${goal.title} — done: ${goal.done_means ?? '(not set yet)'}`;
-    const treeBlock = `<goal_tree goal_id="${goalId}" status="${goal.status}" progress="${counts.progress}" working="${counts.working}" need_you="${counts.need_you}">\n${header}\n${body.join('\n')}\n</goal_tree>`;
+    const treeBlock = `<goal_tree goal_id="${goalId}" status="${goal.status}" progress="${counts.progress}" working="${counts.working}" need_you="${counts.need_you}" awaiting_you="${counts.awaiting_jarvis}">\n${header}\n${body.join('\n')}\n</goal_tree>`;
     return `${focusLine}\n${treeBlock}\n`;
   } catch {
     return '';

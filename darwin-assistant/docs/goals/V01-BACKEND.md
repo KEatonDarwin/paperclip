@@ -53,3 +53,73 @@ list gains the four new event kinds (`ghost_edited_by_kevin`, `kevin_okd_edit`,
 ## Out of scope for this node (owned elsewhere)
 - §11.3 cue *body*: implemented here fully (compose + post). §11.4 focus-injection markers
   (`✎K`, `AWAITING YOUR TAKE`, `awaiting_you`) and §11.5 cockpit UI are separate nodes.
+
+---
+
+## Node #469 — §11.4 focus-injection markers + seed rule + manual exercise
+
+Additive on top of #468's commit. `tsc` clean.
+
+### `src/goals.ts`
+
+| What | Anchor | Notes |
+|---|---|---|
+| `nodeMarker` gains `✎K` | `src/goals.ts` (`nodeMarker`, ghost branch) | appended to the `ghost b:<batch>` marker when `last_edited_by='kevin'` |
+| `reviewLineSuffix` (NEW) | `src/goals.ts` (next to `pendingLabel`) | ` — AWAITING YOUR TAKE (was: "<orig title>")` for `awaiting_jarvis` (title read back out of `kevin_edit_original`); ` — you pushed back: "<review_note>"` for `pushed_back` |
+| `walk()` in `buildGoalThreadContext` | `src/goals.ts` | tree-line now appends `reviewLineSuffix(n)` after the done-means/collapsed-count segment |
+| `<goal_tree …>` | `src/goals.ts` (`buildGoalThreadContext`) | new attribute `awaiting_you="${counts.awaiting_jarvis}"` (reuses the count #468 already computes — no new query) |
+| `composeGoalSeed` rule #7 (NEW) | `src/goals.ts` | tells a fresh goal-thread persona what a `[goal #N — Kevin edited …]` cue means and how to answer it (`accept`/`push_back`) — SKILL.md has the long form |
+
+### Manual exercise (CONTRACT §11 end-to-end, real `goals.ts`, scratch DB)
+
+`scripts/goals-v01-cue-check.mjs` + its ESM loader hook `scripts/goals-v01-cue-check.hooks.mjs`
+drive the real `dist/goals.js` against a throwaway sqlite DB (`JARVIS_DB_PATH` guarded against
+the live path). The hook intercepts `fireGoalReviewCue`'s dynamic `import('./agent.js')` and
+swaps in a stub `processMessage`/`getInFlightMessageId`/`ConversationBusyError` — so the check
+proves the cue is composed and "sent" correctly with **zero real model calls** (no API keys,
+no claude CLI spawn). Run it with:
+
+```
+npm run build
+node scripts/goals-v01-cue-check.mjs
+```
+
+Verified in one pass, against real `createGoal`/`proposeGoalNodes`/`patchGoalNode`/
+`acceptGoalNode`/`pushBackGhost`/`buildGoalThreadContext`:
+1. Kevin edits a JARVIS-proposed ghost, then OKs it → node stays `ghost`, `review_state`
+   flips to `awaiting_jarvis`, exactly ONE cue fires.
+2. A re-click while `awaiting_jarvis` → `409 awaiting_jarvis`, no second cue.
+3. `<goal_tree awaiting_you="1">` and the `✎K` / `AWAITING YOUR TAKE (was: "...")` markers
+   appear on the awaiting node's focus-injection line.
+4. JARVIS `push_back` with a note → stays `ghost`, `review_state='pushed_back'`, the tree
+   line shows `you pushed back: "<note>"`, `awaiting_you` drops back to `0`.
+5. Kevin re-OKs with no further edit → re-asks (`awaiting_jarvis` again), a SECOND cue fires
+   quoting `you pushed back with: "<note>"`.
+6. JARVIS `accept` while `awaiting_jarvis` → node solidifies to `set`, all four review
+   columns clear, `awaiting_you` returns to `0`, the `✎K` marker disappears.
+
+**Captured cue text (step 1, verbatim):**
+```
+[goal #1 — Kevin edited 1 of your proposal and OK'd it. Weigh in.]
+#1 now: "Ship the thing FAST" — done: "thing is shipped, verified, and fast"
+    was (yours): "Ship the thing" — done: "thing is shipped and verified"
+For each node: acknowledge the change in a sentence, then either agree → `goals` op `accept` {node_id} (it solidifies), or `push_back` {node_id, note} with your reason in one or two sentences and talk it out. Don't restate the rest of the tree.
+```
+
+**Captured `<goal_tree>` line (awaiting_jarvis):**
+```
+<goal_tree goal_id="1" status="set" progress="0" working="0" need_you="1" awaiting_you="1">
+- [ghost b:3e82 ✎K ▶] #1 Ship the thing FAST — done: thing is shipped, verified, and fast — AWAITING YOUR TAKE (was: "Ship the thing")
+```
+
+**Captured re-ask cue (step 5, after push-back):**
+```
+[goal #1 — Kevin edited 1 of your proposal and OK'd it. Weigh in.]
+#1 now: "Ship the thing FAST" — done: "thing is shipped, verified, and fast"
+    was (yours): "Ship the thing" — done: "thing is shipped and verified"
+    you pushed back with: "Let's not promise "fast" until we've actually measured it."
+For each node: acknowledge the change in a sentence, then either agree → `goals` op `accept` {node_id} (it solidifies), or `push_back` {node_id, note} with your reason in one or two sentences and talk it out. Don't restate the rest of the tree.
+```
+
+### Out of scope for this node
+§11.5 cockpit UI (click-to-expand, inline edit, review chips) — separate `hopper/goals-ui-v01` node.

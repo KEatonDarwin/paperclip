@@ -524,6 +524,133 @@ try {
     const r = await getJson(`/recall?q=${NEEDLE}`, nonAdminKey);
     assert.equal(r.status, 403, JSON.stringify(r.json));
   });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // [10] ADVERSARIAL-REVIEW REGRESSIONS (node #488). Each of these failed
+  // against the LIVE DB before the review fixes; they are locked in here so a
+  // later change can't quietly undo them.
+  // ═══════════════════════════════════════════════════════════════════════
+  console.log('\n[10] adversarial-review regressions (node #488)');
+
+  const SECRET_CONV = getOrCreateConversation('cockpit:sim-secrets');
+  insertTurnRaw(
+    SECRET_CONV.id,
+    0,
+    'user',
+    `${NEEDLE}REDACT here is the config: export BROWSERBASE_API_KEY=bb_live_kyjGKRtcEmZiU1ibkW and ` +
+      `CHIP_RUNNER_API_KEY=crk_lT_iOyMBGxx_KvFC95jF5WZXX58qNRpFGjojnwo2uEU plus Authorization: Bearer abcdef0123456789abcdef`,
+    sqliteNow(-300),
+  );
+  ensureTurnsFts();
+
+  check('10a', 'recall snippets redact pasted credentials (bb_live_/crk_/KEY=/Bearer) — verified leaking on the live DB before the fix', () => {
+    const res = recall(`${NEEDLE}REDACT`, { sources: ['turn'], days: 3650 });
+    assert.ok(res.hits.length >= 1, `expected the seeded secret turn, got ${JSON.stringify(res.hits)}`);
+    const joined = res.hits.map((h: any) => h.snippet).join(' ');
+    assert.ok(!/bb_live_kyjGKRtcEmZiU1ibkW/.test(joined), `bb_live key leaked: ${joined}`);
+    assert.ok(!/crk_lT_iOyMBGxx/.test(joined), `crk_ token leaked: ${joined}`);
+    assert.ok(!/abcdef0123456789abcdef/.test(joined), `bearer token leaked: ${joined}`);
+    assert.ok(/\[redacted\]/.test(joined), `expected a [redacted] marker: ${joined}`);
+  });
+
+  await checkAsync(
+    '10b',
+    'recall is term-ORDER independent for terms containing `_` — forced LIKE mode (SQLite binds ESCAPE to the LAST LIKE only)',
+    async () => {
+      const runChild = (query: string) => {
+        const child = spawnSync(
+          process.execPath,
+          [path.join(__dirname, 'shared-context-like-check.mjs'), distDir, query],
+          {
+            env: { ...process.env, JARVIS_DB_PATH: DB_PATH, JARVIS_RECALL_FORCE_LIKE: '1', JARVIS_AUTO_MEMORY_DIR: AUTO_MEM_DIR },
+            encoding: 'utf8',
+          },
+        );
+        assert.equal(child.status, 0, `subprocess failed: ${child.stderr}`);
+        const parsed = JSON.parse(child.stdout);
+        assert.equal(parsed.mode, 'like', 'child must run in LIKE mode');
+        return parsed.hits.filter((h: any) => h.source === 'turn');
+      };
+      const underscoreFirst = runChild(`CHIP_RUNNER_API_KEY ${NEEDLE}REDACT`);
+      const underscoreLast = runChild(`${NEEDLE}REDACT CHIP_RUNNER_API_KEY`);
+      assert.ok(underscoreLast.length >= 1, 'expected the seeded secret turn when the underscore term is last');
+      assert.equal(
+        underscoreFirst.length,
+        underscoreLast.length,
+        `LIKE mode is term-order dependent: underscore-first -> ${underscoreFirst.length} turn hit(s), ` +
+          `underscore-last -> ${underscoreLast.length}`,
+      );
+    },
+  );
+
+  check('10c', 'branch extraction ignores prose like "status 0 on network/timeout" (the live digest advertised `branch network/timeout`)', () => {
+    sqliteDb.prepare(`INSERT INTO hopper_trees (id, topic, origin_thread_ext, status) VALUES (?, ?, ?, 'done')`).run(
+      'tree-sim00000004',
+      'Sim tree — prose that used to look like a branch',
+      'cockpit:sim-a',
+    );
+    sqliteDb
+      .prepare(`INSERT INTO hopper_nodes (tree_id, title, status, result) VALUES (?, 'Review', 'done', ?)`)
+      .run('tree-sim00000004', 'client never throws (status 0 on network/timeout), poller tick catch-wrapped.');
+    const data = collectSharedNow();
+    const prose = data.trees.find((t: any) => t.id === 'tree-sim00000004');
+    assert.ok(prose, 'prose tree present');
+    assert.equal(prose.branch, null, `expected no branch, got ${prose.branch}`);
+    // The real "branch mbi/ledger-v2" form must still be extracted.
+    const real = data.trees.find((t: any) => t.id === 'tree-sim00000002');
+    assert.equal(real.branch, 'mbi/ledger-v2', `real branch extraction regressed: ${real.branch}`);
+  });
+
+  check('10d', 'recall returns a DIVERSE source mix — one long tree cannot take every slot (live "MBI" returned 12/12 tree hits before the fix)', () => {
+    // Make one tree overwhelmingly "relevant" by repetition, the exact shape
+    // that crowded out the wiki/auto-memory/thread answers on live data.
+    // On the live DB "MBI" produced 23 separate tree hits, each scoring in the
+    // hundreds — enough to fill all 12 slots. Reproduce that shape: MANY fat
+    // trees, not one.
+    for (let t = 0; t < 15; t++) {
+      const treeId = `tree-simfat${String(t).padStart(5, '0')}`;
+      sqliteDb.prepare(`INSERT INTO hopper_trees (id, topic, origin_thread_ext, status) VALUES (?, ?, ?, 'done')`).run(
+        treeId,
+        `${NEEDLE} fat tree ${t}`,
+        'cockpit:sim-a',
+      );
+      for (let i = 0; i < 8; i++) {
+        sqliteDb
+          .prepare(`INSERT INTO hopper_nodes (tree_id, title, status, result) VALUES (?, ?, 'done', ?)`)
+          .run(treeId, `${NEEDLE} node ${i}`, `${NEEDLE} ${NEEDLE} ${NEEDLE} ${NEEDLE} ${NEEDLE} repeated payload ${i}`);
+      }
+    }
+    const res = recall(NEEDLE, { days: 3650 });
+    const sources = new Set(res.hits.map((h: any) => h.source));
+    assert.ok(sources.size >= 3, `expected >=3 distinct sources, got ${JSON.stringify([...sources])}`);
+    assert.ok(sources.has('auto_memory'), `auto_memory crowded out: ${JSON.stringify([...sources])}`);
+    assert.ok(sources.has('thread_summary'), `thread_summary crowded out: ${JSON.stringify([...sources])}`);
+  });
+
+  check('10e', 'digest truncation keeps every section alive — no section is wiped to feed another (live digest lost ALL summaries before the fix)', () => {
+    const data = collectSharedNow();
+    // Enough sections/bullets that a strict tail-first trim MUST wipe the tail
+    // sections (that is exactly what happened on live data at the real cap).
+    assert.ok(data.trees.length >= 5, `expected the fat trees seeded in 10c: ${data.trees.length}`);
+    const text = renderSharedNow(data, 2600);
+    assert.ok(data.truncated, 'expected the 2600-char cap to truncate');
+    const perSection: Record<string, number> = {};
+    let cur: string | null = null;
+    for (const line of text.split('\n')) {
+      const m = /^## (.+)$/.exec(line);
+      if (m) {
+        cur = m[1];
+        perSection[cur] = 0;
+        continue;
+      }
+      if (cur && line.startsWith('- ') && line !== '- …' && line !== '- (none)') perSection[cur]++;
+    }
+    const headers = Object.keys(perSection);
+    assert.equal(headers.length, 5, `expected all 5 section headers to survive: ${headers.join(' | ')}`);
+    const emptied = headers.filter((h) => perSection[h] === 0 && !/\(0 open\)/.test(h));
+    assert.equal(emptied.length, 0, `section(s) starved to zero bullets: ${emptied.join(', ')} — ${JSON.stringify(perSection)}`);
+  });
+
 } finally {
   server.close();
   owServer?.close();

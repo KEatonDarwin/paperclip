@@ -1,6 +1,6 @@
 # SHARED CONTEXT v0 — CONTRACT (binding; tree-f6da9dbf, node #484)
 
-**Status:** BINDING as of 2026-09-20. Written by the recon node; §1 is BUILT in the same commit (`src/shared-context.ts` + injection seam + route + wiki mirror). §2 (recall), §3 (summary refresher) and §4 (skill) are built by parallel sonnet workers against THIS file without talking to each other. Additive only. If a builder must add something, it adds it here in the same commit and says so in its finish result.
+**Status:** BINDING as of 2026-09-20. **REVIEWED + AMENDED 2026-09-20 by node #488 (adversarial review) — see §7 for the amendments; they are part of the contract.** Written by the recon node; §1 is BUILT in the same commit (`src/shared-context.ts` + injection seam + route + wiki mirror). §2 (recall), §3 (summary refresher) and §4 (skill) are built by parallel sonnet workers against THIS file without talking to each other. Additive only. If a builder must add something, it adds it here in the same commit and says so in its finish result.
 
 Mirror of this file: `/home/kevin/obsidian/paperclip-wiki/skills/shared-context/CONTRACT.md` (keep both identical; repo copy wins on conflict).
 
@@ -244,3 +244,28 @@ Seed: 2 workstreams (one turn=kevin with a thread link), 2 hopper_trees (one act
 - Tables: only `turns_fts` (+ triggers) is new. No changes to existing table shapes.
 - Settings keys: `shared_now_*`, `summary_refresh_*` only.
 - Not in v0: model-written digests, per-provider variants, cockpit UI for the digest (the route + now.md are enough), cross-account Claude auto-memory sync beyond the existing symlink, editing `memory.md`.
+
+
+---
+
+## 7. AMENDMENTS — adversarial review, node #488 (2026-09-20)
+
+Every item below was found by running the built branch against a **read-only VACUUM snapshot of the live `jarvis.db`** (809 MB, 10,739 turns) plus the real wiki vault — not against the sim fixtures. Each is fixed on-branch and pinned by a new sim check in section **[10]** (all five fail on the pre-fix code, all five pass after; the sim is 26/26).
+
+| # | Amendment | Why (measured) |
+|---|---|---|
+| A1 | **New module `src/redact.ts`; every recall snippet/title and every digest bullet goes through `redactSecrets()`.** Dependency-free so §1 and §2 can both import it without a cycle. | §2.1 said snippets never come from `claude_output`/`tool_result` — but `turns.content` itself holds real credentials. On live data `recall("BROWSERBASE_API_KEY")` returned a plaintext `bb_live_…` key and `recall("CHIP_RUNNER_API_KEY")` a plaintext `crk_…` bearer token out of old Slack threads. Before this branch those were reachable only inside that one thread; §1/§2 made them quotable from **every** thread on **every** provider. |
+| A2 | **§2.1 score: occurrences are capped at 5 per term** (`OCCURRENCE_CAP`), and the returned slice is **round-robined across sources** (`diversify()`). | `recall("MBI")` — the literal question that motivated this build — returned **12/12 `tree` hits**, all near-duplicate hopper blobs. The top tree scored 539 (term repeated across every node's spec+result) vs. 16 for `mbi-lead-trace-model.md`; the auto-memory answer ranked **19th** and was never returned at the default `limit=12`. After: 8 distinct sources in 12 hits, auto-memory included. |
+| A3 | **§2.1 LIKE fallback: `ESCAPE '\'` on EVERY condition, not just the last.** | SQLite binds `ESCAPE` to the immediately preceding `LIKE`, so earlier terms kept a literal backslash. Proven at raw-SQL level: `recall('CHIP_RUNNER_API_KEY bearer')` → **0 hits**, `recall('bearer CHIP_RUNNER_API_KEY')` → **2 hits**. Silent, term-order-dependent zero results in the no-FTS5 fallback. |
+| A4 | **§2.1 turn candidates: the `role IN ('user','assistant')` + worker-thread-eligibility + date filters move INTO the SQL** (`NON_ELIGIBLE_PREFIXES` is now exported from `shared-context.ts` and rendered as a `LOWER(...) NOT LIKE` predicate). | Those filters ran in JS **after** `LIMIT 200`. For "mbi", **158 of the 200** candidates were hopper-worker turns that were then discarded — 79 % of the search window wasted, and eligible older turns never entered it. |
+| A5 | **§1.4 truncation is two-phase with per-section floors** (`[3,3,2,2,3]`): phase 1 trims the **longest** section still above its floor; phase 2 (all at floor) falls back to the contract's tail-first order. | At the real `shared_now_max_chars=7200` on live data, strict tail-first wiped **all 10 thread summaries** and 3 of 4 commitments while 12 tree bullets kept ~4,000 chars — i.e. the "where does X live" evidence was dropped to preserve tree telemetry. After: summaries 0→8, commitments 1→4, trees 12→5, still ~1,777 tokens. |
+| A6 | **§1.3 `branch` regex: the bare `\b(?:branch\|on)\s+` alternative loses `on`.** A generic branch must be introduced by the word "branch"; an explicit `hopper/…` path still matches alone. | It matched the prose *"status 0 on network/timeout"* in a node result, so the live digest advertised **`tree-43fb4584 · branch network/timeout`** — a fresh thread on any provider would have told Kevin the Guards work lived on that branch. |
+| A7 | **§3.2 `summary_refresh_batch` default 15 → 6; the script's inter-POST stagger 2s → 15s.** | 88 threads are stale on live data, the largest with a 266 KB (~66k-token) transcript. Each selection becomes a live `claude` one-shot inside `jarvis.service` — a path the hopper governor does **not** gate. A batch of 15 staggered 2s apart ran concurrently against Kevin's Claude window. 6 × 15s keeps the same backlog trajectory (~7 h) at under half the burst; still overridable via settings-KV / `--batch`. |
+| A8 | **FTS5 `MATCH` query sanitised** (`buildFtsMatchQuery`): terms with no letters/digits tokenize to nothing and raise `fts5: syntax error`, which silently cost the whole turn section via the catch block. They're dropped instead. | Defensive; found by inspection, no live occurrence. |
+
+**Measured, unchanged, and accepted as-is:**
+
+- **Per-turn cost.** Real digest against live data: **7,106 chars ≈ 1,777 tokens**, `collectSharedNow()` **4 ms** + render **1 ms**. Zero model calls, zero network, zero `spawn` in `shared-context.ts` / `recall.ts` / `redact.ts` (verified by grep). Injected on turn 1 and after a ≥120-min idle gap only.
+- **Every adapter gets it.** `sharedNowBlock` sits in `perTurnContextPrefix`, which is used on all five stdin paths (initial, `<memory_refresh>` resume, transcript replay, both retries). It is plain prompt text — a codex/auggie/devin thread with no MCP still receives it.
+- **FTS5 on the live schema.** `CREATE VIRTUAL TABLE IF NOT EXISTS` + three `IF NOT EXISTS` triggers, rebuild only on first creation: **185 ms**, **+6.7 MB** on the 809 MB DB, one time at first boot after deploy. Verified idempotent on a second call, and verified that insert/delete on `turns` keeps `turns_fts` in sync. The only `UPDATE turns SET content` in the codebase is `reconcileInterruptedRuns()` at startup, so `turns_au` is effectively idle.
+- **Wiki mirror does not touch `memory.md`.** It writes `agent-memory/jarvis/now.md` only, sha1-guarded against churn, with a cold-start compare against what is already on disk.

@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { sqliteDb, getSetting } from './conversation-db.js';
+import { redactSecrets } from './redact.js';
 
 export interface SharedNowWorkstream {
   id: number;
@@ -131,7 +132,7 @@ export function sharedNowSettings(): {
 // foundry workers (they get their spec, not the world), disposable quick chats,
 // ephemeral one-offs, check-in firings and monitor runs. Group cover chats and
 // goal chats are real JARVIS turns and stay eligible.
-const NON_ELIGIBLE_PREFIXES = [
+export const NON_ELIGIBLE_PREFIXES: readonly string[] = [
   'cockpit:hopper-node-',
   'cockpit:foundry-node-',
   'quick:',
@@ -201,7 +202,13 @@ function shortTs(value: string | null | undefined): string {
   return value.replace(' ', 'T').slice(0, 16);
 }
 
-const BRANCH_RE = /\bhopper\/[A-Za-z0-9._/-]+|\b(?:branch|on)\s+`?([A-Za-z][A-Za-z0-9._-]*\/[A-Za-z0-9._/-]+)`?/;
+// Adversarial review (node #488): the old alternative `\b(?:branch|on)\s+…`
+// matched the prose "status 0 on network/timeout" in a node result, so the live
+// digest advertised `tree-43fb4584 · branch network/timeout` — a fresh thread on
+// any provider would have told Kevin the Guards work lived on that branch. The
+// bare `on` alternative is gone; a generic branch must be introduced by the word
+// "branch" (an explicit `hopper/…` path still matches on its own).
+const BRANCH_RE = /\bhopper\/[A-Za-z0-9._/-]+|\bbranch(?:es)?\s*:?\s+`?([A-Za-z][A-Za-z0-9._-]*\/[A-Za-z0-9._/-]+)`?/i;
 const COMMIT_RE = /(?:commit\s*`?|@)([0-9a-f]{7,40})\b/i;
 
 function extractBranch(text: string): string | null {
@@ -455,12 +462,16 @@ function renderSections(data: SharedNowData): string[][] {
     (s) => `- [${s.external_id}] ${s.title}${s.one_liner ? ` — ${s.one_liner}` : ''} (${shortTs(s.created_at)})`,
   );
   const none = ['- (none)'];
+  // Credential scrub before the budget maths (redactSecrets never lengthens):
+  // next_action / node results / summary one-liners are free text Kevin has
+  // pasted keys into. See src/redact.ts.
+  const scrub = (lines: string[]) => lines.map(redactSecrets);
   return [
-    [`## Workstreams (${data.workstreams.length} open)`, ...(ws.length ? ws : none)],
-    [`## Trees (last 7 days, ${data.trees.length})`, ...(trees.length ? trees : none)],
-    [`## Goals (${data.goals.length} open)`, ...(goals.length ? goals : none)],
-    [`## Commitments (open)`, ...(commitments.length ? commitments : none)],
-    [`## Recent thread summaries`, ...(summaries.length ? summaries : none)],
+    [`## Workstreams (${data.workstreams.length} open)`, ...(ws.length ? scrub(ws) : none)],
+    [`## Trees (last 7 days, ${data.trees.length})`, ...(trees.length ? scrub(trees) : none)],
+    [`## Goals (${data.goals.length} open)`, ...(goals.length ? scrub(goals) : none)],
+    [`## Commitments (open)`, ...(commitments.length ? scrub(commitments) : none)],
+    [`## Recent thread summaries`, ...(summaries.length ? scrub(summaries) : none)],
   ];
 }
 
@@ -478,20 +489,52 @@ export function renderSharedNow(data: SharedNowData, maxChars?: number): string 
     data.truncated = false;
     return text;
   }
-  // Trim tail-first: summaries → commitments → goals → trees → workstreams,
-  // dropping the LAST bullet of the lowest-priority non-empty section until it fits.
+  // Adversarial review (node #488): strict tail-first trimming starved the two
+  // sections that answer Kevin's actual question. Measured against the live DB
+  // the digest hit the 7,200-char cap and the trim wiped ALL 10 "Recent thread
+  // summaries" and 3 of 4 commitments, while 12 hopper-tree bullets (with their
+  // 140-char `outcome:` blobs) kept ~4,000 chars — i.e. the "where does X live"
+  // evidence was dropped to preserve tree telemetry.
+  //
+  // Two phases now. PHASE 1 trims the LONGEST section that is still above its
+  // floor, so the fattest section pays first. PHASE 2 (everything at its floor)
+  // falls back to the contract's tail-first order.
   data.truncated = true;
-  const order = [4, 3, 2, 1, 0];
+  const floors = [3, 3, 2, 2, 3]; // workstreams, trees, goals, commitments, summaries
+  const bulletCount = (sec: string[]) =>
+    sec.filter((l, i) => i > 0 && l !== '- (none)' && l !== '- …').length;
+  const sectionChars = (sec: string[]) => sec.join('\n').length;
+  const dropLast = (sec: string[]): boolean => {
+    if (sec.length <= 1) return false;
+    const last = sec[sec.length - 1];
+    if (last === '- (none)' || last === '- …') return false;
+    sec.pop();
+    if (sec.length === 1) sec.push('- …');
+    return true;
+  };
+  const tailFirst = [4, 3, 2, 1, 0];
   let guard = 0;
   while (text.length > cap && guard++ < 500) {
     let dropped = false;
-    for (const idx of order) {
-      const sec = sections[idx];
-      if (sec.length > 1 && sec[sec.length - 1] !== '- (none)' && sec[sec.length - 1] !== '- …') {
-        sec.pop();
-        if (sec.length === 1) sec.push('- …');
-        dropped = true;
-        break;
+    // Phase 1 — fattest section above its floor.
+    let fattest = -1;
+    let fattestChars = -1;
+    for (let i = 0; i < sections.length; i++) {
+      if (bulletCount(sections[i]) <= floors[i]) continue;
+      const chars = sectionChars(sections[i]);
+      if (chars > fattestChars) {
+        fattestChars = chars;
+        fattest = i;
+      }
+    }
+    if (fattest >= 0) dropped = dropLast(sections[fattest]);
+    // Phase 2 — everything is at its floor; fall back to tail-first.
+    if (!dropped) {
+      for (const idx of tailFirst) {
+        if (dropLast(sections[idx])) {
+          dropped = true;
+          break;
+        }
       }
     }
     if (!dropped) break;

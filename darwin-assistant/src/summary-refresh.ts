@@ -24,7 +24,14 @@ export interface StaleThread {
 }
 
 const DEFAULT_MIN_TURNS = 6;
-const DEFAULT_BATCH = 15;
+// Adversarial review (node #488): measured 88 stale threads on the live DB, the
+// largest with a 266 KB (~66k-token) transcript. Each selected thread becomes a
+// live `claude` one-shot inside jarvis.service — a path the hopper governor does
+// NOT gate — so a batch of 15 every 30 min burns Kevin's Claude window hard
+// while the backlog clears. 6 keeps the same clear-the-backlog trajectory
+// (~7 hours) at under half the burst. Override per run with --batch or the
+// settings-KV `summary_refresh_batch`.
+const DEFAULT_BATCH = 6;
 
 interface CandidateRow {
   conversation_id: number;

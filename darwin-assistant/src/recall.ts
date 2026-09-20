@@ -13,7 +13,8 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { sqliteDb } from './conversation-db.js';
-import { isSharedNowEligibleThread } from './shared-context.js';
+import { isSharedNowEligibleThread, NON_ELIGIBLE_PREFIXES } from './shared-context.js';
+import { redactSecrets } from './redact.js';
 
 export type RecallSource =
   | 'thread_summary'
@@ -168,9 +169,18 @@ function countOccurrences(haystack: string, term: string): number {
   return count;
 }
 
+// Adversarial review (node #488): occurrences are CAPPED per term. Measured on
+// the live DB, `recall("MBI")` scored a single BI hopper tree at 539 (the term
+// repeats across every node's spec+result) while the auto-memory file
+// `mbi-lead-trace-model.md` scored 16 — so all 12 returned hits were near
+// -duplicate tree blobs and the answer Kevin actually wanted ranked 19th.
+// Capping turns the score into "how well does this match" instead of "how long
+// is this document".
+const OCCURRENCE_CAP = 5;
+
 function scoreText(haystack: string, terms: string[], weight: number): number {
   let n = 0;
-  for (const t of terms) n += countOccurrences(haystack, t);
+  for (const t of terms) n += Math.min(countOccurrences(haystack, t), OCCURRENCE_CAP);
   return n * weight;
 }
 
@@ -199,7 +209,9 @@ function recencyBonus(when: string | null | undefined): number {
 }
 
 function buildSnippet(text: string, terms: string[], max = 280): string {
-  const collapsed = text.replace(/\s+/g, ' ').trim();
+  // Scrub credentials BEFORE windowing so a redacted value can never be split
+  // across the snippet boundary (see src/redact.ts for why this is here).
+  const collapsed = redactSecrets(text).replace(/\s+/g, ' ').trim();
   if (!collapsed) return '';
   const lower = collapsed.toLowerCase();
   let idx = -1;
@@ -249,7 +261,7 @@ function collectThreadSummaryHits(terms: string[]): RecallHit[] {
       hits.push({
         source: 'thread_summary',
         ref: r.external_id,
-        title: r.title ?? r.external_id,
+        title: redactSecrets(r.title ?? r.external_id),
         snippet: buildSnippet(r.content, terms),
         when: r.created_at,
         score: scoreText(r.content, terms, SOURCE_WEIGHT.thread_summary) + recencyBonus(r.created_at),
@@ -276,8 +288,8 @@ function collectThreadTitleHits(terms: string[]): RecallHit[] {
       hits.push({
         source: 'thread_title',
         ref: r.external_id,
-        title: r.title ?? r.external_id,
-        snippet: clip(hay, 280),
+        title: redactSecrets(r.title ?? r.external_id),
+        snippet: buildSnippet(hay, terms),
         when: r.updated_at,
         score: scoreText(hay, terms, SOURCE_WEIGHT.thread_title) + recencyBonus(r.updated_at),
       });
@@ -287,6 +299,21 @@ function collectThreadTitleHits(terms: string[]): RecallHit[] {
     console.warn('[recall] thread_title section failed:', err instanceof Error ? err.message : err);
     return [];
   }
+}
+
+/** SQL predicate mirroring isSharedNowEligibleThread(ext,{workers:false}) so the
+ * worker/quick/ephemeral exclusion happens inside the candidate window instead
+ * of after it. NON_ELIGIBLE_PREFIXES contain no LIKE wildcards. */
+function ELIGIBLE_THREAD_SQL(column: string): string {
+  return NON_ELIGIBLE_PREFIXES.map((p: string) => `LOWER(${column}) NOT LIKE '${p}%'`).join(' AND ');
+}
+
+/** FTS5 phrase query. A term with no alphanumerics tokenizes to nothing and
+ * makes `MATCH` raise "fts5: syntax error"; drop those rather than lose the
+ * whole turn section to the catch block. Returns '' when nothing is usable. */
+function buildFtsMatchQuery(terms: string[]): string {
+  const usable = terms.filter((t) => /[\p{L}\p{N}]/u.test(t)).map((t) => `"${t.replace(/"/g, '""')}"`);
+  return usable.join(' AND ');
 }
 
 interface TurnCandidate {
@@ -303,27 +330,47 @@ function collectTurnHits(terms: string[], days: number): RecallHit[] {
     const mode = ensureTurnsFts().mode;
     const cutoffMs = Date.now() - days * 86_400_000;
     let candidates: TurnCandidate[];
+    // Adversarial review (node #488): the role + worker-thread filters used to
+    // run in JS AFTER `LIMIT 200`. Measured on the live DB, 158 of the 200
+    // candidates for "mbi" were hopper-worker turns — 79% of the search window
+    // thrown away, and eligible older turns never entered it at all. Both
+    // filters now run in SQL so the window holds 200 USABLE rows.
+    const eligibilitySql = ELIGIBLE_THREAD_SQL('c.external_id');
     if (mode === 'fts5' && tableExists('turns_fts')) {
-      const ftsQuery = terms.map((t) => `"${t.replace(/"/g, '""')}"`).join(' AND ');
+      const ftsQuery = buildFtsMatchQuery(terms);
+      if (!ftsQuery) return [];
       candidates = sqliteDb
         .prepare(
           `SELECT t.id, t.conversation_id, t.content, t.created_at, t.role
              FROM turns_fts f
              JOIN turns t ON t.id = f.rowid
+             JOIN conversations c ON c.id = t.conversation_id
             WHERE turns_fts MATCH ?
+              AND t.role IN ('user','assistant')
+              AND t.created_at >= datetime('now', ?)
+              AND ${eligibilitySql}
             ORDER BY t.id DESC
             LIMIT 200`,
         )
-        .all(ftsQuery) as TurnCandidate[];
+        .all(ftsQuery, `-${days} days`) as TurnCandidate[];
     } else {
-      const conds = terms.map(() => `content LIKE ?`).join(' AND ');
-      const params: unknown[] = terms.map((t) => `%${t.replace(/[%_]/g, (m) => `\\${m}`)}%`);
+      // ESCAPE binds to the IMMEDIATELY PRECEDING `LIKE` in SQLite, so a single
+      // trailing ESCAPE left every earlier term's backslash-escaped `_`/`%`
+      // literal: recall('CHIP_RUNNER_API_KEY bearer') returned 0 hits while
+      // recall('bearer CHIP_RUNNER_API_KEY') returned 2 (proven at raw-SQL
+      // level). One ESCAPE per condition.
+      const conds = terms.map(() => `t.content LIKE ? ESCAPE '\\'`).join(' AND ');
+      const params: unknown[] = terms.map((t) => `%${t.replace(/[%_\\]/g, (m) => `\\${m}`)}%`);
       candidates = sqliteDb
         .prepare(
-          `SELECT id, conversation_id, content, created_at, role
-             FROM turns
-            WHERE ${conds} ESCAPE '\\' AND created_at >= datetime('now', ?)
-            ORDER BY id DESC
+          `SELECT t.id, t.conversation_id, t.content, t.created_at, t.role
+             FROM turns t
+             JOIN conversations c ON c.id = t.conversation_id
+            WHERE ${conds}
+              AND t.role IN ('user','assistant')
+              AND t.created_at >= datetime('now', ?)
+              AND ${eligibilitySql}
+            ORDER BY t.id DESC
             LIMIT 200`,
         )
         .all(...params, `-${days} days`) as TurnCandidate[];
@@ -341,7 +388,7 @@ function collectTurnHits(terms: string[], days: number): RecallHit[] {
       hits.push({
         source: 'turn',
         ref: conv.external_id,
-        title: conv.title ?? conv.external_id,
+        title: redactSecrets(conv.title ?? conv.external_id),
         snippet: buildSnippet(c.content, terms),
         when: c.created_at,
         score: scoreText(c.content, terms, SOURCE_WEIGHT.turn) + recencyBonus(c.created_at),
@@ -376,7 +423,7 @@ function collectTreeHits(terms: string[]): RecallHit[] {
         source: 'tree',
         // hopper_trees.id is already the full "tree-xxxxxxxx" string.
         ref: t.id,
-        title: t.topic,
+        title: redactSecrets(t.topic),
         snippet: buildSnippet(firstMatchingText(parts, terms), terms),
         when: t.updated_at,
         score: scoreText(aggregate, terms, SOURCE_WEIGHT.tree) + recencyBonus(t.updated_at),
@@ -403,7 +450,7 @@ function collectGoalHits(terms: string[]): RecallHit[] {
       hits.push({
         source: 'goal',
         ref: `goal-${g.id}`,
-        title: g.title,
+        title: redactSecrets(g.title),
         snippet: buildSnippet(firstMatchingText(parts, terms), terms),
         when: g.updated_at,
         score: scoreText(aggregate, terms, SOURCE_WEIGHT.goal) + recencyBonus(g.updated_at),
@@ -424,7 +471,7 @@ function collectGoalHits(terms: string[]): RecallHit[] {
         hits.push({
           source: 'goal',
           ref: `goal-${n.goal_id}/node-${n.id}`,
-          title: n.title,
+          title: redactSecrets(n.title),
           snippet: buildSnippet(firstMatchingText(parts, terms), terms),
           when: n.updated_at,
           score: scoreText(aggregate, terms, SOURCE_WEIGHT.goal) + recencyBonus(n.updated_at),
@@ -456,7 +503,7 @@ function collectWorkstreamHits(terms: string[]): RecallHit[] {
       hits.push({
         source: 'workstream',
         ref: `workstream-${r.id}`,
-        title: r.title,
+        title: redactSecrets(r.title),
         snippet: buildSnippet(firstMatchingText(parts, terms), terms),
         when: r.updated_at,
         score: scoreText(aggregate, terms, SOURCE_WEIGHT.workstream) + recencyBonus(r.updated_at),
@@ -615,5 +662,39 @@ export function recall(query: string, opts?: RecallOptions): { query: string; mo
     return bWhen - aWhen;
   });
 
-  return { query: trimmed, mode, hits: hits.slice(0, limit) };
+  return { query: trimmed, mode, hits: diversify(hits, limit) };
+}
+
+/**
+ * Adversarial review (node #488). Plain top-N returned 12/12 `tree` hits for
+ * the query that motivated this whole build ("MBI") — the wiki page, the
+ * auto-memory note and the actual conversation were all outranked by long
+ * hopper-node blobs. Round-robin across the sources (each source ordered by
+ * its own score, sources ordered by their best hit) so every place that knows
+ * about the term is represented before any one place takes a second slot;
+ * once a source is exhausted the remaining slots fill by global rank.
+ */
+function diversify(sorted: RecallHit[], limit: number): RecallHit[] {
+  if (sorted.length <= limit) return sorted;
+  const buckets = new Map<RecallSource, RecallHit[]>();
+  for (const h of sorted) {
+    const b = buckets.get(h.source);
+    if (b) b.push(h);
+    else buckets.set(h.source, [h]);
+  }
+  // Map preserves insertion order = order of each source's best hit.
+  const queues = [...buckets.values()];
+  const out: RecallHit[] = [];
+  let progressed = true;
+  while (out.length < limit && progressed) {
+    progressed = false;
+    for (const q of queues) {
+      if (out.length >= limit) break;
+      const next = q.shift();
+      if (!next) continue;
+      out.push(next);
+      progressed = true;
+    }
+  }
+  return out;
 }

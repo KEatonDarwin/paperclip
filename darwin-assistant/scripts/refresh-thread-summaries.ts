@@ -76,7 +76,7 @@ async function main(): Promise<void> {
     : parseInt(getSetting('summary_refresh_min_turns') ?? '', 10) || 6;
   const batch = batchFlag
     ? parseInt(batchFlag, 10)
-    : parseInt(getSetting('summary_refresh_batch') ?? '', 10) || 15;
+    : parseInt(getSetting('summary_refresh_batch') ?? '', 10) || 6;
   const model = getSetting('summary_refresh_model') || 'claude-haiku-4-5';
 
   const stale = selectStaleThreads({ minTurns, batch });
@@ -133,9 +133,12 @@ async function main(): Promise<void> {
     } catch (err) {
       console.error(`[refresh-thread-summaries] ${t.external_id} — request failed:`, err);
     }
-    // The route is async (202) — the live process fans the claude one-shots
-    // out itself; this small stagger just avoids bursting N spawns at once.
-    await new Promise((r) => setTimeout(r, 2000));
+    // The route is async (202) — the live process fans the claude one-shots out
+    // itself, so the stagger is the ONLY thing limiting concurrency. Review
+    // (node #488): 2s meant the whole batch (some with ~66k-token transcripts)
+    // ran concurrently inside jarvis.service. 15s keeps at most a couple in
+    // flight while a batch of 6 still finishes inside the 30-minute timer.
+    await new Promise((r) => setTimeout(r, 15_000));
   }
 
   console.log('[refresh-thread-summaries] done.');

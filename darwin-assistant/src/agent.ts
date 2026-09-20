@@ -31,6 +31,8 @@ import { buildQuickChatContext } from './quick-chat-profiles.js';
 import { buildWorkbenchThreadContext } from './workbench.js';
 import { buildGoalThreadContext } from './goals.js';
 import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { getOrCreateInternalMcpKey } from './api-keys.js';
 import type { SavedImage } from './image-store.js';
 
 const MAX_TOOL_TURNS = 50;
@@ -591,8 +593,7 @@ export function buildToolsBlock(): string {
 
   return [
     '## Tools',
-    'When you need to call a tool, output EXACTLY this format then STOP — do not write anything after the closing tag:',
-    'IMPORTANT: the tools listed below are NOT native functions of your harness — a native tool-use call fails with "No such tool available". They only work as the plain-text block below, written in your reply; the harness parses it, runs the tool, and feeds the result back as the next turn. Never conclude a listed tool is "not wired" — use this block.',
+    'HOW TO CALL THEM — two forms, check in this order. (1) NATIVE: if a tool named `mcp__jarvis__<name>` is in your available tool list (or your harness offers deferred-tool search, e.g. `ToolSearch` with `select:mcp__jarvis__<name>`), just call it natively. (2) TEXT BLOCK: if no such native tool exists here, then these are NOT native functions of your harness — a native tool-use call will fail with "No such tool available". That is NORMAL and does NOT mean the tool is missing or "not wired": never tell the user a listed tool is unavailable, unwired, or uninitialized. Instead output EXACTLY the block below and STOP — do not write anything after the closing tag. The harness parses it, runs the tool, and feeds the result back as the next turn.',
     '<tool_call>',
     '{"name": "tool_name", "arguments": {"param": "value"}}',
     '</tool_call>',
@@ -1034,6 +1035,7 @@ export async function runClaude(
   signal?: AbortSignal,
   imageDirs?: string[],
   imagePaths?: string[],
+  toolContext?: ToolExecutionContext,
 ): Promise<ClaudeResult> {
   // A resolved per-thread runtime (DAR-680 AC#4) wins; otherwise fall back to the
   // global adapter/model settings for callers that don't pass one.
@@ -1068,6 +1070,50 @@ export async function runClaude(
   }
 
   const args = adapter.buildArgs({ sessionId, model, options, imageDirs, imagePaths });
+
+  // Persona-tools MCP (native mcp__jarvis__<name> tools): only the `claude`
+  // adapter supports a per-invocation --mcp-config file, and only calls with a
+  // real toolContext (i.e. inside runConversationTurn) have anything to scope
+  // it to — one-shot utility callers (search/summarize/briefing/etc.) pass no
+  // toolContext and get byte-identical behavior to before this feature.
+  // Best-effort: a failure to write the config file just means this spawn
+  // falls back to the <tool_call> text protocol, never a hard error.
+  let mcpConfigPath: string | null = null;
+  if (toolContext && adapter.id === 'claude') {
+    mcpConfigPath = join(tmpdir(), `jarvis-mcp-config-${process.pid}-${Date.now()}-${Math.round(Math.random() * 1e9)}.json`);
+    try {
+      const internalKey = getOrCreateInternalMcpKey();
+      const serverEntry = join(dirname(fileURLToPath(import.meta.url)), 'mcp', 'persona-tools-server.js');
+      const config = {
+        mcpServers: {
+          jarvis: {
+            command: process.execPath,
+            args: [serverEntry],
+            env: {
+              // originalText is the user's whole message and rides in an ENV var
+              // of the spawned MCP child. Linux caps a single env var at 128KB
+              // (MAX_ARG_STRLEN), so a big paste would make the child fail to
+              // spawn and silently cost this turn all of its native tools. Cap
+              // it: the only consumer is the autonomy ledger's source-text
+              // field, which is a record, not an input.
+              JARVIS_TOOL_CONTEXT: JSON.stringify(
+                toolContext.originalText && toolContext.originalText.length > 8_000
+                  ? { ...toolContext, originalText: `${toolContext.originalText.slice(0, 8_000)}… [truncated for native-MCP env]` }
+                  : toolContext,
+              ),
+              JARVIS_API_BASE: `http://localhost:${process.env.JARVIS_UI_PORT ?? '3201'}/api/v1`,
+              JARVIS_INTERNAL_KEY: internalKey,
+            },
+          },
+        },
+      };
+      // 0600: this file carries an admin-scope loopback key in plaintext.
+      writeFileSync(mcpConfigPath, JSON.stringify(config), { encoding: 'utf8', mode: 0o600 });
+      args.push('--mcp-config', mcpConfigPath);
+    } catch {
+      mcpConfigPath = null; // fall back to text-protocol-only for this call
+    }
+  }
 
   // Prompt delivery: most adapters read the composed prompt from stdin. Adapters
   // that set promptFileArg (Devin) instead get it via a temp file passed on argv.
@@ -1128,6 +1174,7 @@ export async function runClaude(
       activeChildren.delete(child);
       if (promptFilePath) { try { unlinkSync(promptFilePath); } catch { /* noop */ } }
       if (exportFilePath) { try { unlinkSync(exportFilePath); } catch { /* noop */ } }
+      if (mcpConfigPath) { try { unlinkSync(mcpConfigPath); } catch { /* noop */ } }
     };
 
     const forwardEvent = (event: Record<string, unknown>) => {
@@ -1367,6 +1414,12 @@ async function runConversationTurn(
   const planModeActive = isPlanModeMessage(input);
   const modelInput = applyPlanMode(input);
 
+  // Native persona tools (mcp__jarvis__*) must honour the SAME hard plan-mode
+  // gate the text-protocol path enforces below: in plan mode the model gets no
+  // --mcp-config at all, so a native call can't route around the gate (the
+  // loopback route executes for real and has no per-turn plan-mode signal).
+  const mcpToolContext = planModeActive ? undefined : toolContext;
+
   // Tell the model which thread it's running in, so it never has to guess
   // (this is what the cockpit todo-panel self-drive + thread routing rely on).
   const threadContextLine = `<jarvis_thread external_id="${conv.external_id}" conversation_id="${conv.id}"/>\n`;
@@ -1477,7 +1530,7 @@ async function runConversationTurn(
     const claudeT0 = Date.now();
     let result: ClaudeResult;
     try {
-      result = await runClaude(stdinContent, sessionId, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths);
+      result = await runClaude(stdinContent, sessionId, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext);
       sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
 
       // Session expired or unknown — retry without resume
@@ -1487,7 +1540,7 @@ async function runConversationTurn(
         stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model);
         accumulatedText = '';
         sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
-        result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths);
+        result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext);
         sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
       }
     } catch (err) {
@@ -1507,7 +1560,7 @@ async function runConversationTurn(
         accumulatedText = '';
         try {
           sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
-          result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths);
+          result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext);
           sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
         } catch (retryErr) {
           sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
@@ -1563,7 +1616,7 @@ async function runConversationTurn(
           accumulatedText = '';
           try {
             sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
-            result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths);
+            result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext);
             sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
           } catch (rescueErr) {
             // The rescue account also walled/failed → all headroom exhausted →

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { sqliteDb as db } from './conversation-db.js';
+import { sqliteDb as db, getSetting, setSetting } from './conversation-db.js';
 
 const KEY_PREFIX = 'jrv_';
 
@@ -114,4 +114,23 @@ export function callerOwnsExternalId(callerKeyId: number, externalId: string): b
   const row = getApiKey(callerKeyId);
   if (row && isAdminScope(row.scope)) return true;
   return externalId.startsWith(`api:${callerKeyId}:`);
+}
+
+export const INTERNAL_MCP_KEY_SETTING = 'internal_mcp_key_plaintext';
+
+/**
+ * Self-minted admin-scope key used ONLY for the loopback call from the
+ * per-spawn persona-tools MCP server (src/mcp/persona-tools-server.ts) back
+ * into this same running server's /internal/tool-exec route. Minted once and
+ * cached in settings-KV — no cross-app secret sharing, no deploy-time step.
+ */
+export function getOrCreateInternalMcpKey(): string {
+  const cached = getSetting(INTERNAL_MCP_KEY_SETTING);
+  // Re-validate, don't just trust the cache: if this key was revoked from the
+  // keys UI, every native mcp__jarvis__* call would 401 forever and the only
+  // symptom would be tools silently "not working" again. Re-mint instead.
+  if (cached && authenticateBearer(cached)) return cached;
+  const { plaintext } = mintApiKey('internal-mcp-loopback', 'cockpit');
+  setSetting(INTERNAL_MCP_KEY_SETTING, plaintext);
+  return plaintext;
 }

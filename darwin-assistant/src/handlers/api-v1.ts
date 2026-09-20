@@ -21,6 +21,7 @@ import {
   getLastMessageRole,
   linkContinuedThreads,
   updateSessionState,
+  addTurn,
   setThreadModelOverride,
   listAllConversations,
   deriveSource,
@@ -47,7 +48,8 @@ import {
   setGroupColor,
   deleteGroup,
 } from '../conversation-groups.js';
-import { listAutonomyLedger } from '../autonomy-ledger.js';
+import { listAutonomyLedger, withToolExecutionContext, type ToolExecutionContext } from '../autonomy-ledger.js';
+import { TOOL_MAP, ALL_TOOLS } from '../tools/index.js';
 import { listMcpServers, refreshMcpServers } from '../mcp-registry.js';
 import { resolveNativeServer, nativeListTools } from '../tools/mcp-native.js';
 import { listNotes, createNote } from '../notes-db.js';
@@ -353,12 +355,13 @@ import {
 } from '../conversation-db.js';
 import { query } from '../db.js';
 import { listVaultTree, readVaultFile, searchVault } from '../vault-page.js';
-import { sseBus, type SSEEvent } from '../sse-bus.js';
+import { sseBus, type SSEEvent, type ToolCallEvent } from '../sse-bus.js';
 import {
   authenticateBearer,
   callerExternalIdPrefix,
   callerOwnsExternalId,
   isAdminScope,
+  INTERNAL_MCP_KEY_SETTING,
   type ApiKeyRow,
 } from '../api-keys.js';
 
@@ -4644,6 +4647,73 @@ export function createApiV1Router(): Router {
     res.json({ reminder: null });
   });
 
+  // -- GET /internal/tools: persona-tool manifest for the native-MCP server --
+  // The per-spawn persona-tools-server (src/mcp/persona-tools-server.ts) reads
+  // its tools/list surface from HERE rather than importing ../tools/index.js
+  // itself: that import transitively pulls in conversation-db.ts, whose module
+  // scope opens jarvis.db and runs the whole CREATE TABLE / ALTER TABLE block —
+  // i.e. every single claude spawn would open a second writer on the live DB
+  // (the exact sqlite contention the loopback design exists to avoid).
+  router.get('/internal/tools', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'forbidden', 'internal tool manifest requires an admin-scoped key');
+      return;
+    }
+    res.json({
+      tools: ALL_TOOLS.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })),
+    });
+  });
+
+  // -- POST /internal/tool-exec: native-MCP loopback for persona tools ------
+  // Called ONLY by the per-spawn persona-tools-server (src/mcp/persona-tools-
+  // server.ts), authenticated with a self-minted internal key (api-keys.ts
+  // getOrCreateInternalMcpKey, scope='cockpit' = admin, owns every thread —
+  // see isAdminScope/callerOwnsExternalId). Runs the SAME TOOL_MAP handler
+  // with the SAME ToolExecutionContext shape the text-protocol tool_call loop
+  // uses (agent.ts runConversationTurn), and records the SAME tool_call/
+  // tool_result turns + SSE so a native mcp__jarvis__<name> call renders
+  // identically to a text-protocol call in the transcript.
+  router.post('/internal/tool-exec', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    if (!isAdminScope(caller.scope)) {
+      sendError(res, 403, 'forbidden', 'internal tool-exec requires an admin-scoped key');
+      return;
+    }
+    const body = (req.body ?? {}) as { context?: ToolExecutionContext; name?: string; arguments?: Record<string, unknown> };
+    const context = body.context;
+    const name = typeof body.name === 'string' ? body.name : '';
+    if (!context || !context.conversationId || !name) {
+      sendError(res, 400, 'invalid_request', 'context (with conversationId) and name are required');
+      return;
+    }
+    if (!getConversationById(context.conversationId)) {
+      sendError(res, 404, 'not_found', `No conversation with id ${context.conversationId}`);
+      return;
+    }
+    const tool = TOOL_MAP.get(name);
+    if (!tool) {
+      // Shape matches the text-protocol "Unknown tool" branch (agent.ts) —
+      // returned as a 200 tool result, not an HTTP error, so the MCP server
+      // can hand it straight back to the model as the tool's own output.
+      res.json({ result: { error: `Unknown tool: ${name}` } });
+      return;
+    }
+    addTurn(context.conversationId, 'tool_call', null, name, JSON.stringify(body.arguments ?? {}), undefined);
+    sseBus.emit('sse', { type: 'tool_call', conversationId: context.conversationId, toolName: name } satisfies ToolCallEvent);
+    const t0 = Date.now();
+    withToolExecutionContext(context, () => tool.execute(body.arguments ?? {}, context))
+      .then((result) => {
+        const resultStr = JSON.stringify(result, null, 2);
+        addTurn(context.conversationId, 'tool_result', null, name, undefined, resultStr, { timingMs: Date.now() - t0 });
+        res.json({ result });
+      })
+      .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        addTurn(context.conversationId, 'tool_result', null, name, undefined, JSON.stringify({ error: message }), { timingMs: Date.now() - t0 });
+        res.json({ result: { error: message } });
+      });
+  });
+
   // -- GET /threads/:external_id/todos: list per-thread todos ---------------
 
   router.get('/threads/:external_id/todos', (req: AuthedRequest, res) => {
@@ -5316,8 +5386,14 @@ export function createApiV1Router(): Router {
 
   router.get('/settings', async (_req: AuthedRequest, res) => {
     const info = getActiveAdapterInfo();
+    // This route is readable by ANY authenticated key (not just admin), so the
+    // settings dump must never carry a secret: internal_mcp_key_plaintext is a
+    // full admin-scope API key (persona-tools MCP loopback) and returning it
+    // here would let any low-scope caller escalate to admin.
+    const settings = getAllSettings();
+    delete settings[INTERNAL_MCP_KEY_SETTING];
     res.json({
-      settings: getAllSettings(),
+      settings,
       active_adapter: info.adapter,
       active_model: info.model,
       active_runtime: getActiveRuntimeDescriptor(),

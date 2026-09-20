@@ -72,6 +72,8 @@ export { mcpCall, lovableSendMessage, supabaseExecuteSql } from './mcp.js';
 
 export { logDecision } from './decisions.js';
 
+export { recallTool } from './recall-tool.js';
+
 import {
   createIssue,
   searchIssues,
@@ -139,6 +141,7 @@ import { intakeDeploy } from './intake-deploy.js';
 import { cockpitDeploy } from './cockpit-deploy.js';
 import { getMemberThread } from './group-chat-tool.js';
 import { goals } from './goals-tool.js';
+import { recallTool } from './recall-tool.js';
 
 function instrumentTool(tool: ToolDef): ToolDef {
   return {
@@ -209,6 +212,7 @@ export const ALL_TOOLS: ToolDef[] = [
   cockpitDeploy,
   getMemberThread,
   goals,
+  recallTool,
 ].map(instrumentTool);
 
 export const TOOL_MAP: Map<string, ToolDef> = new Map(

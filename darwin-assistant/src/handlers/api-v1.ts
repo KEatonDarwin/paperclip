@@ -267,6 +267,7 @@ import { autoNameThreadFromFirstMessage } from '../thread-autoname.js';
 import { autoGroupThreadFromFirstMessage } from '../thread-autogroup.js';
 import { generateThreadSummary } from '../thread-summarize.js';
 import { getSharedNowSnapshot, sharedNowSettings } from '../shared-context.js';
+import { recall, type RecallSource } from '../recall.js';
 import { condenseThread, buildSmartForkMessage } from '../thread-condense.js';
 import { listThreadSummaries, getLatestThreadSummary } from '../thread-summaries.js';
 import { searchThreadsByQuery } from '../thread-search.js';
@@ -2986,6 +2987,36 @@ export function createApiV1Router(): Router {
     res.json({ as_of: snap.as_of, cached: snap.cached, settings: sharedNowSettings(), text: snap.text, data: snap.data });
   });
 
+  // SHARED CONTEXT v0 §2 (docs/shared-context/CONTRACT.md §2.3) — keyword
+  // search over other threads/trees/goals/workstreams/wiki/auto-memory, the
+  // same engine the `recall` tool calls. Read-only, so any authed caller with
+  // cross-thread visibility (admin/cockpit scope) can hit it, same bar as the
+  // shared-context digest above.
+  router.get('/recall', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Recall search requires an admin-scoped key');
+      return;
+    }
+    const q = typeof req.query.q === 'string' ? req.query.q : '';
+    if (!q.trim()) {
+      sendError(res, 400, 'missing_query', 'q is required');
+      return;
+    }
+    const days = typeof req.query.days === 'string' ? parseInt(req.query.days, 10) : undefined;
+    const limit = typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : undefined;
+    const sources =
+      typeof req.query.sources === 'string' && req.query.sources.trim()
+        ? (req.query.sources.split(',').map((s) => s.trim()) as RecallSource[])
+        : undefined;
+    res.json(
+      recall(q, {
+        days: Number.isFinite(days) ? days : undefined,
+        limit: Number.isFinite(limit) ? limit : undefined,
+        sources,
+      }),
+    );
+  });
+
   // Governor settings-KV — the machine/governor knobs Kevin asked for
   // (2026-09-11: "settings for the levels and their variables"). Reads are
   // always live (getSetting is uncached); writes are admin-scoped and take
@@ -4330,7 +4361,14 @@ export function createApiV1Router(): Router {
       return;
     }
     const conv = result;
-    void generateThreadSummary(conv).catch((err) => {
+    // SHARED CONTEXT v0 §3: optional { adapter?, model? } body lets the
+    // refresher route this one-shot at a cheap tier. Omitted → byte-identical
+    // to before (default adapter, no session).
+    const body = (req.body ?? {}) as { adapter?: unknown; model?: unknown };
+    const opts: { adapter?: string; model?: string } = {};
+    if (typeof body.adapter === 'string' && body.adapter) opts.adapter = body.adapter;
+    if (typeof body.model === 'string' && body.model) opts.model = body.model;
+    void generateThreadSummary(conv, Object.keys(opts).length ? opts : undefined).catch((err) => {
       console.error(`[thread-summarize] failed for conversation ${conv.id}:`, err);
     });
     res.status(202).json({ status: 'generating' });

@@ -37,6 +37,8 @@ export type LeafKind = 'none' | 'machine' | 'human';
 export type PlanState = 'none' | 'proposed' | 'approved';
 export type GoalActor = 'kevin' | 'jarvis' | 'system';
 export type NodeAuthor = 'kevin' | 'jarvis';
+/** v0.1 §11.1 — who last edited a ghost + where it sits in the weigh-in round. */
+export type ReviewState = 'none' | 'awaiting_jarvis' | 'pushed_back';
 
 /** §1.2 — plan JSON stored on a machine leaf. Shape only; propose/approve live in BACKEND B. */
 export interface PlanJsonNode {
@@ -82,6 +84,7 @@ export interface GoalCounts {
   need_you: number;
   ghosts: number;
   human_open: number;
+  awaiting_jarvis: number;   // v0.1 §11.1 — ghosts Kevin OK'd, waiting on JARVIS to weigh in
   progress: number;
 }
 
@@ -112,6 +115,11 @@ export interface GoalNodeDbRow {
   pending_by: 'jarvis' | null;
   proposal_batch: string | null;
   promoted_to_goal_id: number | null;
+  // v0.1 §11.1 — Kevin-edit tracking + JARVIS weigh-in gate.
+  last_edited_by: NodeAuthor | null;
+  kevin_edit_original: string | null;   // JSON {title,done_means,notes} snapshot of the JARVIS wording at Kevin's FIRST edit
+  review_state: ReviewState;
+  review_note: string | null;           // JARVIS's push-back note
   sort_order: number;
   verified_at: string | null;
   created_at: string;
@@ -236,6 +244,22 @@ sqliteDb.exec(`
     updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
   );
 `);
+
+// v0.1 (CONTRACT §11.1) — additive columns for the Kevin-edit / JARVIS-weigh-in
+// gate. Guarded by PRAGMA table_info so the live jarvis.db migrates in place on
+// restart (no migrations framework; ADD COLUMN only). Each DDL fragment is a
+// valid SQLite ADD COLUMN (NOT NULL carries a constant default; CHECKs reference
+// only the new column).
+function ensureGoalNodeColumn(column: string, ddl: string): void {
+  const cols = sqliteDb.prepare(`PRAGMA table_info(goal_nodes)`).all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === column)) {
+    sqliteDb.exec(`ALTER TABLE goal_nodes ADD COLUMN ${ddl}`);
+  }
+}
+ensureGoalNodeColumn('last_edited_by', `last_edited_by TEXT CHECK (last_edited_by IN ('kevin','jarvis') OR last_edited_by IS NULL)`);
+ensureGoalNodeColumn('kevin_edit_original', `kevin_edit_original TEXT`);
+ensureGoalNodeColumn('review_state', `review_state TEXT NOT NULL DEFAULT 'none' CHECK (review_state IN ('none','awaiting_jarvis','pushed_back'))`);
+ensureGoalNodeColumn('review_note', `review_note TEXT`);
 
 // ---------------------------------------------------------------------------
 // Low-level accessors
@@ -363,6 +387,7 @@ const countsStmt = sqliteDb.prepare(`
     SUM(CASE WHEN pending_title IS NOT NULL OR pending_done_means IS NOT NULL OR pending_removal = 1 THEN 1 ELSE 0 END) AS pending_count,
     SUM(CASE WHEN leaf_kind = 'human' AND state = 'set' THEN 1 ELSE 0 END) AS human_open,
     SUM(CASE WHEN plan_state = 'proposed' THEN 1 ELSE 0 END) AS plan_proposed,
+    SUM(CASE WHEN review_state = 'awaiting_jarvis' THEN 1 ELSE 0 END) AS awaiting_jarvis,
     SUM(CASE WHEN state NOT IN ('discarded','parked') THEN 1 ELSE 0 END) AS denom
   FROM goal_nodes WHERE goal_id = ?
 `);
@@ -371,7 +396,7 @@ function computeCounts(goalId: number): GoalCounts {
   const row = countsStmt.get(goalId) as {
     total: number | null; done: number | null; working: number | null; check_count: number | null;
     ghost_state: number | null; pending_count: number | null; human_open: number | null;
-    plan_proposed: number | null; denom: number | null;
+    plan_proposed: number | null; awaiting_jarvis: number | null; denom: number | null;
   };
   const ghosts = (row.ghost_state ?? 0) + (row.pending_count ?? 0);
   const humanOpen = row.human_open ?? 0;
@@ -387,6 +412,7 @@ function computeCounts(goalId: number): GoalCounts {
     need_you: needYou,
     ghosts,
     human_open: humanOpen,
+    awaiting_jarvis: row.awaiting_jarvis ?? 0,
     progress: Math.round((100 * done) / denom),
   };
 }
@@ -862,18 +888,72 @@ export function proposeGoalNodes(goalId: number, args: {
   return { batch_id: batchId, nodes: created.map(deriveSingleNode) };
 }
 
-export function acceptGoalNode(goalId: number, nodeId: number, actor?: unknown): GoalNodeRow {
-  const node = requireNode(goalId, nodeId);
+/** v0.1 §11.2 — ghost → set. Clears the batch AND every review field (the four
+ *  columns are only meaningful while a node is a ghost). */
+function setGhostToSet(goalId: number, nodeId: number, actor: GoalActor, eventKind: string, eventText: string): GoalNodeDbRow {
+  sqliteDb.prepare(`
+    UPDATE goal_nodes SET state = 'set', proposal_batch = NULL,
+      review_state = 'none', review_note = NULL, kevin_edit_original = NULL, last_edited_by = NULL,
+      updated_at = datetime('now')
+    WHERE id = ?
+  `).run(nodeId);
+  insertEvent(goalId, nodeId, actor, eventKind, eventText);
+  const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
+  emitNode('updated', fresh);
+  return fresh;
+}
+
+type AcceptOutcome = { row: GoalNodeDbRow; outcome: 'set' | 'awaiting' | 'agreed'; reask: boolean };
+
+/** v0.1 §11.2 — the agreement gate. A ghost solidifies only when the party who
+ *  did NOT make the last edit approves it (see CONTRACT §11). Does NOT fire the
+ *  review cue itself — the caller collects the `awaiting` rows and fires ONE cue
+ *  per HTTP request. */
+function applyAcceptToNode(goalId: number, node: GoalNodeDbRow, actor: GoalActor): AcceptOutcome {
   if (node.state !== 'ghost') {
     throw new GoalError(409, 'invalid_transition', `node is ${node.state}, not ghost`, { from: node.state, to: 'set' });
   }
-  if (!node.done_means?.trim()) throw new GoalError(409, 'done_means_required', 'done_means is required before this node can be set');
+  if (!node.done_means?.trim()) {
+    throw new GoalError(409, 'done_means_required', 'done_means is required before this node can be set', { node_ids: [node.id] });
+  }
+  if (actor === 'kevin') {
+    if (node.review_state === 'awaiting_jarvis') {
+      throw new GoalError(409, 'awaiting_jarvis', 'JARVIS is weighing in on your edit — see the chat', { node_ids: [node.id] });
+    }
+    if (node.last_edited_by === 'kevin') {
+      // Kevin made the last edit → it must go to JARVIS to weigh in before it
+      // solidifies. Covers the first OK (review_state='none') and a re-OK after a
+      // push-back (review_state='pushed_back', note kept, cue re-fires).
+      const reask = node.review_state === 'pushed_back';
+      sqliteDb.prepare(`UPDATE goal_nodes SET review_state = 'awaiting_jarvis', updated_at = datetime('now') WHERE id = ?`).run(node.id);
+      insertEvent(
+        goalId, node.id, actor, 'kevin_okd_edit',
+        reask ? `Kevin re-OK'd without changes after your push-back: ${node.title}` : `Kevin OK'd his edit: ${node.title}`,
+        { reask },
+      );
+      const fresh = getRawNodeStmt.get(node.id) as GoalNodeDbRow;
+      emitNode('updated', fresh);
+      return { row: fresh, outcome: 'awaiting', reask };
+    }
+    // JARVIS proposed / last reworded it (or an untouched proposal) → Kevin ✓ sets it (v0).
+    return { row: setGhostToSet(goalId, node.id, actor, 'node_accepted', `Accepted: ${node.title}`), outcome: 'set', reask: false };
+  }
+  // actor === 'jarvis' | 'system'
+  if (node.review_state === 'awaiting_jarvis' || node.review_state === 'pushed_back') {
+    // JARVIS agrees with Kevin's edit → it solidifies.
+    return { row: setGhostToSet(goalId, node.id, actor, 'node_agreed', `JARVIS agreed with Kevin's edit: ${node.title}`), outcome: 'agreed', reask: false };
+  }
+  // No Kevin edit awaiting → v0 rule (only when Kevin said yes in chat).
+  return { row: setGhostToSet(goalId, node.id, actor, 'node_accepted', `Accepted: ${node.title}`), outcome: 'set', reask: false };
+}
+
+export function acceptGoalNode(goalId: number, nodeId: number, actor?: unknown): GoalNodeRow {
+  const node = requireNode(goalId, nodeId);
   const act = assertActor(actor, 'kevin');
-  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'set', proposal_batch = NULL, updated_at = datetime('now') WHERE id = ?`).run(nodeId);
-  insertEvent(goalId, nodeId, act, 'node_accepted', `Accepted: ${node.title}`);
-  const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
-  emitNode('updated', fresh);
-  return deriveSingleNode(fresh);
+  const result = applyAcceptToNode(goalId, node, act);
+  const derived = deriveSingleNode(result.row);
+  if (result.outcome === 'awaiting') fireGoalReviewCue(goalId, [derived], result.reask);
+  return derived;
 }
 
 function acceptRows(goalId: number, rows: GoalNodeDbRow[], actor: GoalActor): GoalNodeRow[] {
@@ -881,14 +961,19 @@ function acceptRows(goalId: number, rows: GoalNodeDbRow[], actor: GoalActor): Go
   if (missing.length) {
     throw new GoalError(409, 'done_means_required', 'some nodes are missing done_means', { node_ids: missing.map((r) => r.id) });
   }
+  // A "✓ all" / batch accept from Kevin should not error the whole batch just
+  // because one node is mid-review — skip those (a re-click on a single node
+  // still 409s via applyAcceptToNode, per CONTRACT §11.2).
+  const toProcess = actor === 'kevin' ? rows.filter((r) => r.review_state !== 'awaiting_jarvis') : rows;
   const out: GoalNodeRow[] = [];
-  for (const r of rows) {
-    sqliteDb.prepare(`UPDATE goal_nodes SET state = 'set', proposal_batch = NULL, updated_at = datetime('now') WHERE id = ?`).run(r.id);
-    insertEvent(goalId, r.id, actor, 'node_accepted', `Accepted: ${r.title}`);
-    const fresh = getRawNodeStmt.get(r.id) as GoalNodeDbRow;
-    emitNode('updated', fresh);
-    out.push(deriveSingleNode(fresh));
+  const awaiting: GoalNodeRow[] = [];
+  for (const r of toProcess) {
+    const result = applyAcceptToNode(goalId, r, actor);
+    const derived = deriveSingleNode(result.row);
+    out.push(derived);
+    if (result.outcome === 'awaiting') awaiting.push(derived);
   }
+  if (awaiting.length) fireGoalReviewCue(goalId, awaiting, false);
   return out;
 }
 
@@ -916,13 +1001,95 @@ export function acceptAllGoalNodes(goalId: number, parentId: number | null | und
   return acceptRows(goalId, rows, assertActor(actor, 'kevin'));
 }
 
+// ---------------------------------------------------------------------------
+// v0.1 §11.2/§11.3 — push_back + the review cue into the goal chat
+// ---------------------------------------------------------------------------
+
+/** JARVIS pushes back on Kevin's OK'd edit instead of agreeing — the node stays
+ *  a ghost, the note is shown, and they talk it out (CONTRACT §11.2). */
+export function pushBackGhost(goalId: number, nodeId: number, note: string, actor?: unknown): GoalNodeRow {
+  const node = requireNode(goalId, nodeId);
+  const act = assertActor(actor, 'jarvis');
+  if (act !== 'jarvis') {
+    throw new GoalError(403, 'jarvis_only', 'only JARVIS can push back on an edit');
+  }
+  if (node.state !== 'ghost') {
+    throw new GoalError(409, 'invalid_transition', `node is ${node.state}, not ghost`, { from: node.state, to: node.state });
+  }
+  // Allowed while awaiting a weigh-in, or straight from 'none' when Kevin made
+  // the last edit (JARVIS can pre-empt before Kevin even clicks ✓).
+  const allowed = node.review_state === 'awaiting_jarvis' || (node.review_state === 'none' && node.last_edited_by === 'kevin');
+  if (!allowed) {
+    throw new GoalError(409, 'nothing_to_push_back', 'no Kevin edit is awaiting your weigh-in on this node');
+  }
+  const trimmed = (note ?? '').trim();
+  if (!trimmed) throw new GoalError(400, 'invalid_request', 'push_back requires a non-empty note');
+  sqliteDb.prepare(`UPDATE goal_nodes SET review_state = 'pushed_back', review_note = ?, updated_at = datetime('now') WHERE id = ?`).run(trimmed, nodeId);
+  insertEvent(goalId, nodeId, act, 'jarvis_pushed_back', trimmed);
+  const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
+  emitNode('updated', fresh);
+  return deriveSingleNode(fresh);
+}
+
+const lastEventIdStmt = sqliteDb.prepare(`SELECT id FROM goal_events WHERE goal_id = ? ORDER BY id DESC LIMIT 1`);
+
+/** CONTRACT §11.3 — post ONE cue into the goal chat listing every node Kevin
+ *  just OK'd that now awaits JARVIS's weigh-in. Same seam as `dispatch-gate.ts
+ *  fireCue`; dynamic imports avoid the agent.ts <-> goals.ts static cycle
+ *  (agent.ts imports buildGoalThreadContext from here). Best-effort: a missing
+ *  conversation or a busy thread degrades to enqueue / log, never throws into
+ *  the accept transaction (which has already committed by the time this runs). */
+export function fireGoalReviewCue(goalId: number, nodes: GoalNodeRow[], reask = false): void {
+  if (!nodes.length) return;
+  const externalId = `cockpit:goal-${goalId}`;
+  const conv = getConversation(externalId);
+  if (!conv) {
+    console.warn(`[goals] review cue skipped — no conversation for ${externalId}`);
+    return;
+  }
+  const n = nodes.length;
+  const header = `[goal #${goalId} — Kevin edited ${n} of your proposal${n === 1 ? '' : 's'} and OK'd ${n === 1 ? 'it' : 'them'}. Weigh in.]`;
+  const blocks = nodes.map((node) => {
+    let orig: { title?: string; done_means?: string } = {};
+    if (node.kevin_edit_original) {
+      try { orig = JSON.parse(node.kevin_edit_original) as { title?: string; done_means?: string }; } catch { /* keep {} */ }
+    }
+    let block =
+      `#${node.id} now: "${node.title}" — done: "${node.done_means ?? ''}"\n` +
+      `    was (yours): "${orig.title ?? ''}" — done: "${orig.done_means ?? ''}"`;
+    if (node.review_note) block += `\n    you pushed back with: "${node.review_note}"`;
+    return block;
+  });
+  const footer =
+    'For each node: acknowledge the change in a sentence, then either agree → `goals` op `accept` {node_id} (it solidifies), ' +
+    'or `push_back` {node_id, note} with your reason in one or two sentences and talk it out. Don\'t restate the rest of the tree.';
+  const text = [header, ...blocks, footer].join('\n');
+  const eventId = (lastEventIdStmt.get(goalId) as { id: number } | undefined)?.id ?? 0;
+  const correlationKey = `goal-cue:${goalId}:${eventId}`;
+  const convId = conv.id;
+
+  void reask; // header/per-node note already convey re-ask; param kept for the §11 contract signature
+  Promise.all([import('./agent.js'), import('./thread-message-queue.js')])
+    .then(([agent, queue]) => {
+      if (agent.getInFlightMessageId(convId)) {
+        queue.enqueueMessage(convId, text);
+        return;
+      }
+      agent.processMessage(text, externalId, correlationKey).catch((err: unknown) => {
+        if (err instanceof agent.ConversationBusyError) queue.enqueueMessage(convId, text);
+        else console.error('[goals] review cue post failed', err);
+      });
+    })
+    .catch((err) => console.error('[goals] review cue import failed', err));
+}
+
 export function discardGoalNode(goalId: number, nodeId: number, reason?: string, actor?: unknown): GoalNodeRow {
   const node = requireNode(goalId, nodeId);
   if (node.state !== 'ghost') {
     throw new GoalError(409, 'invalid_transition', `node is ${node.state}, not ghost`, { from: node.state, to: 'discarded' });
   }
   const act = assertActor(actor, 'kevin');
-  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'discarded', proposal_batch = NULL, updated_at = datetime('now') WHERE id = ?`).run(nodeId);
+  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'discarded', proposal_batch = NULL, review_state = 'none', review_note = NULL, kevin_edit_original = NULL, last_edited_by = NULL, updated_at = datetime('now') WHERE id = ?`).run(nodeId);
   insertEvent(goalId, nodeId, act, 'node_discarded', reason ? `Discarded: ${reason}` : `Discarded: ${node.title}`, reason ? { reason } : undefined);
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
@@ -941,7 +1108,7 @@ export function discardGoalBatch(goalId: number, batchId: string, ids?: number[]
   const act = assertActor(actor, 'kevin');
   const out: GoalNodeRow[] = [];
   for (const r of rows) {
-    sqliteDb.prepare(`UPDATE goal_nodes SET state = 'discarded', proposal_batch = NULL, updated_at = datetime('now') WHERE id = ?`).run(r.id);
+    sqliteDb.prepare(`UPDATE goal_nodes SET state = 'discarded', proposal_batch = NULL, review_state = 'none', review_note = NULL, kevin_edit_original = NULL, last_edited_by = NULL, updated_at = datetime('now') WHERE id = ?`).run(r.id);
     insertEvent(goalId, r.id, act, 'node_discarded', `Discarded: ${r.title}`);
     emitNode('updated', getRawNodeStmt.get(r.id) as GoalNodeDbRow);
     maybeSettleParent(r.id);
@@ -972,9 +1139,39 @@ export function patchGoalNode(goalId: number, nodeId: number, patch: {
   const notes = patch.notes !== undefined ? (patch.notes.trim() || null) : node.notes;
   const sortOrder = patch.sort_order !== undefined ? patch.sort_order : node.sort_order;
 
-  sqliteDb.prepare(`UPDATE goal_nodes SET title = ?, done_means = ?, notes = ?, sort_order = ?, updated_at = datetime('now') WHERE id = ?`)
-    .run(title, doneMeans, notes, sortOrder, nodeId);
-  insertEvent(goalId, nodeId, actor, 'node_updated', `Edited: ${title}`, {
+  // v0.1 §11.2 — editing a GHOST moves the "last word":
+  //  - Kevin edits → last_edited_by='kevin', snapshot the original JARVIS wording
+  //    once, and reset any open review round (a fresh edit re-opens it). His next
+  //    ✓ will send it to JARVIS to weigh in rather than solidify.
+  //  - JARVIS edits (edit_ghost) → last_edited_by='jarvis', review reset; JARVIS
+  //    took the last word so Kevin's next ✓ sets it. kevin_edit_original is kept.
+  // Non-ghost edits (Kevin only) never touch the review machinery.
+  const isGhost = node.state === 'ghost';
+  let lastEditedBy = node.last_edited_by;
+  let kevinOriginal = node.kevin_edit_original;
+  let reviewState: ReviewState = node.review_state;
+  let reviewNote = node.review_note;
+  let editEventKind = 'node_updated';
+  if (isGhost && actor === 'kevin') {
+    lastEditedBy = 'kevin';
+    if (kevinOriginal == null) {
+      kevinOriginal = JSON.stringify({ title: node.title, done_means: node.done_means, notes: node.notes });
+    }
+    reviewState = 'none';
+    reviewNote = null;
+    editEventKind = 'ghost_edited_by_kevin';
+  } else if (isGhost && actor === 'jarvis') {
+    lastEditedBy = 'jarvis';
+    reviewState = 'none';
+    reviewNote = null;
+  }
+
+  sqliteDb.prepare(`
+    UPDATE goal_nodes SET title = ?, done_means = ?, notes = ?, sort_order = ?,
+      last_edited_by = ?, kevin_edit_original = ?, review_state = ?, review_note = ?, updated_at = datetime('now')
+    WHERE id = ?
+  `).run(title, doneMeans, notes, sortOrder, lastEditedBy, kevinOriginal, reviewState, reviewNote, nodeId);
+  insertEvent(goalId, nodeId, actor, editEventKind, `Edited: ${title}`, {
     old: { title: node.title, done_means: node.done_means },
     new: { title, done_means: doneMeans },
   });

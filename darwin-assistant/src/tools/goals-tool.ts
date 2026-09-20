@@ -9,6 +9,7 @@ import {
   acceptGoalNode,
   acceptGoalBatch,
   acceptAllGoalNodes,
+  pushBackGhost,
   discardGoalNode,
   discardGoalBatch,
   patchGoalNode,
@@ -60,6 +61,8 @@ const TRIMMED_NODE_KEYS = [
   'id', 'parent_id', 'title', 'done_means', 'state', 'leaf_kind', 'plan_state',
   'tree_id', 'tree_status_cache', 'pending_title', 'pending_done_means',
   'pending_removal', 'pending_by', 'proposal_batch', 'depth', 'child_count', 'authored_by',
+  // v0.1 §11 — so JARVIS can see Kevin's edits + the weigh-in state in `list`.
+  'last_edited_by', 'review_state', 'review_note', 'kevin_edit_original',
 ] as const;
 
 function trimTree(tree: GoalTree): unknown {
@@ -83,15 +86,17 @@ export const goals: ToolDef = {
     'goes through propose / propose_edit / propose_remove and renders as a ghost until he ✓s it. Never create ' +
     'grandchildren: propose children only under the focused node or a node he named, one layer at a time. Every proposed ' +
     'node MUST carry a one-line done_means. While a proposal is still a ghost, reword it in place with `edit_ghost` as you and '+
-    'Kevin talk it through (that is the "watch it change until I am good with it" loop) — do NOT discard and re-propose. Inside a goal thread (cockpit:goal-<id>), goal_id and the default parent_id ' +
-    '(the current focus) are inferred automatically — omit goal_id there.',
+    'Kevin talk it through (that is the "watch it change until I am good with it" loop) — do NOT discard and re-propose. ' +
+    'When KEVIN edits one of your ghosts and OKs it, it does NOT solidify until you weigh in (§11): `accept` {node_id} to agree ' +
+    '(it sets), or `push_back` {node_id, note} with your reason to keep it a ghost and talk it out. Inside a goal thread ' +
+    '(cockpit:goal-<id>), goal_id and the default parent_id (the current focus) are inferred automatically — omit goal_id there.',
   parameters: {
     type: 'object',
     properties: {
       operation: {
         type: 'string',
         enum: [
-          'list', 'set_goal_done_means', 'propose', 'set_from_kevin', 'accept', 'discard',
+          'list', 'set_goal_done_means', 'propose', 'set_from_kevin', 'accept', 'push_back', 'discard',
           'edit_ghost', 'propose_edit', 'propose_remove', 'set_leaf_kind', 'propose_plan', 'dispatch',
           'verify', 'human_done', 'park', 'unpark', 'log', 'promote', 'focus',
         ],
@@ -113,7 +118,7 @@ export const goals: ToolDef = {
       leaf_kind: { type: 'string', enum: ['none', 'machine', 'human'], description: 'For set_leaf_kind / set_from_kevin.' },
       plan: { type: 'object', description: 'PlanJson for propose_plan: {what, deliverable, model, estimate?, nodes:[{title, spec?, adapter?, model?, depends_on_indexes?}]}. adapter defaults to claude; never fable.' },
       passed: { type: 'boolean', description: 'For verify: true=done, false=reopen.' },
-      note: { type: 'string', description: 'Optional note (verify, human_done, done_step-style ops).' },
+      note: { type: 'string', description: 'For verify/human_done: optional. For push_back: REQUIRED — your reason, one or two sentences.' },
       reason: { type: 'string', description: 'Optional reason (discard, propose_remove).' },
       text: { type: 'string', description: 'Log line text, for the log op.' },
       goal: { type: 'boolean', description: 'For verify: true = verify the GOAL root (node_id omitted) rather than a node.' },
@@ -189,6 +194,14 @@ export const goals: ToolDef = {
         if (batchId) return { nodes: acceptGoalBatch(goalId, batchId, undefined, 'jarvis') };
         if (args.node_id !== undefined) return { node: acceptGoalNode(goalId, Number(args.node_id), 'jarvis') };
         return { error: 'accept needs node_id, batch_id, or all:true — and only when Kevin actually said yes' };
+      }
+
+      if (op === 'push_back') {
+        // §11.2 — disagree with Kevin's OK'd edit: stays a ghost, note shown, talk it out.
+        if (args.node_id === undefined) return { error: 'node_id is required' };
+        const note = str(args.note);
+        if (!note) return { error: 'push_back requires a note — your reason in one or two sentences' };
+        return { node: pushBackGhost(goalId, Number(args.node_id), note, 'jarvis') };
       }
 
       if (op === 'discard') {

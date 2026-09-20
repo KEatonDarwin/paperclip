@@ -140,7 +140,8 @@ CREATE TABLE IF NOT EXISTS goal_focus (
 `node_proposed` · `node_created` (kevin-authored, born set) · `node_accepted` · `node_discarded` · `node_updated` ·
 `edit_proposed` · `edit_accepted` · `edit_rejected` · `removal_proposed` · `removal_accepted` · `removal_rejected` ·
 `leaf_kind_set` · `plan_proposed` · `plan_approved` · `plan_rejected` · `tree_planted` · `tree_done` · `tree_blocked` ·
-`node_check` (auto-flip) · `node_verified` · `node_parked` · `node_unparked` · `node_promoted` · `human_done` · `focus_set` · `log`.
+`node_check` (auto-flip) · `node_verified` · `node_parked` · `node_unparked` · `node_promoted` · `human_done` · `focus_set` · `log` ·
+`ghost_edited_by_kevin` · `kevin_okd_edit` · `node_agreed` · `jarvis_pushed_back` (all four v0.1 §11.2).
 
 Every state-changing route/tool op in §3/§5 writes exactly one event (listed per route). `focus_set` is written on focus PUT only when the node actually changes (no spam on re-clicks).
 
@@ -213,6 +214,7 @@ type GoalCounts = {
   need_you: number;        // = ghosts + human_open + check + nodes with plan_state='proposed'
   ghosts: number;          // state='ghost' OR any pending_* set
   human_open: number;      // leaf_kind='human' AND state='set'
+  awaiting_jarvis: number; // v0.1 §11.1 — ghosts with review_state='awaiting_jarvis' (Kevin OK'd, waiting on JARVIS); need_you unchanged
   progress: number;        // 0..100 = round(100 * done / max(1, total_non_discarded_non_parked))
 };
 type GoalSummary = GoalRow & { counts: GoalCounts; focus_node_id: number | null; last_event_at: string | null };
@@ -227,6 +229,11 @@ type GoalNodeRow = {
   tree_id: string | null; tree_status_cache: 'active'|'done'|'blocked'|null;
   pending_title: string | null; pending_done_means: string | null; pending_removal: 0|1; pending_by: 'jarvis'|null;
   proposal_batch: string | null; promoted_to_goal_id: number | null;
+  // v0.1 §11.1 — Kevin-edit tracking + JARVIS weigh-in gate:
+  last_edited_by: 'kevin'|'jarvis'|null;      // who last edited this ghost's title/done_means/notes; NULL once it leaves ghost
+  kevin_edit_original: string | null;         // JSON {title,done_means,notes} snapshot of the JARVIS wording at Kevin's FIRST edit
+  review_state: 'none'|'awaiting_jarvis'|'pushed_back';
+  review_note: string | null;                 // JARVIS's push-back note
   sort_order: number; verified_at: string | null; created_at: string; updated_at: string;
   // derived, always present on reads:
   depth: number;             // 0 = direct child of root
@@ -467,3 +474,68 @@ Open with: if done_means is empty, your clarify questions; otherwise a two-line 
 12. `human_done` → `check`; `verify` → `done`. `park` on working → parked with tree untouched; `unpark` restores `working`.
 13. The three SSE types appear in `/events` for an admin key; a non-admin key still receives them (global events are not thread-scoped).
 14. `tsc` clean in darwin-assistant; cockpit `bun run build` (NOT the deploy script) clean.
+
+---
+
+## 11. v0.1 — Kevin edits a ghost → JARVIS weighs in → both agree → it solidifies (added 2026-09-19, additive)
+
+**Why (Kevin, verbatim, 2026-09-19):** *"I should be able to click any of them, see the synopsis/details, and I should be able to just erase/edit what's there. And it should 'save' the change and understand that I made the change. That way when it's not my turn — when I OK it or whatever — it would see that I made a change and would 'think about' the change, acknowledge I made it, and give me its thought on it. If it agrees, then we're good and it solidifies. But if you push back on it and don't think it should confirm yet, then we talk that one out until we're both good."*
+
+**The one rule this section adds:** a ghost solidifies (`ghost → set`) only when **the party who did NOT make the last edit** approves it.
+- JARVIS proposed / last reworded it + Kevin ✓ → `set` (v0 behaviour, unchanged).
+- Kevin last edited it + Kevin ✓ → **not set yet**: the node enters `review_state='awaiting_jarvis'`, a cue is posted into the goal chat, and JARVIS must either `accept` (agree → `set`) or `push_back` (stays ghost, note shown; they talk it out). JARVIS rewording it with `edit_ghost` hands the last word back to JARVIS, so Kevin's next ✓ sets it.
+- Kevin-AUTHORED nodes (`set_from_kevin` / POST node authored_by=kevin) are still born `set` — the pinned weigh-in on authored nodes is NOT part of v0.1 (only edits to JARVIS proposals). The mechanism below is what v1.1 would reuse.
+
+### 11.1 DDL (additive `ALTER TABLE goal_nodes ADD COLUMN …`, idempotent, guarded by PRAGMA table_info)
+
+```
+last_edited_by       TEXT CHECK (last_edited_by IN ('kevin','jarvis') OR last_edited_by IS NULL)  -- who last changed title/done_means/notes while ghost; NULL = untouched since proposal
+kevin_edit_original  TEXT   -- JSON {title, done_means, notes} = the JARVIS wording at the moment of Kevin's FIRST edit of this ghost; never overwritten by later Kevin edits; cleared (NULL) when the node leaves ghost
+review_state         TEXT NOT NULL DEFAULT 'none' CHECK (review_state IN ('none','awaiting_jarvis','pushed_back'))
+review_note          TEXT   -- JARVIS's push-back note (one or two sentences); cleared when review_state returns to 'none'
+```
+All four are returned on every `GoalNodeRow` read (add to §3.0 type). `GoalCounts` gains `awaiting_jarvis: number` (ghosts with `review_state='awaiting_jarvis'`); `need_you` is unchanged.
+
+### 11.2 Semantics (server-enforced in `goals.ts`)
+
+| Action | actor | Precondition | Effect | event kind |
+|---|---|---|---|---|
+| PATCH node (route 16) title/done_means/notes | kevin | state=ghost | `last_edited_by='kevin'`; if `kevin_edit_original IS NULL` snapshot the pre-edit `{title,done_means,notes}` into it; `review_state='none'`, `review_note=NULL` (a fresh edit re-opens the round) | `ghost_edited_by_kevin` (data: `{old,new}`) |
+| PATCH node / `edit_ghost` | jarvis | state=ghost | `last_edited_by='jarvis'`; `review_state='none'`, `review_note=NULL` (JARVIS took the last word; Kevin's next ✓ sets it). `kevin_edit_original` is kept for the audit trail | `node_updated` (unchanged kind) |
+| accept (one / batch / all) | kevin | state=ghost, `last_edited_by='kevin'` | **does NOT set.** `review_state='awaiting_jarvis'`, `proposal_batch` kept. Then fire ONE cue per HTTP request (§11.3) listing every node that just went awaiting. Nodes in the same request whose `last_edited_by != 'kevin'` set normally | `kevin_okd_edit` |
+| accept | kevin | state=ghost, `review_state='awaiting_jarvis'` (re-click) | `409 awaiting_jarvis` — message: "JARVIS is weighing in on your edit — see the chat" | — |
+| accept | kevin | state=ghost, `review_state='pushed_back'`, `last_edited_by='kevin'` | re-asks: `review_state='awaiting_jarvis'`, `review_note` kept, cue fires again with the note quoted ("Kevin re-OK'd without changes after your push-back") | `kevin_okd_edit` |
+| accept | jarvis | state=ghost, `review_state ∈ {awaiting_jarvis, pushed_back}` | `state='set'`, `review_state='none'`, `review_note=NULL`, `kevin_edit_original=NULL`, `last_edited_by=NULL`, `proposal_batch=NULL` | `node_agreed` (text: "JARVIS agreed with Kevin's edit: <title>") |
+| accept | jarvis | state=ghost, `review_state='none'` | unchanged v0 rule (only when Kevin said yes in chat) | `node_accepted` |
+| `push_back` (NEW tool op + route `POST /goals/:id/nodes/:nodeId/push_back {note}`) | jarvis | state=ghost, `review_state='awaiting_jarvis'` (also allowed from `none` when `last_edited_by='kevin'`) | `review_state='pushed_back'`, `review_note=note` (required, non-empty) | `jarvis_pushed_back` (text = note) |
+| discard | either | state=ghost | unchanged; clears review fields | `node_discarded` |
+| ghost → set by any path | — | — | clears `review_state/review_note/kevin_edit_original/last_edited_by` | — |
+
+`goal_events.kind` closed list gains: `ghost_edited_by_kevin` · `kevin_okd_edit` · `node_agreed` · `jarvis_pushed_back`.
+
+### 11.3 The cue (backend → goal chat)
+
+Same seam as `dispatch-gate.ts fireCue`: `processMessage(text, 'cockpit:goal-<id>', 'goal-cue:<goalId>:<eventId>')`; if the conversation is in flight (`getInFlightMessageId`) or throws `ConversationBusyError` → `enqueueMessage`. Fired once per accept request, after the write transaction commits. Text, exactly this shape (one block per node):
+
+```
+[goal #1 — Kevin edited 2 of your proposals and OK'd them. Weigh in.]
+#12 now: "New title" — done: "new done_means"
+    was (yours): "Old title" — done: "old done_means"
+#14 now: … / was (yours): …
+For each node: acknowledge the change in a sentence, then either agree → `goals` op `accept` {node_id} (it solidifies), or `push_back` {node_id, note} with your reason in one or two sentences and talk it out. Don't restate the rest of the tree.
+```
+When it is a re-ask after push-back, add a line `you pushed back with: "<review_note>"` under that node.
+
+### 11.4 Focus injection additions (§6)
+
+- Node marker gains `✎K` when `last_edited_by='kevin'` (ghost only). Line suffix: ` — AWAITING YOUR TAKE (was: "<original title>")` for `awaiting_jarvis`; ` — you pushed back: "<review_note>"` for `pushed_back`.
+- `<goal_tree …>` gains attribute `awaiting_you="N"`.
+
+### 11.5 Cockpit (§9 additions — `GoalTreePanel.tsx`, `cockpit-api.ts`)
+
+- **Click any row → focus AND expand it in place** (one expanded row at a time; a second click on the same row collapses it; expansion survives refetch/SSE). The expanded block sits directly under the row, inside the tree — no modal, no page change — and shows the FULL title, full done_means, notes, and a meta line (`proposed by JARVIS · edited by you 2m ago` / `authored by you`), plus `was: "<kevin_edit_original.title>" — done: "…"` when present.
+- **Inline edit:** title / done_means / notes are auto-sized textareas when `state ∈ {ghost, set, planned}` and `pending_removal=0`. Save on blur or ⌘/Ctrl+Enter; Esc reverts. PATCH route 16 (actor defaults to kevin). Toast on error, optimistic update.
+- **Row chips:** `✎ you` (small, amber) on a Kevin-edited ghost; `JARVIS weighing in…` (pulsing) when `awaiting_jarvis` — the row's ✓ is disabled with tooltip "JARVIS is weighing in — see the chat"; `JARVIS pushed back` (destructive tint) when `pushed_back` — the note is shown in the expanded block, ✓ re-enabled (re-ask).
+- **Batch bar `✓ all`:** result toast splits the outcome: "3 set · 2 sent to JARVIS to weigh in".
+- **Header card:** the goal's title/done_means no longer truncate silently — click expands + edits (PATCH /goals/:id), same textarea behaviour.
+- Collapsed rows keep single-line truncation but always carry the full text in `title=` tooltips.

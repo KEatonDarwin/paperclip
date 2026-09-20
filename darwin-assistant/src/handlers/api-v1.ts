@@ -89,6 +89,7 @@ import {
   acceptGoalNode,
   acceptGoalBatch,
   acceptAllGoalNodes,
+  pushBackGhost,
   discardGoalNode,
   discardGoalBatch,
   patchGoalNode,
@@ -2402,6 +2403,21 @@ export function createApiV1Router(): Router {
         ? undefined
         : (body.parent_id === null ? null : Number(body.parent_id));
       res.json({ nodes: acceptAllGoalNodes(goalId, parentId, body.actor) });
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  // v0.1 §11.2 — JARVIS pushes back on Kevin's OK'd edit (stays ghost + note; they talk it out).
+  router.post('/goals/:id/nodes/:nodeId/push_back', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const nodeId = parseInt(String(req.params.nodeId), 10);
+    const body = (req.body ?? {}) as { note?: unknown; actor?: unknown };
+    const note = typeof body.note === 'string' ? body.note : '';
+    try {
+      // push_back is a JARVIS action; default the actor accordingly so a bare
+      // POST from the tool/agent doesn't 403 on the kevin default.
+      res.json({ node: pushBackGhost(goalId, nodeId, note, body.actor ?? 'jarvis') });
     } catch (err) {
       sendCaughtGoalError(res, err);
     }

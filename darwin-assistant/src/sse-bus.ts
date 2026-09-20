@@ -18,6 +18,7 @@ import type { MonitorRow, MonitorRunRow } from './monitors.js';
 import type { FoundryModuleResponse, FoundryProjectResponse } from './foundry.js';
 import type { IntelItem, IntelRun } from './intel-desk.js';
 import type { GoalSummary, GoalNodeRow, FocusRow } from './goals.js';
+import type { GoalGuardRow } from './goals-guards.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -326,6 +327,12 @@ export interface GoalFocusEvent {
   goal_id: number;
   focus: FocusRow;
 }
+export interface GoalGuardEvent {          // 'goal_guard' (v0.2 §12.9) — global, like goal/goal_node
+  type: 'goal_guard';
+  action: 'proposed' | 'set' | 'updated' | 'discarded' | 'health';
+  goal_id: number;
+  guard: GoalGuardRow;
+}
 
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
@@ -339,7 +346,7 @@ export type SSEEvent =
   | DispatchEvent | DispatchCueEvent | HopperItemEvent | HopperNodeEvent | SmartTodoEvent
   | WorkstreamEvent | MonitorEvent | MonitorRunEvent | FoundryProjectEvent | FoundryModuleEvent
   | IntelRunEvent | IntelItemEvent | WorkbenchProposalEvent
-  | GoalEvent | GoalNodeEvent | GoalFocusEvent;
+  | GoalEvent | GoalNodeEvent | GoalFocusEvent | GoalGuardEvent;
 
 class SSEBus extends EventEmitter {}
 

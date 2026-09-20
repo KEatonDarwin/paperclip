@@ -85,6 +85,8 @@ export interface GoalCounts {
   ghosts: number;
   human_open: number;
   awaiting_jarvis: number;   // v0.1 §11.1 — ghosts Kevin OK'd, waiting on JARVIS to weigh in
+  guards: number;            // v0.2 §12.11 — count of state='set' guards in the goal
+  guards_failing: number;    // v0.2 §12.11 — set guards with health IN ('failing','error')
   progress: number;
 }
 
@@ -243,6 +245,46 @@ sqliteDb.exec(`
     set_by      TEXT    NOT NULL DEFAULT 'kevin' CHECK (set_by IN ('kevin','jarvis','system')),
     updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
   );
+
+  -- v0.2 Guards (CONTRACT §12.1): every done_means can become a monitored
+  -- Overwatch rule. The TABLE is declared here (goals.ts owns the goal* DDL and
+  -- must reference it in computeCounts / buildGoalThreadContext); the store /
+  -- client / poller / cue logic all live in src/goals-guards.ts.
+  CREATE TABLE IF NOT EXISTS goal_guards (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id           INTEGER NOT NULL REFERENCES goals(id),
+    node_id           INTEGER REFERENCES goal_nodes(id),
+    state             TEXT    NOT NULL DEFAULT 'ghost'
+                      CHECK (state IN ('ghost','set','discarded')),
+    mode              TEXT    NOT NULL DEFAULT 'query'
+                      CHECK (mode IN ('query','agent')),
+    title             TEXT    NOT NULL,
+    sql               TEXT,
+    comparator        TEXT    CHECK (comparator IN ('gte','lte','gt','lt','eq') OR comparator IS NULL),
+    threshold         REAL,
+    value_column      TEXT,
+    sample_columns    TEXT,
+    check_prompt      TEXT,
+    failure_prompt    TEXT,
+    cadence           INTEGER NOT NULL DEFAULT 60,
+    severity          TEXT    NOT NULL DEFAULT 'medium'
+                      CHECK (severity IN ('critical','high','medium','low')),
+    ow_group          TEXT    NOT NULL DEFAULT 'custom',
+    window_minutes    INTEGER NOT NULL DEFAULT 60,
+    overwatch_key     TEXT,
+    overwatch_rule_id TEXT,
+    health            TEXT    NOT NULL DEFAULT 'unknown'
+                      CHECK (health IN ('unknown','passing','failing','error')),
+    last_checked_at   TEXT,
+    last_value        REAL,
+    last_summary      TEXT,
+    authored_by       TEXT    NOT NULL DEFAULT 'jarvis'
+                      CHECK (authored_by IN ('kevin','jarvis')),
+    created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_goal_guards_goal ON goal_guards(goal_id, node_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_guards_owkey ON goal_guards(overwatch_key) WHERE overwatch_key IS NOT NULL;
 `);
 
 // v0.1 (CONTRACT §11.1) — additive columns for the Kevin-edit / JARVIS-weigh-in
@@ -392,12 +434,20 @@ const countsStmt = sqliteDb.prepare(`
   FROM goal_nodes WHERE goal_id = ?
 `);
 
+const guardCountsStmt = sqliteDb.prepare(`
+  SELECT
+    SUM(CASE WHEN state = 'set' THEN 1 ELSE 0 END) AS guards,
+    SUM(CASE WHEN state = 'set' AND health IN ('failing','error') THEN 1 ELSE 0 END) AS guards_failing
+  FROM goal_guards WHERE goal_id = ?
+`);
+
 function computeCounts(goalId: number): GoalCounts {
   const row = countsStmt.get(goalId) as {
     total: number | null; done: number | null; working: number | null; check_count: number | null;
     ghost_state: number | null; pending_count: number | null; human_open: number | null;
     plan_proposed: number | null; awaiting_jarvis: number | null; denom: number | null;
   };
+  const guardRow = guardCountsStmt.get(goalId) as { guards: number | null; guards_failing: number | null };
   const ghosts = (row.ghost_state ?? 0) + (row.pending_count ?? 0);
   const humanOpen = row.human_open ?? 0;
   const checkCount = row.check_count ?? 0;
@@ -413,6 +463,8 @@ function computeCounts(goalId: number): GoalCounts {
     ghosts,
     human_open: humanOpen,
     awaiting_jarvis: row.awaiting_jarvis ?? 0,
+    guards: guardRow.guards ?? 0,
+    guards_failing: guardRow.guards_failing ?? 0,
     progress: Math.round((100 * done) / denom),
   };
 }
@@ -1806,6 +1858,20 @@ export function buildGoalThreadContext(externalId: string): string {
     const focusPathStr = focusPath ? escapeAttr(focusPath.slice(1).join(' › ')) : '';
     const focusLine = `<goal_focus goal_id="${goalId}" node_id="${focusRaw.node_id ?? ''}" path="${focusPathStr}" state="${focusNode?.state ?? ''}" leaf_kind="${focusNode?.leaf_kind ?? ''}" pending="${focusNode ? pendingLabel(focusNode) : 'none'}"/>`;
 
+    // v0.2 §12.11 — set guards, keyed by node_id (null = the goal root). Each
+    // node/root carrying a set guard gets a 🛡 / 🛡✗ suffix in the snapshot.
+    const guardRows = sqliteDb.prepare(
+      `SELECT node_id, health, last_summary FROM goal_guards WHERE goal_id = ? AND state = 'set'`,
+    ).all(goalId) as Array<{ node_id: number | null; health: string; last_summary: string | null }>;
+    const guardByNode = new Map<number | null, { health: string; last_summary: string | null }>();
+    for (const g of guardRows) guardByNode.set(g.node_id, { health: g.health, last_summary: g.last_summary });
+    const guardSuffix = (nodeId: number | null): string => {
+      const g = guardByNode.get(nodeId);
+      if (!g) return '';
+      if (g.health === 'failing' || g.health === 'error') return ` 🛡✗ "${g.last_summary ?? ''}"`;
+      return ' 🛡';
+    };
+
     const allNodes = listRawNodesForGoal(goalId, false); // discarded never appear
     const byId = new Map(allNodes.map((n) => [n.id, n]));
     const byParent = new Map<number | null, GoalNodeDbRow[]>();
@@ -1845,7 +1911,7 @@ export function buildGoalThreadContext(externalId: string): string {
         const hidden = children.length && !showChildren ? countDescendants(n.id) : 0;
         const collapsed = hidden > 0 ? ` (+${hidden})` : '';
         const reviewSuffix = reviewLineSuffix(n);
-        lines.push(`${indent}- [${marker}] #${n.id} ${n.title}${stub} — done: ${doneMeans}${collapsed}${reviewSuffix}`);
+        lines.push(`${indent}- [${marker}] #${n.id} ${n.title}${stub} — done: ${doneMeans}${guardSuffix(n.id)}${collapsed}${reviewSuffix}`);
         if (showChildren) walk(n.id, depth + 1);
       }
     }
@@ -1856,8 +1922,9 @@ export function buildGoalThreadContext(externalId: string): string {
       body = body.slice(0, 59).concat([`… (+${lines.length - 59} more)`]);
     }
 
-    const header = `# ${goal.title} — done: ${goal.done_means ?? '(not set yet)'}`;
-    const treeBlock = `<goal_tree goal_id="${goalId}" status="${goal.status}" progress="${counts.progress}" working="${counts.working}" need_you="${counts.need_you}" awaiting_you="${counts.awaiting_jarvis}">\n${header}\n${body.join('\n')}\n</goal_tree>`;
+    const header = `# ${goal.title} — done: ${goal.done_means ?? '(not set yet)'}${guardSuffix(null)}`;
+    const guardsFailingAttr = counts.guards_failing > 0 ? ` guards_failing="${counts.guards_failing}"` : '';
+    const treeBlock = `<goal_tree goal_id="${goalId}" status="${goal.status}" progress="${counts.progress}" working="${counts.working}" need_you="${counts.need_you}" awaiting_you="${counts.awaiting_jarvis}"${guardsFailingAttr}>\n${header}\n${body.join('\n')}\n</goal_tree>`;
     return `${focusLine}\n${treeBlock}\n`;
   } catch {
     return '';

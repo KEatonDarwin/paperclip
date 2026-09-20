@@ -15,6 +15,8 @@ import {
   patchGoalNode,
   proposeEdit,
   proposeRemoval,
+  moveGoalNode,
+  proposeMove,
   setLeafKind,
   proposePlan,
   approvePlan,
@@ -63,6 +65,8 @@ const TRIMMED_NODE_KEYS = [
   'pending_removal', 'pending_by', 'proposal_batch', 'depth', 'child_count', 'authored_by',
   // v0.1 §11 — so JARVIS can see Kevin's edits + the weigh-in state in `list`.
   'last_edited_by', 'review_state', 'review_note', 'kevin_edit_original',
+  // v0.2 §13 — Kevin structure changes + JARVIS pending move.
+  'kevin_moved_at', 'kevin_move_from', 'pending_parent_id',
 ] as const;
 
 function trimTree(tree: GoalTree): unknown {
@@ -88,8 +92,11 @@ export const goals: ToolDef = {
     'node MUST carry a one-line done_means. While a proposal is still a ghost, reword it in place with `edit_ghost` as you and '+
     'Kevin talk it through (that is the "watch it change until I am good with it" loop) — do NOT discard and re-propose. ' +
     'When KEVIN edits one of your ghosts and OKs it, it does NOT solidify until you weigh in (§11): `accept` {node_id} to agree ' +
-    '(it sets), or `push_back` {node_id, note} with your reason to keep it a ghost and talk it out. Inside a goal thread ' +
-    '(cockpit:goal-<id>), goal_id and the default parent_id (the current focus) are inferred automatically — omit goal_id there.',
+    '(it sets), or `push_back` {node_id, note} with your reason to keep it a ghost and talk it out. When Kevin restructures the ' +
+    'tree himself (adds a row, edits a set row, drags a row under a new parent) the change is already real and flagged awaiting you ' +
+    '(↕K/✎K in the snapshot): on your next turn `accept` {node_id} to agree or `push_back` {node_id, note} — never try to undo it; ' +
+    'to move a set node yourself use `move` {node_id, parent_id} (it becomes a pending move he ✓s), your own ghosts move directly. ' +
+    'Inside a goal thread (cockpit:goal-<id>), goal_id and the default parent_id (the current focus) are inferred automatically — omit goal_id there.',
   parameters: {
     type: 'object',
     properties: {
@@ -97,14 +104,14 @@ export const goals: ToolDef = {
         type: 'string',
         enum: [
           'list', 'set_goal_done_means', 'propose', 'set_from_kevin', 'accept', 'push_back', 'discard',
-          'edit_ghost', 'propose_edit', 'propose_remove', 'set_leaf_kind', 'propose_plan', 'dispatch',
+          'edit_ghost', 'propose_edit', 'propose_remove', 'move', 'set_leaf_kind', 'propose_plan', 'dispatch',
           'verify', 'human_done', 'park', 'unpark', 'log', 'promote', 'focus',
         ],
         description: 'What to do.',
       },
       goal_id: { type: 'number', description: 'Required outside a goal thread (except for list, which lists the forest without it). Ignored inside a goal thread.' },
       node_id: { type: 'number', description: 'Target node id, where applicable.' },
-      parent_id: { type: ['number', 'null'], description: 'Parent node id for propose/set_from_kevin. Omit to default to the current focus node (inside a goal thread) or root-level.' },
+      parent_id: { type: ['number', 'null'], description: 'Parent node id for propose/set_from_kevin (omit = current focus node inside a goal thread, else root-level). For move: the new parent (null = root-level), required.' },
       batch_id: { type: 'string', description: 'Target proposal batch id, for accept/discard.' },
       all: { type: 'boolean', description: "For accept: accept every ghost in scope instead of one node/batch." },
       items: {
@@ -254,6 +261,21 @@ export const goals: ToolDef = {
       if (op === 'propose_remove') {
         if (args.node_id === undefined) return { error: 'node_id is required' };
         return { node: proposeRemoval(goalId, Number(args.node_id), str(args.reason), 'jarvis') };
+      }
+
+      if (op === 'move') {
+        // §13.6 — a ghost is JARVIS's own proposal → direct move; a set node
+        // becomes a pending move Kevin ✓s (route 32), never a direct write.
+        if (args.node_id === undefined) return { error: 'node_id is required' };
+        if (!('parent_id' in args) || args.parent_id === undefined) return { error: 'parent_id is required (number, or null for root-level)' };
+        const parentId = args.parent_id === null ? null : Number(args.parent_id);
+        const tree = getGoalTree(goalId, true);
+        const target = tree?.nodes.find((n) => n.id === Number(args.node_id));
+        if (!target) return { error: `node ${String(args.node_id)} not found in goal ${goalId}`, code: 'node_not_found' };
+        if (target.state === 'ghost') {
+          return { node: moveGoalNode(goalId, target.id, { parent_id: parentId, actor: 'jarvis' }), moved: true };
+        }
+        return { node: proposeMove(goalId, target.id, parentId, 'jarvis'), proposed: true };
       }
 
       if (op === 'set_leaf_kind') {

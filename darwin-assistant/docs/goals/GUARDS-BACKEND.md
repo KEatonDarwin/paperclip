@@ -62,6 +62,46 @@ Everything else (propose/edit/list/discard-of-a-ghost) works offline.
   tick → a live setting change takes effect on the next tick. Auto-starts at module
   load unless `GOAL_GUARD_POLLER=0` (the check sets that and drives `pollGuardsOnce()`).
 
+## Sim coverage (node #478, `hopper/goals-guards-ui` branch — sim lives on the backend branch)
+
+`scripts/goals-sim.ts` §[16] extends the existing lifecycle sim with G-1a..G-9a
+(24 checks) against a real fake-Overwatch HTTP server (mirrors the pattern in
+`scripts/goals-guards-check.mjs`, independently): propose preconditions
+(unverified node → `409 node_not_verifiable`, `guard_exists` on a dupe) →
+Kevin PATCH-before-accept → accept unconfigured (`503`, stays ghost, no
+throw) → accept configured (exact §12 create-payload shape asserted field by
+field) → re-accept (`409 invalid_transition`) → PATCH a set guard (pushed to
+Overwatch) + a `422 overwatch_rejected` leaving the local row untouched →
+the poller's full health lifecycle (unknown→passing silent, passing→failing
+fires ONE cue + `guard_failed` + `counts.guards_failing=1` + the 🛡✗
+snapshot suffix, a repeat tick is a no-op, failing→passing fires
+`guard_recovered`, `status='error'`→`guard_error` with its distinct wording)
+→ the webhook (bad secret 401, unknown key 404, good path applies health via
+the same `applyGuardHealth` path as the poller, secret unset 503) → discard
+(Overwatch `DELETE` called, a 404 there is tolerated) → a discarded guard
+drops out of `counts.guards`/`guards_failing` and the node can be re-guarded
+→ a healthy `set` guard renders a plain 🛡 (no `guards_failing` attribute at
+all when 0, per §12.11) → `goal_guard` SSE reaches the admin-scope stream
+across every action → `counts.need_you` is untouched by any guard event.
+
+The v0/v0.1 sections it runs alongside are unmodified: **104/104 checks pass**
+(`npm run goals:sim`), same run also re-verifies `goals:guards-check` still
+23/23. New loader hook `scripts/goals-guards-sim-cue.hooks.mjs` stubs
+`goals-guards.ts`'s dynamic `import('./agent.js')` (scoped to
+`dist/goals-guards.js`, mirroring `goals-guards-check.hooks.mjs`) onto the
+SAME `globalThis.__goalsCueCalls` array the v0.1 section's stub already
+populates, so one set of `cueCalls()`/`waitForCueCalls()` helpers covers both
+goal-review cues and guard cues — no live model call anywhere in the file.
+
+One real gap the sim exposed and worked around, not a bug: `goalId` (the goal
+these checks are appended onto) reaches `status='done'` partway through the
+existing v0 sections (§11b), and a done goal can no longer take new
+root-level nodes — so the `409 node_not_verifiable` precondition (G-1a) is
+demonstrated on `v01GoalId`/`v01Node2Id` (still `status='set'`, §15) instead;
+`proposeGuard`'s node-scoped precondition only reads the node's own state,
+never its parent goal's status, so this is a faithful equivalent, not a
+workaround of the actual behavior under test.
+
 ## Handoff to the UI lane (node #478, `hopper/goals-guards-ui`)
 
 Add `'goal_guard'` to `sse-worker.ts` `EVENT_TYPES`, the `GoalGuardRow`/`GoalGuardEvent`

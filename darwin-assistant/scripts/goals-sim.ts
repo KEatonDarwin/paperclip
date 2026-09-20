@@ -14,6 +14,7 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
+import http from 'node:http';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { register } from 'node:module';
 
@@ -27,6 +28,10 @@ const repoRoot = path.resolve(__dirname, '..');
 // turn — it just records the call on globalThis.__goalsCueCalls (NO API KEYS /
 // no live model calls anywhere in this file).
 register(pathToFileURL(path.join(__dirname, 'goals-v01-cue-check.hooks.mjs')), import.meta.url);
+// v0.2 §12.6 — goals-guards.ts's fireGuardCue does the SAME dynamic
+// import('./agent.js'), from a different dist file (goals-guards.js). Stub
+// that one too, onto the same __goalsCueCalls array (see the hook file).
+register(pathToFileURL(path.join(__dirname, 'goals-guards-sim-cue.hooks.mjs')), import.meta.url);
 
 // ── scratch DB guard (must run before any dist/ module is imported — ──────
 // conversation-db.js opens the sqlite handle at import time) ──────────────
@@ -46,6 +51,11 @@ console.log(`[goals-sim] scratch DB: ${DB_PATH}`);
 process.env.HOPPER_GOV_ENABLED = '0';
 process.env.HOPPER_ENGINE_SLOTS = process.env.HOPPER_ENGINE_SLOTS ?? '8';
 delete process.env.ANTHROPIC_API_KEY;
+// v0.2 §12.7/§12.12 guards: the poller auto-starts at module load of
+// goals-guards.js (which api-v1.js imports transitively) unless this is set —
+// must be set BEFORE that import. Section [16] drives pollGuardsOnce() by
+// hand instead. No Overwatch key is set yet (checks flip it on/off per-case).
+process.env.GOAL_GUARD_POLLER = '0';
 
 const distDir = path.join(repoRoot, 'dist');
 const express = (await import('express')).default;
@@ -53,6 +63,7 @@ const { createApiV1Router } = await import(path.join(distDir, 'handlers', 'api-v
 const { mintApiKey } = await import(path.join(distDir, 'api-keys.js'));
 const hopperEngine = await import(path.join(distDir, 'hopper-engine.js'));
 const goalsModule = await import(path.join(distDir, 'goals.js'));
+const guardsModule = await import(path.join(distDir, 'goals-guards.js'));
 
 // ── fake worker — no model calls, mirrors scripts/foundry-sim.mjs exactly ──
 const dispatchedNodeIds = new Set<number>();
@@ -189,6 +200,11 @@ function captureSSE(token: string): SSECapture {
   })();
   return { close: () => ctrl.abort(), events };
 }
+
+// v0.2 §12 guards: a fake Overwatch HTTP server, started inside section [16]
+// below. Declared here so the `finally` block can close it alongside the app
+// server regardless of which check (if any) failed.
+let owServer: import('node:http').Server | undefined;
 
 // ═══════════════════════════════════════════════════════════════════════════
 try {
@@ -1075,8 +1091,411 @@ try {
     const ev = (await get(`/goals/${v01GoalId}/events?limit=500`)).json.events.find((e: any) => e.node_id === id && e.kind === 'node_agreed');
     assert.ok(ev, 'the non-editing party approving Kevin\'s wording is an agreement, not a bare accept');
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // v0.2 §12 — Guards: every done_means can become a monitored Overwatch
+  // rule. CONTRACT.md §12, checks G-1..G-9 (node #478). Drives the same real
+  // HTTP path as every check above, against a FAKE Overwatch HTTP server on a
+  // throwaway port (mirrors scripts/goals-guards-check.mjs) — never a live
+  // Overwatch, never a live model call (the guard cue is stubbed by
+  // goals-guards-sim-cue.hooks.mjs registered at the top of this file, onto
+  // the same __goalsCueCalls array the v0.1 section already reads via
+  // cueCalls()/waitForCueCalls()). Guarded on `goalId` (the same goal used by
+  // sections [1]-[14]): `machineChildId` is `done` (from check 7n) and
+  // untouched since, `kevinNodeId` is `set`/unverified (from check 2b).
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[16] v0.2 §12: Guards — done_means -> a monitored Overwatch rule');
+
+  const needYouBaseline = (await get(`/goals/${goalId}`)).json.goal.counts.need_you;
+
+  const OW_KEY = 'sim-ow-key';
+  const owState = {
+    createBodies: [] as Record<string, unknown>[],
+    patchBodies: [] as { key: string; body: Record<string, unknown> }[],
+    deleteKeys: [] as string[],
+    results: new Map<string, { status: string; value: number | null; summary: string | null; at: string } | null>(),
+    next422OnPatch: false,
+    next404OnDelete: false,
+    seq: 0,
+  };
+  function owSlug(name: string): string {
+    return String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'rule';
+  }
+  owServer = http.createServer((httpReq, httpRes) => {
+    const chunks: Buffer[] = [];
+    httpReq.on('data', (c) => chunks.push(c as Buffer));
+    httpReq.on('end', () => {
+      const auth = httpReq.headers['authorization'] ?? '';
+      const url = httpReq.url ?? '';
+      const send = (code: number, obj: unknown) => {
+        httpRes.writeHead(code, { 'Content-Type': 'application/json' });
+        httpRes.end(JSON.stringify(obj));
+      };
+      if (auth !== `Bearer ${OW_KEY}`) { send(401, { error: 'Unauthorized' }); return; }
+      let body: Record<string, unknown> = {};
+      if (chunks.length) { try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { body = {}; } }
+      const m = /^\/api\/v1\/overwatch\/rules(?:\/([^/?]+))?/.exec(url);
+      const key = m && m[1] ? decodeURIComponent(m[1]) : null;
+
+      if (httpReq.method === 'POST' && !key) {
+        owState.createBodies.push(body);
+        const k = `prompt.${owSlug(String(body.name ?? 'rule'))}-${(++owState.seq).toString(16).padStart(4, '0')}`;
+        owState.results.set(k, null);
+        send(201, { ...body, key: k, dashboard_url: 'https://health.thedarwinhub.com/overwatch', last_result: null, created: true });
+        return;
+      }
+      if (httpReq.method === 'GET' && key) {
+        if (!owState.results.has(key)) { send(404, { error: `No prompt rule found for ${key}` }); return; }
+        send(200, { key, last_result: owState.results.get(key) });
+        return;
+      }
+      if (httpReq.method === 'PATCH' && key) {
+        if (owState.next422OnPatch) { owState.next422OnPatch = false; send(422, { error: 'sql was rejected: bad column' }); return; }
+        owState.patchBodies.push({ key, body });
+        send(200, { key, ...body });
+        return;
+      }
+      if (httpReq.method === 'DELETE' && key) {
+        owState.deleteKeys.push(key);
+        if (owState.next404OnDelete) { owState.next404OnDelete = false; send(404, { error: 'not found' }); return; }
+        owState.results.delete(key);
+        send(200, { deleted: true, key });
+        return;
+      }
+      send(400, { error: 'bad request' });
+    });
+  });
+  await new Promise<void>((resolve) => owServer!.listen(0, '127.0.0.1', () => resolve()));
+  const owAddress = owServer!.address();
+  const owPort = typeof owAddress === 'object' && owAddress ? owAddress.port : 0;
+  const OW_URL = `http://127.0.0.1:${owPort}`;
+  console.log(`[goals-sim] fake Overwatch: ${OW_URL}`);
+
+  function setOverwatchConfigured(on: boolean): void {
+    if (on) {
+      process.env.OVERWATCH_API_URL = OW_URL;
+      process.env.OVERWATCH_API_KEY = OW_KEY;
+    } else {
+      delete process.env.OVERWATCH_API_URL;
+      delete process.env.OVERWATCH_API_KEY;
+    }
+  }
+  process.env.GOALS_GUARD_WEBHOOK_SECRET = 'sim-webhook-secret';
+  setOverwatchConfigured(false); // starts unconfigured — G-2a needs this
+
+  const sseGuards = captureSSE(cockpitKey);
+  await sleep(150);
+
+  await check('G-1a', 'propose_guard on a set (unverified) node -> 409 node_not_verifiable', async () => {
+    // goalId's own goal reached status='done' back in [11b] (every node must
+    // be done/parked/discarded to verify a goal), so by now it has no 'set'
+    // node left to demonstrate this precondition on. v01GoalId (still status
+    // 'set', §15) does — v01Node2Id sat 'set' since V01-8c and is untouched
+    // since. propose_guard's node-scoped precondition only reads the NODE's
+    // own state, not its parent goal's status, so this is a faithful check.
+    const r = await post(`/goals/${v01GoalId}/guards/propose`, {
+      node_id: v01Node2Id, mode: 'query', title: 'guard on an unverified node',
+      sql: 'select 1 as v', comparator: 'gte', threshold: 1,
+    });
+    assert.equal(r.status, 409, JSON.stringify(r.json));
+    assert.equal(r.json.error.code, 'node_not_verifiable');
+  });
+
+  let guardId = -1;
+  await check('G-1b', 'propose_guard on a done node (query mode) -> 201 ghost, nothing written to Overwatch, event guard_proposed', async () => {
+    const eventsBefore = (await get(`/goals/${goalId}/events?limit=1000`)).json.events.length;
+    const r = await post(`/goals/${goalId}/guards/propose`, {
+      node_id: machineChildId,
+      mode: 'query',
+      title: 'rule registered + reviewed stays true',
+      sql: 'select count(*) as v from x where 1=1',
+      comparator: 'gte',
+      threshold: 1,
+    });
+    assert.equal(r.status, 201, JSON.stringify(r.json));
+    assert.equal(r.json.guard.state, 'ghost');
+    assert.equal(r.json.guard.node_id, machineChildId);
+    assert.equal(r.json.guard.overwatch_key, null);
+    assert.equal(owState.createBodies.length, 0, 'a ghost must not touch Overwatch');
+    guardId = r.json.guard.id;
+    const events = await get(`/goals/${goalId}/events?limit=1000`);
+    assert.ok(events.json.events.length > eventsBefore);
+    assert.ok(events.json.events.some((e: any) => e.kind === 'guard_proposed' && e.node_id === machineChildId));
+  });
+
+  await check('G-1c', 'a second propose_guard on the same node -> 409 guard_exists', async () => {
+    const r = await post(`/goals/${goalId}/guards/propose`, {
+      node_id: machineChildId, mode: 'query', title: 'dupe', sql: 'select 1 as v', comparator: 'gte', threshold: 1,
+    });
+    assert.equal(r.status, 409, JSON.stringify(r.json));
+    assert.equal(r.json.error.code, 'guard_exists');
+  });
+
+  await check('G-2a', 'accept when Overwatch is not configured -> 503 overwatch_not_connected (clean HTTP error, no throw to the caller); guard stays a ghost', async () => {
+    const r = await post(`/goals/${goalId}/guards/${guardId}/accept`, {});
+    assert.equal(r.status, 503, JSON.stringify(r.json));
+    assert.equal(r.json.error.code, 'overwatch_not_connected');
+    const g = await get(`/goals/${goalId}/guards/${guardId}`);
+    assert.equal(g.status, 200);
+    assert.equal(g.json.guard.state, 'ghost');
+    assert.equal(g.json.guard.health, 'unknown');
+  });
+
+  await check('G-2b', 'Kevin PATCH on the ghost updates sql/threshold/title before it is ever written to Overwatch, event guard_updated', async () => {
+    const r = await patch(`/goals/${goalId}/guards/${guardId}`, {
+      title: 'rule registered + reviewed stays true (tightened)',
+      sql: 'select count(*) as v from x where 1=1 and y=2',
+      threshold: 2,
+    });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.guard.threshold, 2);
+    assert.match(r.json.guard.sql, /y=2/);
+    const events = await get(`/goals/${goalId}/events?limit=1000`);
+    assert.ok(events.json.events.some((e: any) => e.kind === 'guard_updated' && e.node_id === machineChildId));
+  });
+
+  let owKey = '';
+  await check('G-2c', 'accept with Overwatch configured -> POSTs the exact §12 body, state=set, overwatch_key stored, health=unknown, event guard_set', async () => {
+    setOverwatchConfigured(true);
+    const before = owState.createBodies.length;
+    const r = await post(`/goals/${goalId}/guards/${guardId}/accept`, {});
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.guard.state, 'set');
+    assert.equal(r.json.guard.health, 'unknown');
+    assert.ok(r.json.guard.overwatch_key, 'expected an overwatch_key to be stored');
+    owKey = r.json.guard.overwatch_key;
+    assert.equal(owState.createBodies.length, before + 1);
+    const owBody = owState.createBodies[owState.createBodies.length - 1];
+    assert.equal(owBody.name, `Goal ${goalId} · node ${machineChildId} — rule registered + reviewed stays true (tightened)`);
+    assert.equal(owBody.group, 'custom');
+    assert.equal(owBody.severity, 'medium');
+    assert.equal(owBody.mode, 'query');
+    assert.equal(owBody.created_by, 'goals');
+    assert.equal(owBody.sql, 'select count(*) as v from x where 1=1 and y=2');
+    assert.equal(owBody.comparator, 'gte');
+    assert.equal(owBody.threshold, 2);
+    assert.equal(typeof owBody.cadence_minutes, 'number');
+    assert.equal(typeof owBody.window_minutes, 'number');
+    assert.ok(typeof owBody.description === 'string' && owBody.description.length > 0);
+    const events = await get(`/goals/${goalId}/events?limit=1000`);
+    assert.ok(events.json.events.some((e: any) => e.kind === 'guard_set' && e.node_id === machineChildId));
+  });
+
+  await check('G-2d', 're-accept an already-set guard -> 409 invalid_transition', async () => {
+    const r = await post(`/goals/${goalId}/guards/${guardId}/accept`, {});
+    assert.equal(r.status, 409, JSON.stringify(r.json));
+    assert.equal(r.json.error.code, 'invalid_transition');
+  });
+
+  await check('G-3a', 'PATCH a SET guard pushes the change to Overwatch (PATCH /rules/{key}) and applies it locally', async () => {
+    const before = owState.patchBodies.length;
+    const r = await patch(`/goals/${goalId}/guards/${guardId}`, { threshold: 3 });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.guard.threshold, 3);
+    assert.equal(owState.patchBodies.length, before + 1);
+    assert.equal(owState.patchBodies[owState.patchBodies.length - 1].key, owKey);
+    assert.equal(owState.patchBodies[owState.patchBodies.length - 1].body.threshold, 3);
+  });
+
+  await check('G-3b', 'Overwatch 422 on PATCH -> 422 overwatch_rejected, local row unchanged', async () => {
+    owState.next422OnPatch = true;
+    const r = await patch(`/goals/${goalId}/guards/${guardId}`, { threshold: 99 });
+    assert.equal(r.status, 422, JSON.stringify(r.json));
+    assert.equal(r.json.error.code, 'overwatch_rejected');
+    const g = await get(`/goals/${goalId}/guards/${guardId}`);
+    assert.equal(g.json.guard.threshold, 3, 'threshold must remain the last successfully-applied value');
+  });
+
+  await check('G-4a', 'poller: unknown -> passing is a SILENT flip (SSE only) — no event, no cue', async () => {
+    owState.results.set(owKey, { status: 'ok', value: 1, summary: 'holding steady', at: new Date().toISOString() });
+    const before = cueCallCount();
+    await guardsModule.pollGuardsOnce();
+    const g = await get(`/goals/${goalId}/guards/${guardId}`);
+    assert.equal(g.json.guard.health, 'passing');
+    await sleep(120);
+    assert.equal(cueCallCount(), before, 'unknown->passing must not fire a cue');
+  });
+
+  await check('G-4b', 'poller: passing -> failing fires guard_failed + ONE cue + counts.guards_failing=1 + snapshot shows 🛡✗', async () => {
+    owState.results.set(owKey, { status: 'fail', value: 0, summary: 'condition broke', at: new Date().toISOString() });
+    const before = cueCallCount();
+    await guardsModule.pollGuardsOnce();
+    const g = await get(`/goals/${goalId}/guards/${guardId}`);
+    assert.equal(g.json.guard.health, 'failing');
+    const events = await get(`/goals/${goalId}/events?limit=1000`);
+    assert.ok(events.json.events.some((e: any) => e.kind === 'guard_failed' && e.node_id === machineChildId));
+    await waitForCueCalls(before + 1);
+    assert.equal(cueCallCount(), before + 1, 'expected exactly ONE cue for the health flip');
+    const cue = lastCueCall();
+    assert.equal(cue.externalId, `cockpit:goal-${goalId}`);
+    assert.match(cue.text, /is FAILING/);
+    assert.ok(cue.text.includes(`#${machineChildId}`), 'cue must name the node the guard is on');
+
+    const tree = await get(`/goals/${goalId}`);
+    assert.equal(tree.json.goal.counts.guards, 1);
+    assert.equal(tree.json.goal.counts.guards_failing, 1);
+
+    await put(`/goals/${goalId}/focus`, { node_id: machineChildId });
+    const snapshot: string = goalsModule.buildGoalThreadContext(`cockpit:goal-${goalId}`);
+    assert.match(snapshot, /guards_failing="1"/);
+    assert.match(snapshot, /🛡✗ "condition broke"/);
+  });
+
+  await check('G-4c', 'a second identical poll tick (still failing) -> idempotent: no extra event, no extra cue', async () => {
+    const beforeCue = cueCallCount();
+    const beforeFailedEvents = (await get(`/goals/${goalId}/events?limit=1000`)).json.events.filter((e: any) => e.kind === 'guard_failed').length;
+    await guardsModule.pollGuardsOnce();
+    await sleep(120);
+    assert.equal(cueCallCount(), beforeCue, 'no health change -> no cue');
+    const afterFailedEvents = (await get(`/goals/${goalId}/events?limit=1000`)).json.events.filter((e: any) => e.kind === 'guard_failed').length;
+    assert.equal(afterFailedEvents, beforeFailedEvents, 'no health change -> no new event');
+  });
+
+  await check('G-4d', 'poller: failing -> passing fires guard_recovered + cue, guards_failing back to 0', async () => {
+    owState.results.set(owKey, { status: 'ok', value: 1, summary: 'back to normal', at: new Date().toISOString() });
+    const before = cueCallCount();
+    await guardsModule.pollGuardsOnce();
+    await waitForCueCalls(before + 1);
+    const g = await get(`/goals/${goalId}/guards/${guardId}`);
+    assert.equal(g.json.guard.health, 'passing');
+    const events = await get(`/goals/${goalId}/events?limit=1000`);
+    assert.ok(events.json.events.some((e: any) => e.kind === 'guard_recovered' && e.node_id === machineChildId));
+    const cue = lastCueCall();
+    assert.match(cue.text, /RECOVERED/);
+    const tree = await get(`/goals/${goalId}`);
+    assert.equal(tree.json.goal.counts.guards_failing, 0);
+  });
+
+  await check('G-4e', "poller: status='error' fires guard_error + cue (distinct wording — the check itself, not necessarily the goal)", async () => {
+    owState.results.set(owKey, { status: 'error', value: null, summary: 'Hub connection refused', at: new Date().toISOString() });
+    const before = cueCallCount();
+    await guardsModule.pollGuardsOnce();
+    const g = await get(`/goals/${goalId}/guards/${guardId}`);
+    assert.equal(g.json.guard.health, 'error');
+    const events = await get(`/goals/${goalId}/events?limit=1000`);
+    assert.ok(events.json.events.some((e: any) => e.kind === 'guard_error' && e.node_id === machineChildId));
+    await waitForCueCalls(before + 1);
+    const cue = lastCueCall();
+    assert.match(cue.text, /ERRORED/);
+    assert.match(cue.text, /the guard, not necessarily the goal/);
+  });
+
+  await check('G-5a', 'webhook: bad secret -> 401', async () => {
+    const r = await fetch(`${base}/goals/guards/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Goals-Guard-Secret': 'wrong-secret' },
+      body: JSON.stringify({ key: owKey, status: 'ok' }),
+    });
+    assert.equal(r.status, 401);
+  });
+
+  await check('G-5b', 'webhook: good secret but unknown key -> 404 no_guard_for_key (ignored, not alarmed)', async () => {
+    const r = await fetch(`${base}/goals/guards/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Goals-Guard-Secret': 'sim-webhook-secret' },
+      body: JSON.stringify({ key: 'prompt.does-not-exist-0000', status: 'ok' }),
+    });
+    assert.equal(r.status, 404);
+    const j = await r.json();
+    assert.equal(j.error.code, 'no_guard_for_key');
+  });
+
+  await check('G-5c', 'webhook: good secret + known key -> applies health via the SAME applyGuardHealth path as the poller (health flips, cue fires once)', async () => {
+    const before = cueCallCount();
+    const r = await fetch(`${base}/goals/guards/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Goals-Guard-Secret': 'sim-webhook-secret' },
+      body: JSON.stringify({ key: owKey, status: 'fail', value: 0, summary: 'webhook says it broke', ran_at: new Date().toISOString() }),
+    });
+    assert.equal(r.status, 200);
+    const j = await r.json();
+    assert.equal(j.ok, true);
+    const g = await get(`/goals/${goalId}/guards/${guardId}`);
+    assert.equal(g.json.guard.health, 'failing');
+    assert.equal(g.json.guard.last_summary, 'webhook says it broke');
+    await waitForCueCalls(before + 1);
+    assert.equal(cueCallCount(), before + 1);
+  });
+
+  await check('G-5d', 'webhook: secret unconfigured -> 503 webhook_secret_unset', async () => {
+    const saved = process.env.GOALS_GUARD_WEBHOOK_SECRET;
+    delete process.env.GOALS_GUARD_WEBHOOK_SECRET;
+    try {
+      const r = await fetch(`${base}/goals/guards/webhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Goals-Guard-Secret': 'sim-webhook-secret' },
+        body: JSON.stringify({ key: owKey, status: 'ok' }),
+      });
+      assert.equal(r.status, 503);
+      const j = await r.json();
+      assert.equal(j.error.code, 'webhook_secret_unset');
+    } finally {
+      process.env.GOALS_GUARD_WEBHOOK_SECRET = saved;
+    }
+  });
+
+  await check('G-6a', 'discard a SET guard -> Overwatch DELETE called, state=discarded, event guard_discarded', async () => {
+    const before = owState.deleteKeys.length;
+    const r = await post(`/goals/${goalId}/guards/${guardId}/discard`, { reason: 'drill cleanup' });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.guard.state, 'discarded');
+    assert.equal(owState.deleteKeys.length, before + 1);
+    assert.equal(owState.deleteKeys[owState.deleteKeys.length - 1], owKey);
+    const events = await get(`/goals/${goalId}/events?limit=1000`);
+    assert.ok(events.json.events.some((e: any) => e.kind === 'guard_discarded' && e.node_id === machineChildId));
+  });
+
+  await check('G-6b', 'a discarded guard drops out of guards/guards_failing, and the node can be guarded again', async () => {
+    const tree = await get(`/goals/${goalId}`);
+    assert.equal(tree.json.goal.counts.guards, 0);
+    assert.equal(tree.json.goal.counts.guards_failing, 0);
+    const r = await post(`/goals/${goalId}/guards/propose`, {
+      node_id: machineChildId, mode: 'query', title: 'second guard on the same node', sql: 'select 1 as v', comparator: 'gte', threshold: 1,
+    });
+    assert.equal(r.status, 201, JSON.stringify(r.json));
+  });
+
+  let guardId2 = -1;
+  await check('G-7a', 'accepting the second guard sets counts.guards=1/guards_failing=0 and the snapshot shows a plain 🛡 (healthy, not ✗)', async () => {
+    const listed = await get(`/goals/${goalId}/guards`);
+    guardId2 = listed.json.guards.filter((g: any) => g.state === 'ghost')[0].id;
+    const r = await post(`/goals/${goalId}/guards/${guardId2}/accept`, {});
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.guard.state, 'set');
+    assert.equal(r.json.guard.health, 'unknown');
+    const tree = await get(`/goals/${goalId}`);
+    assert.equal(tree.json.goal.counts.guards, 1);
+    assert.equal(tree.json.goal.counts.guards_failing, 0);
+    const snapshot: string = goalsModule.buildGoalThreadContext(`cockpit:goal-${goalId}`);
+    assert.match(snapshot, / 🛡(?!✗)/, 'a set, non-failing guard should render a plain shield');
+    assert.doesNotMatch(snapshot, /guards_failing="/, 'guards_failing attribute must be omitted when 0 (§12.11)');
+  });
+
+  await check('G-7b', 'discard tolerates an Overwatch 404 on DELETE (already gone) — still discards locally', async () => {
+    owState.next404OnDelete = true;
+    const r = await post(`/goals/${goalId}/guards/${guardId2}/discard`, {});
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.guard.state, 'discarded');
+  });
+
+  await check('G-8a', 'SSE: the goal_guard event type reached the admin-scope stream across proposed/set/updated/health/discarded actions', async () => {
+    await sleep(200);
+    const guardEvents = sseGuards.events.filter((e: any) => e.type === 'goal_guard');
+    const actions = new Set(guardEvents.map((e: any) => e.action));
+    assert.ok(guardEvents.length > 0, 'expected at least one goal_guard SSE event');
+    for (const expected of ['proposed', 'set', 'updated', 'health', 'discarded']) {
+      assert.ok(actions.has(expected), `expected a goal_guard SSE event with action=${expected}, saw: ${[...actions].join(',')}`);
+    }
+    sseGuards.close();
+  });
+
+  await check('G-9a', 'need_you is UNCHANGED by guard proposals/health flips/discards (§12.11 — a failing guard cues the chat, it is not a fresh approval)', async () => {
+    const tree = await get(`/goals/${goalId}`);
+    assert.equal(tree.json.goal.counts.need_you, needYouBaseline, 'need_you must not move because of any guard event in this section');
+  });
 } finally {
   server.close();
+  owServer?.close();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

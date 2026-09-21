@@ -7,11 +7,14 @@ import {
   clearThreadLinks,
   getThreadLink,
 } from '../thread-links.js';
+import { normalizeLinkTarget } from '../vault-resolve.js';
 
 function normalizeUrl(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
-  const v = raw.trim();
+  const v = normalizeLinkTarget(raw);
   if (!v) return null;
+  // Wiki-relative citations become the cockpit vault-viewer URL (relative to the cockpit host).
+  if (v.startsWith('/settings/') || v.startsWith('/thread/')) return v;
   // Accept bare hosts by defaulting to https; reject anything that still isn't a URL.
   const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(v) ? v : `https://${v}`;
   try {
@@ -44,7 +47,7 @@ export const threadLinks: ToolDef = {
       },
       url: {
         type: 'string',
-        description: 'The link URL. Required for set_preview and add. A bare host is assumed https://.',
+        description: 'The link URL. Required for set_preview and add. A bare host is assumed https://; a wiki-relative path like outbox/report.md becomes the vault-viewer link.',
       },
       label: {
         type: 'string',

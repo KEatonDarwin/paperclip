@@ -370,6 +370,7 @@ import {
 } from '../conversation-db.js';
 import { query } from '../db.js';
 import { listVaultTree, readVaultFile, searchVault } from '../vault-page.js';
+import { normalizeLinkTarget, resolveVaultPath, resolveVaultPaths } from '../vault-resolve.js';
 import { sseBus, type SSEEvent, type ToolCallEvent } from '../sse-bus.js';
 import {
   authenticateBearer,
@@ -5042,7 +5043,7 @@ export function createApiV1Router(): Router {
     const caller = req.apiKey!;
     const externalId = paramString(req.params.external_id);
     const body = (req.body ?? {}) as { url?: unknown; label?: unknown; kind?: unknown };
-    const url = typeof body.url === 'string' ? body.url.trim() : '';
+    const url = typeof body.url === 'string' ? normalizeLinkTarget(body.url) : '';
     if (!url) {
       sendError(res, 400, 'invalid_request', 'url is required and must be a non-empty string');
       return;
@@ -5829,7 +5830,31 @@ export function createApiV1Router(): Router {
     }
     readVaultFile(path)
       .then((result) => res.json(result))
-      .catch((err: unknown) => sendError(res, 400, 'vault_file_failed', err instanceof Error ? err.message : String(err)));
+      .catch(async (err: unknown) => {
+        // Not in the vault as cited — try to resolve it (repo file → scratch mirror).
+        const r = await resolveVaultPath(path);
+        if (r.status === 'missing') {
+          sendError(res, 404, 'vault_file_not_found', `${path} is not in the vault and could not be located in a known repo`);
+          return;
+        }
+        try {
+          const result = await readVaultFile(r.path);
+          res.json({ ...result, requested_path: path, resolved: r.status, source: r.status === 'scratch' ? r.source : undefined });
+        } catch (err2: unknown) {
+          sendError(res, 400, 'vault_file_failed', err2 instanceof Error ? err2.message : String(err2));
+        }
+        void err;
+      });
+  });
+
+  // POST /vault/resolve { paths: string[] } → { results: { [path]: { status, path, source? } } }
+  // Used by the cockpit linkifier so only openable paths render as links.
+  router.post('/vault/resolve', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { paths?: unknown };
+    const paths = Array.isArray(body.paths) ? body.paths.filter((p): p is string => typeof p === 'string') : [];
+    resolveVaultPaths(paths)
+      .then((results) => res.json({ results }))
+      .catch((err: unknown) => sendError(res, 500, 'vault_resolve_failed', err instanceof Error ? err.message : String(err)));
   });
 
   router.get('/vault/search', (req: AuthedRequest, res) => {

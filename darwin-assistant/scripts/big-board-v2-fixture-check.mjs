@@ -205,6 +205,35 @@ function baseInputs(overrides = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// 3b. tree-status filtering (review fix #535): a `foundry:<project>/<module>`
+// tree is clustered separately by buildSpawnMonitorSnapshot, so prove an ACTIVE
+// foundry tree still reaches trees.active (its summary must be found in the
+// foundry cluster, not just the `single` clusters) — and that draft/archived
+// are excluded alongside done (only `done` was covered above).
+// ---------------------------------------------------------------------------
+{
+  const trees = [
+    tree('tree-foundry', 'active', iso(-2)),
+    tree('tree-draft', 'draft', iso(-1)),
+    tree('tree-archived', 'archived', iso(-1)),
+  ];
+  trees[0].topic = 'foundry:hello-foundry/module-api';
+  const byTree = new Map([
+    ['tree-foundry', [node(30, 'tree-foundry', 'running', iso(-2)), node(31, 'tree-foundry', 'pending', iso(-2))]],
+    ['tree-draft', [node(32, 'tree-draft', 'draft', iso(-1))]],
+  ]);
+  const snap = buildBigBoardSnapshot(baseInputs({ hopperTrees: trees, hopperNodesByTree: byTree }));
+  check(
+    'active foundry tree is NOT dropped by the foundry clustering',
+    snap.trees.active.length === 1 && snap.trees.active[0].id === 'tree-foundry',
+  );
+  check('foundry tree keeps its reused counts', snap.trees.active[0]?.counts.running === 1 && snap.trees.active[0]?.counts.total === 2);
+  check('foundry tree keeps its node list', snap.trees.active[0]?.nodes.map((n) => n.id).join(',') === '30,31');
+  check('draft tree excluded from active', !snap.trees.active.some((t) => t.id === 'tree-draft'));
+  check('archived tree excluded from active', !snap.trees.active.some((t) => t.id === 'tree-archived'));
+}
+
+// ---------------------------------------------------------------------------
 // 4. radar: waiting_on derivation + window + cap
 // ---------------------------------------------------------------------------
 {

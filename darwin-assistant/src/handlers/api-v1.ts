@@ -3102,6 +3102,14 @@ export function createApiV1Router(): Router {
       typeof landedHoursRaw === 'string' && landedHoursRaw.trim() && Number.isFinite(parseFloat(landedHoursRaw))
         ? parseFloat(landedHoursRaw)
         : undefined;
+    // v2: `?radar_hours=` overrides the Radar window (settings-KV
+    // `big_board_radar_hours`, default 6h) for manual debugging — same shape
+    // as landed_hours above.
+    const radarHoursRaw = req.query.radar_hours;
+    const radarHours =
+      typeof radarHoursRaw === 'string' && radarHoursRaw.trim() && Number.isFinite(parseFloat(radarHoursRaw))
+        ? parseFloat(radarHoursRaw)
+        : undefined;
     const providers: BigBoardProviders = {
       claude: readClaudeLiveUsage(),
       claude_accounts: readClaudeAccountsUsage(),
@@ -3109,7 +3117,7 @@ export function createApiV1Router(): Router {
       augment: readAugmentUsage(),
     };
     try {
-      res.json(gatherBigBoardSnapshot({ landedHours, providers }));
+      res.json(gatherBigBoardSnapshot({ landedHours, radarHours, providers }));
     } catch (err) {
       sendError(res, 500, 'big_board_failed', err instanceof Error ? err.message : String(err));
     }

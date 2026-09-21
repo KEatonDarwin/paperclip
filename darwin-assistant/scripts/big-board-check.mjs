@@ -41,10 +41,10 @@ function check(label, ok) {
   }
 }
 
-// -- every top-level section from CONTRACT.md Part 1 is present -------------
+// -- every top-level section from CONTRACT.md Part 1 (+ v2's `trees`) -------
 const REQUIRED_KEYS = [
   'generated_at', 'monitors', 'sentinels', 'commitments', 'in_motion',
-  'goal_spotlight', 'radar', 'landed', 'providers', 'governor',
+  'goal_spotlight', 'trees', 'radar', 'landed', 'providers', 'governor',
 ];
 for (const key of REQUIRED_KEYS) check(`top-level key "${key}" present`, key in snapshot);
 
@@ -66,8 +66,49 @@ check('in_motion.hopper_nodes is an array', Array.isArray(snapshot.in_motion?.ho
 check('in_motion.threads is an array', Array.isArray(snapshot.in_motion?.threads));
 check('in_motion.threads only contains running threads', (snapshot.in_motion?.threads ?? []).every((t) => t.running === true));
 check('goal_spotlight has a nodes array', Array.isArray(snapshot.goal_spotlight?.nodes));
+
+// -- v2: trees (active-tree anchor, reused from buildSpawnMonitorSnapshot) --
+check('trees.active is an array', Array.isArray(snapshot.trees?.active));
+check(
+  'trees.density is none/expanded/compact and matches active.length',
+  ['none', 'expanded', 'compact'].includes(snapshot.trees?.density) &&
+    (snapshot.trees.active.length === 0 ? snapshot.trees.density === 'none'
+      : snapshot.trees.active.length <= 2 ? snapshot.trees.density === 'expanded'
+      : snapshot.trees.density === 'compact'),
+);
+check('every active tree has status "active" (never draft/done/archived)', (snapshot.trees?.active ?? []).every((t) => t.status === 'active'));
+check(
+  'every active tree has counts + nodes array, nodes ordered by id',
+  (snapshot.trees?.active ?? []).every((t) => {
+    if (!t.counts || !Array.isArray(t.nodes)) return false;
+    for (let i = 1; i < t.nodes.length; i++) if (t.nodes[i].id <= t.nodes[i - 1].id) return false;
+    return true;
+  }),
+);
+check(
+  'active trees sorted running-first',
+  (() => {
+    const list = snapshot.trees?.active ?? [];
+    let seenNonRunning = false;
+    for (const t of list) {
+      const running = t.counts.running > 0;
+      if (!running) seenNonRunning = true;
+      if (running && seenNonRunning) return false;
+    }
+    return true;
+  })(),
+);
+
+// -- v2: radar is now curated (waiting_on-tagged, windowed, capped 8) -------
 check('radar is an array', Array.isArray(snapshot.radar));
-check('landed is an array capped at 8', Array.isArray(snapshot.landed) && snapshot.landed.length <= 8);
+check('radar capped at 8 (v2 curated cap)', snapshot.radar.length <= 8);
+check(
+  'every radar entry carries waiting_on in {kevin,jarvis,null}',
+  snapshot.radar.every((r) => r.waiting_on === 'kevin' || r.waiting_on === 'jarvis' || r.waiting_on === null),
+);
+check('every running radar entry has waiting_on = jarvis', snapshot.radar.filter((r) => r.running).every((r) => r.waiting_on === 'jarvis'));
+
+check('landed is an array capped at 6 (v2 tightened from 8)', Array.isArray(snapshot.landed) && snapshot.landed.length <= 6);
 check(
   'landed entries carry kind/text/at',
   (snapshot.landed ?? []).every((l) => ['tree', 'commitment', 'notification'].includes(l.kind) && typeof l.text === 'string' && typeof l.at === 'string'),
@@ -103,6 +144,7 @@ console.log(
     `commitments_open=${snapshot.commitments.open.length} ` +
     `running_hopper_nodes=${snapshot.in_motion.hopper_nodes.length} ` +
     `running_threads=${snapshot.in_motion.threads.length} ` +
+    `active_trees=${snapshot.trees.active.length}(${snapshot.trees.density}) ` +
     `radar=${snapshot.radar.length} ` +
     `goal_spotlight=${snapshot.goal_spotlight.goal ? JSON.stringify(snapshot.goal_spotlight.goal.title) : '(no active goals)'} ` +
     `landed=${snapshot.landed.length}`,

@@ -1,7 +1,8 @@
 import { listCommitments } from '../commitments.js';
+import { gatherBigBoardSnapshot, BIG_BOARD_KIOSK_TOKEN_SETTING, BIG_BOARD_KIOSK_EVENT_TYPES, type BigBoardProviders } from '../big-board.js';
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
 import { statSync, readFileSync } from 'node:fs';
 import { displayContentFromRawOutput, parseTurnSteps } from '../turn-steps.js';
 import { isPlanModeMessage } from '../agent.js';
@@ -1006,9 +1007,44 @@ function findConversationForCaller(caller: ApiKeyRow, externalId: string): Conve
 // itself (fails closed: 503 when the secret is unset) — see its handler.
 const AUTH_EXEMPT_PATHS = new Set(['/goals/guards/webhook']);
 
+// Big Board kiosk auth (docs/big-board/CONTRACT.md Part 3). A dedicated,
+// narrow, revocable ?kiosk= token accepted on exactly these two GET routes —
+// never a generic bearer-header replacement, never on a mutating route. On a
+// match this is NOT aliased to a real api_keys row: it's a distinct, log-
+// visible, single-purpose synthetic credential (read-only, admin-scope so the
+// board's Conversation Radar can see every thread).
+const KIOSK_ELIGIBLE_PATHS = new Set(['/big-board', '/events']);
+const BIG_BOARD_KIOSK_API_KEY: ApiKeyRow = {
+  id: -1,
+  key_hash: '',
+  caller_label: 'big-board-kiosk',
+  scope: 'cockpit',
+  created_at: '',
+  revoked_at: null,
+};
+
+function constantTimeStringEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
 function bearerAuth(req: AuthedRequest, res: Response, next: NextFunction): void {
   if (req.method === 'POST' && AUTH_EXEMPT_PATHS.has(req.path)) {
     next();
+    return;
+  }
+  if (req.method === 'GET' && KIOSK_ELIGIBLE_PATHS.has(req.path) && typeof req.query.kiosk === 'string' && req.query.kiosk.length > 0) {
+    // Fails closed: an unset/empty stored token means kiosk auth is entirely
+    // disabled, so any ?kiosk= value 401s exactly like a missing bearer header.
+    const stored = getSetting(BIG_BOARD_KIOSK_TOKEN_SETTING);
+    if (stored && constantTimeStringEqual(stored, req.query.kiosk)) {
+      req.apiKey = BIG_BOARD_KIOSK_API_KEY;
+      next();
+      return;
+    }
+    sendError(res, 401, 'invalid_or_missing_bearer_token', 'Invalid or disabled kiosk token');
     return;
   }
   const header = req.get('authorization') ?? '';
@@ -3052,6 +3088,45 @@ export function createApiV1Router(): Router {
   // read before routing a new tree's nodes.
   router.get('/hopper-engine/history', (_req: AuthedRequest, res) => {
     res.json(getHopperHistory());
+  });
+
+  // == Big Board ===============================================================
+  // Office-TV kiosk aggregate (docs/big-board/CONTRACT.md). One read-only JSON
+  // endpoint over existing stores, no new tables. Provider-usage readers below
+  // (readClaudeLiveUsage etc.) are private to this file, so they're composed
+  // here rather than inside big-board.ts (would create an import cycle).
+
+  router.get('/big-board', (req: AuthedRequest, res) => {
+    const landedHoursRaw = req.query.landed_hours;
+    const landedHours =
+      typeof landedHoursRaw === 'string' && landedHoursRaw.trim() && Number.isFinite(parseFloat(landedHoursRaw))
+        ? parseFloat(landedHoursRaw)
+        : undefined;
+    const providers: BigBoardProviders = {
+      claude: readClaudeLiveUsage(),
+      claude_accounts: readClaudeAccountsUsage(),
+      openai_codex: readCodexUsage(),
+      augment: readAugmentUsage(),
+    };
+    try {
+      res.json(gatherBigBoardSnapshot({ landedHours, providers }));
+    } catch (err) {
+      sendError(res, 500, 'big_board_failed', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  // Mints (or re-mints) the kiosk's ?kiosk= token — a distinct, revocable,
+  // read-only credential, never aliased to a real api_keys row. Admin-scoped:
+  // Kevin's own bearer key mints it, the kiosk browser only ever carries the
+  // resulting token in its URL. Returns the plaintext once, mirrors mintApiKey.
+  router.post('/big-board/kiosk-token', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Minting the Big Board kiosk token requires an admin-scoped key');
+      return;
+    }
+    const token = `bb_${randomBytes(24).toString('hex')}`;
+    setSetting(BIG_BOARD_KIOSK_TOKEN_SETTING, token);
+    res.status(201).json({ token });
   });
 
   // == Spawn-Tree Mission Control =============================================
@@ -5388,8 +5463,12 @@ export function createApiV1Router(): Router {
     res.write(':\n\n');
     const heartbeat = setInterval(() => res.write(':\n\n'), 15000);
 
+    // The Big Board kiosk credential only ever gets the board's own event
+    // types — never turn/stream_delta transcript traffic (review fix #520).
+    const kiosk = caller === BIG_BOARD_KIOSK_API_KEY;
     const handler = (ev: SSEEvent) => {
       if (!FORWARD.has(ev.type)) return;
+      if (kiosk && !BIG_BOARD_KIOSK_EVENT_TYPES.has(ev.type)) return;
       // Scope non-admin callers to their own threads.
       if (!seesAll && 'conversationId' in ev) {
         const c = getConversationById(ev.conversationId);

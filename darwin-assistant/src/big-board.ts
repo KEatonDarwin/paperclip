@@ -26,6 +26,17 @@ import { getLatestThreadSummary } from './thread-summaries.js';
 // single constant.
 export const BIG_BOARD_KIOSK_TOKEN_SETTING = 'big_board_kiosk_token';
 
+// The ONLY SSE event types the kiosk credential may receive on /events
+// (CONTRACT Part 2's ticker list). Review fix (node #520): the kiosk token is
+// a read-only credential for the BOARD, not a firehose — without this cap a
+// ?kiosk= holder would also stream every `turn`/`stream_delta` (full assistant
+// replies, incl. password-locked threads) in real time. Everything else on the
+// /events FORWARD set stays admin-bearer-only.
+export const BIG_BOARD_KIOSK_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'hopper_node', 'goal', 'goal_node', 'goal_focus', 'goal_guard', 'monitor', 'monitor_run',
+  'notification', 'dispatch', 'dispatch_cue', 'workstream', 'conversation_updated', 'status',
+]);
+
 const SENTINEL_HEARTBEAT_FILE = '/tmp/jarvis-watchdog-heartbeat.json';
 const SENTINEL_NAMES = ['foreman', 'dead_turn', 'commitments', 'services', 'hopper_stall'] as const;
 const SENTINEL_FRESH_MS = 90_000; // watchdog timer fires every 60s
@@ -139,8 +150,14 @@ function selectSpotlightNodes(tree: GoalTree): GoalNodeRow[] {
   return out;
 }
 
-function isExcludedThread(externalId: string): boolean {
-  return RUNNING_THREAD_EXCLUDE_PATTERNS.some((re) => re.test(externalId));
+/** Threads the board never shows (review fix, node #520): worker/ephemeral
+ *  prefixes (as GET /threads), PLUS password-locked threads — a TV in the
+ *  office must never display a title/summary Kevin explicitly locked — PLUS
+ *  archived ones (the radar is "what's alive," not the archive). */
+function isExcludedThread(conv: ConversationRow): boolean {
+  if (conv.password_hash) return true;
+  if (conv.status === 'archived') return true;
+  return RUNNING_THREAD_EXCLUDE_PATTERNS.some((re) => re.test(conv.external_id));
 }
 
 export function buildBigBoardSnapshot(input: BigBoardInputs): BigBoardSnapshot {
@@ -183,7 +200,7 @@ export function buildBigBoardSnapshot(input: BigBoardInputs): BigBoardSnapshot {
   }
 
   // -- in motion: cockpit/slack threads + conversation radar -----------------
-  const eligibleThreads = input.allConversations.filter((c) => !isExcludedThread(c.external_id));
+  const eligibleThreads = input.allConversations.filter((c) => !isExcludedThread(c));
   const threadLites = eligibleThreads.map((c) => input.resolveThreadLite(c));
   const runningThreads = threadLites.filter((t) => t.running);
   const radar = threadLites; // already updated_at DESC (pinned-first) from listAllConversations()
@@ -269,7 +286,10 @@ function readSentinelHeartbeat(now: Date): { ran_at: string | null; fresh: boole
       })),
     };
   } catch {
-    return { ran_at: null, fresh: false, sentinels: [] };
+    // Missing/unreadable file = the watchdog itself is dead. Keep the fixed
+    // sentinel grid on screen and paint every sentinel red rather than
+    // collapsing the grid (an empty list read as "nothing to worry about").
+    return { ran_at: null, fresh: false, sentinels: SENTINEL_NAMES.map((name) => ({ name, ok: false })) };
   }
 }
 
@@ -305,8 +325,14 @@ export function gatherBigBoardSnapshot(opts: { landedHours?: number; providers?:
   const now = new Date();
 
   const trees = listAllHopperTrees();
+  // Only non-terminal trees can carry a running node, so skip the per-tree
+  // node query for done/archived trees (88 trees live → ~1 query instead of
+  // 88 every refetch). The pure fn treats a missing entry as "no nodes."
   const hopperNodesByTree = new Map<string, HopperNodeRow[]>();
-  for (const t of trees) hopperNodesByTree.set(t.id, listTreeNodes(t.id));
+  for (const t of trees) {
+    if (t.status === 'done' || t.status === 'archived') continue;
+    hopperNodesByTree.set(t.id, listTreeNodes(t.id));
+  }
 
   // notifications: fetch a generous window then let the pure fn cut by
   // landedHours — listNotifications has no severity filter param.

@@ -27,6 +27,7 @@ console.log(`[big-board-check] DB: ${DB_PATH} (read-only aggregation — this sc
 
 const distDir = path.join(__dirname, '..', 'dist');
 const { gatherBigBoardSnapshot } = await import(path.join(distDir, 'big-board.js'));
+const { listAllConversations } = await import(path.join(distDir, 'conversation-db.js'));
 
 const snapshot = gatherBigBoardSnapshot({});
 
@@ -86,6 +87,16 @@ const combined = [...(snapshot.radar ?? []), ...(snapshot.in_motion?.threads ?? 
 const leaks = combined.filter((t) => EXCLUDE_RES.some((re) => re.test(t.thread_id)));
 check(`no ephemeral/checkin/hopper-node-worker threads in radar or in_motion.threads (checked ${combined.length})`, leaks.length === 0);
 if (leaks.length) console.error('  leaked thread_ids:', leaks.map((t) => t.thread_id));
+
+// -- review fix (node #520): password-locked + archived threads never reach the TV
+const byExt = new Map(listAllConversations().map((c) => [c.external_id, c]));
+const shown = combined.map((t) => byExt.get(t.thread_id)).filter(Boolean);
+check(`no password-locked threads in radar or in_motion.threads (checked ${shown.length})`, shown.every((c) => !c.password_hash));
+check('no archived threads in radar or in_motion.threads', shown.every((c) => c.status !== 'archived'));
+check(
+  'sentinels grid never collapses (fixed 5 names present even when the heartbeat is missing)',
+  snapshot.sentinels.sentinels.length >= 5,
+);
 
 console.log(
   `\n[big-board-check] monitors=${snapshot.monitors.open.length} ` +

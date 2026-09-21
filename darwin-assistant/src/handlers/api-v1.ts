@@ -1,5 +1,5 @@
 import { listCommitments } from '../commitments.js';
-import { gatherBigBoardSnapshot, BIG_BOARD_KIOSK_TOKEN_SETTING, type BigBoardProviders } from '../big-board.js';
+import { gatherBigBoardSnapshot, BIG_BOARD_KIOSK_TOKEN_SETTING, BIG_BOARD_KIOSK_EVENT_TYPES, type BigBoardProviders } from '../big-board.js';
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { spawn } from 'node:child_process';
 import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
@@ -5462,8 +5462,12 @@ export function createApiV1Router(): Router {
     res.write(':\n\n');
     const heartbeat = setInterval(() => res.write(':\n\n'), 15000);
 
+    // The Big Board kiosk credential only ever gets the board's own event
+    // types — never turn/stream_delta transcript traffic (review fix #520).
+    const kiosk = caller === BIG_BOARD_KIOSK_API_KEY;
     const handler = (ev: SSEEvent) => {
       if (!FORWARD.has(ev.type)) return;
+      if (kiosk && !BIG_BOARD_KIOSK_EVENT_TYPES.has(ev.type)) return;
       // Scope non-admin callers to their own threads.
       if (!seesAll && 'conversationId' in ev) {
         const c = getConversationById(ev.conversationId);

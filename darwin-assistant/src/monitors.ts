@@ -538,11 +538,13 @@ export function recordMonitorRunOutcome(
 }
 
 function parseMonitorEnvelope(raw: string): { outcome: MonitorOutcome; summary: string; detail: string | null } {
-  const finalLine = raw
+  // Tolerate models that fence the envelope (```json … ```) or trail prose:
+  // drop fence lines, then take the LAST line that looks like a JSON object.
+  const lines = raw
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter(Boolean)
-    .at(-1);
+    .filter((line) => line && !/^`{3,}/.test(line));
+  const finalLine = [...lines].reverse().find((line) => line.startsWith('{') && line.endsWith('}')) ?? lines.at(-1);
   if (!finalLine) {
     return {
       outcome: 'error',

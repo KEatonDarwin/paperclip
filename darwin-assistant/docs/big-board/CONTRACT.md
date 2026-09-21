@@ -201,6 +201,108 @@ Instead: a dedicated, narrow, revocable token —
 - No interactivity is required (no click targets) — this is a passive display. If a future
   rev wants "tap to open the goal chat" that's a v1.1, not this build.
 
+## Part 5 — v2 (tree-e1c07f73, node #532): Active Trees anchor, curated Radar, Commitments card removed
+
+**Why:** Kevin's day-one feedback on the live board (2026-09-21): the "Commitments open" card
+"isn't useful right now" — remove it. The single-tree card on `/spawn-tree` ("what tree is
+being worked on and where, which item is being worked on in the tree, how much has been done,
+what's left") is "massively useful" — put as much of that on the board as possible. Design
+agreed with Kevin ("let's see it"): every zone answers one question at a glance. This section
+is **additive** to Part 1 — every v1 field still exists in the payload except `radar`'s element
+shape (extended, not replaced) and `landed`'s cap (tightened).
+
+### `GET /api/v1/big-board` — v2 additions
+
+```jsonc
+{
+  // ... every Part 1 field unchanged, PLUS:
+
+  "trees": {
+    "active": [
+      {
+        // Everything SpawnMonitorTreeSummary already carries (GET /spawn-monitor),
+        // reused via buildSpawnMonitorSnapshot — NEVER re-derived, so the board and
+        // /spawn-tree can never disagree on a count:
+        "id": "tree-...", "topic": "...", "status": "active",
+        "origin_thread_ext": "cockpit:...", "created_at": "...", "updated_at": "...",
+        "counts": { "total": 9, "done": 5, "running": 1, "pending": 2, "blocked": 0, "blocked_question": 0, "draft": 0, "split": 1 },
+        "models": ["claude/claude-sonnet-5", "claude/claude-opus-5"],
+        "running_nodes": [{ "id": 532, "title": "...", "lease_expires_at": "..." }],
+        "attention": [],
+        // NEW in v2 — the full ordered node list, capped 40, id ascending:
+        "nodes": [
+          { "id": 517, "title": "...", "status": "done", "model": "claude-sonnet-5",
+            "adapter": "claude", "depends_on": [], "updated_at": "..." },
+          { "id": 532, "title": "...", "status": "running", "model": "claude-sonnet-5",
+            "adapter": "claude", "depends_on": [531], "updated_at": "..." }
+        ]
+      }
+    ],
+    "density": "none" | "expanded" | "compact"
+  },
+
+  "radar": [
+    // v1's BigBoardThreadLite fields, PLUS:
+    { "thread_id": "...", "title": "...", "headline": null, "adapter": "...", "model": "...",
+      "updated_at": "...", "running": false, "latest_summary": "...",
+      "waiting_on": "kevin" | "jarvis" | null }
+  ]
+}
+```
+
+- **`trees.active`** = every `hopper_trees` row with `status = 'active'` (the only
+  "in-progress" tree status — verified in `hopper-engine.ts`: the real enum is
+  `draft | active | done | archived`, not `agreed | running` as an earlier draft of this
+  contract's originating ask assumed). Foundry module trees (`foundry:<project>/<module>`)
+  are included whenever they're individually `active`, same as any other tree — no special
+  case; `buildSpawnMonitorSnapshot`'s cluster grouping is used only to source per-tree
+  summaries, its foundry clustering itself is not surfaced on the board.
+- **Sort:** trees with `counts.running > 0` first, then by `updated_at` descending among the
+  rest (and among the running ones too — ties within the running group also fall back to
+  `updated_at` desc, since the sort comparator only branches on running-vs-not).
+- **`density`**: `active.length === 0 -> "none"`, `<= 2 -> "expanded"`, `>= 3 -> "compact"`.
+  Purely a hint for the UI (which decides how much of each tree card to render); `nodes` is
+  always present in the payload regardless of density.
+- **`nodes`** per tree: full node list ordered by `id` ascending (creation order), capped at
+  40 per tree (payload-size bound, not a UI truncation signal — a tree this large is rare).
+  `depends_on` is the parsed `HopperNodeRow.depends_on` JSON column (empty array if null/
+  unparseable).
+- **`radar.waiting_on`**: `running: true` always wins and reads `"jarvis"` (already in motion,
+  regardless of turn history). Otherwise derived from the thread's **last `user`/`assistant`
+  turn** in `turns` (`role` column — `tool`-role rows, if any, are ignored for this purpose):
+  last turn `role = 'user'` (Kevin's) → `"jarvis"` owes a reply; last turn `role = 'assistant'`
+  (JARVIS's) → `"kevin"` owes a reply; a conversation with no `user`/`assistant` turn yet →
+  `null`. Computed in **one SQL query** (a `MAX(turn_index)` self-join scoped to the most-
+  recent ~150 eligible conversation ids, never per-thread) — see `fetchWaitingOnMap` in
+  `big-board.ts`.
+- **Radar window + cap (curated, not "every thread"):** only conversations whose
+  `updated_at` falls within the last `radarHours` (default **6**, settings-KV
+  `big_board_radar_hours` overrides the default, `?radar_hours=` query param overrides both —
+  same override shape as `landed_hours`), capped at **8** entries, sorted `updated_at` desc
+  (unchanged ordering from v1 — `listAllConversations()` is already DESC/pinned-first).
+- **`landed` cap tightened from 8 to 6** (v1's `LANDED_CAP`) to give the new Active Trees
+  anchor and the curated Radar more room on screen. No other change to `landed`'s shape or
+  union sources.
+- **`commitments.open` field is UNCHANGED and still populated** — kept for API/compat reasons
+  (nothing reads it from the UI anymore, per Kevin's "isn't useful right now"; the field
+  itself was never load-bearing for anything else, so it stays rather than being a breaking
+  removal). `in_motion.hopper_nodes` is likewise unchanged/still populated — `trees.active[]`
+  is the new home for "what's running," `in_motion.threads` is the ONLY thing that zone shows
+  in v2 (a running hopper node is never double-counted between the two zones: it appears
+  inside its tree's `nodes`/`running_nodes`, not in `in_motion.hopper_nodes`'s UI use — the
+  field's presence in the payload is compat-only, same as `commitments`).
+- **No new `hopper_tree` SSE event exists** (verified in `hopper-engine.ts`: tree status
+  changes ride on `hopper_node` events for their constituent nodes, plus a `notification` on
+  tree completion — there is no tree-level SSE event type anywhere in this codebase). Part 2's
+  refetch strategy is unchanged as written; `hopper_node` (already in
+  `BIG_BOARD_KIOSK_EVENT_TYPES`) already triggers a debounced refetch on any node claim/finish
+  inside an active tree, which is what actually needs to move the board's pulsing state.
+
 ## Corrections
 
 *(append dated notes here if reality contradicts anything above — do not silently deviate)*
+
+- **2026-09-21 (node #532):** `hopperTreeRow.status` enum is `draft | active | done | archived`
+  — confirmed by reading `hopper-engine.ts` directly. The build task's spec referenced
+  `agreed`/`running` tree statuses that do not exist; `active` is the correct "in-progress"
+  filter and is what `trees.active` uses.

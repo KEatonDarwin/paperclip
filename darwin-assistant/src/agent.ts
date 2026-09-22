@@ -1456,7 +1456,9 @@ async function runConversationTurn(
   // GOALS (CONTRACT.md §6) — the goal-driven development surface. Every turn
   // of a `cockpit:goal-<id>` thread gets a fresh <goal_focus/>+<goal_tree>
   // snapshot instead of transcript memory. '' for every other thread.
-  const goalContextBlock = buildGoalThreadContext(conv.external_id);
+  // v0.4 §15.10: the turn input is passed so an autopilot cue turn gets its
+  // <autopilot_cue/> prefix line (matched on the fixed `[autopilot goal #g —` header).
+  const goalContextBlock = buildGoalThreadContext(conv.external_id, input);
 
   // DAR-744: hand the model an absolute file path per attached image, mirroring
   // the working vision-critique.ts pattern (local claude CLI reads an image when

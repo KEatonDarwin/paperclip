@@ -2463,6 +2463,263 @@ try {
     const cy = tree.nodes.find((n: any) => n.title === 'C-y');
     assert.equal((await post(`/goals/${v03GoalId}/nodes/${cy.id}/discard`, {})).status, 200);
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[18] v0.5 §16: forest payload — last_activity sources, hot_nodes ordering, additive shape');
+
+  // GET /goals (the LIST route) is the only GoalSummary producer that populates
+  // last_activity/hot_nodes (see the comment on GoalSummary in src/goals.ts) —
+  // GET /goals/:id does NOT, so every check below reads through the list.
+  async function getGoalSummary(goalId: number): Promise<any> {
+    const r = await get('/goals');
+    assert.equal(r.status, 200);
+    const found = r.json.goals.find((g: any) => g.id === goalId);
+    assert.ok(found, `goal ${goalId} present in GET /goals`);
+    return found;
+  }
+
+  // A minimal fixture: one set goal with exactly one accepted node that has its
+  // own node chat — gives all four last_activity candidate columns a row to
+  // read from (goals.updated_at, goal_events.created_at, the goal thread's
+  // conversations.updated_at, the node chat's conversations.updated_at).
+  async function buildV05Fixture(title: string): Promise<{ goalId: number; goalExt: string; nodeExt: string }> {
+    const g = await post('/goals', { title, done_means: 'v0.5 fixture' });
+    assert.equal(g.status, 201, JSON.stringify(g.json));
+    const goalId = g.json.goal.id;
+    const goalExt = `cockpit:goal-${goalId}`;
+    const propose = await post(`/goals/${goalId}/nodes/propose`, {
+      parent_id: null, actor: 'jarvis', items: [{ title: 'leaf', done_means: 'x' }],
+    });
+    assert.equal(propose.status, 201, JSON.stringify(propose.json));
+    const nodeId = propose.json.nodes[0].id;
+    assert.equal((await post(`/goals/${goalId}/batches/${propose.json.batch_id}/accept`, {})).status, 200);
+    const chat = await post(`/goals/${goalId}/nodes/${nodeId}/thread`, {});
+    assert.equal(chat.status, 200, JSON.stringify(chat.json));
+    return { goalId, goalExt, nodeExt: chat.json.external_id };
+  }
+
+  // Pins every candidate timestamp for this goal to the same offset (default
+  // well in the past) so a subsequent single bump is unambiguously the max —
+  // avoids flakiness from SQLite datetime('now')'s 1-second resolution when
+  // several mutations land inside the same wall-clock second.
+  function pinV05Timestamps(goalId: number, exts: string[], offset: string): void {
+    convDb.sqliteDb.prepare(`UPDATE goals SET updated_at = datetime('now', ?) WHERE id = ?`).run(offset, goalId);
+    convDb.sqliteDb.prepare(`UPDATE goal_events SET created_at = datetime('now', ?) WHERE goal_id = ?`).run(offset, goalId);
+    for (const ext of exts) {
+      convDb.sqliteDb.prepare(`UPDATE conversations SET updated_at = datetime('now', ?) WHERE external_id = ?`).run(offset, ext);
+    }
+  }
+
+  await check('V05-1', 'last_activity source A: goals.updated_at wins when it is the newest of the four signals', async () => {
+    const { goalId, goalExt, nodeExt } = await buildV05Fixture('V05 fixture A (goal.updated_at wins)');
+    pinV05Timestamps(goalId, [goalExt, nodeExt], '-10 minutes');
+    convDb.sqliteDb.prepare(`UPDATE goals SET updated_at = datetime('now', '+5 minutes') WHERE id = ?`).run(goalId);
+    const expected = (convDb.sqliteDb.prepare(`SELECT updated_at FROM goals WHERE id = ?`).get(goalId) as any).updated_at;
+    const summary = await getGoalSummary(goalId);
+    assert.equal(summary.last_activity, expected);
+  });
+
+  await check('V05-2', "last_activity source B: last_event_at (goal_events, most recent by id) wins", async () => {
+    const { goalId, goalExt, nodeExt } = await buildV05Fixture('V05 fixture B (last_event_at wins)');
+    pinV05Timestamps(goalId, [goalExt, nodeExt], '-10 minutes');
+    convDb.sqliteDb.prepare(`
+      UPDATE goal_events SET created_at = datetime('now', '+5 minutes')
+      WHERE id = (SELECT id FROM goal_events WHERE goal_id = ? ORDER BY id DESC LIMIT 1)
+    `).run(goalId);
+    const expected = (convDb.sqliteDb.prepare(
+      `SELECT created_at FROM goal_events WHERE goal_id = ? ORDER BY id DESC LIMIT 1`,
+    ).get(goalId) as any).created_at;
+    const summary = await getGoalSummary(goalId);
+    assert.equal(summary.last_activity, expected);
+  });
+
+  await check('V05-3', "last_activity source C: the goal-thread conversation's updated_at wins", async () => {
+    const { goalId, goalExt, nodeExt } = await buildV05Fixture('V05 fixture C (goal thread wins)');
+    pinV05Timestamps(goalId, [goalExt, nodeExt], '-10 minutes');
+    convDb.sqliteDb.prepare(`UPDATE conversations SET updated_at = datetime('now', '+5 minutes') WHERE external_id = ?`).run(goalExt);
+    const expected = convDb.getConversation(goalExt).updated_at;
+    const summary = await getGoalSummary(goalId);
+    assert.equal(summary.last_activity, expected);
+  });
+
+  await check('V05-4', "last_activity source D: a node chat's conversation.updated_at wins", async () => {
+    const { goalId, goalExt, nodeExt } = await buildV05Fixture('V05 fixture D (node chat wins)');
+    pinV05Timestamps(goalId, [goalExt, nodeExt], '-10 minutes');
+    convDb.sqliteDb.prepare(`UPDATE conversations SET updated_at = datetime('now', '+5 minutes') WHERE external_id = ?`).run(nodeExt);
+    const expected = convDb.getConversation(nodeExt).updated_at;
+    const summary = await getGoalSummary(goalId);
+    assert.equal(summary.last_activity, expected);
+  });
+
+  await check('V05-5', 'MAX is taken across MULTIPLE node chats on the same goal, not just the first one queried', async () => {
+    const g = await post('/goals', { title: 'V05 fixture E (multi node chat MAX)', done_means: 'x' });
+    assert.equal(g.status, 201, JSON.stringify(g.json));
+    const goalId = g.json.goal.id;
+    const goalExt = `cockpit:goal-${goalId}`;
+    const propose = await post(`/goals/${goalId}/nodes/propose`, {
+      parent_id: null, actor: 'jarvis',
+      items: [{ title: 'leaf1', done_means: 'x' }, { title: 'leaf2', done_means: 'x' }],
+    });
+    assert.equal(propose.status, 201, JSON.stringify(propose.json));
+    const [n1, n2] = propose.json.nodes.map((n: any) => n.id);
+    assert.equal((await post(`/goals/${goalId}/batches/${propose.json.batch_id}/accept`, {})).status, 200);
+    const c1 = await post(`/goals/${goalId}/nodes/${n1}/thread`, {});
+    const c2 = await post(`/goals/${goalId}/nodes/${n2}/thread`, {});
+    assert.equal(c1.status, 200); assert.equal(c2.status, 200);
+    const ext1 = c1.json.external_id, ext2 = c2.json.external_id;
+    pinV05Timestamps(goalId, [goalExt, ext1, ext2], '-10 minutes');
+    // bump the SECOND node chat (not the one that happens to sort first) —
+    // proves the MAX aggregation, not a "first row wins" bug.
+    convDb.sqliteDb.prepare(`UPDATE conversations SET updated_at = datetime('now', '+5 minutes') WHERE external_id = ?`).run(ext2);
+    const expected = convDb.getConversation(ext2).updated_at;
+    const summary = await getGoalSummary(goalId);
+    assert.equal(summary.last_activity, expected);
+  });
+
+  await check(
+    'V05-6',
+    'additive-shape guard: every pre-v0.5 GoalSummary field is still present with the same shape, plus the two new fields',
+    async () => {
+      const g = await post('/goals', { title: 'V05 shape guard', notes: 'a note', done_means: 'x' });
+      assert.equal(g.status, 201, JSON.stringify(g.json));
+      const summary = await getGoalSummary(g.json.goal.id);
+
+      const typeOf = (v: unknown): string => (Array.isArray(v) ? 'array' : v === null ? 'null' : typeof v);
+      const assertField = (key: string, allowed: string[]) => {
+        assert.ok(key in summary, `field '${key}' missing from GET /goals row`);
+        const t = typeOf(summary[key]);
+        assert.ok(allowed.includes(t), `field '${key}': expected one of [${allowed}], got ${t} (${JSON.stringify(summary[key])})`);
+      };
+
+      // pre-v0.5 GoalRow fields (unchanged)
+      assertField('id', ['number']);
+      assertField('title', ['string']);
+      assertField('done_means', ['string', 'null']);
+      assertField('notes', ['string', 'null']);
+      assertField('status', ['string']);
+      assertField('authored_by', ['string']);
+      assertField('thread_ext', ['string', 'null']);
+      assertField('promoted_from_node_id', ['number', 'null']);
+      assertField('sort_order', ['number']);
+      assertField('verified_at', ['string', 'null']);
+      assertField('archived', ['number']);
+      assertField('autopilot', ['number']);
+      assertField('autopilot_config', ['object', 'null']);
+      assertField('created_at', ['string']);
+      assertField('updated_at', ['string']);
+      // pre-v0.5 GoalSummary additions (unchanged)
+      assertField('counts', ['object']);
+      for (const k of [
+        'total', 'done', 'working', 'check', 'need_you', 'ghosts', 'human_open',
+        'awaiting_jarvis', 'node_chats', 'guards', 'guards_failing', 'autopilot_set', 'parked', 'progress',
+      ]) {
+        assert.equal(typeOf(summary.counts[k]), 'number', `counts.${k} should be a number, got ${typeOf(summary.counts[k])}`);
+      }
+      assertField('focus_node_id', ['number', 'null']);
+      assertField('last_event_at', ['string', 'null']);
+      assertField('autopilot_next', ['object', 'null']);
+      // v0.5 §16 additions — additive only
+      assertField('last_activity', ['string']);
+      assertField('hot_nodes', ['array']);
+    },
+  );
+
+  await check(
+    'V05-7',
+    'empty goal (no nodes, no node chats, no turns) does not crash — last_activity falls back to goals.updated_at, hot_nodes is []',
+    async () => {
+      const g = await post('/goals', { title: 'V05 empty goal', done_means: 'x' });
+      assert.equal(g.status, 201, JSON.stringify(g.json));
+      const goalId = g.json.goal.id;
+      const goalExt = `cockpit:goal-${goalId}`;
+      // no nodes were ever created, so there is no node-chat row for this goal at
+      // all (not even a null one) — push the other two signals into the past so
+      // goals.updated_at is unambiguously the max, and confirm the fallback.
+      convDb.sqliteDb.prepare(`UPDATE goal_events SET created_at = datetime('now', '-10 minutes') WHERE goal_id = ?`).run(goalId);
+      convDb.sqliteDb.prepare(`UPDATE conversations SET updated_at = datetime('now', '-10 minutes') WHERE external_id = ?`).run(goalExt);
+      convDb.sqliteDb.prepare(`UPDATE goals SET updated_at = datetime('now', '-1 minutes') WHERE id = ?`).run(goalId);
+      const tree = await get(`/goals/${goalId}`);
+      assert.equal(tree.status, 200);
+      assert.deepEqual(tree.json.nodes, [], 'genuinely empty tree');
+      const expected = (convDb.sqliteDb.prepare(`SELECT updated_at FROM goals WHERE id = ?`).get(goalId) as any).updated_at;
+      const summary = await getGoalSummary(goalId);
+      assert.equal(summary.last_activity, expected);
+      assert.deepEqual(summary.hot_nodes, [], 'no candidate nodes -> empty hot_nodes, no crash');
+    },
+  );
+
+  await check(
+    'V05-8',
+    'hot_nodes: priority working(1) > check(2) > need-you(3), recency tie-break within a tier, capped at 3',
+    async () => {
+      const g = await post('/goals', { title: 'V05 hot nodes', done_means: 'x' });
+      assert.equal(g.status, 201, JSON.stringify(g.json));
+      const goalId = g.json.goal.id;
+
+      // N1: a ghost, will end up the OLDEST need-you candidate (excluded by the cap)
+      const n1p = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'N1 ghost (oldest)', done_means: 'x' }] });
+      assert.equal(n1p.status, 201, JSON.stringify(n1p.json));
+      const n1 = n1p.json.nodes[0].id;
+
+      // N2: an open human leaf (state=set, leaf_kind=human) — a second need-you candidate, also excluded by the cap
+      const n2p = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'N2 human-open', done_means: 'x' }] });
+      assert.equal(n2p.status, 201, JSON.stringify(n2p.json));
+      const n2 = n2p.json.nodes[0].id;
+      assert.equal((await post(`/goals/${goalId}/batches/${n2p.json.batch_id}/accept`, {})).status, 200);
+      assert.equal((await post(`/goals/${goalId}/nodes/${n2}/leaf_kind`, { leaf_kind: 'human' })).status, 200);
+
+      // N3: a machine leaf with an approved plan -> state=working, priority 1
+      const n3p = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'N3 working', done_means: 'x' }] });
+      assert.equal(n3p.status, 201, JSON.stringify(n3p.json));
+      const n3 = n3p.json.nodes[0].id;
+      assert.equal((await post(`/goals/${goalId}/batches/${n3p.json.batch_id}/accept`, {})).status, 200);
+      assert.equal((await post(`/goals/${goalId}/nodes/${n3}/leaf_kind`, { leaf_kind: 'machine' })).status, 200);
+      const planned = await post(`/goals/${goalId}/nodes/${n3}/propose_plan`, {
+        plan: {
+          what: 'x', deliverable: 'y', model: 'claude-sonnet-5', adapter: 'claude',
+          nodes: [{ title: 'n', spec: 's', adapter: 'claude', model: 'claude-sonnet-5' }],
+        },
+      });
+      assert.equal(planned.status, 200, JSON.stringify(planned.json));
+      const approved = await post(`/goals/${goalId}/nodes/${n3}/approve_plan`, {});
+      assert.equal(approved.status, 200, JSON.stringify(approved.json));
+      assert.equal(approved.json.node.state, 'working');
+
+      // N4: a human leaf taken to human_done -> state=check, priority 2
+      const n4p = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'N4 check', done_means: 'x' }] });
+      assert.equal(n4p.status, 201, JSON.stringify(n4p.json));
+      const n4 = n4p.json.nodes[0].id;
+      assert.equal((await post(`/goals/${goalId}/batches/${n4p.json.batch_id}/accept`, {})).status, 200);
+      assert.equal((await post(`/goals/${goalId}/nodes/${n4}/leaf_kind`, { leaf_kind: 'human' })).status, 200);
+      const done4 = await post(`/goals/${goalId}/nodes/${n4}/human_done`, {});
+      assert.equal(done4.status, 200, JSON.stringify(done4.json));
+      assert.equal(done4.json.node.state, 'check');
+
+      // N5: a second, newer ghost — the need-you candidate that SHOULD win the 3rd slot
+      const n5p = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'N5 ghost (newest)', done_means: 'x' }] });
+      assert.equal(n5p.status, 201, JSON.stringify(n5p.json));
+      const n5 = n5p.json.nodes[0].id;
+
+      // Pin recency deterministically (all 5 mutations above can land inside the
+      // same 1-second datetime('now') bucket during a fast run).
+      const offsets: Array<[number, string]> = [
+        [n1, '-20 minutes'], [n2, '-15 minutes'], [n3, '-10 minutes'], [n4, '-5 minutes'], [n5, '+5 minutes'],
+      ];
+      for (const [id, off] of offsets) {
+        convDb.sqliteDb.prepare(`UPDATE goal_nodes SET updated_at = datetime('now', ?) WHERE id = ?`).run(off, id);
+      }
+
+      const summary = await getGoalSummary(goalId);
+      assert.equal(summary.hot_nodes.length, 3, `expected the cap of 3, got ${JSON.stringify(summary.hot_nodes)}`);
+      assert.deepEqual(
+        summary.hot_nodes.map((n: any) => n.id),
+        [n3, n4, n5],
+        'working first, then check, then the single most-recent need-you node (N1/N2 excluded by the cap despite qualifying)',
+      );
+      assert.deepEqual(summary.hot_nodes.map((n: any) => n.state), ['working', 'check', 'ghost']);
+      assert.deepEqual(summary.hot_nodes.map((n: any) => n.title), ['N3 working', 'N4 check', 'N5 ghost (newest)']);
+    },
+  );
 } finally {
   server.close();
   owServer?.close();
@@ -2477,7 +2734,7 @@ const outDir = '/home/kevin/obsidian/paperclip-wiki/outbox/goals';
 fs.mkdirSync(outDir, { recursive: true });
 const reportPath = path.join(outDir, 'sim-report.md');
 const lines: string[] = [];
-lines.push('# GOALS — sim report (hopper node #459; v0.3 §14 node chats added by node #489)');
+lines.push('# GOALS — sim report (hopper node #459; v0.3 §14 node chats added by node #489; v0.5 §16 forest payload added by node #601)');
 lines.push('');
 lines.push(`Run at ${new Date().toISOString()}. Scratch DB: \`${DB_PATH}\`. ${passed}/${results.length} checks passed.`);
 lines.push('');

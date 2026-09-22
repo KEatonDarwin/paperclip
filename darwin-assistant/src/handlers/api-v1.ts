@@ -122,6 +122,8 @@ import {
 // v0.4 §15 — importing the driver module also registers the autopilot hooks
 // into goals.ts and starts the tick loop (unless GOALS_AUTOPILOT_DRIVER=0).
 import { getAutopilotStatus, buildNightReport } from '../goals-autopilot.js';
+// v0.6 §17 — the COMMAND DECK aggregate payload behind GET /goals/board.
+import { buildGoalsBoard } from '../goals-board.js';
 import {
   listGuards,
   getGuard,
@@ -2305,6 +2307,13 @@ export function createApiV1Router(): Router {
     } catch (err) {
       sendCaughtGoalError(res, err);
     }
+  });
+
+  // v0.6 §17 — registered BEFORE /goals/:id so 'board' is never swallowed as
+  // an :id param (parseInt('board') is NaN, which would 404 as goal_not_found
+  // instead of reaching this handler).
+  router.get('/goals/board', (_req: AuthedRequest, res) => {
+    res.json(buildGoalsBoard());
   });
 
   router.get('/goals/:id', (req: AuthedRequest, res) => {

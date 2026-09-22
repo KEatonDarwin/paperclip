@@ -2720,6 +2720,318 @@ try {
       assert.deepEqual(summary.hot_nodes.map((n: any) => n.title), ['N3 working', 'N4 check', 'N5 ghost (newest)']);
     },
   );
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // v0.6 §17 — COMMAND DECK board payload: GET /goals/board (map + attention +
+  // in_flight), CONTRACT.md §17, checks V06-*.
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n[19] v0.6 §17: GET /goals/board — map + attention + in_flight');
+  async function getBoard(): Promise<any> {
+    const r = await get('/goals/board');
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    return r.json;
+  }
+  function mapNode(board: any, nodeId: number): any {
+    return board.map.find((n: any) => n.id === nodeId);
+  }
+  function attentionFor(board: any, kind: string, nodeId: number | null): any {
+    return board.attention.find((a: any) => a.kind === kind && a.node_id === nodeId);
+  }
+
+  await check('V06-1', 'shape: goals/map/attention/in_flight all present; goals matches GET /goals?include_done=1', async () => {
+    const board = await getBoard();
+    assert.ok(Array.isArray(board.goals));
+    assert.ok(Array.isArray(board.map));
+    assert.ok(Array.isArray(board.attention));
+    assert.ok(Array.isArray(board.in_flight));
+    const listed = (await get('/goals?include_done=1')).json.goals;
+    assert.deepEqual(board.goals.map((g: any) => g.id).sort((a: number, b: number) => a - b), listed.map((g: any) => g.id).sort((a: number, b: number) => a - b));
+  });
+
+  await check('V06-2', 'map: a plain ghost -> flag "ghost"; a plain set leaf -> flag null; has_chat/sort_order/leaf_kind carried', async () => {
+    const g = await post('/goals', { title: 'V06 map drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const gp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 ghost', done_means: 'x' }] });
+    const ghostId = gp.json.nodes[0].id;
+    const sp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 set', done_means: 'x' }] });
+    const setId = sp.json.nodes[0].id;
+    assert.equal((await post(`/goals/${goalId}/batches/${sp.json.batch_id}/accept`, {})).status, 200);
+
+    const board = await getBoard();
+    const ghostRow = mapNode(board, ghostId);
+    assert.ok(ghostRow, 'ghost node present in map');
+    assert.equal(ghostRow.goal_id, goalId, 'each map row is tagged with its goal so the client can group without a second lookup');
+    assert.equal(ghostRow.state, 'ghost');
+    assert.equal(ghostRow.flag, 'ghost');
+    assert.equal(ghostRow.has_chat, false);
+    assert.equal(ghostRow.leaf_kind, 'none');
+    assert.equal(typeof ghostRow.sort_order, 'number');
+
+    const setRow = mapNode(board, setId);
+    assert.ok(setRow, 'set node present in map');
+    assert.equal(setRow.state, 'set');
+    assert.equal(setRow.flag, null, 'a settled set node carries no flag');
+
+    assert.ok(attentionFor(board, 'ghost_awaiting_you', ghostId), 'the ghost is in the Kevin-actionable queue');
+  });
+
+  await check('V06-3', 'map+attention: review_state=awaiting_jarvis -> flag "awaiting_jarvis" and EXCLUDED from attention (that is JARVIS\'s queue)', async () => {
+    const g = await post('/goals', { title: 'V06 awaiting_jarvis drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const gp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 kevin-edited ghost', done_means: 'x' }] });
+    const nodeId = gp.json.nodes[0].id;
+    assert.equal((await patch(`/goals/${goalId}/nodes/${nodeId}`, { title: 'V06 kevin-edited ghost (reworded)', actor: 'kevin' })).status, 200);
+    const accepted = await post(`/goals/${goalId}/nodes/${nodeId}/accept`, { actor: 'kevin' });
+    assert.equal(accepted.status, 200, JSON.stringify(accepted.json));
+    assert.equal(accepted.json.node.review_state, 'awaiting_jarvis');
+    assert.equal(accepted.json.node.state, 'ghost', 'still a ghost — accept did not set it, JARVIS has not weighed in yet');
+
+    const board = await getBoard();
+    const row = mapNode(board, nodeId);
+    assert.ok(row, 'node present in map');
+    assert.equal(row.flag, 'awaiting_jarvis');
+    assert.equal(attentionFor(board, 'ghost_awaiting_you', nodeId), undefined, 'not Kevin-actionable — the ball is with JARVIS');
+    assert.equal(board.attention.find((a: any) => a.node_id === nodeId), undefined, 'no attention item of ANY kind for this node while awaiting_jarvis');
+  });
+
+  await check('V06-4', 'map+attention: a JARVIS pending edit on a set node -> flag "pending_edit", kind "ghost_awaiting_you"', async () => {
+    const g = await post('/goals', { title: 'V06 pending-edit drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const sp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 will-be-edited', done_means: 'x' }] });
+    const nodeId = sp.json.nodes[0].id;
+    assert.equal((await post(`/goals/${goalId}/batches/${sp.json.batch_id}/accept`, {})).status, 200);
+    const edited = await post(`/goals/${goalId}/nodes/${nodeId}/propose_edit`, { title: 'V06 will-be-edited (proposed)', actor: 'jarvis' });
+    assert.equal(edited.status, 200, JSON.stringify(edited.json));
+    assert.equal(edited.json.node.pending_title, 'V06 will-be-edited (proposed)');
+
+    const board = await getBoard();
+    const row = mapNode(board, nodeId);
+    assert.equal(row.state, 'set', 'a pending edit never touches state');
+    assert.equal(row.flag, 'pending_edit');
+    const item = attentionFor(board, 'ghost_awaiting_you', nodeId);
+    assert.ok(item, 'a pending JARVIS proposal on a set node is Kevin-actionable, same bucket as a plain ghost');
+    assert.equal(item.goal_title, 'V06 pending-edit drill');
+  });
+
+  await check('V06-5', 'attention: an open human leaf -> kind "human_open"', async () => {
+    const g = await post('/goals', { title: 'V06 human-open drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const sp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 human leaf', done_means: 'x' }] });
+    const nodeId = sp.json.nodes[0].id;
+    assert.equal((await post(`/goals/${goalId}/batches/${sp.json.batch_id}/accept`, {})).status, 200);
+    assert.equal((await post(`/goals/${goalId}/nodes/${nodeId}/leaf_kind`, { leaf_kind: 'human' })).status, 200);
+
+    const board = await getBoard();
+    const item = attentionFor(board, 'human_open', nodeId);
+    assert.ok(item, 'open human leaf present in attention');
+    assert.equal(item.node_title, 'V06 human leaf');
+  });
+
+  await check('V06-6', 'attention+in_flight: a working leaf whose tree is blocked -> kind "need_you" AND still listed in in_flight', async () => {
+    const g = await post('/goals', { title: 'V06 blocked-tree drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const sp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 working leaf', done_means: 'x' }] });
+    const nodeId = sp.json.nodes[0].id;
+    assert.equal((await post(`/goals/${goalId}/batches/${sp.json.batch_id}/accept`, {})).status, 200);
+    assert.equal((await post(`/goals/${goalId}/nodes/${nodeId}/leaf_kind`, { leaf_kind: 'machine' })).status, 200);
+    const planned = await post(`/goals/${goalId}/nodes/${nodeId}/propose_plan`, {
+      plan: { what: 'x', deliverable: 'y', model: 'claude-sonnet-5', adapter: 'claude', nodes: [{ title: 'n', spec: 's', adapter: 'claude', model: 'claude-sonnet-5' }] },
+    });
+    assert.equal(planned.status, 200, JSON.stringify(planned.json));
+    const approved = await post(`/goals/${goalId}/nodes/${nodeId}/approve_plan`, {});
+    assert.equal(approved.status, 200, JSON.stringify(approved.json));
+    assert.equal(approved.json.node.state, 'working');
+    const treeId = approved.json.node.tree_id;
+    assert.ok(treeId, 'tree_id set on dispatch');
+    convDb.sqliteDb.prepare(`UPDATE goal_nodes SET tree_status_cache = 'blocked' WHERE id = ?`).run(nodeId);
+
+    const board = await getBoard();
+    const need = attentionFor(board, 'need_you', nodeId);
+    assert.ok(need, 'blocked working leaf present in attention as need_you');
+    const flight = board.in_flight.find((f: any) => f.node_id === nodeId);
+    assert.ok(flight, 'a blocked leaf is STILL in_flight — it is working, just stuck');
+    assert.equal(flight.tree_id, treeId);
+    assert.equal(flight.goal_title, 'V06 blocked-tree drill');
+    assert.equal(flight.node_title, 'V06 working leaf');
+    assert.equal(typeof flight.since, 'string');
+  });
+
+  await check('V06-7', 'attention: a failing/error guard -> kind "guard_failing" (node-scoped and goal-scoped)', async () => {
+    const g = await post('/goals', { title: 'V06 guard drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const sp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 guarded node', done_means: 'x' }] });
+    const nodeId = sp.json.nodes[0].id;
+    assert.equal((await post(`/goals/${goalId}/batches/${sp.json.batch_id}/accept`, {})).status, 200);
+    // Direct insert — the guard lifecycle itself (propose/accept/poll) is
+    // covered end-to-end by goals:guards-check; this only proves the board
+    // reads goal_guards correctly.
+    convDb.sqliteDb.prepare(`
+      INSERT INTO goal_guards (goal_id, node_id, state, mode, title, health, authored_by)
+      VALUES (?, ?, 'set', 'query', 'V06 node guard', 'failing', 'jarvis')
+    `).run(goalId, nodeId);
+    convDb.sqliteDb.prepare(`
+      INSERT INTO goal_guards (goal_id, node_id, state, mode, title, health, authored_by)
+      VALUES (?, NULL, 'set', 'query', 'V06 goal-level guard', 'error', 'jarvis')
+    `).run(goalId);
+
+    const board = await getBoard();
+    const nodeGuard = attentionFor(board, 'guard_failing', nodeId);
+    assert.ok(nodeGuard, 'node-scoped failing guard present');
+    assert.equal(nodeGuard.node_title, 'V06 guarded node');
+    const goalGuard = board.attention.find((a: any) => a.kind === 'guard_failing' && a.goal_id === goalId && a.node_id === null);
+    assert.ok(goalGuard, 'goal-scoped (no node_id) error guard present with node_id null');
+  });
+
+  await check('V06-8', "attention: a node parked by a non-kevin actor on an autopilot goal -> kind \"autopilot_parked\"", async () => {
+    const g = await post('/goals', { title: 'V06 autopilot-parked drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const sp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 park me', done_means: 'x' }] });
+    const nodeId = sp.json.nodes[0].id;
+    assert.equal((await post(`/goals/${goalId}/batches/${sp.json.batch_id}/accept`, {})).status, 200);
+    // Flip autopilot on directly (bypasses route 37's own side effects — the
+    // driver's 1s kick timer is irrelevant here since we read the board and
+    // flip autopilot back off again in the same synchronous tick).
+    convDb.sqliteDb.prepare(`UPDATE goals SET autopilot = 1 WHERE id = ?`).run(goalId);
+    const parked = goalsModule.parkGoalNode(goalId, nodeId, 'system', 'verify failed 2/2: no gap text');
+    assert.equal(parked.state, 'parked');
+    convDb.sqliteDb.prepare(`UPDATE goals SET autopilot = 0 WHERE id = ?`).run(goalId);
+
+    const board = await getBoard();
+    const item = attentionFor(board, 'autopilot_parked', nodeId);
+    assert.ok(item, 'autopilot-parked node present in attention');
+    assert.equal(item.node_title, 'V06 park me');
+
+    // A Kevin-actor park never fires the event -> never shows as autopilot_parked.
+    const g2 = await post('/goals', { title: 'V06 kevin-parked drill', done_means: 'x' });
+    const goalId2 = g2.json.goal.id;
+    const sp2 = await post(`/goals/${goalId2}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 kevin parks this', done_means: 'x' }] });
+    const nodeId2 = sp2.json.nodes[0].id;
+    assert.equal((await post(`/goals/${goalId2}/batches/${sp2.json.batch_id}/accept`, {})).status, 200);
+    assert.equal((await post(`/goals/${goalId2}/nodes/${nodeId2}/park`, {})).status, 200);
+    const board2 = await getBoard();
+    assert.equal(attentionFor(board2, 'autopilot_parked', nodeId2), undefined, "Kevin's own park is not an autopilot park");
+  });
+
+  await check('V06-9', 'attention: a node sitting in `check` -> kind "goal_check" (node_id set)', async () => {
+    const g = await post('/goals', { title: 'V06 node-check drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const sp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 human -> check', done_means: 'x' }] });
+    const nodeId = sp.json.nodes[0].id;
+    assert.equal((await post(`/goals/${goalId}/batches/${sp.json.batch_id}/accept`, {})).status, 200);
+    assert.equal((await post(`/goals/${goalId}/nodes/${nodeId}/leaf_kind`, { leaf_kind: 'human' })).status, 200);
+    const done = await post(`/goals/${goalId}/nodes/${nodeId}/human_done`, {});
+    assert.equal(done.status, 200, JSON.stringify(done.json));
+    assert.equal(done.json.node.state, 'check');
+
+    const board = await getBoard();
+    const item = attentionFor(board, 'goal_check', nodeId);
+    assert.ok(item, 'check-state node present in attention');
+    assert.equal(item.goal_id, goalId);
+  });
+
+  await check('V06-10', 'attention: a goal root ready to verify -> kind "goal_check" (node_id null); a parked sibling does not block readiness (denom excludes parked)', async () => {
+    const g = await post('/goals', { title: 'V06 root-ready drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const aP = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 A (will be done)', done_means: 'x' }] });
+    const nodeA = aP.json.nodes[0].id;
+    const bP = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 B (will be parked)', done_means: 'x' }] });
+    const nodeB = bP.json.nodes[0].id;
+    assert.equal((await post(`/goals/${goalId}/batches/${aP.json.batch_id}/accept`, {})).status, 200);
+    assert.equal((await post(`/goals/${goalId}/batches/${bP.json.batch_id}/accept`, {})).status, 200);
+
+    // Not ready yet: A still set, B still set.
+    assert.equal(attentionFor(await getBoard(), 'goal_check', null), undefined);
+
+    assert.equal((await post(`/goals/${goalId}/nodes/${nodeB}/park`, {})).status, 200);
+    assert.equal((await post(`/goals/${goalId}/nodes/${nodeA}/leaf_kind`, { leaf_kind: 'human' })).status, 200);
+    assert.equal((await post(`/goals/${goalId}/nodes/${nodeA}/human_done`, {})).status, 200);
+    assert.equal((await post(`/goals/${goalId}/nodes/${nodeA}/verify`, { passed: true })).status, 200);
+
+    const board = await getBoard();
+    const item = board.attention.find((a: any) => a.kind === 'goal_check' && a.goal_id === goalId && a.node_id === null);
+    assert.ok(item, 'root ready-to-verify present even though one sibling is parked, not done');
+    assert.equal(item.node_title, null);
+    assert.equal(item.goal_title, 'V06 root-ready drill');
+  });
+
+  await check('V06-11', 'in_flight: a plain (unblocked) working leaf is listed with the right tree_id/titles', async () => {
+    const g = await post('/goals', { title: 'V06 in-flight drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const sp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 dispatched leaf', done_means: 'x' }] });
+    const nodeId = sp.json.nodes[0].id;
+    assert.equal((await post(`/goals/${goalId}/batches/${sp.json.batch_id}/accept`, {})).status, 200);
+    assert.equal((await post(`/goals/${goalId}/nodes/${nodeId}/leaf_kind`, { leaf_kind: 'machine' })).status, 200);
+    assert.equal((await post(`/goals/${goalId}/nodes/${nodeId}/propose_plan`, {
+      plan: { what: 'x', deliverable: 'y', model: 'claude-sonnet-5', adapter: 'claude', nodes: [{ title: 'n', spec: 's', adapter: 'claude', model: 'claude-sonnet-5' }] },
+    })).status, 200);
+    const approved = await post(`/goals/${goalId}/nodes/${nodeId}/approve_plan`, {});
+    assert.equal(approved.status, 200, JSON.stringify(approved.json));
+
+    const board = await getBoard();
+    const item = board.in_flight.find((f: any) => f.node_id === nodeId);
+    assert.ok(item, 'dispatched leaf present in in_flight');
+    assert.equal(item.goal_id, goalId);
+    assert.equal(item.goal_title, 'V06 in-flight drill');
+    assert.equal(item.node_title, 'V06 dispatched leaf');
+    assert.equal(item.tree_id, approved.json.node.tree_id);
+    assert.equal(attentionFor(board, 'need_you', nodeId), undefined, 'an unblocked working leaf is not need_you');
+  });
+
+  await check('V06-12', 'attention: sorted oldest-first across mixed kinds', async () => {
+    const older = await post('/goals', { title: 'V06 order drill (older)', done_means: 'x' });
+    const olderGoalId = older.json.goal.id;
+    const olderP = await post(`/goals/${olderGoalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 older ghost', done_means: 'x' }] });
+    const olderNodeId = olderP.json.nodes[0].id;
+
+    const newer = await post('/goals', { title: 'V06 order drill (newer)', done_means: 'x' });
+    const newerGoalId = newer.json.goal.id;
+    const newerP = await post(`/goals/${newerGoalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 newer human', done_means: 'x' }] });
+    const newerNodeId = newerP.json.nodes[0].id;
+    assert.equal((await post(`/goals/${newerGoalId}/batches/${newerP.json.batch_id}/accept`, {})).status, 200);
+    assert.equal((await post(`/goals/${newerGoalId}/nodes/${newerNodeId}/leaf_kind`, { leaf_kind: 'human' })).status, 200);
+
+    convDb.sqliteDb.prepare(`UPDATE goal_nodes SET updated_at = datetime('now', '-1 hour') WHERE id = ?`).run(olderNodeId);
+    convDb.sqliteDb.prepare(`UPDATE goal_nodes SET updated_at = datetime('now', '+1 hour') WHERE id = ?`).run(newerNodeId);
+
+    const board = await getBoard();
+    const olderIdx = board.attention.findIndex((a: any) => a.node_id === olderNodeId);
+    const newerIdx = board.attention.findIndex((a: any) => a.node_id === newerNodeId);
+    assert.ok(olderIdx !== -1 && newerIdx !== -1, 'both items present');
+    assert.ok(olderIdx < newerIdx, 'the older item sorts before the newer one (oldest-first)');
+  });
+
+  await check('V06-13', 'map/attention/in_flight exclude archived goals; the goals array excludes them too', async () => {
+    const g = await post('/goals', { title: 'V06 archive-me drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const sp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 node in an archived goal', done_means: 'x' }] });
+    const nodeId = sp.json.nodes[0].id;
+    assert.equal((await patch(`/goals/${goalId}`, { archived: true })).status, 200);
+
+    const board = await getBoard();
+    assert.equal(board.goals.find((x: any) => x.id === goalId), undefined, 'archived goal excluded from goals');
+    assert.equal(mapNode(board, nodeId), undefined, 'its node excluded from map');
+    assert.equal(board.attention.find((a: any) => a.goal_id === goalId), undefined, 'no attention items from an archived goal');
+  });
+
+  await check('V06-14', 'map: titles over 60 chars are truncated with an ellipsis; the full title is untouched elsewhere', async () => {
+    const longTitle = 'V06 a very long node title that is deliberately well past the sixty character cap for the mini-map rail';
+    assert.ok(longTitle.length > 60, 'fixture sanity');
+    const g = await post('/goals', { title: 'V06 truncation drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const sp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: longTitle, done_means: 'x' }] });
+    const nodeId = sp.json.nodes[0].id;
+
+    const board = await getBoard();
+    const row = mapNode(board, nodeId);
+    assert.ok(row, 'node present');
+    assert.equal(row.title.length, 60);
+    assert.ok(row.title.endsWith('…'));
+    assert.ok(longTitle.startsWith(row.title.slice(0, 59)));
+
+    const tree = (await get(`/goals/${goalId}`)).json;
+    const full = tree.nodes.find((n: any) => n.id === nodeId);
+    assert.equal(full.title, longTitle, 'the full-fidelity node read is never truncated');
+  });
 } finally {
   server.close();
   owServer?.close();

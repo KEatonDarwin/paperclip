@@ -995,8 +995,10 @@ function computeThreadActivityMap(): Map<number, string> {
 
 /** Candidate nodes for the "what's hot" preview, ALL goals in one query, already
  *  ordered priority-then-recency: working(1) > check(2) > need-you(3) — ghosts,
- *  pending edits/removals, open human leaves, proposed plans. Parked/done/set
- *  non-human nodes never qualify. */
+ *  pending edits/removals, open human leaves, proposed plans. A plain set
+ *  machine node, or a done/parked node with nothing pending on it, never
+ *  qualifies; a parked node DOES qualify while it carries a pending edit or
+ *  removal, because that is still a thing waiting on Kevin. */
 const hotNodeCandidatesStmt = sqliteDb.prepare(`
   SELECT id, goal_id, title, state, updated_at,
     CASE

@@ -134,8 +134,16 @@ function parsePlan(node: Pick<GoalNodeRow, 'plan'>): PlanJson | null {
   try { return JSON.parse(node.plan) as PlanJson; } catch { return null; }
 }
 
+/** settled(n) for the ORDERING walk (§15.4). `working` counts: a leaf that
+ *  has been dispatched already holds its place in the row — concurrency is
+ *  limited by row 3's `parallel` cap, not by ordering. With parallel=1 row 3
+ *  fires before this walk whenever anything is working, so parallel=1
+ *  behaviour is byte-identical; with parallel>1 the NEXT leaf in DFS order may
+ *  start while the earlier one runs (AP-7's `parallel:2` example). REVIEW fix
+ *  (node #541): previously `working` was NOT settled, which made parallel>1
+ *  inert. `planned` (plant retry pending) is deliberately not settled. */
 function isSettled(n: GoalNodeRow): boolean {
-  return n.state === 'done' || n.state === 'parked' || n.leaf_kind === 'human' || n.state === 'check' || n.promoted_to_goal_id != null;
+  return n.state === 'done' || n.state === 'parked' || n.state === 'working' || n.leaf_kind === 'human' || n.state === 'check' || n.promoted_to_goal_id != null;
 }
 
 interface TreeIndex {
@@ -521,6 +529,14 @@ function noteHold(goalId: number, s: GoalDriverState, reason: string | null): vo
   s.lastHold = reason;
 }
 
+/** Unblock cues already posted for this node during the current run. */
+function countUnblockCues(goalId: number, nodeId: number): number {
+  const startId = runStartEventId(goalId, null) ?? 0;
+  const row = sqliteDb.prepare(`SELECT COUNT(*) AS n FROM goal_events WHERE goal_id = ? AND node_id = ? AND kind = 'autopilot_cue' AND id >= ? AND data LIKE '%"action":"unblock"%'`)
+    .get(goalId, nodeId, startId) as { n: number };
+  return row?.n ?? 0;
+}
+
 /** After a `wrap` cue's turn ended: flip off + fallback report (§15.4 row 9). */
 function finalizeWrap(goal: GoalRow, tree: GoalTree, s: GoalDriverState): void {
   const allDone = tree.nodes.every((n) => n.state === 'done' || (n.state === 'check' && n.parent_id == null));
@@ -577,9 +593,26 @@ async function tickGoal(goalId: number, reason: string): Promise<void> {
       return;
     }
 
-    // Dedupe (§15.4).
     const key = `autopilot:${goalId}:${d.action}:${d.node_id ?? 0}`;
     const cuedNode = d.node_id != null ? tree.nodes.find((n) => n.id === d.node_id) ?? null : null;
+
+    // REVIEW fix (node #541) — bound the unblock loop. A tree that JARVIS
+    // re-pends and that blocks AGAIN changes the node's signature every time, so
+    // the "cue ignored twice" guard below never trips and the night would spend
+    // a JARVIS turn + a worker attempt per cycle, forever. Cap unblock cues per
+    // node per run at max_attempts; past that → park with the tree id.
+    if (d.action === 'unblock' && cuedNode) {
+      const prior = countUnblockCues(goalId, cuedNode.id);
+      if (prior >= cfg.max_attempts) {
+        try {
+          parkGoalNode(goalId, cuedNode.id, 'system', `tree ${cuedNode.tree_id ?? '?'} blocked ${prior + 1} times — unblock cues exhausted (${cfg.max_attempts})`.slice(0, 500));
+        } catch (err) { console.error('[autopilot] park after exhausted unblock cues failed', err); }
+        s.lastCue = null;
+        return;
+      }
+    }
+
+    // Dedupe (§15.4).
     const sig = nodeSig(cuedNode);
     let secondAsk = false;
     if (s.lastCue && s.lastCue.key === key) {

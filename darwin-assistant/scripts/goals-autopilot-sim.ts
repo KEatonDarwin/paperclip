@@ -509,29 +509,31 @@ try {
     assert.equal(d4.action, 'plan');
     assert.equal(d4.node_id, B.id);
   });
-  await check(
-    'AP-7b',
-    'parallel=2 does NOT unblock a later sibling while an earlier one is "working" — earlierSettled() excludes state=working regardless of the parallel value ' +
-      '(a divergence from CONTRACT.md §15.12 AP-7\'s literal "cue plan A2" example; see sim-report notes for REVIEW-BACKEND, not patched here)',
-    () => {
-      const A = mkNode({ title: 'A', leaf_kind: 'none', child_count: 2 });
-      const A1 = mkNode({ title: 'A1', parent_id: A.id, leaf_kind: 'machine', depth: 1, state: 'working' });
-      const A2 = mkNode({ title: 'A2', parent_id: A.id, leaf_kind: 'machine', depth: 1 });
-      const B = mkNode({ title: 'B', leaf_kind: 'machine' });
-      const cfg2 = fixtureCfg({ parallel: 2 });
-      const d = ap.computeNextAction([A, A1, A2, B], cfg2);
-      assert.equal(d.action, null);
-      assert.equal(d.reason, 'waiting_on_work', 'row3 does not fire (1 < 2) but the DFS walk still finds nothing runnable');
-      // Confirmed with two fully independent root-level leaves too (no shared
-      // parent at all) — same result, so this is not an artifact of A2 sharing
-      // a container with A1.
-      const X1 = mkNode({ title: 'X1', leaf_kind: 'machine', state: 'working' });
-      const X2 = mkNode({ title: 'X2', leaf_kind: 'machine' });
-      const d2 = ap.computeNextAction([X1, X2], cfg2);
-      assert.equal(d2.action, null);
-      assert.equal(d2.reason, 'waiting_on_work');
-    },
-  );
+  await check('AP-7b', 'parallel=2: after A1 is working, the NEXT leaf in DFS order (A2) is cued; B still waits (A is not settled) — CONTRACT §15.12 AP-7 literal example (REVIEW fix node #541: `working` counts as settled for ORDERING; row 3 still caps concurrency)', () => {
+    const A = mkNode({ title: 'A', leaf_kind: 'none', child_count: 2 });
+    const A1 = mkNode({ title: 'A1', parent_id: A.id, leaf_kind: 'machine', depth: 1, state: 'working' });
+    const A2 = mkNode({ title: 'A2', parent_id: A.id, leaf_kind: 'machine', depth: 1 });
+    const B = mkNode({ title: 'B', leaf_kind: 'machine' });
+    const cfg2 = fixtureCfg({ parallel: 2 });
+    const d = ap.computeNextAction([A, A1, A2, B], cfg2);
+    assert.equal(d.action, 'plan');
+    assert.equal(d.node_id, A2.id, 'A2 runs alongside A1; B waits on A');
+    // parallel=1 is byte-identical to before: row 3 fires before the walk.
+    const d1 = ap.computeNextAction([A, A1, A2, B], fixtureCfg({ parallel: 1 }));
+    assert.equal(d1.action, null);
+    assert.equal(d1.reason, 'parallel_full');
+    // two independent root leaves, parallel=2: X2 is cued while X1 works; a third waits at the cap.
+    const X1 = mkNode({ title: 'X1', leaf_kind: 'machine', state: 'working' });
+    const X2 = mkNode({ title: 'X2', leaf_kind: 'machine' });
+    const X3 = mkNode({ title: 'X3', leaf_kind: 'machine' });
+    const d2 = ap.computeNextAction([X1, X2, X3], cfg2);
+    assert.equal(d2.action, 'plan');
+    assert.equal(d2.node_id, X2.id);
+    const X2w = { ...X2, state: 'working' };
+    const d3 = ap.computeNextAction([X1, X2w, X3], cfg2);
+    assert.equal(d3.action, null);
+    assert.equal(d3.reason, 'parallel_full');
+  });
 
   console.log('\n[5] AP-8 — decompose (depth < max_depth) vs classify (depth = max_depth)');
   await check('AP-8a', 'a set+none leaf with no children at depth 1 of max 4 -> decompose; the same shape at depth 4 -> classify', () => {
@@ -826,6 +828,53 @@ try {
     assert.equal(goal.json.goal.autopilot_config.stop_reason, 'complete', 'W1 done, W2 human+done -> nothing parked');
   });
 
+  // ───────────────────────────────────────────────────────────────────────
+  console.log('\n[11] AP-15 (REVIEW node #541) — the unblock loop is bounded: a tree that keeps re-blocking parks after max_attempts unblock cues');
+  let g5 = -1;
+  let u1 = -1;
+  await check('AP-15a', 'setup: goal on autopilot (max_attempts 2); machine leaf dispatched; its build node finishes `blocked` -> tree blocked -> tick cues unblock #1', async () => {
+    const created = goalsModule.createGoal({ title: 'AP-15 unblock cap drill', done_means: 'a re-blocking tree cannot loop all night', actor: 'kevin' });
+    g5 = created.goal.id;
+    const on = await post(`/goals/${g5}/autopilot`, { on: true, config: { max_attempts: 2, tick_minutes: 1 } });
+    assert.equal(on.status, 200, JSON.stringify(on.json));
+    const n = goalsModule.createGoalNode(g5, { title: 'U1', done_means: 'U1 evidence exists', parent_id: null, authored_by: 'kevin', actor: 'jarvis', leaf_kind: 'machine' });
+    u1 = n.id;
+    ap.__setAutopilotTestOverrides({ governor: () => ({ allow: true, reason: 'ok' }), inFlight: () => null });
+    const planned = await post(`/goals/${g5}/nodes/${u1}/propose_plan`, {
+      plan: { what: 'w', deliverable: 'd', model: 'claude-sonnet-5', adapter: 'claude', nodes: [{ title: 'build it', spec: 'build U1', adapter: 'claude', model: 'claude-sonnet-5' }] },
+    });
+    assert.equal(planned.status, 200, JSON.stringify(planned.json));
+    const gnode = await nodeById(g5, u1);
+    const plan = JSON.parse(gnode.plan);
+    const buildId = (planned.json.hopper_nodes as any[]).map((h) => h.id).find((id) => id !== plan.verify_hopper_node_id);
+    await waitFor(`build ${buildId} running`, async () => (await overlayStatus(g5, u1, buildId)) === 'running');
+    const fin = await post(`/hopper-nodes/${buildId}/finish`, { outcome: 'blocked', result: 'toolchain missing' });
+    assert.equal(fin.status, 200, JSON.stringify(fin.json));
+    await waitFor('node tree_status_cache blocked', async () => (await nodeById(g5, u1))?.tree_status_cache === 'blocked');
+    await tick(g5, 'sim');
+    assert.equal(lastApCue(g5).correlationKey, `autopilot:${g5}:unblock:${u1}`);
+    assert.equal(apCueCalls(g5).length, 1);
+  });
+  await check('AP-15b', 'the tree "changes" (re-pended, blocks again: node signature differs) -> unblock #2 posts as a fresh ask, not a second-ask', async () => {
+    const { sqliteDb } = await import(path.join(distDir, 'conversation-db.js'));
+    sqliteDb.prepare(`UPDATE goal_nodes SET updated_at = datetime('now', '+1 minute') WHERE id = ?`).run(u1);
+    await tick(g5, 'sim');
+    assert.equal(apCueCalls(g5).length, 2);
+    assert.ok(!lastApCue(g5).text.includes('(second ask)'));
+  });
+  await check('AP-15c', 'a third re-block -> the node is PARKED (reason names the tree + "unblock cues exhausted"), no third cue; autopilot stays on', async () => {
+    const { sqliteDb } = await import(path.join(distDir, 'conversation-db.js'));
+    sqliteDb.prepare(`UPDATE goal_nodes SET updated_at = datetime('now', '+2 minute') WHERE id = ?`).run(u1);
+    await tick(g5, 'sim');
+    assert.equal(apCueCalls(g5).length, 2, 'no third unblock cue');
+    const n = await nodeById(g5, u1);
+    assert.equal(n.state, 'parked');
+    assert.match(n.parked_reason, /unblock cues exhausted \(2\)/);
+    assert.match(n.parked_reason, new RegExp(`tree ${n.tree_id}`));
+    const goal = await get(`/goals/${g5}`);
+    assert.equal(goal.json.goal.autopilot, 1);
+  });
+
   console.log(`\n[autopilot-sim] every prior goals sim (v0–v0.3, guards) is unaffected — this file only ADDS autopilot coverage and does not touch their scratch DB.`);
 } finally {
   server.close();
@@ -881,24 +930,14 @@ if (failed.length) {
   lines.push("All checks passed against `CONTRACT.md` §15.12's acceptance list during this run.");
 }
 lines.push('');
-lines.push('## Notes for REVIEW-BACKEND (not treated as bugs, not patched here)');
+lines.push('## Review notes');
 lines.push('');
 lines.push(
-  '1. **`parallel > 1` is inert in the current `computeNextAction` implementation.** CONTRACT.md §15.12 AP-7\'s ' +
-    'worked example claims "With `parallel:2`: after A1 dispatched, tick → cue `plan A2`" — but `earlierSettled()` ' +
-    'treats `state=\'working\'` as NOT settled (only `done`/`parked`/`human`/`check`/promoted count), and every ' +
-    'node — sibling under the same container OR a fully independent root-level leaf — has the currently-working ' +
-    'node in its `earlier()` chain once that node is the first thing dispatched. Verified empirically two ways ' +
-    '(check AP-7b): A2 under A while A1 is `working`, and two fully unrelated root leaves X1(`working`)/X2, both ' +
-    'return `{action:null, reason:\'waiting_on_work\'}` regardless of `parallel:1` vs `parallel:2` — the ONLY ' +
-    'observable difference `parallel` makes is the *reason string* on row 3 (`parallel_full` vs falling through to ' +
-    'the walk, which then also returns null). Given "execute them in a row" is the explicit design intent ' +
-    '(AUTOPILOT.md §2.3: "Sibling ordering = execution order... a machine leaf is runnable only when every earlier ' +
-    'sibling... is done/parked/human"), this may be working as designed and the CONTRACT prose\'s specific example ' +
-    'is simply wrong — or `parallel>1` was meant to unlock something the current DFS-walk-with-earlier-gating ' +
-    'structure cannot express (independent BRANCHES running concurrently) and needs a real design decision before ' +
-    'it does anything. Either way it is not a one-line fix and not something to guess at here.',
+  '1. `parallel > 1` was inert in the original build (`working` did not count as settled in the ordering walk, ' +
+    'so nothing could ever run alongside a working leaf). Fixed in the REVIEW node (#541): `working` is settled ' +
+    'for ORDERING; row 3\'s `parallel` cap alone limits concurrency; parallel=1 is byte-identical (AP-7b covers both).',
 );
+lines.push('');
 fs.writeFileSync(reportPath, lines.join('\n') + '\n');
 console.log(`[autopilot-sim] report written: ${reportPath}`);
 

@@ -23,9 +23,11 @@ import {
   agreeHopperTree,
   getHopperTree,
   listTreeNodes,
+  updateHopperNodeSpec,
   type HopperTreeRow,
   type HopperNodeRow,
 } from './hopper-engine.js';
+import { buildVerifyPlanNode } from './goals-autopilot-verify.js';
 
 // ---------------------------------------------------------------------------
 // Types (mirrors CONTRACT.md §1 / §3.0 exactly — additive-only if extended)
@@ -58,6 +60,37 @@ export interface PlanJson {
   nodes: PlanJsonNode[];
   proposed_at?: string | null;
   approved_at?: string | null;
+  // v0.4 §15.2/§15.3 — set by the server on an autopilot plan.
+  verify_index?: number | null;            // index of the appended VERIFY node in `nodes`
+  verify_hopper_node_id?: number | null;   // hopper_nodes.id of that VERIFY node once planted
+  autopilot?: boolean;                     // true when the server dispatched this plan itself
+}
+
+// v0.4 §15.1.1 — per-goal autopilot config (every key present after normalisation).
+export interface AutopilotConfig {
+  build_model: string;
+  light_model: string;
+  verify_model: string;
+  max_depth: number;
+  parallel: number;
+  tick_minutes: number;
+  max_attempts: number;
+  started_at: string | null;
+  stopped_at: string | null;
+  stop_reason: 'kevin' | 'complete' | 'stuck' | 'goal_done' | 'goal_parked' | null;
+}
+export interface AutopilotVerdict {
+  verdict: 'PASS' | 'FAIL';
+  evidence: string;
+  gaps: string[];
+  tree_id: string;
+  at: string;
+}
+export type AutopilotActionKind = 'unblock' | 'plan' | 'replan' | 'decompose' | 'classify' | 'weigh_in' | 'wrap';
+export interface AutopilotNextAction {
+  action: AutopilotActionKind | null;
+  node_id: number | null;
+  reason: string;
 }
 
 export interface GoalRow {
@@ -72,6 +105,9 @@ export interface GoalRow {
   sort_order: number;
   verified_at: string | null;
   archived: 0 | 1;
+  // v0.4 §15.1 — parsed on read (loadGoal); the column stores JSON.
+  autopilot: 0 | 1;
+  autopilot_config: AutopilotConfig | null;
   created_at: string;
   updated_at: string;
 }
@@ -88,6 +124,8 @@ export interface GoalCounts {
   node_chats: number;        // v0.3 §14.1 — non-discarded nodes that have their own node chat (thread_ext set)
   guards: number;            // v0.2 §12.11 — count of state='set' guards in the goal
   guards_failing: number;    // v0.2 §12.11 — set guards with health IN ('failing','error')
+  autopilot_set: number;     // v0.4 §15.1 — non-discarded nodes set by autopilot without Kevin's ✓
+  parked: number;            // v0.4 §15.1 — nodes with state='parked'
   progress: number;
 }
 
@@ -95,6 +133,8 @@ export interface GoalSummary extends GoalRow {
   counts: GoalCounts;
   focus_node_id: number | null;
   last_event_at: string | null;
+  /** v0.4 §15.1 — the driver's next-action preview (pure read); null when autopilot is off. */
+  autopilot_next: AutopilotNextAction | null;
 }
 
 /** Raw DB row for goal_nodes — snake_case, 1:1 with the table. */
@@ -129,6 +169,11 @@ export interface GoalNodeDbRow {
   pending_parent_id: number | null;     // JARVIS-proposed re-parent awaiting ✓/✕ (-1 = to root); NULL = none
   // v0.3 §14.1 — the node's own chat (`cockpit:goal-<g>-node-<n>`); NULL until Kevin opens one, never cleared.
   thread_ext: string | null;
+  // v0.4 §15.1 — autopilot bookkeeping (autopilot_verdict is JSON on the raw row, parsed on GoalNodeRow).
+  autopilot_set: 0 | 1;
+  autopilot_attempts: number;
+  autopilot_verdict: string | null;
+  parked_reason: string | null;
   sort_order: number;
   verified_at: string | null;
   created_at: string;
@@ -136,7 +181,8 @@ export interface GoalNodeDbRow {
 }
 
 /** Public node shape — raw row + derived depth/child_count/path (CONTRACT §3.0). */
-export interface GoalNodeRow extends GoalNodeDbRow {
+export interface GoalNodeRow extends Omit<GoalNodeDbRow, 'autopilot_verdict'> {
+  autopilot_verdict: AutopilotVerdict | null;
   depth: number;
   child_count: number;
   path: string[];
@@ -316,6 +362,19 @@ ensureGoalNodeColumn('pending_parent_id', `pending_parent_id INTEGER`);
 // v0.3 (CONTRACT §14.1) — node chats: one pinned-focus conversation per node, on Kevin's say-so.
 ensureGoalNodeColumn('thread_ext', `thread_ext TEXT`);
 sqliteDb.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_nodes_thread_ext ON goal_nodes(thread_ext) WHERE thread_ext IS NOT NULL`);
+// v0.4 (CONTRACT §15.1) — autopilot: a flag + config on the goal, bookkeeping on nodes.
+function ensureGoalColumn(column: string, ddl: string): void {
+  const cols = sqliteDb.prepare(`PRAGMA table_info(goals)`).all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === column)) {
+    sqliteDb.exec(`ALTER TABLE goals ADD COLUMN ${ddl}`);
+  }
+}
+ensureGoalColumn('autopilot', `autopilot INTEGER NOT NULL DEFAULT 0`);
+ensureGoalColumn('autopilot_config', `autopilot_config TEXT`);
+ensureGoalNodeColumn('autopilot_set', `autopilot_set INTEGER NOT NULL DEFAULT 0`);
+ensureGoalNodeColumn('autopilot_attempts', `autopilot_attempts INTEGER NOT NULL DEFAULT 0`);
+ensureGoalNodeColumn('autopilot_verdict', `autopilot_verdict TEXT`);
+ensureGoalNodeColumn('parked_reason', `parked_reason TEXT`);
 
 // ---------------------------------------------------------------------------
 // Low-level accessors
@@ -324,8 +383,24 @@ sqliteDb.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_nodes_thread_ext ON go
 const getGoalRowStmt = sqliteDb.prepare(`SELECT * FROM goals WHERE id = ?`);
 const getRawNodeStmt = sqliteDb.prepare(`SELECT * FROM goal_nodes WHERE id = ?`);
 
+/** v0.4 §15.1 — the raw goals row with `autopilot_config` parsed (JSON → object). */
+function parseGoalRow(raw: Record<string, unknown> | undefined): GoalRow | undefined {
+  if (!raw) return undefined;
+  let cfg: AutopilotConfig | null = null;
+  const rawCfg = raw.autopilot_config;
+  if (typeof rawCfg === 'string' && rawCfg) {
+    try { cfg = JSON.parse(rawCfg) as AutopilotConfig; } catch { cfg = null; }
+  } else if (rawCfg && typeof rawCfg === 'object') {
+    cfg = rawCfg as AutopilotConfig;
+  }
+  return { ...(raw as unknown as GoalRow), autopilot: (Number(raw.autopilot) === 1 ? 1 : 0), autopilot_config: cfg };
+}
+function loadGoal(id: number): GoalRow | undefined {
+  return parseGoalRow(getGoalRowStmt.get(id) as Record<string, unknown> | undefined);
+}
+
 function requireGoal(id: number): GoalRow {
-  const row = getGoalRowStmt.get(id) as GoalRow | undefined;
+  const row = loadGoal(id);
   if (!row) throw new GoalError(404, 'goal_not_found', 'goal not found');
   return row;
 }
@@ -354,6 +429,18 @@ function normLeafKind(value: unknown): LeafKind {
 // ---------------------------------------------------------------------------
 // Derived fields — depth / child_count / path
 // ---------------------------------------------------------------------------
+
+/** v0.4 §15.1 — raw JSON column → AutopilotVerdict (null on missing/garbage). */
+export function parseVerdictJson(raw: string | null | undefined): AutopilotVerdict | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as Partial<AutopilotVerdict>;
+    if (v && (v.verdict === 'PASS' || v.verdict === 'FAIL')) {
+      return { verdict: v.verdict, evidence: v.evidence ?? '', gaps: Array.isArray(v.gaps) ? v.gaps : [], tree_id: v.tree_id ?? '', at: v.at ?? '' };
+    }
+  } catch { /* fall through */ }
+  return null;
+}
 
 function buildDerivedNodes(goalTitle: string, rawNodes: GoalNodeDbRow[]): GoalNodeRow[] {
   const byId = new Map<number, GoalNodeDbRow>(rawNodes.map((n) => [n.id, n]));
@@ -397,7 +484,7 @@ function buildDerivedNodes(goalTitle: string, rawNodes: GoalNodeDbRow[]): GoalNo
   const out: GoalNodeRow[] = [];
   function walk(parentId: number | null): void {
     for (const n of childrenOf.get(parentId) ?? []) {
-      out.push({ ...n, depth: depthOf(n), child_count: childCountOf.get(n.id) ?? 0, path: pathOf(n) });
+      out.push({ ...n, autopilot_verdict: parseVerdictJson(n.autopilot_verdict), depth: depthOf(n), child_count: childCountOf.get(n.id) ?? 0, path: pathOf(n) });
       walk(n.id);
     }
   }
@@ -418,7 +505,7 @@ function deriveSingleNode(node: GoalNodeDbRow): GoalNodeRow {
 export function pathForNode(nodeId: number): string[] | null {
   const node = getRawNodeStmt.get(nodeId) as GoalNodeDbRow | undefined;
   if (!node) return null;
-  const goal = getGoalRowStmt.get(node.goal_id) as GoalRow | undefined;
+  const goal = loadGoal(node.goal_id);
   if (!goal) return null;
   const chain: string[] = [];
   let cur: GoalNodeDbRow | undefined = node;
@@ -445,6 +532,8 @@ const countsStmt = sqliteDb.prepare(`
     SUM(CASE WHEN plan_state = 'proposed' THEN 1 ELSE 0 END) AS plan_proposed,
     SUM(CASE WHEN review_state = 'awaiting_jarvis' THEN 1 ELSE 0 END) AS awaiting_jarvis,
     SUM(CASE WHEN thread_ext IS NOT NULL AND state != 'discarded' THEN 1 ELSE 0 END) AS node_chats,
+    SUM(CASE WHEN autopilot_set = 1 AND state != 'discarded' THEN 1 ELSE 0 END) AS autopilot_set,
+    SUM(CASE WHEN state = 'parked' THEN 1 ELSE 0 END) AS parked,
     SUM(CASE WHEN state NOT IN ('discarded','parked') THEN 1 ELSE 0 END) AS denom
   FROM goal_nodes WHERE goal_id = ?
 `);
@@ -461,6 +550,7 @@ function computeCounts(goalId: number): GoalCounts {
     total: number | null; done: number | null; working: number | null; check_count: number | null;
     ghost_state: number | null; pending_count: number | null; human_open: number | null;
     plan_proposed: number | null; awaiting_jarvis: number | null; node_chats: number | null; denom: number | null;
+    autopilot_set: number | null; parked: number | null;
   };
   const guardRow = guardCountsStmt.get(goalId) as { guards: number | null; guards_failing: number | null };
   const ghosts = (row.ghost_state ?? 0) + (row.pending_count ?? 0);
@@ -481,6 +571,8 @@ function computeCounts(goalId: number): GoalCounts {
     node_chats: row.node_chats ?? 0,
     guards: guardRow.guards ?? 0,
     guards_failing: guardRow.guards_failing ?? 0,
+    autopilot_set: row.autopilot_set ?? 0,
+    parked: row.parked ?? 0,
     progress: Math.round((100 * done) / denom),
   };
 }
@@ -489,14 +581,39 @@ const lastEventAtStmt = sqliteDb.prepare(`
   SELECT created_at FROM goal_events WHERE goal_id = ? ORDER BY id DESC LIMIT 1
 `);
 
+// v0.4 §15 — seams registered by src/goals-autopilot.ts at module load (it
+// imports this file, so this file cannot import it back). `preview` = the pure
+// decision-table read for GoalSummary.autopilot_next; `kick` = "something on
+// an autopilot goal changed, tick it soon".
+type AutopilotPreviewFn = (goalId: number) => AutopilotNextAction | null;
+type AutopilotKickFn = (goalId: number) => void;
+/** Sync gates only (disabled / stop_file / governor) — for the §15.10 `held:` attribute. */
+type AutopilotHoldFn = (goalId: number) => string | null;
+let autopilotPreview: AutopilotPreviewFn | null = null;
+let autopilotKick: AutopilotKickFn | null = null;
+let autopilotHold: AutopilotHoldFn | null = null;
+export function registerAutopilotHooks(hooks: { preview?: AutopilotPreviewFn; kick?: AutopilotKickFn; hold?: AutopilotHoldFn }): void {
+  if (hooks.preview) autopilotPreview = hooks.preview;
+  if (hooks.kick) autopilotKick = hooks.kick;
+  if (hooks.hold) autopilotHold = hooks.hold;
+}
+export function kickAutopilot(goalId: number): void {
+  try { autopilotKick?.(goalId); } catch (err) { console.error('[goals] autopilot kick failed', err); }
+}
+
 function toGoalSummary(row: GoalRow): GoalSummary {
   const focus = getFocusRaw(row.id);
   const lastEvent = lastEventAtStmt.get(row.id) as { created_at: string } | undefined;
+  let autopilotNext: AutopilotNextAction | null = null;
+  if (row.autopilot === 1 && autopilotPreview) {
+    try { autopilotNext = autopilotPreview(row.id); } catch { autopilotNext = null; }
+  }
   return {
     ...row,
     counts: computeCounts(row.id),
     focus_node_id: focus.node_id,
     last_event_at: lastEvent?.created_at ?? null,
+    autopilot_next: autopilotNext,
   };
 }
 
@@ -536,7 +653,7 @@ function insertEvent(
 }
 
 function emitGoal(action: GoalEvent['action'], goalId: number): void {
-  const row = getGoalRowStmt.get(goalId) as GoalRow | undefined;
+  const row = loadGoal(goalId);
   if (!row) return;
   sseBus.emit('sse', { type: 'goal', action, goal: toGoalSummary(row) } satisfies GoalEvent);
 }
@@ -545,6 +662,10 @@ function emitGoal(action: GoalEvent['action'], goalId: number): void {
 function touchGoal(goalId: number): void {
   sqliteDb.prepare(`UPDATE goals SET updated_at = datetime('now') WHERE id = ?`).run(goalId);
   emitGoal('updated', goalId);
+  // v0.4 §15.4 — every node write on an autopilot goal kicks the driver
+  // (coalesced there; the driver ignores kicks caused by its own tick writes).
+  const g = loadGoal(goalId);
+  if (g?.autopilot === 1) kickAutopilot(goalId);
 }
 
 function emitNode(action: GoalNodeEvent['action'], node: GoalNodeDbRow, batchId?: string | null): void {
@@ -608,6 +729,190 @@ export function setGoalFocus(goalId: number, nodeId: number | null, setBy?: unkn
 }
 
 // ---------------------------------------------------------------------------
+// v0.4 §15 — AUTOPILOT: per-goal flag + config, on/off, adoption pass, and the
+// small helpers the autopilot-aware transitions below share. The DRIVER (ticks,
+// cues, verdict parsing, night report) lives in src/goals-autopilot.ts.
+// ---------------------------------------------------------------------------
+
+export const AUTOPILOT_DEFAULTS: Omit<AutopilotConfig, 'started_at' | 'stopped_at' | 'stop_reason'> = {
+  build_model: 'claude-sonnet-5',
+  light_model: 'claude-haiku-4-5-20251001',
+  verify_model: 'claude-opus-5',
+  max_depth: 4,
+  parallel: 1,
+  tick_minutes: 10,
+  max_attempts: 2,
+};
+const AUTOPILOT_INT_RANGES: Record<'max_depth' | 'parallel' | 'tick_minutes' | 'max_attempts', [number, number]> = {
+  max_depth: [1, 8],
+  parallel: [1, 3],
+  tick_minutes: [1, 120],
+  max_attempts: [1, 5],
+};
+const AUTOPILOT_MODEL_KEYS = ['build_model', 'light_model', 'verify_model'] as const;
+const AUTOPILOT_CONFIG_KEYS = new Set<string>([...AUTOPILOT_MODEL_KEYS, ...Object.keys(AUTOPILOT_INT_RANGES), 'started_at', 'stopped_at', 'stop_reason']);
+
+/** §15.1.1 — frontier/planner models never run leaf or verify work. Same
+ *  deny-list as §1.2 `plan_invalid` plus the per-pool frontier tier. */
+export function isFrontierModel(model: string): boolean {
+  return /fable/i.test(model) || /gpt-6-astra/i.test(model);
+}
+
+/** §15.1.1 — merge a partial config over `base` (defaults, or the stored config
+ *  on a re-`on`), validate, and return the full object. Server-owned keys in the
+ *  input are ignored. Throws 400 autopilot_config_invalid. */
+export function normalizeAutopilotConfig(input: unknown, base?: AutopilotConfig | null): AutopilotConfig {
+  const out: AutopilotConfig = {
+    ...AUTOPILOT_DEFAULTS,
+    ...(base ?? {}),
+    started_at: base?.started_at ?? null,
+    stopped_at: base?.stopped_at ?? null,
+    stop_reason: base?.stop_reason ?? null,
+  };
+  if (input === undefined || input === null) return out;
+  if (typeof input !== 'object' || Array.isArray(input)) {
+    throw new GoalError(400, 'autopilot_config_invalid', 'config must be an object', { reason: 'not_object' });
+  }
+  const obj = input as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    if (!AUTOPILOT_CONFIG_KEYS.has(key)) {
+      throw new GoalError(400, 'autopilot_config_invalid', `unknown config key: ${key}`, { reason: `unknown_key:${key}` });
+    }
+  }
+  for (const key of AUTOPILOT_MODEL_KEYS) {
+    if (obj[key] === undefined) continue;
+    const v = obj[key];
+    if (typeof v !== 'string' || !v.trim()) {
+      throw new GoalError(400, 'autopilot_config_invalid', `${key} must be a non-empty string`, { reason: `${key}_not_string` });
+    }
+    const model = v.trim();
+    if (isFrontierModel(model)) {
+      throw new GoalError(400, 'autopilot_config_invalid', `${key} must not be a frontier/planner model: ${model}`, { reason: `${key}_frontier` });
+    }
+    if (!/^claude-/i.test(model)) {
+      throw new GoalError(400, 'autopilot_config_invalid', `${key} must be a claude model id (adapter 'claude'): ${model}`, { reason: `${key}_not_claude` });
+    }
+    out[key] = model;
+  }
+  for (const key of Object.keys(AUTOPILOT_INT_RANGES) as Array<keyof typeof AUTOPILOT_INT_RANGES>) {
+    if (obj[key] === undefined) continue;
+    const [lo, hi] = AUTOPILOT_INT_RANGES[key];
+    const n = Number(obj[key]);
+    if (!Number.isInteger(n) || n < lo || n > hi) {
+      throw new GoalError(400, 'autopilot_config_invalid', `${key} must be an integer in ${lo}..${hi}`, { reason: `${key}_range` });
+    }
+    out[key] = n;
+  }
+  return out;
+}
+
+/** The goal's live config when autopilot is ON, else null. */
+export function autopilotConfigFor(goalId: number): AutopilotConfig | null {
+  const g = loadGoal(goalId);
+  if (!g || g.autopilot !== 1) return null;
+  return g.autopilot_config ?? normalizeAutopilotConfig(null);
+}
+
+function writeAutopilotConfig(goalId: number, cfg: AutopilotConfig, on: 0 | 1): void {
+  sqliteDb.prepare(`UPDATE goals SET autopilot = ?, autopilot_config = ?, updated_at = datetime('now') WHERE id = ?`)
+    .run(on, JSON.stringify(cfg), goalId);
+}
+
+export type AutopilotStopReason = NonNullable<AutopilotConfig['stop_reason']>;
+
+/** §15.2 row 2 — flip autopilot OFF (any path). No-op when already off. */
+export function setAutopilotOff(goalId: number, reason: AutopilotStopReason, actor: GoalActor = 'system'): GoalSummary {
+  const goal = requireGoal(goalId);
+  if (goal.autopilot !== 1) return toGoalSummary(goal);
+  const cfg = normalizeAutopilotConfig(null, goal.autopilot_config);
+  cfg.stopped_at = new Date().toISOString();
+  cfg.stop_reason = reason;
+  writeAutopilotConfig(goalId, cfg, 0);
+  insertEvent(goalId, null, actor, 'autopilot_off', `Autopilot off (${reason}).`, { stop_reason: reason });
+  emitGoal('updated', goalId);
+  return toGoalSummary(requireGoal(goalId));
+}
+
+/** §15.2 row 1 (+ route 37) — turn autopilot on/off. `on:true` on an already-on
+ *  goal re-merges the config and re-kicks (no adoption pass). Returns the summary. */
+export function setGoalAutopilot(goalId: number, on: boolean, configInput?: unknown, actor?: unknown): GoalSummary {
+  const goal = requireGoal(goalId);
+  const act = assertActor(actor, 'kevin');
+  if (!on) {
+    return setAutopilotOff(goalId, 'kevin', act === 'system' ? 'system' : act);
+  }
+  if (goal.status === 'done') {
+    throw new GoalError(409, 'invalid_transition', 'goal is done; autopilot cannot be turned on', { from: goal.status, to: goal.status });
+  }
+  if (goal.status !== 'set') {
+    throw new GoalError(409, 'goal_not_set', `goal is ${goal.status}; set its done_means first`);
+  }
+  const alreadyOn = goal.autopilot === 1;
+  const cfg = normalizeAutopilotConfig(configInput, goal.autopilot_config);
+  if (!alreadyOn) {
+    cfg.started_at = new Date().toISOString();
+    cfg.stopped_at = null;
+    cfg.stop_reason = null;
+  }
+  writeAutopilotConfig(goalId, cfg, 1);
+  insertEvent(goalId, null, act, 'autopilot_on', alreadyOn ? 'Autopilot config updated.' : 'Autopilot on.', { ...cfg, re_on: alreadyOn });
+
+  if (!alreadyOn) {
+    // Adoption pass (§15.2 row 1): JARVIS ghosts with no open review round are
+    // born set now; pending JARVIS edits/removals/moves apply as if accepted;
+    // awaiting_jarvis / pushed_back ghosts are left for the first cue's weigh-in.
+    const nodes = listRawNodesForGoal(goalId, false);
+    for (const n of nodes) {
+      if (n.state === 'ghost' && n.authored_by === 'jarvis' && n.review_state === 'none' && n.last_edited_by !== 'kevin' && n.done_means?.trim()) {
+        const batchId = n.proposal_batch;
+        sqliteDb.prepare(`
+          UPDATE goal_nodes SET state = 'set', autopilot_set = 1, proposal_batch = NULL,
+            review_state = 'none', review_note = NULL, kevin_edit_original = NULL, last_edited_by = NULL,
+            kevin_moved_at = NULL, kevin_move_from = NULL, updated_at = datetime('now')
+          WHERE id = ?
+        `).run(n.id);
+        insertEvent(goalId, n.id, 'system', 'autopilot_set', `Set by autopilot (adopted at on): ${n.title}`, { at_on: true, batch_id: batchId });
+        emitNode('updated', getRawNodeStmt.get(n.id) as GoalNodeDbRow);
+      }
+    }
+    for (const n of listRawNodesForGoal(goalId, false)) {
+      if (n.pending_by !== 'jarvis') continue;
+      const hasEdit = n.pending_title != null || n.pending_done_means != null;
+      const isRemoval = n.pending_removal === 1;
+      const hasMove = !isRemoval && n.pending_parent_id != null;
+      try {
+        resolvePending(goalId, n.id, true, 'system');
+        if (isRemoval) insertEvent(goalId, n.id, 'system', 'autopilot_remove', `Removed by autopilot (adopted at on): ${n.title}`, { at_on: true });
+        else if (hasEdit) insertEvent(goalId, n.id, 'system', 'autopilot_edit', `Edited by autopilot (adopted at on): ${n.title}`, { at_on: true });
+        if (hasEdit || isRemoval) sqliteDb.prepare(`UPDATE goal_nodes SET autopilot_set = 1 WHERE id = ?`).run(n.id);
+        void hasMove; // move_accepted is already written by resolvePending (actor system)
+      } catch (err) {
+        console.warn(`[goals] autopilot adoption skipped pending change on node #${n.id}:`, err instanceof Error ? err.message : err);
+      }
+    }
+  }
+  emitGoal('updated', goalId);
+  kickAutopilot(goalId);
+  return toGoalSummary(requireGoal(goalId));
+}
+
+/** §15.2 verify row (driver) — store the parsed VERIFY result on the node and,
+ *  on FAIL, consume one attempt. Emits `autopilot_verdict`. Does NOT change
+ *  state — the driver calls verifyGoalNode(...) around it. */
+export function recordAutopilotVerdict(goalId: number, nodeId: number, verdict: AutopilotVerdict): GoalNodeRow {
+  const node = requireNode(goalId, nodeId);
+  const attempts = verdict.verdict === 'FAIL' ? node.autopilot_attempts + 1 : node.autopilot_attempts;
+  sqliteDb.prepare(`UPDATE goal_nodes SET autopilot_verdict = ?, autopilot_attempts = ?, updated_at = datetime('now') WHERE id = ?`)
+    .run(JSON.stringify(verdict), attempts, nodeId);
+  insertEvent(goalId, nodeId, 'system', 'autopilot_verdict',
+    `VERDICT: ${verdict.verdict}${verdict.gaps.length ? ` — ${verdict.gaps[0]}` : ''}`,
+    { ...verdict, attempt: attempts });
+  const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
+  emitNode('updated', fresh);
+  return deriveSingleNode(fresh);
+}
+
+// ---------------------------------------------------------------------------
 // §2.4(1) — child settles → parent check (the only auto-flip this file owns;
 // tree-done→check and tree-blocked badges are BACKEND B's hopper-hook wiring).
 // ---------------------------------------------------------------------------
@@ -644,8 +949,8 @@ export function listGoals(includeDone = false, includeArchived = false): GoalSum
     SELECT * FROM goals
     WHERE (archived = 0 OR ?) AND (status != 'done' OR ?)
     ORDER BY sort_order ASC, id ASC
-  `).all(includeArchived ? 1 : 0, includeDone ? 1 : 0) as GoalRow[];
-  return rows.map(toGoalSummary);
+  `).all(includeArchived ? 1 : 0, includeDone ? 1 : 0) as Array<Record<string, unknown>>;
+  return rows.map((r) => toGoalSummary(parseGoalRow(r)!));
 }
 
 /** Seed text for the goal's dedicated thread (CONTRACT §8). Exported for BACKEND B's
@@ -707,7 +1012,7 @@ export function createGoal(args: {
   insertEvent(id, null, actor, 'goal_created', `Goal created: ${title}`);
   insertEvent(id, null, 'system', 'thread_opened', `Thread ${externalId} opened.`);
 
-  const row = getGoalRowStmt.get(id) as GoalRow;
+  const row = loadGoal(id)!;
   emitGoal('created', id);
   const seedText = composeGoalSeed(row);
   return {
@@ -717,7 +1022,7 @@ export function createGoal(args: {
 }
 
 export function getGoalTree(id: number, includeDiscarded = false): GoalTree | null {
-  const row = getGoalRowStmt.get(id) as GoalRow | undefined;
+  const row = loadGoal(id);
   if (!row) return null;
   const raw = listRawNodesForGoal(id, includeDiscarded);
   const nodes = buildDerivedNodes(row.title, raw);
@@ -765,7 +1070,7 @@ export function patchGoal(id: number, patch: {
 
   insertEvent(id, null, actor, flipped ? 'goal_set' : 'goal_updated', flipped ? 'Goal set: done_means confirmed.' : 'Goal updated.');
   emitGoal('updated', id);
-  return toGoalSummary(getGoalRowStmt.get(id) as GoalRow);
+  return toGoalSummary(loadGoal(id)!);
 }
 
 export function verifyGoal(id: number, passed: boolean, note?: string, actor?: unknown): { goal: GoalSummary; verified: boolean } {
@@ -779,6 +1084,10 @@ export function verifyGoal(id: number, passed: boolean, note?: string, actor?: u
     throw new GoalError(409, 'invalid_transition', `goal is ${existing.status}, not set`, { from: existing.status, to: 'done' });
   }
   const act = assertActor(actor, 'kevin');
+  // v0.4 §15.2 — the root verify is Kevin's "we're done" moment; never auto-closed.
+  if (existing.autopilot === 1 && act === 'jarvis') {
+    throw new GoalError(409, 'autopilot_root_verify_is_kevins', 'propose it in the report; Kevin verifies the goal');
+  }
   const nodes = listRawNodesForGoal(id, true);
   const blocking = nodes.filter((n) => n.state !== 'discarded' && n.state !== 'parked' && n.state !== 'done');
   if (blocking.length) {
@@ -786,9 +1095,10 @@ export function verifyGoal(id: number, passed: boolean, note?: string, actor?: u
   }
   sqliteDb.prepare(`UPDATE goals SET status = 'done', verified_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`).run(id);
   insertEvent(id, null, act, 'goal_done', note ? `Goal verified done: ${note}` : 'Goal verified done.', { note });
+  if (existing.autopilot === 1) setAutopilotOff(id, 'goal_done');
   emitGoal('updated', id);
   flipPromotedStubOnGoalDone(id);
-  return { goal: toGoalSummary(getGoalRowStmt.get(id) as GoalRow), verified: true };
+  return { goal: toGoalSummary(loadGoal(id)!), verified: true };
 }
 
 /** §3.6(4) — when a promoted-into goal reaches done, the stub node left behind
@@ -811,8 +1121,9 @@ export function parkGoal(id: number, actor?: unknown): GoalSummary {
   const act = assertActor(actor, 'kevin');
   sqliteDb.prepare(`UPDATE goals SET status = 'parked', updated_at = datetime('now') WHERE id = ?`).run(id);
   insertEvent(id, null, act, 'goal_parked', 'Goal parked.');
+  if (existing.autopilot === 1) setAutopilotOff(id, 'goal_parked');
   emitGoal('updated', id);
-  return toGoalSummary(getGoalRowStmt.get(id) as GoalRow);
+  return toGoalSummary(loadGoal(id)!);
 }
 
 export function unparkGoal(id: number, actor?: unknown): GoalSummary {
@@ -824,7 +1135,7 @@ export function unparkGoal(id: number, actor?: unknown): GoalSummary {
   sqliteDb.prepare(`UPDATE goals SET status = 'set', updated_at = datetime('now') WHERE id = ?`).run(id);
   insertEvent(id, null, act, 'goal_unparked', 'Goal unparked.');
   emitGoal('updated', id);
-  return toGoalSummary(getGoalRowStmt.get(id) as GoalRow);
+  return toGoalSummary(loadGoal(id)!);
 }
 
 export function listGoalEvents(id: number, after?: number, limit = 100): GoalEventRow[] {
@@ -954,21 +1265,36 @@ export function proposeGoalNodes(goalId: number, args: {
 
   const batchId = randomUUID();
   const actor = assertActor(args.actor, 'jarvis');
+  // v0.4 §15.2 — under autopilot a JARVIS proposal is born SET (autopilot_set=1,
+  // no batch on the rows); Kevin reviews it in the morning like any set node.
+  const apCfg = actor !== 'kevin' ? autopilotConfigFor(goalId) : null;
+  if (apCfg) {
+    const childDepth = parent ? deriveSingleNode(parent).depth + 1 : 0;
+    if (childDepth > apCfg.max_depth) {
+      throw new GoalError(409, 'autopilot_max_depth', `children would sit at depth ${childDepth}, above autopilot max_depth ${apCfg.max_depth}`, { depth: childDepth, max_depth: apCfg.max_depth });
+    }
+  }
   let sortOrder = nextSortOrder(goalId, parentId);
   const created: GoalNodeDbRow[] = [];
 
   for (const item of items) {
     const leafKind = normLeafKind(item.leaf_kind);
-    const info = sqliteDb.prepare(`
-      INSERT INTO goal_nodes (goal_id, parent_id, title, done_means, notes, authored_by, state, leaf_kind, proposal_batch, sort_order)
-      VALUES (?, ?, ?, ?, ?, 'jarvis', 'ghost', ?, ?, ?)
-    `).run(goalId, parentId, item.title.trim(), item.done_means.trim(), item.notes?.trim() || null, leafKind, batchId, sortOrder);
+    const info = apCfg
+      ? sqliteDb.prepare(`
+          INSERT INTO goal_nodes (goal_id, parent_id, title, done_means, notes, authored_by, state, leaf_kind, proposal_batch, sort_order, autopilot_set)
+          VALUES (?, ?, ?, ?, ?, 'jarvis', 'set', ?, NULL, ?, 1)
+        `).run(goalId, parentId, item.title.trim(), item.done_means.trim(), item.notes?.trim() || null, leafKind, sortOrder)
+      : sqliteDb.prepare(`
+          INSERT INTO goal_nodes (goal_id, parent_id, title, done_means, notes, authored_by, state, leaf_kind, proposal_batch, sort_order)
+          VALUES (?, ?, ?, ?, ?, 'jarvis', 'ghost', ?, ?, ?)
+        `).run(goalId, parentId, item.title.trim(), item.done_means.trim(), item.notes?.trim() || null, leafKind, batchId, sortOrder);
     sortOrder += 1;
     created.push(getRawNodeStmt.get(Number(info.lastInsertRowid)) as GoalNodeDbRow);
   }
 
   for (const row of created) {
-    insertEvent(goalId, row.id, actor, 'node_proposed', `Proposed: ${row.title}`, { batch_id: batchId });
+    if (apCfg) insertEvent(goalId, row.id, actor, 'autopilot_set', `Set by autopilot: ${row.title}`, { batch_id: batchId });
+    else insertEvent(goalId, row.id, actor, 'node_proposed', `Proposed: ${row.title}`, { batch_id: batchId });
     emitNode('created', row, batchId);
   }
   return { batch_id: batchId, nodes: created.map(deriveSingleNode) };
@@ -977,14 +1303,17 @@ export function proposeGoalNodes(goalId: number, args: {
 /** v0.1 §11.2 — ghost → set. Clears the batch AND every review field (the four
  *  columns are only meaningful while a node is a ghost). */
 function setGhostToSet(goalId: number, nodeId: number, actor: GoalActor, eventKind: string, eventText: string): GoalNodeDbRow {
+  // v0.4 §15.2 — JARVIS closing its own ghost on an autopilot goal (the hand-run
+  // allowance) is an autopilot close, not a Kevin click: flag + event say so.
+  const apClose = eventKind === 'node_accepted' && actor !== 'kevin' && autopilotConfigFor(goalId) != null;
   sqliteDb.prepare(`
     UPDATE goal_nodes SET state = 'set', proposal_batch = NULL,
       review_state = 'none', review_note = NULL, kevin_edit_original = NULL, last_edited_by = NULL,
-      kevin_moved_at = NULL, kevin_move_from = NULL,
+      kevin_moved_at = NULL, kevin_move_from = NULL,${apClose ? ' autopilot_set = 1,' : ''}
       updated_at = datetime('now')
     WHERE id = ?
   `).run(nodeId);
-  insertEvent(goalId, nodeId, actor, eventKind, eventText);
+  insertEvent(goalId, nodeId, actor, apClose ? 'autopilot_set' : eventKind, apClose ? eventText.replace(/^Accepted:/, 'Set by autopilot:') : eventText);
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
   return fresh;
@@ -1320,6 +1649,22 @@ export function proposeEdit(goalId: number, nodeId: number, args: { title?: stri
     throw new GoalError(400, 'invalid_request', 'propose_edit needs at least one of title/done_means');
   }
   const actor = assertActor(args.actor, 'jarvis');
+  if (actor !== 'kevin' && autopilotConfigFor(goalId)) {
+    // v0.4 §15.2 — under autopilot the edit applies now; Kevin reviews it in the morning.
+    const title = args.title !== undefined ? args.title.trim() : node.title;
+    const doneMeans = args.done_means !== undefined ? args.done_means.trim() : node.done_means;
+    if (!title) throw new GoalError(400, 'title_required', 'title cannot be empty');
+    if (!doneMeans) throw new GoalError(409, 'done_means_required', 'done_means cannot be cleared on a set node');
+    sqliteDb.prepare(`UPDATE goal_nodes SET title = ?, done_means = ?, autopilot_set = 1, pending_title = NULL, pending_done_means = NULL, updated_at = datetime('now') WHERE id = ?`)
+      .run(title, doneMeans, nodeId);
+    insertEvent(goalId, nodeId, actor, 'autopilot_edit', `Edited by autopilot: ${title}`, {
+      old: { title: node.title, done_means: node.done_means }, new: { title, done_means: doneMeans },
+    });
+    const freshAp = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
+    if (title !== node.title && freshAp.thread_ext) applyNodeChatLabel(freshAp);
+    emitNode('updated', freshAp);
+    return deriveSingleNode(freshAp);
+  }
   // A pending EDIT and a pending REMOVAL cannot coexist: resolve_pending reads
   // pending_removal first, so leaving a stale removal flag set would silently
   // discard the node when Kevin ✓s what he was shown as a text diff.
@@ -1344,6 +1689,20 @@ export function proposeRemoval(goalId: number, nodeId: number, reason?: string, 
   const childCount = (sqliteDb.prepare(`SELECT COUNT(*) AS n FROM goal_nodes WHERE parent_id = ? AND state != 'discarded'`).get(nodeId) as { n: number }).n;
   if (childCount > 0) throw new GoalError(409, 'node_has_children', 'node has children and cannot be removed directly');
   const actor2 = assertActor(actor, 'jarvis');
+  if (actor2 !== 'kevin' && autopilotConfigFor(goalId)) {
+    // v0.4 §15.2 — under autopilot the removal applies now (row kept as discarded for the audit read).
+    sqliteDb.prepare(`
+      UPDATE goal_nodes SET state = 'discarded', autopilot_set = 1, proposal_batch = NULL, pending_title = NULL, pending_done_means = NULL, pending_removal = 0, pending_parent_id = NULL, pending_by = NULL,
+        review_state = 'none', review_note = NULL, last_edited_by = NULL, kevin_edit_original = NULL, kevin_moved_at = NULL, kevin_move_from = NULL, updated_at = datetime('now')
+      WHERE id = ?
+    `).run(nodeId);
+    insertEvent(goalId, nodeId, actor2, 'autopilot_remove', reason ? `Removed by autopilot: ${reason}` : `Removed by autopilot: ${node.title}`, { reason: reason ?? null });
+    const freshAp = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
+    emitNode('updated', freshAp);
+    maybeSettleParent(nodeId);
+    resetFocusIfNode(goalId, nodeId);
+    return deriveSingleNode(getRawNodeStmt.get(nodeId) as GoalNodeDbRow);
+  }
   // Mirror of propose_edit: a removal supersedes any pending text edit.
   sqliteDb.prepare(`UPDATE goal_nodes SET pending_removal = 1, pending_title = NULL, pending_done_means = NULL, pending_parent_id = NULL, pending_by = 'jarvis', updated_at = datetime('now') WHERE id = ?`).run(nodeId);
   insertEvent(goalId, nodeId, actor2, 'removal_proposed', reason ? `Removal proposed: ${reason}` : 'Removal proposed.', reason ? { reason } : undefined);
@@ -1484,6 +1843,7 @@ function applyMove(
   newParentId: number | null,
   sortOrder: number | undefined,
   actor: GoalActor,
+  extraData?: Record<string, unknown>,
 ): { changed: boolean; row: GoalNodeDbRow } {
   const parent = validateMoveTarget(goalId, node, newParentId);
   const oldParentId = node.parent_id ?? null;
@@ -1502,7 +1862,7 @@ function applyMove(
     : `Reordered "${node.title}"`;
   insertEvent(goalId, node.id, actor, 'node_moved', text, {
     old_parent_id: oldParentId, new_parent_id: newParentId ?? null,
-    old_sort_order: node.sort_order, new_sort_order: newSort, actor,
+    old_sort_order: node.sort_order, new_sort_order: newSort, actor, ...(extraData ?? {}),
   });
 
   // §2.4(1) for the OLD parent — the moved node no longer counts against it.
@@ -1562,6 +1922,11 @@ export function proposeMove(goalId: number, nodeId: number, parentId: number | n
     throw new GoalError(409, 'nothing_to_move', 'node is already under that parent');
   }
   validateMoveTarget(goalId, node, target);
+  if (act !== 'kevin' && autopilotConfigFor(goalId)) {
+    // v0.4 §15.2 — under autopilot the move applies now (route 31 semantics, no review flag).
+    applyMove(goalId, node, target, undefined, act, { autopilot: true });
+    return deriveSingleNode(getRawNodeStmt.get(nodeId) as GoalNodeDbRow);
+  }
   // A pending move coexists with a pending text edit; a removal supersedes both.
   sqliteDb.prepare(`UPDATE goal_nodes SET pending_parent_id = ?, pending_removal = 0, pending_by = 'jarvis', updated_at = datetime('now') WHERE id = ?`)
     .run(target ?? -1, nodeId);
@@ -1639,7 +2004,7 @@ export function fireGoalStructureCue(goalId: number): void {
   structureBursts.delete(goalId);
   if (!burst) return;
   if (burst.timer) clearTimeout(burst.timer);
-  const goal = getGoalRowStmt.get(goalId) as GoalRow | undefined;
+  const goal = loadGoal(goalId);
   if (!goal) return;
 
   const entries = [...burst.entries.values()].filter((e) => {
@@ -1740,8 +2105,10 @@ export function verifyGoalNode(goalId: number, nodeId: number, passed: boolean, 
     maybeSettleParent(nodeId);
   } else {
     const clearPlan = node.leaf_kind === 'machine';
+    // v0.4 §15.1 — Kevin reopening a leaf by hand = "try again": the attempt budget resets.
+    const resetAttempts = act === 'kevin';
     sqliteDb.prepare(`
-      UPDATE goal_nodes SET state = 'set'${clearPlan ? ", plan_state = 'none', tree_status_cache = NULL" : ''}, updated_at = datetime('now')
+      UPDATE goal_nodes SET state = 'set'${clearPlan ? ", plan_state = 'none', tree_status_cache = NULL" : ''}${resetAttempts ? ', autopilot_attempts = 0' : ''}, updated_at = datetime('now')
       WHERE id = ?
     `).run(nodeId);
     insertEvent(goalId, nodeId, act, 'node_verified', note ? `Reopened: ${note}` : 'Reopened.', { passed: false, note });
@@ -1750,14 +2117,23 @@ export function verifyGoalNode(goalId: number, nodeId: number, passed: boolean, 
   return deriveSingleNode(getRawNodeStmt.get(nodeId) as GoalNodeDbRow);
 }
 
-export function parkGoalNode(goalId: number, nodeId: number, actor?: unknown): GoalNodeRow {
+export function parkGoalNode(goalId: number, nodeId: number, actor?: unknown, reason?: string): GoalNodeRow {
   const node = requireNode(goalId, nodeId);
   if (!['set', 'planned', 'check', 'working'].includes(node.state)) {
     throw new GoalError(409, 'invalid_transition', `node is ${node.state}, cannot be parked`, { from: node.state, to: 'parked' });
   }
   const act = assertActor(actor, 'kevin');
-  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'parked', updated_at = datetime('now') WHERE id = ?`).run(nodeId);
-  insertEvent(goalId, nodeId, act, 'node_parked', `Parked (was ${node.state}).`, { from: node.state });
+  const trimmedReason = (reason ?? '').trim() || null;
+  // v0.4 §15.2 — on an autopilot goal a system/JARVIS park must say why (the report surfaces it).
+  const apCfg = autopilotConfigFor(goalId);
+  if (apCfg && act !== 'kevin' && !trimmedReason) {
+    throw new GoalError(400, 'reason_required', 'park on an autopilot goal requires a reason');
+  }
+  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'parked', parked_reason = ?, updated_at = datetime('now') WHERE id = ?`).run(trimmedReason, nodeId);
+  insertEvent(goalId, nodeId, act, 'node_parked', trimmedReason ? `Parked (was ${node.state}): ${trimmedReason}` : `Parked (was ${node.state}).`, { from: node.state, reason: trimmedReason });
+  if (apCfg && act !== 'kevin') {
+    insertEvent(goalId, nodeId, act, 'autopilot_parked', trimmedReason ?? 'parked', { reason: trimmedReason, attempts: node.autopilot_attempts });
+  }
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
   return deriveSingleNode(fresh);
@@ -1790,7 +2166,8 @@ export function unparkGoalNode(goalId: number, nodeId: number, actor?: unknown):
     }
   }
 
-  sqliteDb.prepare(`UPDATE goal_nodes SET state = ?, updated_at = datetime('now') WHERE id = ?`).run(restoreTo, nodeId);
+  // v0.4 §15.2 — unpark = "try again": reason cleared, attempt budget reset.
+  sqliteDb.prepare(`UPDATE goal_nodes SET state = ?, parked_reason = NULL, autopilot_attempts = 0, updated_at = datetime('now') WHERE id = ?`).run(restoreTo, nodeId);
   insertEvent(goalId, nodeId, act, 'node_unparked', `Unparked to ${restoreTo}.`);
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
@@ -1807,7 +2184,7 @@ export function getRawGoalNode(nodeId: number): GoalNodeDbRow | null {
 }
 
 export function getRawGoal(goalId: number): GoalRow | null {
-  return (getGoalRowStmt.get(goalId) as GoalRow | undefined) ?? null;
+  return (loadGoal(goalId)) ?? null;
 }
 
 export { requireGoal, requireNode, listRawNodesForGoal, deriveSingleNode, maybeSettleParent, insertEvent, emitNode, emitGoal, touchGoal };
@@ -1908,19 +2285,57 @@ function validatePlanJson(raw: unknown): PlanJson {
 
 // -- §3.4 route 21/22: propose_plan / reject_plan --------------------------
 
-export function proposePlan(goalId: number, nodeId: number, planInput: unknown, actor?: unknown): GoalNodeRow {
+/** v0.4 §15.3 — does the stored plan already carry the server-appended VERIFY node? */
+function planHasVerify(plan: PlanJson): boolean {
+  return plan.verify_index != null && plan.verify_index >= 0 && plan.verify_index < plan.nodes.length;
+}
+
+/** v0.4 §15.2 (b)–(c) — validate the autopilot extras and append the VERIFY
+ *  node as the LAST plan entry (depends on every build node). */
+function appendVerifyNode(goal: GoalRow, node: GoalNodeDbRow, plan: PlanJson, cfg: AutopilotConfig): PlanJson {
+  if (plan.nodes.length > 11) {
+    throw new GoalError(400, 'plan_invalid', 'autopilot plans take at most 11 build nodes (the server appends the verifier)', { reason: 'autopilot_plan_too_long' });
+  }
+  if (plan.nodes.some((n) => /^VERIFY:/i.test(n.title.trim()))) {
+    throw new GoalError(400, 'plan_invalid', 'a node titled "VERIFY: …" is reserved for the server-appended verifier', { reason: 'verify_node_reserved' });
+  }
+  const verify = buildVerifyPlanNode({ goal, node, plan, verify_model: cfg.verify_model });
+  return { ...plan, nodes: [...plan.nodes, verify], verify_index: plan.nodes.length, verify_hopper_node_id: null, autopilot: true };
+}
+
+export interface ProposePlanResult {
+  node: GoalNodeRow;
+  /** true = autopilot dispatched it in the same call (route 23's shape follows). */
+  dispatched: boolean;
+  tree?: { id: string; topic: string };
+  hopper_nodes?: HopperNodeRow[];
+}
+
+/** Route 21. Under autopilot (§15.2) the VERIFY node is appended and the plan is
+ *  approved + planted in the same call via approvePlan(actor 'system'). */
+export function proposePlanEx(goalId: number, nodeId: number, planInput: unknown, actor?: unknown): ProposePlanResult {
   const node = requireNode(goalId, nodeId);
   if (node.leaf_kind !== 'machine' || node.state !== 'set') {
     throw new GoalError(409, 'plan_requires_machine_leaf', 'node must be leaf_kind=machine and state=set to receive a plan', { leaf_kind: node.leaf_kind, state: node.state });
   }
-  const plan = validatePlanJson(planInput);
+  let plan = validatePlanJson(planInput);
   const act = assertActor(actor, 'jarvis');
+  const apCfg = act !== 'kevin' ? autopilotConfigFor(goalId) : null;
+  if (apCfg) plan = appendVerifyNode(requireGoal(goalId), node, plan, apCfg);
   sqliteDb.prepare(`UPDATE goal_nodes SET plan = ?, plan_state = 'proposed', updated_at = datetime('now') WHERE id = ?`)
     .run(JSON.stringify(plan), nodeId);
   insertEvent(goalId, nodeId, act, 'plan_proposed', `Plan proposed: ${node.title}`);
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
-  return deriveSingleNode(fresh);
+  if (!apCfg) return { node: deriveSingleNode(fresh), dispatched: false };
+  // (e) same write transaction as far as the caller is concerned: a plant
+  // failure leaves the node `planned` (route 23 semantics) for the driver's P0 retry.
+  const result = approvePlan(goalId, nodeId, 'system');
+  return { node: result.node, dispatched: true, tree: result.tree, hopper_nodes: result.hopper_nodes };
+}
+
+export function proposePlan(goalId: number, nodeId: number, planInput: unknown, actor?: unknown): GoalNodeRow {
+  return proposePlanEx(goalId, nodeId, planInput, actor).node;
 }
 
 export function rejectPlan(goalId: number, nodeId: number, reason?: string, actor?: unknown): GoalNodeRow {
@@ -1981,6 +2396,13 @@ export function approvePlan(goalId: number, nodeId: number, actor?: unknown): {
     throw new GoalError(500, 'plan_invalid', 'stored plan is not valid JSON');
   }
 
+  // v0.4 §15.2 `dispatch` row — a hand-run plan on an autopilot goal is still
+  // tested: append the VERIFY node before planting when the plan has none.
+  const apCfg = autopilotConfigFor(goalId);
+  if (apCfg && !isRetry && !planHasVerify(plan)) {
+    plan = appendVerifyNode(requireGoal(goalId), node, plan, apCfg);
+  }
+
   if (!isRetry) {
     plan.approved_at = new Date().toISOString();
     sqliteDb.prepare(`UPDATE goal_nodes SET plan = ?, plan_state = 'approved', updated_at = datetime('now') WHERE id = ?`)
@@ -2016,6 +2438,23 @@ export function approvePlan(goalId: number, nodeId: number, actor?: unknown): {
   sqliteDb.prepare(`UPDATE goal_nodes SET state = 'working', tree_id = ?, tree_status_cache = 'active', updated_at = datetime('now') WHERE id = ?`)
     .run(created.tree.id, nodeId);
   insertEvent(goalId, nodeId, 'system', 'tree_planted', `Tree planted: ${created.tree.id}`, { tree_id: created.tree.id });
+  // v0.4 §15.2/§15.3 — remember which hopper node is the verifier (the driver
+  // reads its `result`) and give its spec the real tree id.
+  if (planHasVerify(plan)) {
+    const verifyHopper = created.nodes[plan.verify_index as number];
+    if (verifyHopper) {
+      plan.verify_hopper_node_id = verifyHopper.id;
+      sqliteDb.prepare(`UPDATE goal_nodes SET plan = ? WHERE id = ?`).run(JSON.stringify(plan), nodeId);
+      if (verifyHopper.spec && verifyHopper.spec.includes('{{tree_id}}')) {
+        updateHopperNodeSpec(verifyHopper.id, verifyHopper.spec.split('{{tree_id}}').join(created.tree.id));
+      }
+    }
+    if (apCfg) {
+      insertEvent(goalId, nodeId, 'system', 'autopilot_dispatched', `Autopilot dispatched ${created.tree.id} (attempt ${node.autopilot_attempts + 1}/${apCfg.max_attempts})`, {
+        tree_id: created.tree.id, attempt: node.autopilot_attempts + 1, verify_hopper_node_id: plan.verify_hopper_node_id ?? null,
+      });
+    }
+  }
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
   return { node: deriveSingleNode(fresh), tree: { id: created.tree.id, topic }, hopper_nodes: listTreeNodes(created.tree.id) };
@@ -2149,7 +2588,7 @@ function applyNodeChatLabel(node: GoalNodeDbRow, goalTitle?: string): void {
   if (!node.thread_ext) return;
   const conv = getConversation(node.thread_ext);
   if (!conv) return;
-  const title = goalTitle ?? (getGoalRowStmt.get(node.goal_id) as GoalRow | undefined)?.title ?? '';
+  const title = goalTitle ?? (loadGoal(node.goal_id))?.title ?? '';
   renameConversation(conv.id, nodeChatLabel(node, title));
 }
 
@@ -2267,7 +2706,7 @@ function groupByCueTarget<T extends { id: number }>(goalId: number, nodes: T[]):
 
 /** Shared "post a cue as a real JARVIS turn" seam (§11.3 / §12.6 / §13.5 /
  *  §14.6): in-flight → enqueue; busy → enqueue; else processMessage. */
-function postCue(externalId: string, text: string, correlationKey: string, tag: string): void {
+export function postCue(externalId: string, text: string, correlationKey: string, tag: string): void {
   const conv = getConversation(externalId);
   if (!conv) {
     console.warn(`[goals] ${tag} cue skipped — no conversation for ${externalId}`);
@@ -2357,7 +2796,7 @@ export function promoteNode(goalId: number, nodeId: number, actor?: unknown): {
     sseBus.emit('sse', { type: 'goal_focus', goal_id: goalId, focus: toFocusRow(goalId, getFocusRaw(goalId)) } satisfies GoalFocusEvent);
   }
 
-  const newGoalRow = getGoalRowStmt.get(newGoalId) as GoalRow;
+  const newGoalRow = loadGoal(newGoalId)!;
   emitGoal('created', newGoalId);
   const stubFresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', stubFresh);
@@ -2473,13 +2912,43 @@ function latestAssistantLine(externalId: string, max = 160): { text: string; age
  *  caching). A node chat sees the goal root + the path above its node + its
  *  own subtree ONLY; the goal chat sees the whole tree with 💬 on chatted
  *  nodes + a `<node_chats>` block. */
-export function buildGoalThreadContext(externalId: string): string {
+export function buildGoalThreadContext(externalId: string, turnInput?: string): string {
   try {
     const scope = resolveGoalScope(externalId);
     if (!scope) return '';
     const goalId = scope.goal_id;
-    const goal = getGoalRowStmt.get(goalId) as GoalRow | undefined;
+    const goal = loadGoal(goalId);
     if (!goal) return '';
+    // v0.4 §15.10 — autopilot attributes + the cue-turn prefix line.
+    const apCfg = goal.autopilot === 1 ? (goal.autopilot_config ?? normalizeAutopilotConfig(null)) : null;
+    let autopilotAttrs = '';
+    let cueLine = '';
+    if (apCfg) {
+      let nextAttr = '';
+      const held = autopilotHold ? autopilotHold(goalId) : null;
+      if (held) nextAttr = `held:${held}`;
+      else if (autopilotPreview) {
+        const next = autopilotPreview(goalId);
+        nextAttr = next?.action ? `${next.action} #${next.node_id ?? 0}` : `wait:${next?.reason ?? 'idle'}`;
+      }
+      autopilotAttrs = ` autopilot="1"${nextAttr ? ` autopilot_next="${escapeAttr(nextAttr)}"` : ''}`;
+      const m = turnInput ? /^\[autopilot goal #(\d+) — ([A-Z_]+) #(\d+)/.exec(turnInput.trimStart()) : null;
+      if (m && Number(m[1]) === goalId) {
+        const action = m[2].toLowerCase();
+        const cuedNode = Number(m[3]);
+        const ev = sqliteDb.prepare(`SELECT data FROM goal_events WHERE goal_id = ? AND kind = 'autopilot_cue' ORDER BY id DESC LIMIT 1`).get(goalId) as { data: string | null } | undefined;
+        let correlation = `autopilot:${goalId}:${action}:${cuedNode}`;
+        if (ev?.data) {
+          try {
+            const d = JSON.parse(ev.data) as { correlation?: string; action?: string; node_id?: number };
+            if (d.action === action && Number(d.node_id ?? 0) === cuedNode && d.correlation) correlation = d.correlation;
+          } catch { /* keep the derived key */ }
+        }
+        const cuedRow = cuedNode ? (getRawNodeStmt.get(cuedNode) as GoalNodeDbRow | undefined) : undefined;
+        const attempt = cuedRow ? cuedRow.autopilot_attempts + 1 : 1;
+        cueLine = `<autopilot_cue action="${action}" node_id="${cuedNode}" attempt="${attempt}" correlation="${escapeAttr(correlation)}"/>\n`;
+      }
+    }
     const pinned = scope.pinned_node_id != null ? (getRawNodeStmt.get(scope.pinned_node_id) as GoalNodeDbRow | undefined) : undefined;
     if (scope.pinned_node_id != null && !pinned) return '';
 
@@ -2513,12 +2982,12 @@ export function buildGoalThreadContext(externalId: string): string {
 
     const header = `# ${goal.title} — done: ${goal.done_means ?? '(not set yet)'}${guardSuffix(null)}`;
     const guardsFailingAttr = counts.guards_failing > 0 ? ` guards_failing="${counts.guards_failing}"` : '';
-    const treeOpen = `<goal_tree goal_id="${goalId}"${pinnedAttr} status="${goal.status}" progress="${counts.progress}" working="${counts.working}" need_you="${counts.need_you}" awaiting_you="${counts.awaiting_jarvis}"${guardsFailingAttr}>`;
+    const treeOpen = `<goal_tree goal_id="${goalId}"${pinnedAttr}${autopilotAttrs} status="${goal.status}" progress="${counts.progress}" working="${counts.working}" need_you="${counts.need_you}" awaiting_you="${counts.awaiting_jarvis}"${guardsFailingAttr}>`;
 
     // v0.3 §14.4 — a pinned node that became a promoted stub: one line, no tree.
     if (pinned && pinned.promoted_to_goal_id != null) {
       const stubLine = `- [${nodeMarker(pinned)}] #${pinned.id} ${pinned.title} → goal #${pinned.promoted_to_goal_id} — this branch now lives in cockpit:goal-${pinned.promoted_to_goal_id}; talk there.`;
-      return `${focusLine}\n${treeOpen}\n${header}\n${stubLine}\n</goal_tree>\n`;
+      return `${cueLine}${focusLine}\n${treeOpen}\n${header}\n${stubLine}\n</goal_tree>\n`;
     }
 
     const allNodes = listRawNodesForGoal(goalId, false); // discarded never appear
@@ -2562,7 +3031,14 @@ export function buildGoalThreadContext(externalId: string): string {
       const collapsed = hidden > 0 ? ` (+${hidden})` : '';
       const chat = n.thread_ext && !pinned ? ' 💬' : ''; // v0.3 §14.4 — goal chat only
       const reviewSuffix = reviewLineSuffix(n);
-      lines.push(`${indent}- [${marker}] #${n.id} ${n.title}${stub} — done: ${doneMeans}${guardSuffix(n.id)}${chat}${collapsed}${reviewSuffix}`);
+      // v0.4 §15.10 — 🌙 on autopilot-set rows, verdict chip on machine leaves, parked reason.
+      const moon = n.autopilot_set === 1 ? ' 🌙' : '';
+      const verdict = parseVerdictJson(n.autopilot_verdict);
+      const verdictChip = verdict
+        ? (verdict.verdict === 'PASS' ? ' ✔PASS' : ` ✘FAIL ${n.autopilot_attempts}/${apCfg?.max_attempts ?? AUTOPILOT_DEFAULTS.max_attempts}`)
+        : '';
+      const parkedSuffix = n.state === 'parked' && n.parked_reason ? ` — parked: ${n.parked_reason}` : '';
+      lines.push(`${indent}- [${marker}]${moon} #${n.id} ${n.title}${verdictChip}${stub} — done: ${doneMeans}${parkedSuffix}${guardSuffix(n.id)}${chat}${collapsed}${reviewSuffix}`);
       if (showChildren) for (const c of children) renderNode(c, depth + 1, false);
     }
 
@@ -2581,7 +3057,7 @@ export function buildGoalThreadContext(externalId: string): string {
       body = body.slice(0, 59).concat([`… (+${lines.length - 59} more)`]);
     }
 
-    let out = `${focusLine}\n${treeOpen}\n${header}\n${body.join('\n')}\n</goal_tree>\n`;
+    let out = `${cueLine}${focusLine}\n${treeOpen}\n${header}\n${body.join('\n')}\n</goal_tree>\n`;
 
     // v0.3 §14.4 — the goal chat stays aware of every node chat: one line each.
     if (!pinned) {

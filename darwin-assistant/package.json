@@ -25,6 +25,8 @@
     "persona-mcp:review-checks": "npm run build && JARVIS_DB_PATH=/tmp/persona-mcp-review.db npx tsx scripts/persona-mcp-review-checks.ts",
     "tree-cue:check": "npm run build && JARVIS_DB_PATH=/tmp/tree-cue-check.db node --import ./scripts/tree-cue-check.hooks.mjs scripts/tree-cue-check.mjs",
     "goals:guards-check": "npm run build && JARVIS_DB_PATH=/tmp/goals-guards.db npx tsx scripts/goals-guards-check.mjs",
+    "goals:autopilot-check": "npm run build && JARVIS_DB_PATH=/tmp/goals-autopilot-check.db node scripts/goals-autopilot-check.mjs",
+    "goals:autopilot-sim": "npm run build && JARVIS_DB_PATH=/tmp/goals-autopilot-sim.db npx tsx scripts/goals-autopilot-sim.ts",
     "big-board:check": "npm run build && node scripts/big-board-check.mjs",
     "big-board:v2-fixture-check": "npm run build && node scripts/big-board-v2-fixture-check.mjs"
   },

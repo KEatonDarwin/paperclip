@@ -18,8 +18,9 @@ import {
   moveGoalNode,
   proposeMove,
   setLeafKind,
-  proposePlan,
+  proposePlanEx,
   approvePlan,
+  setGoalAutopilot,
   verifyGoal,
   verifyGoalNode,
   humanDoneNode,
@@ -40,6 +41,9 @@ import {
   type GoalTree,
 } from '../goals.js';
 import { listGuards, proposeGuard, discardGuard, getGuard } from '../goals-guards.js';
+// v0.4 §15.7 — importing the driver module also registers the autopilot hooks
+// into goals.ts and starts the tick loop (unless GOALS_AUTOPILOT_DRIVER=0).
+import { getAutopilotStatus, buildNightReport } from '../goals-autopilot.js';
 
 // GOALS tool (CONTRACT.md §5) — the ONLY way a goal chat touches the tree.
 // Scope resolution: inside a `cockpit:goal-<id>` thread, goal_id is IMPLIED
@@ -123,7 +127,12 @@ export const goals: ToolDef = {
     'and writes the moment Kevin\'s key lands. When a guard fails, propose the fix under that node. ' +
     'NODE CHATS (v0.3): Kevin can give one node its own chat (💬, cockpit:goal-<g>-node-<n>): inside it you are PINNED to that node — ' +
     'shape only inside its branch; anything above it (or a sibling) → say so in one line, it happens in the goal chat. ' +
-    'Call `open_node_chat` {node_id} only when Kevin asked for it in words ("give #7 its own chat") — never on your own initiative.',
+    'Call `open_node_chat` {node_id} only when Kevin asked for it in words ("give #7 its own chat") — never on your own initiative. ' +
+    'AUTOPILOT (v0.4): on an AUTOPILOT goal (🌙 on the snapshot\'s `<goal_tree autopilot="1">`) your `propose` lands set and your ' +
+    '`propose_plan` dispatches itself (the server appends the VERIFY node — never add your own); `accept` on your own batch and ' +
+    '`dispatch` are allowed; Kevin is asleep — never ask, `park` {node_id, reason} instead. Turn autopilot on/off (`autopilot` op) ' +
+    'only when Kevin asked in words ("run it overnight", "autopilot this", "stop the autopilot"); `autopilot_status` previews the ' +
+    'driver\'s next action; `night_report` writes the morning report (the wrap cue tells you when).',
   parameters: {
     type: 'object',
     properties: {
@@ -135,6 +144,7 @@ export const goals: ToolDef = {
           'verify', 'human_done', 'park', 'unpark', 'log', 'promote', 'focus',
           'list_guards', 'propose_guard', 'discard_guard',
           'open_node_chat',
+          'autopilot', 'autopilot_status', 'night_report',
         ],
         description: 'What to do.',
       },
@@ -171,6 +181,10 @@ export const goals: ToolDef = {
       cadence: { type: 'number', description: 'How often Overwatch runs the rule, in minutes (default 60).' },
       severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'], description: 'Guard severity (default medium).' },
       ow_group: { type: 'string', description: "Overwatch group (leads/email/queue/billing/revenue/system/custom/general); default custom." },
+      // v0.4 autopilot:
+      on: { type: 'boolean', description: 'For autopilot: true = turn it on, false = stop it. Only when Kevin said so in words.' },
+      config: { type: 'object', description: 'For autopilot {on:true}: partial AutopilotConfig — build_model/light_model/verify_model (claude ids, never fable/frontier), max_depth 1-8, parallel 1-3, tick_minutes 1-120, max_attempts 1-5. Merged over defaults (or the stored config).' },
+      date: { type: 'string', description: 'For night_report: YYYY-MM-DD (default = the current run/today).' },
     },
     required: ['operation'],
   },
@@ -446,7 +460,12 @@ export const goals: ToolDef = {
           const model = typeof n.model === 'string' ? n.model : '';
           if (/fable/i.test(model)) return { error: `plan node model must not be a fable/frontier planner model: ${model}` };
         }
-        return { node: proposePlan(goalId, Number(args.node_id), rawPlan, 'jarvis') };
+        // v0.4 §15.2 — under autopilot the plan is dispatched in the same call;
+        // the result then carries {dispatched:true, tree, hopper_nodes}.
+        const planResult = proposePlanEx(goalId, Number(args.node_id), rawPlan, 'jarvis');
+        return planResult.dispatched
+          ? { node: planResult.node, dispatched: true, tree: planResult.tree, hopper_nodes: planResult.hopper_nodes }
+          : { node: planResult.node };
       }
 
       if (op === 'dispatch') {
@@ -476,7 +495,9 @@ export const goals: ToolDef = {
         if (args.node_id !== undefined) {
           assertInScope(Number(args.node_id));
           const node = op === 'park'
-            ? parkGoalNode(goalId, Number(args.node_id), 'jarvis')
+            // v0.4 §15.2 — a JARVIS park on an autopilot goal REQUIRES a reason
+            // (enforced server-side; the night report surfaces it).
+            ? parkGoalNode(goalId, Number(args.node_id), 'jarvis', str(args.reason))
             : unparkGoalNode(goalId, Number(args.node_id), 'jarvis');
           return { node };
         }
@@ -583,6 +604,30 @@ export const goals: ToolDef = {
             actor: 'jarvis',
           }),
         };
+      }
+
+      // -- v0.4 §15.7 autopilot ---------------------------------------------
+      // All three are goal-level: inside a node chat they are outside_pinned_scope.
+      if (op === 'autopilot') {
+        assertGoalLevelAllowed('autopilot');
+        if (typeof args.on !== 'boolean') return { error: 'on (boolean) is required — and only when Kevin said so in words' };
+        const goal = setGoalAutopilot(goalId, args.on, args.config, 'jarvis');
+        const status = await getAutopilotStatus(goalId);
+        return { goal, autopilot: status };
+      }
+
+      if (op === 'autopilot_status') {
+        assertGoalLevelAllowed('autopilot_status');
+        return await getAutopilotStatus(goalId);
+      }
+
+      if (op === 'night_report') {
+        assertGoalLevelAllowed('night_report');
+        const report = buildNightReport(goalId, str(args.date) ?? null);
+        // §15.7 — link the wrap turn's account and the file in the event log.
+        insertEvent(goalId, null, 'jarvis', 'log', `autopilot: night report written → ${report.path}`);
+        emitGoal('updated', goalId);
+        return { markdown: report.markdown, path: report.path, written: report.written };
       }
 
       if (op === 'discard_guard') {

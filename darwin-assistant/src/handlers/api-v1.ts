@@ -110,13 +110,18 @@ import {
   setGoalFocus,
   setLeafKind,
   proposePlan,
+  proposePlanEx,
   rejectPlan,
   approvePlan,
   promoteNode,
   getNodeTreeOverlay,
   getOrCreateGoalThread,
   getOrCreateNodeThread,
+  setGoalAutopilot,
 } from '../goals.js';
+// v0.4 §15 — importing the driver module also registers the autopilot hooks
+// into goals.ts and starts the tick loop (unless GOALS_AUTOPILOT_DRIVER=0).
+import { getAutopilotStatus, buildNightReport } from '../goals-autopilot.js';
 import {
   listGuards,
   getGuard,
@@ -2673,9 +2678,11 @@ export function createApiV1Router(): Router {
   router.post('/goals/:id/nodes/:nodeId/park', (req: AuthedRequest, res) => {
     const goalId = parseInt(String(req.params.id), 10);
     const nodeId = parseInt(String(req.params.nodeId), 10);
-    const body = (req.body ?? {}) as { actor?: unknown };
+    const body = (req.body ?? {}) as { actor?: unknown; reason?: unknown };
     try {
-      res.json({ node: parkGoalNode(goalId, nodeId, body.actor) });
+      // v0.4 §15.2 — reason is REQUIRED for system/jarvis parks on an autopilot
+      // goal (enforced in parkGoalNode); Kevin's park may omit it.
+      res.json({ node: parkGoalNode(goalId, nodeId, body.actor, typeof body.reason === 'string' ? body.reason : undefined) });
     } catch (err) {
       sendCaughtGoalError(res, err);
     }
@@ -2735,7 +2742,11 @@ export function createApiV1Router(): Router {
     const nodeId = parseInt(String(req.params.nodeId), 10);
     const body = (req.body ?? {}) as { plan?: unknown; actor?: unknown };
     try {
-      res.json({ node: proposePlan(goalId, nodeId, body.plan, body.actor) });
+      // v0.4 §15.2 — under autopilot the plan is dispatched in the same call and
+      // the response is route 23's shape ({node, tree, hopper_nodes}, a superset).
+      const result = proposePlanEx(goalId, nodeId, body.plan, body.actor);
+      if (result.dispatched) res.json({ node: result.node, tree: result.tree, hopper_nodes: result.hopper_nodes });
+      else res.json({ node: result.node });
     } catch (err) {
       sendCaughtGoalError(res, err);
     }
@@ -2779,6 +2790,48 @@ export function createApiV1Router(): Router {
     const nodeId = parseInt(String(req.params.nodeId), 10);
     try {
       res.json(getNodeTreeOverlay(goalId, nodeId));
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  // -- Autopilot (v0.4, CONTRACT §15.6 routes 37–39) --------------------------
+  // The report route is registered FIRST so `/goals/:id/autopilot/report` is
+  // never shadowed by the plain `/goals/:id/autopilot` GET.
+
+  router.get('/goals/:id/autopilot/report', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const dateRaw = typeof req.query.date === 'string' ? req.query.date : undefined;
+    if (dateRaw !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(dateRaw)) {
+      sendError(res, 400, 'invalid_request', 'date must be YYYY-MM-DD');
+      return;
+    }
+    try {
+      res.json(buildNightReport(goalId, dateRaw ?? null));
+    } catch (err) {
+      sendCaughtGoalError(res, err);
+    }
+  });
+
+  router.get('/goals/:id/autopilot', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    getAutopilotStatus(goalId)
+      .then((status) => res.json(status))
+      .catch((err) => sendCaughtGoalError(res, err));
+  });
+
+  router.post('/goals/:id/autopilot', (req: AuthedRequest, res) => {
+    const goalId = parseInt(String(req.params.id), 10);
+    const body = (req.body ?? {}) as { on?: unknown; config?: unknown; actor?: unknown };
+    if (typeof body.on !== 'boolean') {
+      sendError(res, 400, 'invalid_request', 'on must be a boolean');
+      return;
+    }
+    try {
+      const goal = setGoalAutopilot(goalId, body.on, body.config, body.actor);
+      getAutopilotStatus(goalId)
+        .then((status) => res.json({ goal, autopilot: status }))
+        .catch((err) => sendCaughtGoalError(res, err));
     } catch (err) {
       sendCaughtGoalError(res, err);
     }

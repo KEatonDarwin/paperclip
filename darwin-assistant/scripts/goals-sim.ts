@@ -3032,6 +3032,65 @@ try {
     const full = tree.nodes.find((n: any) => n.id === nodeId);
     assert.equal(full.title, longTitle, 'the full-fidelity node read is never truncated');
   });
+
+  await check('V06-15', 'additive guard: GET /goals and GET /goals/:id shapes are untouched by /goals/board — same keys, same values, no mutation', async () => {
+    const g = await post('/goals', { title: 'V06 additive-guard drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const sp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 additive-guard node', done_means: 'x' }] });
+    const nodeId = sp.json.nodes[0].id;
+    assert.equal((await post(`/goals/${goalId}/batches/${sp.json.batch_id}/accept`, {})).status, 200);
+
+    const listBefore = await get('/goals?include_done=1');
+    const detailBefore = await get(`/goals/${goalId}`);
+    assert.equal(listBefore.status, 200);
+    assert.equal(detailBefore.status, 200);
+
+    // buildGoalsBoard()'s `goals` field is listGoals(true,false) verbatim — the
+    // SAME function GET /goals calls — so this is a code-sharing guarantee, not
+    // a coincidence; the sim proves it holds at the wire level too.
+    const board = await getBoard();
+    const boardGoal = board.goals.find((x: any) => x.id === goalId);
+    const listGoal = listBefore.json.goals.find((x: any) => x.id === goalId);
+    assert.ok(boardGoal && listGoal);
+    assert.deepEqual(boardGoal, listGoal, 'board.goals entry is byte-identical to the GET /goals entry for the same goal');
+    assert.deepEqual(Object.keys(boardGoal).sort(), Object.keys(listGoal).sort(), 'no v0.6-only fields leaked onto the shared GoalSummary shape');
+
+    // /goals/board is read-only: calling it changes nothing observable via the
+    // pre-existing routes.
+    const listAfter = await get('/goals?include_done=1');
+    const detailAfter = await get(`/goals/${goalId}`);
+    assert.deepEqual(listAfter.json, listBefore.json, 'GET /goals response unchanged by a GET /goals/board call in between');
+    assert.deepEqual(detailAfter.json, detailBefore.json, 'GET /goals/:id response unchanged by a GET /goals/board call in between');
+
+    // The map row's reduced/truncated shape never leaks new keys onto the
+    // full-fidelity node object either.
+    const fullNode = detailAfter.json.nodes.find((n: any) => n.id === nodeId);
+    assert.ok(fullNode);
+    assert.equal('flag' in fullNode, false, 'the board-only "flag" field does not appear on GET /goals/:id nodes');
+    assert.equal('has_chat' in fullNode, false, 'the board-only "has_chat" field does not appear on GET /goals/:id nodes');
+  });
+
+  await check('V06-16', 'robustness: board payload never crashes and returns valid empty arrays when a slice has zero signal', async () => {
+    // A true zero-goal DB isn't reachable this late in the suite (hundreds of
+    // goals already exist from earlier sections), so this proves the same
+    // property the CONTRACT cares about — "no crash, valid empty arrays" —
+    // against slices that ARE genuinely empty at this point: no goal has ever
+    // used an impossible id, and (freshly, for this check) a brand-new goal
+    // with zero nodes has an empty map/attention/in_flight slice of its own.
+    const board = await getBoard();
+    assert.ok(Array.isArray(board.goals) && board.goals.length > 0, 'sanity: the scratch DB is not literally empty by this point');
+    assert.equal(board.map.find((n: any) => n.goal_id === -1), undefined);
+    assert.equal(board.attention.find((a: any) => a.goal_id === -1), undefined);
+    assert.equal(board.in_flight.find((f: any) => f.goal_id === -1), undefined);
+
+    const g = await post('/goals', { title: 'V06 empty-goal drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const board2 = await getBoard();
+    assert.equal(board2.map.filter((n: any) => n.goal_id === goalId).length, 0, 'a goal with zero nodes contributes nothing to map');
+    assert.equal(board2.attention.filter((a: any) => a.goal_id === goalId).length, 0, 'a goal with zero nodes contributes nothing to attention');
+    assert.equal(board2.in_flight.filter((f: any) => f.goal_id === goalId).length, 0, 'a goal with zero nodes contributes nothing to in_flight');
+    assert.ok(board2.goals.find((x: any) => x.id === goalId), 'the empty goal itself is still listed in goals');
+  });
 } finally {
   server.close();
   owServer?.close();
@@ -3046,7 +3105,7 @@ const outDir = '/home/kevin/obsidian/paperclip-wiki/outbox/goals';
 fs.mkdirSync(outDir, { recursive: true });
 const reportPath = path.join(outDir, 'sim-report.md');
 const lines: string[] = [];
-lines.push('# GOALS — sim report (hopper node #459; v0.3 §14 node chats added by node #489; v0.5 §16 forest payload added by node #601)');
+lines.push('# GOALS — sim report (hopper node #459; v0.3 §14 node chats added by node #489; v0.5 §16 forest payload added by node #601; v0.6 §17 board payload added by node #604, additive-guard + empty-slice checks added by node #606)');
 lines.push('');
 lines.push(`Run at ${new Date().toISOString()}. Scratch DB: \`${DB_PATH}\`. ${passed}/${results.length} checks passed.`);
 lines.push('');

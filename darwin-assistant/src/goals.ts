@@ -135,6 +135,18 @@ export interface GoalSummary extends GoalRow {
   last_event_at: string | null;
   /** v0.4 §15.1 — the driver's next-action preview (pure read); null when autopilot is off. */
   autopilot_next: AutopilotNextAction | null;
+  /** v0.5 §16 — forest dashboard enrichment. Populated by listGoals() only; every
+   *  other GoalSummary producer (toGoalSummary via SSE emits, createGoal, etc.)
+   *  leaves these undefined — additive, nothing else changes shape. */
+  last_activity?: string;
+  hot_nodes?: GoalHotNode[];
+}
+
+/** v0.5 §16 — one row of the forest card's "what's hot" preview. */
+export interface GoalHotNode {
+  id: number;
+  title: string;
+  state: GoalNodeState;
 }
 
 /** Raw DB row for goal_nodes — snake_case, 1:1 with the table. */
@@ -941,6 +953,90 @@ function settleParentIfComplete(parentId: number): void {
 }
 
 // ---------------------------------------------------------------------------
+// v0.5 §16 — forest dashboard enrichment (last_activity + hot_nodes). Both are
+// computed with a FIXED number of prepared statements across the WHOLE list —
+// never a per-goal query — so listGoals() stays O(1) queries regardless of how
+// many goals/nodes exist. See skills/goals/CONTRACT.md §16.
+// ---------------------------------------------------------------------------
+
+/** One row per goal that has its own thread: that thread's conversations.updated_at.
+ *  touchConversation() runs on every turn (conversation-db.ts addTurn), so this is
+ *  a cheap, reliable "last messaged" signal without touching `turns` at all. */
+const goalThreadActivityStmt = sqliteDb.prepare(`
+  SELECT g.id AS goal_id, c.updated_at AS updated_at
+  FROM goals g
+  JOIN conversations c ON c.external_id = g.thread_ext
+`);
+
+/** Per goal, the MAX conversations.updated_at across all of its node chats (§14). */
+const nodeChatActivityStmt = sqliteDb.prepare(`
+  SELECT gn.goal_id AS goal_id, MAX(c.updated_at) AS max_updated
+  FROM goal_nodes gn
+  JOIN conversations c ON c.external_id = gn.thread_ext
+  WHERE gn.thread_ext IS NOT NULL
+  GROUP BY gn.goal_id
+`);
+
+/** Combines both queries above into goal_id → the most recent thread/node-chat
+ *  timestamp. All values come from SQLite `datetime('now')`, a fixed-width
+ *  lexicographically-sortable format, so plain string MAX is correct. */
+function computeThreadActivityMap(): Map<number, string> {
+  const map = new Map<number, string>();
+  for (const r of goalThreadActivityStmt.all() as Array<{ goal_id: number; updated_at: string }>) {
+    map.set(r.goal_id, r.updated_at);
+  }
+  for (const r of nodeChatActivityStmt.all() as Array<{ goal_id: number; max_updated: string }>) {
+    if (!r.max_updated) continue;
+    const cur = map.get(r.goal_id);
+    if (!cur || r.max_updated > cur) map.set(r.goal_id, r.max_updated);
+  }
+  return map;
+}
+
+/** Candidate nodes for the "what's hot" preview, ALL goals in one query, already
+ *  ordered priority-then-recency: working(1) > check(2) > need-you(3) — ghosts,
+ *  pending edits/removals, open human leaves, proposed plans. Parked/done/set
+ *  non-human nodes never qualify. */
+const hotNodeCandidatesStmt = sqliteDb.prepare(`
+  SELECT id, goal_id, title, state, updated_at,
+    CASE
+      WHEN state = 'working' THEN 1
+      WHEN state = 'check' THEN 2
+      ELSE 3
+    END AS priority
+  FROM goal_nodes
+  WHERE state != 'discarded'
+    AND (
+      state IN ('working', 'check', 'ghost')
+      OR pending_title IS NOT NULL OR pending_done_means IS NOT NULL OR pending_removal = 1
+      OR (leaf_kind = 'human' AND state = 'set')
+      OR plan_state = 'proposed'
+    )
+  ORDER BY priority ASC, updated_at DESC
+`);
+
+/** goal_id → up to 3 hot nodes, taken in the global priority/recency order above
+ *  (stable per-goal since that global order is also a valid per-goal order). */
+function computeHotNodesMap(): Map<number, GoalHotNode[]> {
+  const map = new Map<number, GoalHotNode[]>();
+  const rows = hotNodeCandidatesStmt.all() as Array<{ id: number; goal_id: number; title: string; state: GoalNodeState }>;
+  for (const r of rows) {
+    let list = map.get(r.goal_id);
+    if (!list) { list = []; map.set(r.goal_id, list); }
+    if (list.length < 3) list.push({ id: r.id, title: r.title, state: r.state });
+  }
+  return map;
+}
+
+/** Merges a goal's own updated_at/last_event_at with the thread-activity map. */
+function resolveLastActivity(summary: GoalSummary, threadActivity: string | undefined): string {
+  let best = summary.updated_at;
+  if (summary.last_event_at && summary.last_event_at > best) best = summary.last_event_at;
+  if (threadActivity && threadActivity > best) best = threadActivity;
+  return best;
+}
+
+// ---------------------------------------------------------------------------
 // Goals — §3.1 (routes 1-7; route 8 GET/POST .../thread is BACKEND B's)
 // ---------------------------------------------------------------------------
 
@@ -950,7 +1046,14 @@ export function listGoals(includeDone = false, includeArchived = false): GoalSum
     WHERE (archived = 0 OR ?) AND (status != 'done' OR ?)
     ORDER BY sort_order ASC, id ASC
   `).all(includeArchived ? 1 : 0, includeDone ? 1 : 0) as Array<Record<string, unknown>>;
-  return rows.map((r) => toGoalSummary(parseGoalRow(r)!));
+  const threadActivity = computeThreadActivityMap();
+  const hotNodes = computeHotNodesMap();
+  return rows.map((r) => {
+    const summary = toGoalSummary(parseGoalRow(r)!);
+    summary.last_activity = resolveLastActivity(summary, threadActivity.get(summary.id));
+    summary.hot_nodes = hotNodes.get(summary.id) ?? [];
+    return summary;
+  });
 }
 
 /** Seed text for the goal's dedicated thread (CONTRACT §8). Exported for BACKEND B's

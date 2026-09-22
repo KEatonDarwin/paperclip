@@ -3091,6 +3091,49 @@ try {
     assert.equal(board2.in_flight.filter((f: any) => f.goal_id === goalId).length, 0, 'a goal with zero nodes contributes nothing to in_flight');
     assert.ok(board2.goals.find((x: any) => x.id === goalId), 'the empty goal itself is still listed in goals');
   });
+
+  await check('V06-17', 'REVIEW (node #607): guard_failing `since` is FAILING-since, not LAST-CHECKED — a guard re-polled red keeps its original age', async () => {
+    const g = await post('/goals', { title: 'V06 guard-age drill', done_means: 'x' });
+    const goalId = g.json.goal.id;
+    const sp = await post(`/goals/${goalId}/nodes/propose`, { parent_id: null, actor: 'jarvis', items: [{ title: 'V06 aged guard node', done_means: 'x' }] });
+    const nodeId = sp.json.nodes[0].id;
+    assert.equal((await post(`/goals/${goalId}/batches/${sp.json.batch_id}/accept`, {})).status, 200);
+    const info = convDb.sqliteDb.prepare(`
+      INSERT INTO goal_guards (goal_id, node_id, state, mode, title, health, authored_by, last_checked_at, updated_at)
+      VALUES (?, ?, 'set', 'query', 'V06 aged guard', 'failing', 'jarvis', datetime('now'), datetime('now'))
+    `).run(goalId, nodeId);
+    const guardId = Number(info.lastInsertRowid);
+    // The transition event the poller writes when it first went red, three days ago.
+    const threeDaysAgo = "datetime('now', '-3 days')";
+    convDb.sqliteDb.prepare(`
+      INSERT INTO goal_events (goal_id, node_id, actor, kind, text, data, created_at)
+      VALUES (?, ?, 'system', 'guard_failed', 'went red', ?, ${threeDaysAgo})
+    `).run(goalId, nodeId, JSON.stringify({ guard_id: guardId, health: 'failing' }));
+
+    const board = await getBoard();
+    const item = attentionFor(board, 'guard_failing', nodeId);
+    assert.ok(item, 'failing guard still present in attention');
+    const ageMs = Date.now() - new Date(`${item.since.replace(' ', 'T')}Z`).getTime();
+    assert.ok(ageMs > 2.5 * 24 * 3600 * 1000, `since must date the FAILING transition, not the last poll (got ${item.since})`);
+
+    // Another poll that leaves it red rewrites last_checked_at/updated_at but
+    // must NOT rejuvenate the queue entry (the pre-fix bug).
+    convDb.sqliteDb.prepare(`UPDATE goal_guards SET last_checked_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`).run(guardId);
+    const board2 = await getBoard();
+    const item2 = attentionFor(board2, 'guard_failing', nodeId);
+    assert.equal(item2.since, item.since, 'a no-change re-poll leaves `since` untouched');
+
+    // A guard that never transitioned (seeded red) still falls back cleanly.
+    const info2 = convDb.sqliteDb.prepare(`
+      INSERT INTO goal_guards (goal_id, node_id, state, mode, title, health, authored_by, last_checked_at)
+      VALUES (?, NULL, 'set', 'query', 'V06 never-transitioned guard', 'error', 'jarvis', datetime('now'))
+    `).run(goalId);
+    assert.ok(info2.lastInsertRowid);
+    const board3 = await getBoard();
+    const rootGuard = board3.attention.find((a: any) => a.kind === 'guard_failing' && a.goal_id === goalId && a.node_id === null);
+    assert.ok(rootGuard, 'an eventless guard still surfaces (fallback to last_checked_at)');
+    assert.equal(typeof rootGuard.since, 'string');
+  });
 } finally {
   server.close();
   owServer?.close();
@@ -3105,7 +3148,7 @@ const outDir = '/home/kevin/obsidian/paperclip-wiki/outbox/goals';
 fs.mkdirSync(outDir, { recursive: true });
 const reportPath = path.join(outDir, 'sim-report.md');
 const lines: string[] = [];
-lines.push('# GOALS — sim report (hopper node #459; v0.3 §14 node chats added by node #489; v0.5 §16 forest payload added by node #601; v0.6 §17 board payload added by node #604, additive-guard + empty-slice checks added by node #606)');
+lines.push('# GOALS — sim report (hopper node #459; v0.3 §14 node chats added by node #489; v0.5 §16 forest payload added by node #601; v0.6 §17 board payload added by node #604, additive-guard + empty-slice checks added by node #606, guard-age check added by the adversarial review node #607)');
 lines.push('');
 lines.push(`Run at ${new Date().toISOString()}. Scratch DB: \`${DB_PATH}\`. ${passed}/${results.length} checks passed.`);
 lines.push('');

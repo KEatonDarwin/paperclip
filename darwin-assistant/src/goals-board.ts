@@ -133,10 +133,29 @@ const attentionHumanOpenStmt = sqliteDb.prepare(`
 `);
 
 /** §17.3(d) guard_failing — a set guard currently failing/erroring. `node_id`/
- *  `node_title` are NULL for a goal-level guard (no node_id on the guard row). */
+ *  `node_title` are NULL for a goal-level guard (no node_id on the guard row).
+ *
+ *  REVIEW FIX (node #607): `since` must be FAILING-since, not LAST-CHECKED.
+ *  `setHealth` (goals-guards.ts) rewrites BOTH `last_checked_at` and
+ *  `updated_at` on every poll even when health is unchanged, so the original
+ *  `COALESCE(last_checked_at, updated_at)` reset to "now" every cadence tick —
+ *  which, in an oldest-first queue, sank a guard that had been red for days to
+ *  the BOTTOM of Kevin's rail and rendered it as "1m". The transition itself
+ *  IS recorded: `setHealth` inserts a `guard_failed`/`guard_error` goal_event
+ *  (data.guard_id) only on a meaningful flip. Take the newest such event for
+ *  this guard, falling back to the old expression when none exists (a guard
+ *  seeded straight into a red health without ever transitioning). */
 const attentionGuardFailingStmt = sqliteDb.prepare(`
   SELECT gg.node_id AS node_id, gg.goal_id, gn.title AS node_title, g.title AS goal_title,
-         COALESCE(gg.last_checked_at, gg.updated_at) AS since
+         COALESCE(
+           (SELECT ge.created_at FROM goal_events ge
+             WHERE ge.goal_id = gg.goal_id
+               AND ge.kind IN ('guard_failed', 'guard_error')
+               AND json_extract(ge.data, '$.guard_id') = gg.id
+             ORDER BY ge.id DESC LIMIT 1),
+           gg.last_checked_at,
+           gg.updated_at
+         ) AS since
   FROM goal_guards gg
   JOIN goals g ON g.id = gg.goal_id
   LEFT JOIN goal_nodes gn ON gn.id = gg.node_id

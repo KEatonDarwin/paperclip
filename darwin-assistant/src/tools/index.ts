@@ -139,6 +139,7 @@ import { intakeDeploy } from './intake-deploy.js';
 import { cockpitDeploy } from './cockpit-deploy.js';
 import { getMemberThread } from './group-chat-tool.js';
 import { goals } from './goals-tool.js';
+import { deployControl } from './deploy-control.js';
 
 function instrumentTool(tool: ToolDef): ToolDef {
   return {
@@ -209,6 +210,7 @@ export const ALL_TOOLS: ToolDef[] = [
   cockpitDeploy,
   getMemberThread,
   goals,
+  deployControl,
 ].map(instrumentTool);
 
 export const TOOL_MAP: Map<string, ToolDef> = new Map(

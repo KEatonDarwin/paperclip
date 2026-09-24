@@ -60,7 +60,18 @@ process.env.HOPPER_GOV_ENABLED = '0';
 // v0.2 §13.5 — the structure digest is debounced 20s per goal in production;
 // collapse it so the V02 checks can observe ONE cue per burst quickly.
 process.env.GOALS_STRUCTURE_DEBOUNCE_MS = process.env.GOALS_STRUCTURE_DEBOUNCE_MS ?? '60';
-process.env.HOPPER_ENGINE_SLOTS = process.env.HOPPER_ENGINE_SLOTS ?? '8';
+// [V03-6d] node #459 REVIEW: several earlier sections (7, V02) dispatch hopper
+// leaves and deliberately never finish them (they're testing the
+// dispatched-leaf precondition, not tree completion), so 2+ slots stay
+// permanently occupied for the rest of the run. `?? '8'` only wins when the
+// var is unset — an ambient HOPPER_ENGINE_SLOTS from the operator's shell
+// (a real production tuning knob, e.g. '2') silently overrides it and starves
+// every later dispatch, exactly the failure foundry-sim.mjs floors against.
+// Floor it the same way so this file's dispatch checks never depend on
+// whatever happens to be exported in the running shell.
+const MIN_SIM_SLOTS = 24;
+const requestedSlots = parseInt(process.env.HOPPER_ENGINE_SLOTS ?? '', 10);
+process.env.HOPPER_ENGINE_SLOTS = String(Math.max(Number.isFinite(requestedSlots) ? requestedSlots : 0, MIN_SIM_SLOTS));
 delete process.env.ANTHROPIC_API_KEY;
 // v0.2 §12.7/§12.12 guards: the poller auto-starts at module load of
 // goals-guards.js (which api-v1.js imports transitively) unless this is set —

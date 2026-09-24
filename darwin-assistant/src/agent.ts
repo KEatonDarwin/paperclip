@@ -34,6 +34,8 @@ import { nightShiftContextBlock } from './night-shift.js';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getOrCreateInternalMcpKey } from './api-keys.js';
+import { refuseModelTurnInScratch } from './sim-guard.js';
+import { isAutomatedTurn, acquireAutomatedSlot, releaseAutomatedSlot } from './turn-admission.js';
 import type { SavedImage } from './image-store.js';
 
 const MAX_TOOL_TURNS = 50;
@@ -1269,7 +1271,30 @@ export function clearConversation(externalId: string): void {
   dbCloseConversation(externalId);
 }
 
+/** Admission wrapper — sim guard + concurrent-automated-turn ceiling. */
 export async function processMessage(
+  input: string,
+  conversationId: string,
+  messageId?: string,
+  images?: SavedImage[],
+): Promise<string> {
+  if (refuseModelTurnInScratch(`processMessage(${conversationId})`)) {
+    return '[sim-guard] model turn refused — scratch environment. No tokens were spent.';
+  }
+  if (!isAutomatedTurn(conversationId, messageId)) {
+    return await processMessageInner(input, conversationId, messageId, images);
+  }
+  if (!(await acquireAutomatedSlot(conversationId))) {
+    return '[turn-admission] skipped — the automated-turn queue stayed full for 10 minutes.';
+  }
+  try {
+    return await processMessageInner(input, conversationId, messageId, images);
+  } finally {
+    releaseAutomatedSlot();
+  }
+}
+
+async function processMessageInner(
   input: string,
   conversationId: string,
   messageId?: string,

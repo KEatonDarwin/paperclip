@@ -58,6 +58,7 @@ import { listMcpServers, refreshMcpServers } from '../mcp-registry.js';
 import { resolveNativeServer, nativeListTools } from '../tools/mcp-native.js';
 import { listNotes, createNote } from '../notes-db.js';
 import { triageNote } from '../notes.js';
+import { getNotepadDay, putNotepadDay, listNotepadDays, isValidNotepadDate, todayNotepadDate } from '../notepad.js';
 import {
   listNotifications,
   unreadNotificationCount,
@@ -1626,6 +1627,36 @@ export function createApiV1Router(): Router {
       console.error('[notes] triage failed unexpectedly', err);
     });
     res.status(201).json({ note });
+  });
+
+  // == Notepad — one free-form note per day, line-identity-preserving =========
+
+  router.get('/notepad', (req: AuthedRequest, res) => {
+    const dateParam = typeof req.query.date === 'string' ? req.query.date : undefined;
+    const day = dateParam ?? todayNotepadDate();
+    if (!isValidNotepadDate(day)) {
+      sendError(res, 400, 'invalid_date', 'date must be YYYY-MM-DD');
+      return;
+    }
+    res.json(getNotepadDay(day));
+  });
+
+  router.put('/notepad', (req: AuthedRequest, res) => {
+    const day = typeof req.body?.date === 'string' ? req.body.date : todayNotepadDate();
+    if (!isValidNotepadDate(day)) {
+      sendError(res, 400, 'invalid_date', 'date must be YYYY-MM-DD');
+      return;
+    }
+    const text = typeof req.body?.text === 'string' ? req.body.text : undefined;
+    if (text === undefined) {
+      sendError(res, 400, 'text_required', 'text is required (use an empty string to clear the note)');
+      return;
+    }
+    res.json(putNotepadDay(day, text));
+  });
+
+  router.get('/notepad/days', (_req: AuthedRequest, res) => {
+    res.json(listNotepadDays());
   });
 
   // == Quick-capture todo widget (DAR-737) =====================================

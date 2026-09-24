@@ -3538,6 +3538,12 @@ export function createApiV1Router(): Router {
   // or advance the split cursor). PATCH/preset are admin-scoped, all-or-nothing,
   // and share ONE validation chokepoint with every other write path.
 
+  // Seed the four presets ONCE, at router creation — not inside the GET handler.
+  // AC-16 asserts GET /throttle changes no settings row, and on a fresh DB a
+  // first-GET seed is exactly such a write. Idempotent; never overwrites Kevin's
+  // edited presets (§6.2).
+  seedThrottlePresets();
+
   /** Composes the governor + account views GET /throttle needs (§7.1: throttle.ts
    *  cannot import them — hopper-governor and claude-accounts both import IT). */
   function composeThrottleInputs(): {
@@ -3591,7 +3597,6 @@ export function createApiV1Router(): Router {
   }
 
   router.get('/throttle', (_req: AuthedRequest, res) => {
-    seedThrottlePresets(); // idempotent; never overwrites Kevin's edited presets
     res.json(throttleStatus(composeThrottleInputs()));
   });
 

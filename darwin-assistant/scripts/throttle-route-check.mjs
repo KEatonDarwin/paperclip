@@ -43,7 +43,20 @@ const admin = mintApiKey('throttle-route-admin', 'admin').plaintext;
 const plain = mintApiKey('throttle-route-plain', 'jarvis').plaintext;
 let pass = 0; const ok = (m) => { console.log(`  ✓ ${m}`); pass++; };
 
+const { sqliteDb } = await import(path.join(distDir, 'conversation-db.js'));
+const settingsSnapshot = () =>
+  JSON.stringify(sqliteDb.prepare('SELECT key, value FROM settings ORDER BY key').all());
+
 try {
+  // AC-16 (fresh-DB half) — the presets were seeded at ROUTER CREATION, so the
+  // very FIRST GET on a fresh DB is already pure. Seeding inside the GET handler
+  // would make first-GET a settings write, which is exactly what AC-16 forbids.
+  assert.ok(getSetting('throttle_presets') != null, 'presets must be seeded at router creation, not by GET');
+  const freshSnap = settingsSnapshot();
+  assert.equal((await req('GET', '/throttle', { token: plain })).status, 200);
+  assert.equal(settingsSnapshot(), freshSnap, 'the FIRST GET /throttle on a fresh DB must not write any setting');
+  ok('AC-16 fresh-DB: presets seeded at router creation; the very first GET writes nothing');
+
   // AC-17 — auth posture.
   assert.equal((await req('GET', '/throttle')).status, 401);
   assert.equal((await req('GET', '/throttle', { token: plain })).status, 200);
@@ -104,13 +117,10 @@ try {
   assert.equal(nf.status, 404); assert.equal(nf.json.error.code, 'unknown_preset');
   ok('§6.3 preset turned_up applies its dials + sets throttle_preset; unknown name → 404');
 
-  // AC-16 — GET is pure.
-  const snap = JSON.stringify([...(await import(path.join(distDir, 'conversation-db.js'))).sqliteDb
-    .prepare('SELECT key, value FROM settings ORDER BY key').all()]);
+  // AC-16 — GET is pure (steady-state half; the fresh-DB half ran first).
+  const snap = settingsSnapshot();
   for (let i = 0; i < 25; i++) await req('GET', '/throttle', { token: plain });
-  const after = JSON.stringify([...(await import(path.join(distDir, 'conversation-db.js'))).sqliteDb
-    .prepare('SELECT key, value FROM settings ORDER BY key').all()]);
-  assert.equal(after, snap, 'GET /throttle must not mutate any setting');
+  assert.equal(settingsSnapshot(), snap, 'GET /throttle must not mutate any setting');
   ok('AC-16 25× GET /throttle mutates no settings row');
 
   console.log(`\n[throttle-route-check] ${pass}/${pass} checks passed`);

@@ -18,6 +18,7 @@ import { listGoals, getGoalTree, type GoalSummary, type GoalTree, type GoalNodeR
 import { governorStatus, governorStatusAll, type GovernorProvider, type GovernorVerdict } from './hopper-governor.js';
 import { listAllHopperTrees, listTreeNodes, type HopperTreeRow, type HopperNodeRow, type HopperNodeStatus } from './hopper-engine.js';
 import { listMonitors, type MonitorRow } from './monitors.js';
+import type { GlobalStreamEventType } from './sse-bus.js';
 import { listNotifications, type NotificationRow } from './notifications.js';
 import { getLatestThreadSummary } from './thread-summaries.js';
 import { listAllSpawnTasks, type SpawnTaskRow } from './spawn-tasks.js';
@@ -42,10 +43,15 @@ export const BIG_BOARD_KIOSK_TOKEN_SETTING = 'big_board_kiosk_token';
 // any active tree already triggers the kiosk's debounced refetch — the spec's
 // "refetch on hopper_node/hopper_tree events" requirement is met by the
 // former; the latter doesn't exist to add (per CONTRACT: verify, don't invent).
+// The `satisfies` clause is load-bearing: a name in here that ISN'T in
+// sse-bus.ts's GLOBAL_STREAM_EVENT_TYPES would be a kiosk allowance for an
+// event the global stream never forwards — a dead entry that reads as coverage.
+// The public type stays ReadonlySet<string> so callers can test an arbitrary
+// SSEEvent['type'] against it.
 export const BIG_BOARD_KIOSK_EVENT_TYPES: ReadonlySet<string> = new Set([
   'hopper_node', 'goal', 'goal_node', 'goal_focus', 'goal_guard', 'monitor', 'monitor_run',
   'notification', 'dispatch', 'dispatch_cue', 'workstream', 'conversation_updated', 'status',
-]);
+] as const satisfies readonly GlobalStreamEventType[]);
 
 const SENTINEL_HEARTBEAT_FILE = '/tmp/jarvis-watchdog-heartbeat.json';
 const SENTINEL_NAMES = ['foreman', 'dead_turn', 'commitments', 'services', 'hopper_stall'] as const;

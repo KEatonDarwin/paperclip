@@ -379,7 +379,12 @@ import {
 import { query } from '../db.js';
 import { listVaultTree, readVaultFile, searchVault } from '../vault-page.js';
 import { normalizeLinkTarget, resolveVaultPath, resolveVaultPaths } from '../vault-resolve.js';
-import { sseBus, type SSEEvent, type ToolCallEvent } from '../sse-bus.js';
+import {
+  sseBus,
+  GLOBAL_STREAM_EVENT_TYPES,
+  type SSEEvent,
+  type ToolCallEvent,
+} from '../sse-bus.js';
 import {
   authenticateBearer,
   callerExternalIdPrefix,
@@ -1020,7 +1025,11 @@ const AUTH_EXEMPT_PATHS = new Set(['/goals/guards/webhook']);
 // match this is NOT aliased to a real api_keys row: it's a distinct, log-
 // visible, single-purpose synthetic credential (read-only, admin-scope so the
 // board's Conversation Radar can see every thread).
-const KIOSK_ELIGIBLE_PATHS = new Set(['/big-board', '/events']);
+// '/events/types' rides along with '/events': it is the same read-only
+// answer (narrowed to the kiosk's own event set), and a kiosk client that
+// can open the stream but not ask what the stream carries would be stuck
+// hardcoding the list — the exact drift this endpoint exists to remove.
+const KIOSK_ELIGIBLE_PATHS = new Set(['/big-board', '/events', '/events/types']);
 const BIG_BOARD_KIOSK_API_KEY: ApiKeyRow = {
   id: -1,
   key_hash: '',
@@ -5496,6 +5505,25 @@ export function createApiV1Router(): Router {
     });
   });
 
+  // The exact list of event names a given caller will see on GET /events. The
+  // kiosk credential is capped to the board's own types, so it gets told a
+  // narrower list than an admin bearer — a client that subscribes from this
+  // answer is correct either way, which is why discovery is per-connection
+  // rather than one global constant shipped to every client.
+  const announcedStreamTypes = (kiosk: boolean): string[] =>
+    kiosk
+      ? GLOBAL_STREAM_EVENT_TYPES.filter((t) => BIG_BOARD_KIOSK_EVENT_TYPES.has(t))
+      : [...GLOBAL_STREAM_EVENT_TYPES];
+
+  // -- GET /events/types: what GET /events will forward to THIS caller -------
+  // Plain-fetch twin of the `stream_types` frame below, so a client that misses
+  // the frame (or wants the list before opening a stream) has a second way to
+  // get it, and so the contract is curl-checkable.
+  router.get('/events/types', (req: AuthedRequest, res) => {
+    const kiosk = req.apiKey! === BIG_BOARD_KIOSK_API_KEY;
+    res.json({ types: announcedStreamTypes(kiosk) });
+  });
+
   // -- GET /events: GLOBAL stream across all of the caller's threads ----------
   // Powers the sidebar's live view — a Slack message landing on any thread, or
   // JARVIS replying to it, bumps + re-statuses the row in real time without the
@@ -5512,17 +5540,14 @@ export function createApiV1Router(): Router {
     const caller = req.apiKey!;
     const seesAll = isAdminScope(caller.scope);
     const prefix = callerExternalIdPrefix(caller.id);
-    const FORWARD = new Set([
-      'turn', 'conversation_updated', 'conversation_created',
-      'conversation_renamed', 'conversation_deleted', 'status', 'thread_todo',
-      'thread_link', 'thread_reminder',
-      'queued_message', 'note', 'stream_start', 'stream_delta', 'stream_end',
-      'quick_capture', 'thread_summary', 'notification',
-      'dispatch', 'dispatch_cue', 'hopper_item', 'hopper_node', 'smart_todo',
-      'workstream', 'monitor', 'monitor_run', 'foundry_project', 'foundry_module',
-      'intel_run', 'intel_item', 'workbench_proposal',
-      'goal', 'goal_node', 'goal_focus', 'goal_guard',
-    ]);
+    // The forward set is NOT a literal here — it is sse-bus.ts's
+    // GLOBAL_STREAM_EVENT_TYPES, the single server-owned list, announced to the
+    // client below so nothing has to keep a second copy. See the contract block
+    // in sse-bus.ts for the two silent-drop bugs that motivated it.
+    const FORWARD: ReadonlySet<string> = new Set(GLOBAL_STREAM_EVENT_TYPES);
+    // The Big Board kiosk credential only ever gets the board's own event
+    // types — never turn/stream_delta transcript traffic (review fix #520).
+    const kiosk = caller === BIG_BOARD_KIOSK_API_KEY;
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -5531,11 +5556,14 @@ export function createApiV1Router(): Router {
       'X-Accel-Buffering': 'no',
     });
     res.write(':\n\n');
+    // Announce the contract FIRST, before any real event can be written, so a
+    // client can subscribe to exactly what this stream forwards instead of
+    // hardcoding a copy that silently rots. EventSource dispatches frames in
+    // order, so listeners registered from this frame are in place before the
+    // next one is delivered — no race, nothing missed.
+    res.write(`event: stream_types\ndata: ${JSON.stringify({ types: announcedStreamTypes(kiosk) })}\n\n`);
     const heartbeat = setInterval(() => res.write(':\n\n'), 15000);
 
-    // The Big Board kiosk credential only ever gets the board's own event
-    // types — never turn/stream_delta transcript traffic (review fix #520).
-    const kiosk = caller === BIG_BOARD_KIOSK_API_KEY;
     const handler = (ev: SSEEvent) => {
       if (!FORWARD.has(ev.type)) return;
       if (kiosk && !BIG_BOARD_KIOSK_EVENT_TYPES.has(ev.type)) return;

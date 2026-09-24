@@ -348,6 +348,67 @@ export type SSEEvent =
   | IntelRunEvent | IntelItemEvent | WorkbenchProposalEvent
   | GoalEvent | GoalNodeEvent | GoalFocusEvent | GoalGuardEvent;
 
+// ---------------------------------------------------------------------------
+// THE GLOBAL-STREAM EVENT CONTRACT — one list, server-owned.
+//
+// `GET /events` forwards exactly the types in GLOBAL_STREAM_EVENT_TYPES, and it
+// ANNOUNCES that list to every client in a `stream_types` frame on connect (see
+// api-v1.ts) — plus `GET /events/types` for a plain fetch. That announcement is
+// the whole point: the cockpit's SharedWorker
+// (jarvis-command-center/src/lib/sse-worker.ts) used to carry its own hardcoded
+// copy of this list, and because a SharedWorker only fans out event names it
+// explicitly subscribed to, anything missing from that copy was silently
+// dropped for EVERY tab. Both halves of that bug were live:
+//   - `notification` was in FORWARD but missing from the worker's copy, so bell
+//     toasts never fired live on the SharedWorker path (Chrome) — only after a
+//     manual refresh or a stream reconnect.
+//   - `thread_group` was the mirror image: subscribed on the client, never in
+//     FORWARD, so group renames never reached a tab either.
+// The cockpit is a separate repo, so a shared import is impossible; runtime
+// discovery is what makes the two lists incapable of diverging.
+//
+// ADDING AN EVENT TYPE: add it to SSEEvent, then put its name in exactly ONE of
+// the two arrays below. The assertion underneath will not compile until you do.
+// ---------------------------------------------------------------------------
+export const GLOBAL_STREAM_EVENT_TYPES = [
+  'turn', 'conversation_created', 'conversation_updated',
+  'conversation_renamed', 'conversation_deleted', 'status',
+  'stream_start', 'stream_delta', 'stream_end',
+  'note', 'quick_capture', 'notification',
+  'thread_todo', 'thread_link', 'thread_reminder', 'thread_summary',
+  'thread_group', 'queued_message',
+  'dispatch', 'dispatch_cue',
+  'hopper_item', 'hopper_node', 'smart_todo', 'workbench_proposal', 'workstream',
+  'monitor', 'monitor_run',
+  'foundry_project', 'foundry_module',
+  'intel_run', 'intel_item',
+  'goal', 'goal_node', 'goal_focus', 'goal_guard',
+] as const satisfies readonly SSEEvent['type'][];
+
+export type GlobalStreamEventType = (typeof GLOBAL_STREAM_EVENT_TYPES)[number];
+
+// Emitted on the bus but deliberately NOT on the global stream. Each of these
+// is either per-thread-only or has no client consumer at all — spelled out so
+// that omission is a decision on the record rather than an oversight:
+//   tool_call              per-thread only; carries conversationId, so the
+//                          /threads/:ext/events stream already delivers it.
+//   autonomy_ledger_entry  no conversationId and no cockpit consumer today, so
+//   autonomy_ledger_review forwarding them would be dead weight on the stream.
+//   jarvis_decision        same — written to the ledger, read back over REST.
+export const LOCAL_ONLY_SSE_EVENT_TYPES = [
+  'tool_call', 'autonomy_ledger_entry', 'autonomy_ledger_review', 'jarvis_decision',
+] as const satisfies readonly SSEEvent['type'][];
+
+// Compile-time exhaustiveness: if a new member of the SSEEvent union is in
+// neither array, `UnclassifiedSSEEventType` stops being `never` and this line
+// fails to typecheck with the offending name in the error message.
+type AssertNever<T extends never> = T;
+type UnclassifiedSSEEventType = Exclude<
+  SSEEvent['type'],
+  GlobalStreamEventType | (typeof LOCAL_ONLY_SSE_EVENT_TYPES)[number]
+>;
+export type _EverySSEEventTypeIsClassified = AssertNever<UnclassifiedSSEEventType>;
+
 class SSEBus extends EventEmitter {}
 
 export const sseBus = new SSEBus();

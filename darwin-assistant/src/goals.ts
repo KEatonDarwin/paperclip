@@ -3018,10 +3018,27 @@ function latestAssistantLine(externalId: string, max = 160): { text: string; age
  *  own subtree ONLY; the goal chat sees the whole tree with 💬 on chatted
  *  nodes + a `<node_chats>` block. */
 export function buildGoalThreadContext(externalId: string, turnInput?: string): string {
+  const scope = resolveGoalScope(externalId);
+  if (!scope) return '';
+  return renderGoalTreeSnapshot(scope.goal_id, {
+    pinned_node_id: scope.pinned_node_id,
+    turn_input: turnInput,
+    include_node_chats: scope.pinned_node_id == null,
+  });
+}
+
+/** NIGHT SHIFT (CONTRACT §6.1) — the `<goal_focus/>` + `<goal_tree>` snapshot
+ *  itself, factored out of buildGoalThreadContext so the ONE orchestrator
+ *  thread (`cockpit:night-shift`) can be handed the cued goal's tree with the
+ *  SAME markers. Goal/node chats call it through buildGoalThreadContext with
+ *  the scope they resolved, so their output is byte-for-byte what it was. */
+export function renderGoalTreeSnapshot(
+  goalId: number,
+  opts: { pinned_node_id?: number | null; turn_input?: string; include_node_chats?: boolean } = {},
+): string {
   try {
-    const scope = resolveGoalScope(externalId);
-    if (!scope) return '';
-    const goalId = scope.goal_id;
+    const scope = { goal_id: goalId, pinned_node_id: opts.pinned_node_id ?? null };
+    const turnInput = opts.turn_input;
     const goal = loadGoal(goalId);
     if (!goal) return '';
     // v0.4 §15.10 — autopilot attributes + the cue-turn prefix line.
@@ -3165,7 +3182,7 @@ export function buildGoalThreadContext(externalId: string, turnInput?: string): 
     let out = `${cueLine}${focusLine}\n${treeOpen}\n${header}\n${body.join('\n')}\n</goal_tree>\n`;
 
     // v0.3 §14.4 — the goal chat stays aware of every node chat: one line each.
-    if (!pinned) {
+    if (!pinned && opts.include_node_chats !== false) {
       const chatted = allNodes.filter((n) => n.thread_ext).sort((a, b) => a.id - b.id);
       if (chatted.length) {
         const rows = chatted.map((n) => {

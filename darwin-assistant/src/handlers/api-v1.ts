@@ -122,6 +122,26 @@ import {
 // v0.4 §15 — importing the driver module also registers the autopilot hooks
 // into goals.ts and starts the tick loop (unless GOALS_AUTOPILOT_DRIVER=0).
 import { getAutopilotStatus, buildNightReport } from '../goals-autopilot.js';
+import {
+  NightError,
+  activeNightRun,
+  addNightItem,
+  buildNightBoard,
+  buildNightShiftReport,
+  ensureNightThread,
+  getNightRun,
+  latestNightRun,
+  listNightItems,
+  moveNightItem,
+  nightEtaEnd,
+  pauseNightRun,
+  planNight,
+  resumeNightRun,
+  skipNightItem,
+  startNightRun,
+  stopNightRun,
+  type NightRunMode,
+} from '../night-shift.js';
 // v0.6 §17 — the COMMAND DECK aggregate payload behind GET /goals/board.
 import { buildGoalsBoard } from '../goals-board.js';
 import {
@@ -1029,7 +1049,8 @@ const AUTH_EXEMPT_PATHS = new Set(['/goals/guards/webhook']);
 // answer (narrowed to the kiosk's own event set), and a kiosk client that
 // can open the stream but not ask what the stream carries would be stuck
 // hardcoding the list — the exact drift this endpoint exists to remove.
-const KIOSK_ELIGIBLE_PATHS = new Set(['/big-board', '/events', '/events/types']);
+// '/night/board' = the Night Shift kiosk read (node #680).
+const KIOSK_ELIGIBLE_PATHS = new Set(['/big-board', '/events', '/events/types', '/night/board']);
 const BIG_BOARD_KIOSK_API_KEY: ApiKeyRow = {
   id: -1,
   key_hash: '',
@@ -2289,6 +2310,92 @@ export function createApiV1Router(): Router {
   // skills/goals/CONTRACT.md — this block covers §3.1/§3.2/§3.3/§3.5 (BACKEND A,
   // node #455). leaf_kind/propose_plan/reject_plan/approve_plan/promote/the
   // GET|POST .../thread endpoint/tree overlay proxy are BACKEND B (node #456).
+
+  // ─── NIGHT SHIFT (skills/night-shift/CONTRACT.md §5) ─────────────────────
+  // Registered BEFORE the /goals block and with the literal paths BEFORE the
+  // /night/runs/:id/... param routes, so 'board' / 'plan' / 'thread' are never
+  // swallowed as an :id.
+
+  function sendNightError(res: Response, err: unknown): void {
+    if (err instanceof NightError) { sendError(res, err.status, err.code, err.message); return; }
+    console.error('[api] night-shift route failed', err);
+    sendError(res, 500, 'night_shift_failed', err instanceof Error ? err.message : String(err));
+  }
+
+  router.get('/night/board', (_req: AuthedRequest, res) => {
+    try { res.json(buildNightBoard()); } catch (err) { sendNightError(res, err); }
+  });
+
+  router.post('/night/plan', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { mode?: unknown; goal_ids?: unknown; config?: unknown };
+    try {
+      res.json(planNight({
+        mode: body.mode as NightRunMode | undefined,
+        goal_ids: Array.isArray(body.goal_ids) ? (body.goal_ids as unknown[]).map(Number) : undefined,
+        config: body.config,
+        actor: 'kevin',
+      }));
+    } catch (err) { sendNightError(res, err); }
+  });
+
+  router.post('/night/thread', (_req: AuthedRequest, res) => {
+    try { res.json(ensureNightThread()); } catch (err) { sendNightError(res, err); }
+  });
+
+  router.get('/night/runs/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const run = getNightRun(id);
+    if (!run) { sendError(res, 404, 'night_run_not_found', 'night run not found'); return; }
+    res.json({ run, items: listNightItems(id), eta_end: nightEtaEnd(id) });
+  });
+
+  router.post('/night/runs/:id/start', (req: AuthedRequest, res) => {
+    try { res.json({ run: startNightRun(parseInt(String(req.params.id), 10), 'kevin') }); } catch (err) { sendNightError(res, err); }
+  });
+  router.post('/night/runs/:id/pause', (req: AuthedRequest, res) => {
+    try { res.json({ run: pauseNightRun(parseInt(String(req.params.id), 10), 'kevin') }); } catch (err) { sendNightError(res, err); }
+  });
+  router.post('/night/runs/:id/resume', (req: AuthedRequest, res) => {
+    try { res.json({ run: resumeNightRun(parseInt(String(req.params.id), 10), 'kevin') }); } catch (err) { sendNightError(res, err); }
+  });
+  router.post('/night/runs/:id/stop', (req: AuthedRequest, res) => {
+    try { res.json({ run: stopNightRun(parseInt(String(req.params.id), 10), 'kevin', 'kevin') }); } catch (err) { sendNightError(res, err); }
+  });
+
+  router.post('/night/runs/:id/items', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { goal_id?: unknown; node_id?: unknown; after_item_id?: unknown };
+    if (typeof body.goal_id !== 'number' || typeof body.node_id !== 'number') {
+      sendError(res, 400, 'goal_id_and_node_id_required', 'goal_id and node_id (numbers) are required');
+      return;
+    }
+    try {
+      res.status(201).json({
+        item: addNightItem(parseInt(String(req.params.id), 10), body.goal_id, body.node_id,
+          typeof body.after_item_id === 'number' ? body.after_item_id : null, 'kevin'),
+      });
+    } catch (err) { sendNightError(res, err); }
+  });
+
+  router.post('/night/runs/:id/items/:itemId/move', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { position?: unknown };
+    if (typeof body.position !== 'number') { sendError(res, 400, 'position_required', 'position (number) is required'); return; }
+    try {
+      res.json({ items: moveNightItem(parseInt(String(req.params.id), 10), parseInt(String(req.params.itemId), 10), body.position, 'kevin') });
+    } catch (err) { sendNightError(res, err); }
+  });
+
+  router.post('/night/runs/:id/items/:itemId/skip', (req: AuthedRequest, res) => {
+    try {
+      res.json({ item: skipNightItem(parseInt(String(req.params.id), 10), parseInt(String(req.params.itemId), 10), 'kevin') });
+    } catch (err) { sendNightError(res, err); }
+  });
+
+  router.get('/night/runs/:id/report', (req: AuthedRequest, res) => {
+    try {
+      const r = buildNightShiftReport(parseInt(String(req.params.id), 10));
+      res.json({ markdown: r.markdown, path: r.path, written: r.written });
+    } catch (err) { sendNightError(res, err); }
+  });
 
   router.get('/goals', (req: AuthedRequest, res) => {
     const includeDone = req.query.include_done === '1';

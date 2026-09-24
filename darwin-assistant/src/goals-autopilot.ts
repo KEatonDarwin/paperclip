@@ -50,6 +50,19 @@ import {
 } from './goals.js';
 import { VAULT_ROOT } from './goals-autopilot-verify.js';
 
+// NIGHT SHIFT §4.5 — night-shift.ts imports this module (predicates, cue text,
+// verdict parser), so we must NOT import it back. It registers its ownership
+// probe here at its own module load; null until then = nobody owns anything.
+type NightOwnsFn = (goalId: number) => boolean;
+let nightOwns: NightOwnsFn | null = null;
+export function registerNightShiftOwnership(fn: NightOwnsFn | null): void {
+  nightOwns = fn;
+}
+export function nightShiftOwnsGoal(goalId: number): boolean {
+  if (!nightOwns) return false;
+  try { return nightOwns(goalId); } catch { return false; }
+}
+
 export const STOP_FILE = process.env.GOALS_AUTOPILOT_STOP_FILE?.trim() || '/tmp/goals-autopilot.stop';
 const LOOP_MS = (() => {
   const n = Number(process.env.GOALS_AUTOPILOT_LOOP_MS);
@@ -165,17 +178,17 @@ function parsePlan(node: Pick<GoalNodeRow, 'plan'>): PlanJson | null {
  *  start while the earlier one runs (AP-7's `parallel:2` example). REVIEW fix
  *  (node #541): previously `working` was NOT settled, which made parallel>1
  *  inert. `planned` (plant retry pending) is deliberately not settled. */
-function isSettled(n: GoalNodeRow): boolean {
+export function isSettled(n: GoalNodeRow): boolean {
   return n.state === 'done' || n.state === 'parked' || n.state === 'working' || n.leaf_kind === 'human' || n.state === 'check' || n.promoted_to_goal_id != null;
 }
 
-interface TreeIndex {
+export interface TreeIndex {
   nodes: GoalNodeRow[];
   byId: Map<number, GoalNodeRow>;
   childrenOf: Map<number | null, GoalNodeRow[]>;
 }
 
-function indexTree(nodes: GoalNodeRow[]): TreeIndex {
+export function indexTree(nodes: GoalNodeRow[]): TreeIndex {
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const childrenOf = new Map<number | null, GoalNodeRow[]>();
   for (const n of nodes) {
@@ -187,7 +200,7 @@ function indexTree(nodes: GoalNodeRow[]): TreeIndex {
 }
 
 /** earlier(n): preceding siblings + earlier(parent), recursively. */
-function earlierOf(ix: TreeIndex, n: GoalNodeRow): GoalNodeRow[] {
+export function earlierOf(ix: TreeIndex, n: GoalNodeRow): GoalNodeRow[] {
   const out: GoalNodeRow[] = [];
   let cur: GoalNodeRow | undefined = n;
   while (cur) {
@@ -199,7 +212,7 @@ function earlierOf(ix: TreeIndex, n: GoalNodeRow): GoalNodeRow[] {
   return out;
 }
 
-function ancestorsBlock(ix: TreeIndex, n: GoalNodeRow): boolean {
+export function ancestorsBlock(ix: TreeIndex, n: GoalNodeRow): boolean {
   let cur = n.parent_id != null ? ix.byId.get(n.parent_id) : undefined;
   while (cur) {
     if (cur.state === 'ghost' || cur.state === 'parked') return true;
@@ -208,11 +221,11 @@ function ancestorsBlock(ix: TreeIndex, n: GoalNodeRow): boolean {
   return false;
 }
 
-function earlierSettled(ix: TreeIndex, n: GoalNodeRow): boolean {
+export function earlierSettled(ix: TreeIndex, n: GoalNodeRow): boolean {
   return earlierOf(ix, n).every(isSettled);
 }
 
-function isRunnable(ix: TreeIndex, n: GoalNodeRow, cfg: AutopilotConfig): boolean {
+export function isRunnable(ix: TreeIndex, n: GoalNodeRow, cfg: AutopilotConfig): boolean {
   return n.state === 'set' && n.leaf_kind === 'machine' && n.plan_state === 'none'
     && n.autopilot_attempts < cfg.max_attempts && earlierSettled(ix, n);
 }
@@ -610,6 +623,10 @@ async function tickGoal(goalId: number, reason: string): Promise<void> {
     loadLastCue(goalId, s);
     const goal = getRawGoal(goalId);
     if (!goal || goal.autopilot !== 1) return;
+    // NIGHT SHIFT (CONTRACT §4.5) — while a night run owns this goal, the
+    // per-goal driver stands down entirely: Night Shift drives every cue for
+    // it out of the ONE orchestrator thread. Restored at the run's wrap.
+    if (nightShiftOwnsGoal(goalId)) return;
     const cfg = cfgOf(goal);
     let tree = getGoalTree(goalId);
     if (!tree) return;

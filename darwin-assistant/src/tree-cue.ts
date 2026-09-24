@@ -26,6 +26,7 @@ import {
   type HopperNodeRow,
 } from './hopper-engine.js';
 import { cueTargetForTree } from './goals.js';
+import { nightShiftOwnsGoal } from './goals-autopilot.js';
 
 // -- dedupe column: one cue per (tree, status) transition ------------------
 // PRAGMA-checked additive ALTER, same pattern as hopper-engine's router cols.
@@ -174,6 +175,24 @@ export function treeCueOnTreeStatus(treeId: string, status: 'done' | 'blocked' |
   // already suppresses foundry bells (isFoundryTree). Foundry reports through
   // /foundry; the module trees are its internal steps, not Kevin's review gate.
   if (tree.topic.startsWith('foundry:')) return;
+  // NIGHT SHIFT (review node #682): while a night run OWNS a goal, its trees are
+  // the night's items — the driver's P0 sync already settles them and kicks on
+  // the same tree-status event, and every cue for that goal must land in the ONE
+  // orchestrator thread (`cockpit:night-shift`), not the goal chat. Without this
+  // a finished night tree ran a SECOND, un-briefed JARVIS turn in the goal chat
+  // telling it to "review the deliverables and deploy per your standing rules" —
+  // two drivers on one node, and a [needs Kevin] prompt at 3AM. Returns false
+  // for every non-night tree, so nothing outside a live run changes.
+  {
+    const owner = sqliteDb.prepare(
+      `SELECT goal_id FROM goal_nodes WHERE tree_id = ? AND state != 'discarded' ORDER BY id DESC LIMIT 1`,
+    ).get(treeId) as { goal_id: number } | undefined;
+    if (owner && nightShiftOwnsGoal(owner.goal_id)) {
+      setLastCueStmt.run(status, treeId);
+      console.log(`[tree-cue] ${treeId} ${status}: goal #${owner.goal_id} is owned by a night run — the orchestrator thread drives it`);
+      return;
+    }
+  }
   // GOALS v0.3 (CONTRACT §14.6): a tree planted from a goal node (approve_plan)
   // carries the GOAL chat as its origin; when that node — or an ancestor — has
   // its own node chat, the cue belongs there instead. cueTargetForTree is null

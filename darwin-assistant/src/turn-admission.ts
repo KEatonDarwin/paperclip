@@ -23,6 +23,11 @@ import { getSetting } from './conversation-db.js';
 const AUTOMATED_KEY_PREFIXES = [
   'goal-structure:', 'goal-weighin:', 'goal-guard:', 'goal-tree:', 'autopilot:',
   'dispatch-cue:', 'tree-cue:', 'nightshift:', 'critic:', 'checkin:',
+  // NIGHT SHIFT (review node #682): its cues mint `night:<run>:<item>:<n>` —
+  // `nightshift:` never matched one, so up to 4 lanes of orchestrator turns ran
+  // OUTSIDE the ceiling all night, which is exactly the surface this file exists
+  // to cap. Gated turns WAIT for a slot, so nothing is lost.
+  'night:',
 ];
 
 export function isAutomatedTurn(externalId: string, correlationKey?: string): boolean {

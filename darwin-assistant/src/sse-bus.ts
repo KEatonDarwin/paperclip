@@ -19,6 +19,7 @@ import type { FoundryModuleResponse, FoundryProjectResponse } from './foundry.js
 import type { IntelItem, IntelRun } from './intel-desk.js';
 import type { GoalSummary, GoalNodeRow, FocusRow } from './goals.js';
 import type { GoalGuardRow } from './goals-guards.js';
+import type { NightRunRow, NightItemRow } from './night-shift.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -334,6 +335,20 @@ export interface GoalGuardEvent {          // 'goal_guard' (v0.2 §12.9) — glo
   guard: GoalGuardRow;
 }
 
+// NIGHT SHIFT (CONTRACT §7) — global like GoalEvent (no conversationId). Planning
+// emits ONE `night_run` with action 'planned'; per-item events fire only for
+// individual status/position/insert changes during a run (§12.15).
+export interface NightRunEvent {
+  type: 'night_run';
+  action: 'planned' | 'updated' | 'started' | 'paused' | 'resumed' | 'stopped' | 'complete';
+  run: NightRunRow;
+}
+export interface NightItemEvent {
+  type: 'night_item';
+  action: 'created' | 'updated';
+  item: NightItemRow;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
@@ -346,7 +361,8 @@ export type SSEEvent =
   | DispatchEvent | DispatchCueEvent | HopperItemEvent | HopperNodeEvent | SmartTodoEvent
   | WorkstreamEvent | MonitorEvent | MonitorRunEvent | FoundryProjectEvent | FoundryModuleEvent
   | IntelRunEvent | IntelItemEvent | WorkbenchProposalEvent
-  | GoalEvent | GoalNodeEvent | GoalFocusEvent | GoalGuardEvent;
+  | GoalEvent | GoalNodeEvent | GoalFocusEvent | GoalGuardEvent
+  | NightRunEvent | NightItemEvent;
 
 // ---------------------------------------------------------------------------
 // THE GLOBAL-STREAM EVENT CONTRACT — one list, server-owned.
@@ -383,6 +399,7 @@ export const GLOBAL_STREAM_EVENT_TYPES = [
   'foundry_project', 'foundry_module',
   'intel_run', 'intel_item',
   'goal', 'goal_node', 'goal_focus', 'goal_guard',
+  'night_run', 'night_item',   // Night Shift (node #679/#680): board + /night live updates
 ] as const satisfies readonly SSEEvent['type'][];
 
 export type GlobalStreamEventType = (typeof GLOBAL_STREAM_EVENT_TYPES)[number];

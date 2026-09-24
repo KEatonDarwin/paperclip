@@ -13,6 +13,9 @@ import { startHopperEngine } from './hopper-engine.js';
 // Side-effect import: registers the tree-status listener that cues JARVIS in a
 // tree's origin thread on done/blocked (see src/tree-cue.ts).
 import './tree-cue.js';
+// Side-effect import: registers the hopper paused-tree provider + the goals
+// autopilot stand-down probe and starts the Night Shift driver (NIGHT_SHIFT_DRIVER=0 disables).
+import './night-shift.js';
 import { startFoundry } from './foundry.js';
 import { startMonitorScheduler } from './monitors.js';
 

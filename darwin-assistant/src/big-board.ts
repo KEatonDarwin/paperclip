@@ -45,6 +45,7 @@ export const BIG_BOARD_KIOSK_TOKEN_SETTING = 'big_board_kiosk_token';
 export const BIG_BOARD_KIOSK_EVENT_TYPES: ReadonlySet<string> = new Set([
   'hopper_node', 'goal', 'goal_node', 'goal_focus', 'goal_guard', 'monitor', 'monitor_run',
   'notification', 'dispatch', 'dispatch_cue', 'workstream', 'conversation_updated', 'status',
+  'night_run', 'night_item',
 ]);
 
 const SENTINEL_HEARTBEAT_FILE = '/tmp/jarvis-watchdog-heartbeat.json';

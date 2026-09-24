@@ -140,6 +140,9 @@ import { cockpitDeploy } from './cockpit-deploy.js';
 import { getMemberThread } from './group-chat-tool.js';
 import { goals } from './goals-tool.js';
 import { deployControl } from './deploy-control.js';
+// Side-effect of importing the tool: night-shift.ts registers the paused-tree
+// provider + the autopilot stand-down probe and starts its driver.
+import { nightShift } from './night-shift-tool.js';
 
 function instrumentTool(tool: ToolDef): ToolDef {
   return {
@@ -211,6 +214,7 @@ export const ALL_TOOLS: ToolDef[] = [
   getMemberThread,
   goals,
   deployControl,
+  nightShift,
 ].map(instrumentTool);
 
 export const TOOL_MAP: Map<string, ToolDef> = new Map(

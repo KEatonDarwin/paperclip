@@ -266,8 +266,15 @@ const lastReason = new Map<GovernorProvider, GovernorVerdict['reason']>();
  * adapter so the verdict is metered against the plan that work actually burns.
  * Logs on state change only, per provider.
  */
-export function governorCheck(adapter?: string | null): GovernorVerdict {
-  const verdict = evaluate(providerFor(adapter ?? WORKER_DEFAULT_ADAPTER));
+export interface GovernorOptions {
+  /** NIGHT SHIFT (CONTRACT §4.2): skip ONLY the kevin_active gate. Ceilings,
+   *  staleness, weekly and provider overrides are untouched. Kevin drives the
+   *  night by hand — Night Shift never auto-pauses when he shows up. */
+  ignoreKevinActive?: boolean;
+}
+
+export function governorCheck(adapter?: string | null, opts?: GovernorOptions): GovernorVerdict {
+  const verdict = evaluate(providerFor(adapter ?? WORKER_DEFAULT_ADAPTER), opts);
   if (verdict.reason !== lastReason.get(verdict.provider)) {
     console.log(
       `[hopper-governor] ${verdict.provider}: ${verdict.allow ? 'OPEN' : 'HOLD'} (${verdict.reason}) — ${verdict.detail}`,
@@ -282,8 +289,8 @@ export function governorCheck(adapter?: string | null): GovernorVerdict {
  * Defaults to claude semantics (back-compat top-level verdict); pass an
  * adapter string to check a specific lane.
  */
-export function governorStatus(adapter?: string | null): GovernorVerdict {
-  return evaluate(providerFor(adapter ?? 'claude'));
+export function governorStatus(adapter?: string | null, opts?: GovernorOptions): GovernorVerdict {
+  return evaluate(providerFor(adapter ?? 'claude'), opts);
 }
 
 const ALL_PROVIDERS: GovernorProvider[] = ['claude', 'codex', 'auggie', 'devin'];
@@ -295,7 +302,7 @@ export function governorStatusAll(): Record<GovernorProvider, GovernorVerdict> {
   return out;
 }
 
-function evaluate(provider: GovernorProvider): GovernorVerdict {
+function evaluate(provider: GovernorProvider, opts?: GovernorOptions): GovernorVerdict {
   const CONFIG = currentConfig();
 
   if (!ENABLED) {
@@ -365,7 +372,7 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
     enabledAccounts[0].config_dir === null;
 
   if (isDefaultSingle) {
-    const v = evaluateClaudeLegacy(CONFIG);
+    const v = evaluateClaudeLegacy(CONFIG, opts);
     const acct = enabledAccounts[0];
     // Additive only — the gating decision above is untouched.
     return {
@@ -377,7 +384,7 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
     };
   }
 
-  return evaluateClaudeAccounts(CONFIG, enabledAccounts);
+  return evaluateClaudeAccounts(CONFIG, enabledAccounts, opts);
 }
 
 /**
@@ -386,7 +393,7 @@ function evaluate(provider: GovernorProvider): GovernorVerdict {
  * Kevin-active in order. Kept verbatim so the default single-account path is
  * byte-identical to before the multi-account feature existed.
  */
-function evaluateClaudeLegacy(CONFIG: GovernorConfig): GovernorVerdict {
+function evaluateClaudeLegacy(CONFIG: GovernorConfig, opts?: GovernorOptions): GovernorVerdict {
   const provider: GovernorProvider = 'claude';
   const { fiveHour, weekly, staleMinutes } = readUsage();
   const FIVE_HOUR_CEILING = CONFIG.five_hour_ceiling;
@@ -445,7 +452,7 @@ function evaluateClaudeLegacy(CONFIG: GovernorConfig): GovernorVerdict {
     };
   }
 
-  if (kevinActive()) {
+  if (!opts?.ignoreKevinActive && kevinActive()) {
     // 2026-09-11: "it's OK to use Claude while I'm here" below half the 5h
     // window burned. Unknown utilization never grants the waiver — it holds
     // exactly like an at/above-threshold reading would.
@@ -487,7 +494,7 @@ function evaluateClaudeLegacy(CONFIG: GovernorConfig): GovernorVerdict {
  * with 5h headroom are all over their weekly budget. Weekly is still honored
  * per soft/hard mode, exactly as the single-account gate does.
  */
-function evaluateClaudeAccounts(CONFIG: GovernorConfig, accounts: ReturnType<typeof listClaudeAccounts>): GovernorVerdict {
+function evaluateClaudeAccounts(CONFIG: GovernorConfig, accounts: ReturnType<typeof listClaudeAccounts>, opts?: GovernorOptions): GovernorVerdict {
   const provider: GovernorProvider = 'claude';
   const ceiling = CONFIG.five_hour_ceiling;
   const weeklyCeil = CONFIG.weekly_ceiling;
@@ -553,7 +560,7 @@ function evaluateClaudeAccounts(CONFIG: GovernorConfig, accounts: ReturnType<typ
       );
     }
     // Kevin-active waiver still applies globally, keyed to the account we'd run on.
-    if (kevinActive()) {
+    if (!opts?.ignoreKevinActive && kevinActive()) {
       const maxActive = CONFIG.kevin_active_claude_max_5h;
       const waived = s.usage.five_hour != null && s.usage.five_hour < maxActive;
       if (!waived) {

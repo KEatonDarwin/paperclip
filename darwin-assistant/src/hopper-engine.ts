@@ -267,6 +267,26 @@ const treeStatusListeners: TreeStatusListener[] = [];
 export function registerTreeStatusListener(fn: TreeStatusListener): void {
   treeStatusListeners.push(fn);
 }
+// NIGHT SHIFT (CONTRACT §4.4, decision §12.16) — while a night run is PAUSED,
+// nothing new starts anywhere in the run: dispatchTick skips pending nodes of
+// the run's trees. night-shift.ts registers the provider at module init; a
+// setter (not an import) so the engine never imports night-shift.ts back.
+type PausedTreesProvider = () => ReadonlySet<string>;
+let pausedTreesProvider: PausedTreesProvider | null = null;
+export function setNightShiftPausedTreesProvider(fn: PausedTreesProvider | null): void {
+  pausedTreesProvider = fn;
+}
+const NO_PAUSED_TREES: ReadonlySet<string> = new Set<string>();
+function pausedTreeIds(): ReadonlySet<string> {
+  if (!pausedTreesProvider) return NO_PAUSED_TREES;
+  try {
+    return pausedTreesProvider();
+  } catch (err) {
+    console.error('[hopper-engine] night-shift paused-tree provider failed', err);
+    return NO_PAUSED_TREES;
+  }
+}
+
 function notifyTreeStatusListeners(treeId: string, status: 'done' | 'blocked' | 'active'): void {
   for (const fn of treeStatusListeners) {
     try {
@@ -764,8 +784,11 @@ export async function dispatchTick(reason: string): Promise<void> {
       : 0;
     let cappedLogged = false;
     const verdicts = new Map<string, boolean>(); // one governor eval per adapter per tick
+    // NIGHT SHIFT §4.4 — one lookup per tick; an empty set when no run is paused.
+    const nightPaused = pausedTreeIds();
     for (const node of readyLeavesStmt.all()) {
       if (free <= 0) break;
+      if (nightPaused.size && nightPaused.has(node.tree_id)) continue;
       if (!depsSatisfied(node)) continue;
       const adapter = node.adapter ?? WORKER_ADAPTER;
       let allowed = verdicts.get(adapter);

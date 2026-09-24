@@ -97,8 +97,14 @@ try {
   ok('no VERDICT line = FAIL no-verdict', pv('all good').gaps[0].startsWith('no verdict'));
   ok('empty result = FAIL no-verdict', pv('').verdict === 'FAIL');
   ok('non-done hopper status = FAIL', pv('VERDICT: PASS\ngaps:\n- none', 'split').gaps[0].startsWith('no verdict'));
-  const downgraded = pv('VERDICT: PASS\nevidence:\n- looked\ngaps:\n- one real gap');
-  ok('PASS with gaps downgraded to FAIL', downgraded.verdict === 'FAIL' && downgraded.gaps[0] === 'verifier reported gaps alongside PASS');
+  // Changed 2026-09-24: a PASS that also lists gaps STAYS a PASS. The old
+  // downgrade cost real re-plan trees on goal-5 nodes #49 and #52 when the
+  // verifier passed and then listed nice-to-haves. The contract says the first
+  // line's token IS the verdict; gaps survive as advisory follow-ups.
+  const advisory = pv('VERDICT: PASS\nevidence:\n- looked\ngaps:\n- one real gap');
+  ok('PASS with gaps STAYS pass (no phantom re-plan round)', advisory.verdict === 'PASS');
+  ok('...and its gaps are kept, marked advisory', advisory.gaps.length === 1 && advisory.gaps[0] === 'advisory (did not block PASS): one real gap');
+  ok('a real FAIL is still a FAIL', pv('VERDICT: FAIL\ngaps:\n- broken').verdict === 'FAIL');
 
   // [2] goal + route 37 on --------------------------------------------------
   console.log('[2] autopilot on (route 37)');

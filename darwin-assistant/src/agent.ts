@@ -34,6 +34,7 @@ import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getOrCreateInternalMcpKey } from './api-keys.js';
 import { refuseModelTurnInScratch } from './sim-guard.js';
+import { isAutomatedTurn, acquireAutomatedSlot, releaseAutomatedSlot } from './turn-admission.js';
 import type { SavedImage } from './image-store.js';
 
 const MAX_TOOL_TURNS = 50;
@@ -1269,7 +1270,36 @@ export function clearConversation(externalId: string): void {
   dbCloseConversation(externalId);
 }
 
+/**
+ * Admission wrapper. Keeps two global protections in ONE place that every
+ * ingress already funnels through, instead of at 16 call sites:
+ *   - the sim guard (never spend tokens against a scratch DB), and
+ *   - the concurrent-automated-turn ceiling (never drown the box again).
+ * Kevin-facing turns are never gated; automated ones wait for a slot.
+ */
 export async function processMessage(
+  input: string,
+  conversationId: string,
+  messageId?: string,
+  images?: SavedImage[],
+): Promise<string> {
+  if (refuseModelTurnInScratch(`processMessage(${conversationId})`)) {
+    return '[sim-guard] model turn refused — scratch environment. No tokens were spent.';
+  }
+  if (!isAutomatedTurn(conversationId, messageId)) {
+    return await processMessageInner(input, conversationId, messageId, images);
+  }
+  if (!(await acquireAutomatedSlot(conversationId))) {
+    return '[turn-admission] skipped — the automated-turn queue stayed full for 10 minutes.';
+  }
+  try {
+    return await processMessageInner(input, conversationId, messageId, images);
+  } finally {
+    releaseAutomatedSlot();
+  }
+}
+
+async function processMessageInner(
   input: string,
   conversationId: string,
   messageId?: string,

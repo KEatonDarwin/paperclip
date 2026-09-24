@@ -127,6 +127,23 @@ export function parseVerdict(resultText: string | null | undefined, hopperStatus
   return { verdict, evidence, gaps };
 }
 
+/**
+ * How many hopper trees this goal has planted in the last `hours`. Counts
+ * `tree_planted` goal_events rather than goal_nodes.tree_id, because a node only
+ * remembers its LATEST tree — the re-plan rounds, which are exactly what the
+ * budget exists to catch, would otherwise be invisible.
+ */
+function treesPlantedSince(goalId: number, hours: number): number {
+  const row = sqliteDb
+    .prepare<[number], { n: number }>(
+      `SELECT COUNT(*) AS n FROM goal_events
+        WHERE goal_id = ? AND kind = 'tree_planted'
+          AND created_at > datetime('now', '-${Number(hours)} hours')`,
+    )
+    .get(goalId);
+  return row?.n ?? 0;
+}
+
 // ---------------------------------------------------------------------------
 // §15.4 decision table (pure over a GoalTree read)
 // ---------------------------------------------------------------------------
@@ -486,7 +503,33 @@ export function composeCueText(goal: GoalRow, tree: GoalTree, d: Decision, secon
       );
       if (gapsBlock) lines.push(gapsBlock);
       if (d.action === 'replan') {
-        lines.push(`The previous tree was ${node!.tree_id ?? '(unknown)'}; read its build results + the VERIFY result before rewriting the spec. If the gaps show the done_means itself is unachievable as written, \`park\` with the reason instead of retrying.`);
+        // PATCH-TREE MODE (2026-09-24). A re-plan used to mean a whole fresh tree
+        // — ≤6 build nodes plus a verifier — even when the verifier had named one
+        // broken line in one file. On 2026-09-23 that turned goal 5 into NINETEEN
+        // trees: nodes #48/#49/#51/#52 each cycled 3–4 fix rounds, and every round
+        // cost a full tree of workers. The verdicts were RIGHT (a real SQL-guard
+        // bypass, an uncommitted branch, tests hitting the live Hub); the response
+        // was just wildly oversized.
+        //
+        // So the first two attempts are now a PATCH: one node, same branch, fix
+        // exactly the named gaps. A full re-plan is reserved for the case the
+        // gaps actually argue for — the approach itself being wrong.
+        const patchMode = attempt <= 2;
+        lines.push(
+          `The previous tree was ${node!.tree_id ?? '(unknown)'}; read its build results + the VERIFY result before you write anything.`,
+        );
+        if (patchMode) {
+          lines.push(
+            `**Default to a PATCH, not a rebuild.** The verifier named specific gaps, so \`propose_plan\` with EXACTLY ONE build node that fixes those gaps and nothing else: same repo, same branch/worktree the previous tree used (name it explicitly in the spec — do not cut a new branch), spec = the gap list turned into concrete edits + the commands that prove each one closed. The server still appends its own verifier, so a patch round costs two workers instead of a whole tree. Do NOT restate the original plan, do NOT re-do work the verifier already passed.`,
+          );
+          lines.push(
+            `Only escalate to a FULL re-plan (≤6 nodes, fresh branch) if the gaps show the APPROACH is wrong — wrong design, wrong files, the build fundamentally misread the node — rather than a defect in an otherwise-right build. Say which you chose and why in your \`log\`.`,
+          );
+        } else {
+          lines.push(
+            `This is attempt ${attempt}: the patch rounds did not close it, so write a FULL plan (≤6 nodes) that takes a genuinely different approach — repeating the same shape a third time is how a goal burns a night. If the gaps show the done_means itself is unachievable as written, \`park\` with the reason instead of retrying.`,
+          );
+        }
       }
       break;
     }
@@ -579,7 +622,27 @@ async function tickGoal(goalId: number, reason: string): Promise<void> {
     if (hold) { noteHold(goalId, s, hold); return; }
 
     // Decision (pure) → gate 4 checks the goal chat + the target chat.
-    const d = computeNextAction(tree.nodes, cfg);
+    let d = computeNextAction(tree.nodes, cfg);
+
+    // Gate 3.5 — TREE BUDGET (2026-09-24). The last brake before a goal is allowed
+    // to plant more work. On 2026-09-23 goal 5 planted NINE trees in one night;
+    // nothing in the system had an opinion about that number. Patch-tree mode makes
+    // each fix round cheap, but cheap × unbounded is still unbounded, so there is
+    // now a ceiling: a goal may plant at most `autopilot_max_trees_per_day` (default
+    // 8) in a rolling 24h. Over it, the goal parks instead of planting — the work is
+    // preserved and Kevin decides, rather than the box discovering the limit for us.
+    if (d.action === 'plan' || d.action === 'replan') {
+      const budget = Number(getSetting('autopilot_max_trees_per_day') ?? '') || 8;
+      const planted = treesPlantedSince(goalId, 24);
+      if (planted >= budget) {
+        const why = `tree budget reached — goal ${goalId} planted ${planted} trees in the last 24h (cap ${budget}). ` +
+          `Parking instead of planting another. Raise settings-KV autopilot_max_trees_per_day, or look at why this goal keeps re-planning.`;
+        console.log(`[autopilot] goal ${goalId}: ${why}`);
+        if (d.node_id) parkGoalNode(goalId, d.node_id, 'system', why);
+        noteHold(goalId, s, 'tree_budget');
+        return;
+      }
+    }
     const target = cueTargetForNode(goalId, d.node_id);
     if (await chatBusy(goalId, target)) {
       noteHold(goalId, s, 'chat_busy');

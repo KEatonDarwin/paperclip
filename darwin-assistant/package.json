@@ -29,7 +29,8 @@
     "goals:autopilot-sim": "npm run build && JARVIS_DB_PATH=/tmp/goals-autopilot-sim.db npx tsx scripts/goals-autopilot-sim.ts",
     "big-board:check": "npm run build && node scripts/big-board-check.mjs",
     "big-board:v2-fixture-check": "npm run build && node scripts/big-board-v2-fixture-check.mjs",
-    "night:sim": "npm run build && node scripts/night-shift-sim.mjs"
+    "night:sim": "npm run build && node scripts/night-shift-sim.mjs",
+    "night:check": "npm run build && bash scripts/night-shift-check.sh"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

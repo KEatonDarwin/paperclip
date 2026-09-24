@@ -3,7 +3,18 @@ import './spawn-tasks.js'; // side-effect: guarantees the spawn_tasks DDL ran be
 import { sqliteDb, getOrCreateConversation, renameConversation, setThreadModelOverride, getSetting } from './conversation-db.js';
 import { sseBus, type HopperNodeEvent } from './sse-bus.js';
 import { createNotification } from './notifications.js';
-import { governorCheck, governorStatus, kevinActive, providerFor, concurrencyCap, type GovernorProvider } from './hopper-governor.js';
+import { governorCheck, governorStatus, kevinActive, providerFor, concurrencyCap, type GovernorProvider, type GovernorVerdict } from './hopper-governor.js';
+// ⚡ THROTTLE — Kevin's dials (skills/throttle/CONTRACT.md). Every one is read
+// uncached, so a change lands on the NEXT tick with no restart.
+import {
+  hopperSlots,
+  enforceAdmissionFloor,
+  throttleCapsForTick,
+  throttleRerouteFor,
+  rerouteAuditLine,
+  notifyReroute,
+  setThrottlePausedTreesProvider,
+} from './throttle.js';
 
 // HOPPER ENGINE — the autonomous work-tree executor (designed 2026-09-06 with
 // Kevin; worker-model details hashed out in cockpit:worker-engine-design-2026-09-06).
@@ -59,6 +70,8 @@ export interface HopperNodeRow {
   adapter: string | null;
   model: string | null;
   foundry_auto_retries: number;
+  /** ⚡ THROTTLE §5.2: audit trail for a cross-provider reroute; null normally. */
+  throttle_reroute: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -68,10 +81,11 @@ export interface HopperNodeRow {
 // module-load env constant, which meant the one dial he most wanted to turn
 // required a service restart. Settings-KV wins over env; uncached, so a change
 // lands on the very next tick.
+// Delegates to throttle.ts so there is exactly ONE implementation of the dial
+// (the throttle API, the admission floor and dispatch must never disagree about
+// how many slots there are).
 function maxSlots(): number {
-  const raw = getSetting('hopper_slots')?.trim() || process.env.HOPPER_ENGINE_SLOTS;
-  const n = parseInt(raw ?? '', 10);
-  return Number.isFinite(n) && n >= 1 ? Math.min(n, 12) : 2;
+  return hopperSlots();
 }
 const LEASE_MINUTES = Math.max(5, parseInt(process.env.HOPPER_ENGINE_LEASE_MIN ?? '30', 10) || 30);
 const MAX_ATTEMPTS = 2;
@@ -184,7 +198,12 @@ sqliteDb.exec(`
 // ROUTER (phase 1, 2026-09-07): per-node model/adapter chosen by the PLANNER at
 // decomposition time — the tree-breakdown conversation IS the router brain, so
 // there's no separate scoring service. Additive columns; null = default loadout.
-for (const col of ['adapter TEXT', 'model TEXT', 'foundry_auto_retries INTEGER NOT NULL DEFAULT 0']) {
+// ⚡ THROTTLE §5.2: `throttle_reroute` makes a cross-provider rewrite auditable —
+// spawn_tasks records `model` but no `adapter`, so without this a reroute would
+// be invisible. jarvis.db is JARVIS's own local SQLite, not a Darwin production
+// database, so the eggshell rule does not apply; this is the same additive
+// ALTER TABLE pattern every trailing column in this schema used.
+for (const col of ['adapter TEXT', 'model TEXT', 'foundry_auto_retries INTEGER NOT NULL DEFAULT 0', 'throttle_reroute TEXT']) {
   try {
     sqliteDb.exec(`ALTER TABLE hopper_nodes ADD COLUMN ${col}`);
   } catch {
@@ -286,6 +305,10 @@ export function setNightShiftPausedTreesProvider(fn: PausedTreesProvider | null)
   pausedTreesProvider = fn;
 }
 const NO_PAUSED_TREES: ReadonlySet<string> = new Set<string>();
+// The throttle's status endpoint needs the same set to report a `night_paused`
+// hold. Handing it the accessor (rather than having throttle.ts import this
+// module) keeps the dependency edge one-directional.
+setThrottlePausedTreesProvider(() => pausedTreeIds());
 function pausedTreeIds(): ReadonlySet<string> {
   if (!pausedTreesProvider) return NO_PAUSED_TREES;
   try {
@@ -780,6 +803,17 @@ export async function dispatchTick(reason: string): Promise<void> {
     //    a maxed Claude window holds claude leaves while auggie/codex leaves in
     //    the same tree still dispatch (lease recovery above always runs; running
     //    workers are never interrupted). Held node = skip it, try the next.
+    //
+    // ⚡ THROTTLE §2.2 call site 2 (MANDATORY): enforce
+    // `max_concurrent_auto_turns >= hopper_slots + 2` once per tick, before
+    // `free` is computed. Slots above the admission cap produce workers that
+    // CLAIM a node, start its 30-minute lease, then block in
+    // acquireAutomatedSlot for up to 10 minutes and give up silently. Doing it
+    // here (not only on API writes) is what catches a hand-edited sqlite write,
+    // a stale value surviving a restart, or someone lowering admission out from
+    // under a running pool — and Kevin turns these dials by hand, which is the
+    // entire reason the invariant exists.
+    enforceAdmissionFloor();
     let free = maxSlots() - (runningCountStmt.get()?.n ?? 0);
     if (free <= 0) return;
     // While Kevin is active, non-Claude lanes stay open (separate plans) but
@@ -792,25 +826,93 @@ export async function dispatchTick(reason: string): Promise<void> {
       ? runningAdaptersStmt.all().filter((r) => providerFor(r.adapter ?? WORKER_ADAPTER) !== 'claude').length
       : 0;
     let cappedLogged = false;
-    const verdicts = new Map<string, boolean>(); // one governor eval per adapter per tick
+    // One governor eval per adapter per tick. Holds the whole VERDICT now (not
+    // just `allow`) because the throttle's cross-provider fallback needs the
+    // hold REASON to decide whether a reroute is even permitted.
+    const verdicts = new Map<string, GovernorVerdict>();
     // NIGHT SHIFT §4.4 — one lookup per tick; an empty set when no run is paused.
     const nightPaused = pausedTreeIds();
+    // ⚡ THROTTLE §3 — per-GOAL and per-TREE caps. Built ONCE per tick from the
+    // running nodes and then incremented IN-LOOP as nodes are claimed (exactly
+    // like daytimeRunning below): building the maps and never updating them
+    // would let six ready leaves of one goal all pass a per-goal cap of 2 inside
+    // a single tick. Both caps default to 0 = unlimited, in which case
+    // `caps.check()` is never consulted and dispatch is identical to before.
+    const caps = throttleCapsForTick();
+    let capHoldLogged = false;
     for (const node of readyLeavesStmt.all()) {
       if (free <= 0) break;
       if (nightPaused.size && nightPaused.has(node.tree_id)) continue;
       if (!depsSatisfied(node)) continue;
-      const adapter = node.adapter ?? WORKER_ADAPTER;
-      let allowed = verdicts.get(adapter);
-      if (allowed === undefined) {
-        allowed = governorCheck(adapter).allow;
-        verdicts.set(adapter, allowed);
+      let adapter = node.adapter ?? WORKER_ADAPTER;
+      let verdict = verdicts.get(adapter);
+      if (verdict === undefined) {
+        verdict = governorCheck(adapter);
+        verdicts.set(adapter, verdict);
       }
-      if (!allowed) continue;
+      if (!verdict.allow) {
+        // ⚡ THROTTLE §5 — cross-provider fallback. OFF by default, in which case
+        // this is a plain `continue` and no adapter is ever rewritten. When ON,
+        // a Claude node held on a CAPACITY reason (never usage_stale — flying
+        // blind still holds; never kevin_active — that is "his turn", not "we
+        // are out") may be rerouted to the next metered pool with headroom. The
+        // rewrite happens on a PENDING node, before claimStmt: a running worker
+        // is never re-provisioned (§5.3).
+        // §5.1 rule 5 operates on the EFFECTIVE model, not the raw column.
+        // A node with `model = null` spawns on defaultWorkerModel() — which is
+        // `hopper_worker_model`, and falls back to env HOPPER_WORKER_MODEL
+        // (claude-opus-5 on this box). Testing `node.model` raw would see an
+        // empty string, skip the frontier refusal, and silently demote an
+        // Opus-default review node onto a codex worker tier — exactly the
+        // "green review that reviewed nothing" the rule exists to prevent
+        // (review node #719).
+        const effectiveModel = node.model ?? defaultWorkerModel();
+        const outcome = throttleRerouteFor({ adapter: node.adapter, model: effectiveModel }, verdict.reason, (p) => {
+          // The provider name IS a valid adapter label (providerFor('codex') ===
+          // 'codex'), so the per-adapter verdict cache is reused as-is.
+          let v = verdicts.get(p);
+          if (v === undefined) {
+            v = governorCheck(p);
+            verdicts.set(p, v);
+          }
+          return v.allow;
+        });
+        if (outcome.kind === 'refused') {
+          console.log(
+            `[throttle] node ${node.id} reroute_refused: ${outcome.why} (model ${effectiveModel ?? 'default'}) — holding on ${verdict.reason}`,
+          );
+          continue;
+        }
+        if (outcome.kind !== 'reroute') continue;
+        const line = rerouteAuditLine('claude', outcome.provider, verdict.reason, effectiveModel, outcome.model);
+        setNode(node.id, { adapter: outcome.adapter, model: outcome.model, throttle_reroute: line });
+        console.log(`[throttle] reroute node ${node.id} ${line}`);
+        notifyReroute(node.id, outcome.provider, verdict.reason);
+        const rerouted = getNodeStmt.get(node.id);
+        if (!rerouted || rerouted.status !== 'pending') continue;
+        node.adapter = rerouted.adapter;
+        node.model = rerouted.model;
+        adapter = outcome.adapter;
+      }
       const nonClaude = providerFor(adapter) !== 'claude';
       if (daytime && nonClaude && daytimeRunning >= cap) {
         if (!cappedLogged) {
           console.log(`[hopper-engine] concurrency cap: ${daytimeRunning}/${cap} non-claude workers running while Kevin is active — holding the rest`);
           cappedLogged = true;
+        }
+        continue;
+      }
+      // ⚡ THROTTLE §3.4 — the caps sit AFTER the governor/daytime gates on
+      // purpose: a governor hold is GLOBAL ("the Claude lane is shut") while a
+      // cap is LOCAL to one goal, and reporting "per-goal cap" while the whole
+      // subscription is stopped out would send Kevin to the wrong dial.
+      // §3.5 — SKIP, never park: status stays `pending`, no attempt consumed, no
+      // notification, no lease. A sibling finishing picks it up on a later tick.
+      const capHold = caps.check(node.tree_id);
+      if (capHold) {
+        if (!capHoldLogged) {
+          console.log(`[throttle] ${capHold}: ${caps.detail(node.tree_id, capHold)} — holding node ${node.id}`);
+          capHoldLogged = true;
         }
         continue;
       }
@@ -822,6 +924,7 @@ export async function dispatchTick(reason: string): Promise<void> {
       const tree = getHopperTree(node.tree_id)!;
       free -= 1;
       if (nonClaude) daytimeRunning += 1;
+      caps.record(node.tree_id);
       console.log(`[hopper-engine] dispatch node ${node.id} (${reason}) → ${ext}`);
       void spawnWorker(fresh, tree);
     }

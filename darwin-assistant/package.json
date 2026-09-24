@@ -1,7 +1,7 @@
 {
   "name": "darwin-assistant",
   "version": "0.1.0",
-  "description": "External Darwin AI assistant \u2014 voice intake, Slack bot, full Paperclip access",
+  "description": "External Darwin AI assistant — voice intake, Slack bot, full Paperclip access",
   "private": true,
   "type": "module",
   "scripts": {
@@ -35,7 +35,10 @@
     "night:sim": "npm run build && node scripts/night-shift-sim.mjs",
     "night:check": "npm run build && bash scripts/night-shift-check.sh",
     "notepad:check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-check.db node scripts/notepad-check.mjs",
-    "notepad:sim": "npm run build && JARVIS_DB_PATH=/tmp/notepad-sim.db node scripts/notepad-sim.mjs"
+    "notepad:sim": "npm run build && JARVIS_DB_PATH=/tmp/notepad-sim.db node scripts/notepad-sim.mjs",
+    "throttle:check": "npm run build && JARVIS_DB_PATH=/tmp/throttle-check.db JARVIS_SIM=1 node scripts/throttle-check.mjs",
+    "throttle:route-check": "npm run build && JARVIS_DB_PATH=/tmp/throttle-route-check.db JARVIS_SIM=1 node scripts/throttle-route-check.mjs",
+    "throttle:sim": "npm run build && JARVIS_DB_PATH=/tmp/throttle-sim.db JARVIS_SIM=1 node scripts/throttle-sim.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

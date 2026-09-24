@@ -143,6 +143,7 @@ import { deployControl } from './deploy-control.js';
 // Side-effect of importing the tool: night-shift.ts registers the paused-tree
 // provider + the autopilot stand-down probe and starts its driver.
 import { nightShift } from './night-shift-tool.js';
+import { throttle } from './throttle-tool.js';
 
 function instrumentTool(tool: ToolDef): ToolDef {
   return {
@@ -215,6 +216,7 @@ export const ALL_TOOLS: ToolDef[] = [
   goals,
   deployControl,
   nightShift,
+  throttle,
 ].map(instrumentTool);
 
 export const TOOL_MAP: Map<string, ToolDef> = new Map(

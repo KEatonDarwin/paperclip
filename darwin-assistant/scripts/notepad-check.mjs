@@ -11,6 +11,10 @@
 //   (d) move a line to the end -> same id.
 //   (e) delete a line -> only that id disappears; everything else unchanged.
 //   (f) a 5,000-line note saves and round-trips byte-for-byte.
+//   (g) COMBINED edits in one save (delete-above + reword-below, insert-above +
+//       reword-below, two distant rewords) keep each line's OWN id — the hole
+//       ordinal leftover-pairing had, found in the node #713 review.
+//   (h) a note of thousands of identical lines stays off the O(n^2) path.
 //
 //   npm run build && JARVIS_DB_PATH=/tmp/notepad-check.db node scripts/notepad-check.mjs
 
@@ -144,6 +148,71 @@ check('empty save: day still appears in the pager (touched, not deleted)', listN
   const savedBig2 = putNotepadDay(BIG_DAY, bigLines.join('\n'));
   check('(f) reword in a 5000-line note keeps neighbor ids', savedBig2.lines[2499].id === bigIdsBefore[2499] && savedBig2.lines[2501].id === bigIdsBefore[2501]);
   check('(f) reword in a 5000-line note keeps the reworded line\'s own id', savedBig2.lines[2500].id === bigIdsBefore[2500] && savedBig2.lines[2500].text === 'REWORDED MIDDLE LINE');
+}
+
+// -- (g) COMBINED edits in ONE save: the case ordinal pairing got wrong --------
+// Regression for node #713 review. Before the fix, leftover old lines were
+// paired with leftover new lines by ordinal position, so a save that both
+// removed a line above and reworded a line below handed the reworded line the
+// REMOVED line's id (and threw away its own). Same for "insert at the top +
+// reword at the bottom": the brand-new line stole an existing id.
+{
+  const D = '2026-09-26';
+  const first = putNotepadDay(D, ['a', 'b', 'c', 'd', 'e', 'f'].join('\n'));
+  const idOf = Object.fromEntries(first.lines.map((l) => [l.text, l.id]));
+
+  // delete 'b' AND reword 'e' in the same save
+  const after = putNotepadDay(D, ['a', 'c', 'd', 'E-reworded', 'f'].join('\n'));
+  const reworded = after.lines.find((l) => l.text === 'E-reworded');
+  check("(g) delete-above + reword-below: reworded line keeps its OWN id", reworded.id === idOf.e);
+  check("(g) delete-above + reword-below: the deleted line's id is gone", !after.lines.some((l) => l.id === idOf.b));
+  check('(g) delete-above + reword-below: untouched lines keep their ids',
+    after.lines.find((l) => l.text === 'a').id === idOf.a &&
+    after.lines.find((l) => l.text === 'c').id === idOf.c &&
+    after.lines.find((l) => l.text === 'd').id === idOf.d &&
+    after.lines.find((l) => l.text === 'f').id === idOf.f);
+}
+{
+  const D = '2026-09-27';
+  const first = putNotepadDay(D, ['one', 'two', 'three', 'four'].join('\n'));
+  const idOf = Object.fromEntries(first.lines.map((l) => [l.text, l.id]));
+  const known = new Set(first.lines.map((l) => l.id));
+
+  // insert a NEW first line AND reword the last line in the same save
+  const after = putNotepadDay(D, ['NEW', 'one', 'two', 'three', 'FOUR!'].join('\n'));
+  check('(g) insert-above + reword-below: reworded line keeps its own id',
+    after.lines.find((l) => l.text === 'FOUR!').id === idOf.four);
+  check('(g) insert-above + reword-below: the inserted line gets a NEW id, not a stolen one',
+    !known.has(after.lines.find((l) => l.text === 'NEW').id));
+  check('(g) insert-above + reword-below: middle lines keep their ids',
+    after.lines.find((l) => l.text === 'one').id === idOf.one &&
+    after.lines.find((l) => l.text === 'three').id === idOf.three);
+}
+{
+  // Two far-apart rewords in one save must not swap ids with each other.
+  const D = '2026-09-28';
+  const lines = Array.from({ length: 40 }, (_, i) => `row ${i}`);
+  const first = putNotepadDay(D, lines.join('\n'));
+  const ids = first.lines.map((l) => l.id);
+  lines[3] = 'row 3 reworded';
+  lines[31] = 'row 31 reworded';
+  const after = putNotepadDay(D, lines.join('\n'));
+  check('(g) two distant rewords in one save keep their own ids',
+    after.lines[3].id === ids[3] && after.lines[31].id === ids[31]);
+  check('(g) two distant rewords leave every other id untouched',
+    after.lines.every((l, i) => l.id === ids[i]));
+}
+
+// -- (h) cost caps: a note of thousands of identical lines stays cheap --------
+{
+  const D = '2026-09-29';
+  const same = Array.from({ length: 3000 }, () => '---');
+  putNotepadDay(D, same.join('\n'));
+  const t0 = Date.now();
+  const after = putNotepadDay(D, same.concat(['---']).join('\n'));
+  const ms = Date.now() - t0;
+  check('(h) 3000 identical lines + append round-trips correctly', after.lines.length === 3001 && after.text === same.concat(['---']).join('\n'));
+  check(`(h) that save stayed off the O(n^2) path (${ms}ms < 250ms)`, ms < 250);
 }
 
 // -- days pager ----------------------------------------------------------------

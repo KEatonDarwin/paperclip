@@ -8,6 +8,12 @@ import { sqliteDb } from './conversation-db.js';
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+// Cost caps for the line diff (see applyLineDiff). Both are deliberately well
+// above any realistic single edit and only bite on a wholesale rewrite or a
+// note built almost entirely out of one repeated line.
+const PAIR_WORK_CAP = 20_000;
+const GROUP_SCAN_CAP = 20_000;
+
 export interface NotepadLine {
   id: number;
   idx: number;
@@ -111,11 +117,20 @@ export function listNotepadDays(): NotepadDaySummary[] {
  *      note, including moved to a different position) keep their id. When a
  *      trimmed text appears more than once, the nearest-index old candidate
  *      wins for each new occurrence.
- *   2. Positional reword — old lines left unconsumed by (1) are paired, in
- *      original relative order, with new lines left unmatched by (1). This is
- *      "the line at roughly this spot got reworded" — same id, new text.
+ *   2. Positional reword — old lines left unconsumed by (1) are paired with
+ *      new lines left unmatched by (1) by NEAREST INDEX (closest pairs claimed
+ *      first), not by ordinal position. Ordinal pairing looks right until one
+ *      save both deletes a line above and rewords a line below: the reworded
+ *      line then inherits the deleted line's id and its own id is destroyed.
+ *      Nearest-index pairing keeps "the line at roughly this spot got
+ *      reworded" true even when the note shifted around it.
  *   3. Anything left over on the new side is a genuine insert (new id);
  *      anything left over on the old side is a genuine delete.
+ *
+ * Both phases are cost-capped (PAIR_WORK_CAP / GROUP_SCAN_CAP): a wholesale
+ * rewrite or a note of thousands of identical lines degrades to in-order
+ * pairing — semantically identical for indistinguishable lines, and it keeps
+ * a save off the O(n^2) path that would stall the shared event loop.
  */
 function applyLineDiff(day: string, oldLines: NotepadLineRow[], newTexts: string[]): void {
   const oldGroups = new Map<string, NotepadLineRow[]>();
@@ -141,15 +156,21 @@ function applyLineDiff(day: string, oldLines: NotepadLineRow[], newTexts: string
     const candidates = oldGroups.get(key);
     if (!candidates || candidates.length === 0) continue;
     const available = candidates.slice(); // already idx-ascending
+    // Lines with identical text are interchangeable, so for a huge bucket
+    // (thousands of blank or repeated lines) in-order pairing is just as
+    // correct as nearest-index and avoids an O(n^2) scan on every autosave.
+    const scanNearest = candidates.length * newIdxs.length <= GROUP_SCAN_CAP;
     for (const newIdx of newIdxs) {
       if (available.length === 0) break;
       let bestPos = 0;
-      let bestDist = Math.abs(available[0].idx - newIdx);
-      for (let p = 1; p < available.length; p++) {
-        const dist = Math.abs(available[p].idx - newIdx);
-        if (dist < bestDist) {
-          bestDist = dist;
-          bestPos = p;
+      if (scanNearest) {
+        let bestDist = Math.abs(available[0].idx - newIdx);
+        for (let p = 1; p < available.length; p++) {
+          const dist = Math.abs(available[p].idx - newIdx);
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestPos = p;
+          }
         }
       }
       const chosen = available.splice(bestPos, 1)[0];
@@ -164,11 +185,41 @@ function applyLineDiff(day: string, oldLines: NotepadLineRow[], newTexts: string
     if (!matchedNewToOld.has(i)) leftoverNewIdxs.push(i);
   }
 
-  const rewordCount = Math.min(leftoverOld.length, leftoverNewIdxs.length);
   const rewordMap = new Map<number, NotepadLineRow>();
-  for (let i = 0; i < rewordCount; i++) rewordMap.set(leftoverNewIdxs[i], leftoverOld[i]);
-  const insertIdxs = leftoverNewIdxs.slice(rewordCount);
-  const deletes = leftoverOld.slice(rewordCount);
+  const usedOld = new Set<number>();
+  const usedNew = new Set<number>();
+
+  if (leftoverOld.length * leftoverNewIdxs.length <= PAIR_WORK_CAP) {
+    // Nearest-index pairing: build every (old, new) candidate, then claim the
+    // closest pairs first. A line reworded in place is always nearer to its
+    // own old row than to a row that was deleted somewhere else in the note.
+    const pairs: Array<[number, number, number]> = []; // [distance, oldPos, newPos]
+    for (let a = 0; a < leftoverOld.length; a++) {
+      for (let b = 0; b < leftoverNewIdxs.length; b++) {
+        pairs.push([Math.abs(leftoverOld[a].idx - leftoverNewIdxs[b]), a, b]);
+      }
+    }
+    // Ties resolve by original order so the result is fully deterministic.
+    pairs.sort((x, y) => x[0] - y[0] || x[1] - y[1] || x[2] - y[2]);
+    for (const [, a, b] of pairs) {
+      if (usedOld.has(a) || usedNew.has(b)) continue;
+      usedOld.add(a);
+      usedNew.add(b);
+      rewordMap.set(leftoverNewIdxs[b], leftoverOld[a]);
+    }
+  } else {
+    // Wholesale rewrite — nothing is "roughly in the same spot", so pair in
+    // order and keep the save cheap.
+    const rewordCount = Math.min(leftoverOld.length, leftoverNewIdxs.length);
+    for (let i = 0; i < rewordCount; i++) {
+      rewordMap.set(leftoverNewIdxs[i], leftoverOld[i]);
+      usedOld.add(i);
+      usedNew.add(i);
+    }
+  }
+
+  const insertIdxs = leftoverNewIdxs.filter((_, b) => !usedNew.has(b));
+  const deletes = leftoverOld.filter((_, a) => !usedOld.has(a));
 
   for (const line of deletes) deleteLineStmt.run(line.id);
 

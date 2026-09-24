@@ -112,6 +112,11 @@ export interface NightRunConfig {
   predicted_children: number;
   predicted_nodes: number;
   kevin_active_bypass: boolean;
+  /** REVIEW (node #682) — minutes before an unanswered model cue is re-asked,
+   *  and again before it is failed + parked. Mirrors autopilot's tick_minutes
+   *  re-ask window (goals-autopilot.ts §15.4); without it a cue the orchestrator
+   *  never answers holds its lane for the whole night. */
+  recue_minutes: number;
 }
 
 export const NIGHT_EST_DEFAULTS: NightEstConfig = {
@@ -131,6 +136,7 @@ export const NIGHT_DEFAULTS: NightRunConfig = {
   predicted_children: 3,
   predicted_nodes: 4,
   kevin_active_bypass: true,
+  recue_minutes: 10,
 };
 
 export interface PriorAutopilotEntry { autopilot: 0 | 1; config: AutopilotConfig | null }
@@ -417,6 +423,7 @@ export function normalizeNightConfig(input: unknown, base?: NightRunConfig | nul
   out.per_goal_parallel = intIn(o.per_goal_parallel, 1, 3, 'per_goal_parallel', b.per_goal_parallel);
   out.predicted_children = intIn(o.predicted_children, 1, 10, 'predicted_children', b.predicted_children);
   out.predicted_nodes = intIn(o.predicted_nodes, 1, 10, 'predicted_nodes', b.predicted_nodes);
+  out.recue_minutes = intIn(o.recue_minutes, 1, 120, 'recue_minutes', b.recue_minutes);
   if (o.kevin_active_bypass !== undefined) out.kevin_active_bypass = !!o.kevin_active_bypass;
   for (const key of ['build_model', 'light_model', 'verify_model'] as const) {
     if (o[key] === undefined) continue;
@@ -904,7 +911,7 @@ export function planNight(input: {
 /** §6.2 — the one place a model touches the order before Start. Never blocks it. */
 function postPlanReadyCue(run: NightRunRow, items: NightItemRow[], etaEnd: string | null): void {
   try {
-    ensureNightThread();
+    seedNightThreadIfNew();
     const top = items.slice(0, 12).map((it) => `#${it.position} G${it.goal_id} ${it.node_id != null ? `#${it.node_id} ` : ''}${it.title} · ${it.kind} · ${it.est_minutes}m — ${it.why}`);
     const text = [
       `[night-shift PLAN READY run #${run.id} — ${items.length} items, est until ${ctTime(etaEnd)}]`,
@@ -986,28 +993,40 @@ export function nightEtaEnd(runId: number): string | null {
 // Position surgery — §3.3 / §12.12: locked rows keep their ABSOLUTE position
 // ---------------------------------------------------------------------------
 
-/** Shift open rows down one slot from `from` (inclusive), skipping locked rows:
- *  an insertion lands AFTER a locked occupant instead of displacing it. */
-function makeRoom(runId: number, from: number, count: number): number {
-  let target = from;
+/** Open `count` slots for new rows at/after `from`, honouring §12.12: a LOCKED
+ *  row keeps its ABSOLUTE position, unlocked rows slide down around it, and the
+ *  list stays contiguous 1..N+count. Returns the positions the new rows take.
+ *
+ *  REVIEW (node #682) — the previous version bumped `position + count` on every
+ *  unlocked row at/after the target and then `renumber()`d the whole list, which
+ *  (a) COLLIDED a shifted row onto a locked row sitting further down and (b)
+ *  then moved that locked row anyway when renumber re-packed by (position, id).
+ *  Building the final slot order in memory is both correct and simpler. */
+function makeRoom(runId: number, from: number, count: number): number[] {
   const items = listNightItems(runId);
-  // Walk past any locked item sitting exactly at the insertion point.
-  for (;;) {
-    const occupant = items.find((i) => i.position === target);
-    if (occupant?.locked) { target += 1; continue; }
-    break;
+  const total = items.length + count;
+  const locked = new Map<number, NightItemRow>();
+  const unlocked: NightItemRow[] = [];
+  for (const it of items) {
+    if (it.locked && !locked.has(it.position)) locked.set(it.position, it);
+    else unlocked.push(it);
   }
-  sqliteDb.prepare(
-    `UPDATE night_items SET position = position + ?, updated_at = datetime('now')
-     WHERE run_id = ? AND position >= ? AND locked = 0`,
-  ).run(count, runId, target);
-  return target;
-}
+  // Walk past any locked occupant sitting exactly at the insertion point.
+  let target = Math.max(1, Math.min(from, total));
+  while (locked.has(target)) target += 1;
 
-function renumber(runId: number): void {
-  const items = listNightItems(runId);
-  const upd = sqliteDb.prepare(`UPDATE night_items SET position = ? WHERE id = ?`);
-  items.forEach((it, i) => { if (it.position !== i + 1) upd.run(i + 1, it.id); });
+  const holes: number[] = [];
+  const upd = sqliteDb.prepare(`UPDATE night_items SET position = ?, updated_at = datetime('now') WHERE id = ?`);
+  let holesLeft = count;
+  let ui = 0;
+  for (let pos = 1; pos <= total; pos += 1) {
+    const lk = locked.get(pos);
+    if (lk) { if (lk.position !== pos) upd.run(pos, lk.id); continue; }
+    if (pos >= target && holesLeft > 0) { holes.push(pos); holesLeft -= 1; continue; }
+    if (ui < unlocked.length) { const it = unlocked[ui]; ui += 1; if (it.position !== pos) upd.run(pos, it.id); continue; }
+    holes.push(pos); holesLeft -= 1;
+  }
+  return holes;
 }
 
 interface InsertSpec {
@@ -1020,21 +1039,20 @@ function insertAfter(run: NightRunRow, afterItemId: number | null, specs: Insert
   if (!specs.length) return [];
   const anchor = afterItemId != null ? getItem(afterItemId) : null;
   const from = anchor ? anchor.position + 1 : listNightItems(run.id).length + 1;
-  const target = makeRoom(run.id, from, specs.length);
+  const holes = makeRoom(run.id, from, specs.length);
   const insert = sqliteDb.prepare(
     `INSERT INTO night_items (run_id, position, goal_id, node_id, parent_item_id, kind, title, why, est_minutes, attempt)
      VALUES (?,?,?,?,?,?,?,?,?,?)`,
   );
   const out: NightItemRow[] = [];
   specs.forEach((s, i) => {
-    const info = insert.run(run.id, target + i, s.goal_id, s.node_id, s.parent_item_id ?? null,
+    const info = insert.run(run.id, holes[i], s.goal_id, s.node_id, s.parent_item_id ?? null,
       s.kind, s.title.slice(0, 300), s.why, Math.max(1, Math.round(s.est_minutes)), s.attempt ?? 1);
     const row = getItem(Number(info.lastInsertRowid))!;
     out.push(row);
     emitItem('created', row);
     insertNightEvent(run.id, row.id, 'system', 'item_inserted', `#${row.position} ${row.kind} — ${row.title}`, { after: afterItemId, kind: row.kind });
   });
-  renumber(run.id);
   resimulateEtas(getNightRun(run.id)!);
   return out.map((r) => getItem(r.id)!);
 }
@@ -1164,6 +1182,24 @@ export function ensureNightThread(): { external_id: string; created: boolean; se
 }
 export const getOrCreateNightThread = ensureNightThread;
 
+/** REVIEW (node #682) — seed the thread the moment WE create it.
+ *
+ *  `ensureNightThread()` only RETURNS the seed text; the cockpit posts it on
+ *  first open. But `planNight` / `startNightRun` both create the thread too —
+ *  so a night planned from the tool or a curl (no /night tab open) got a
+ *  PLAN-READY cue in a thread with no persona at all, and the UI, seeing
+ *  `created:false` later, would never seed it. Same failure as the un-seeded
+ *  goal-1 chat. Posting it as a cue is idempotent by construction: it only ever
+ *  fires on the turn the conversation is born. */
+function seedNightThreadIfNew(): void {
+  try {
+    const t = ensureNightThread();
+    if (t.created && t.seed_text) postCue(NIGHT_THREAD_EXT, t.seed_text, 'night:seed', 'night-shift');
+  } catch (err) {
+    console.error('[night-shift] orchestrator seed failed', err);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // §2.1 Run lifecycle
 // ---------------------------------------------------------------------------
@@ -1228,7 +1264,7 @@ export function startNightRun(runId: number, actor: 'kevin' | 'jarvis' = 'kevin'
       console.warn(`[night-shift] could not adopt goal #${gid} onto autopilot:`, err instanceof Error ? err.message : err);
     }
   }
-  ensureNightThread();
+  seedNightThreadIfNew();
   registerCommitment(updated);
   insertNightEvent(runId, null, actor, 'run_started',
     `Night run #${runId} started (${updated.mode}, ${updated.config.lanes} lanes, ${updated.goal_ids.length} goals).`,
@@ -1507,6 +1543,24 @@ function syncItems(run: NightRunRow): void {
       }
       if (derived.state === 'done') { finishItem(run, fresh, 'done', 'node verified done'); continue; }
       if (derived.state === 'parked') { finishItem(run, fresh, 'failed', node.parked_reason ?? 'node parked'); continue; }
+      // REVIEW (node #682) — the plan was approved but the tree never planted:
+      // the planner's rule 4 case, reached mid-run. Settle the item and let the
+      // `replant` server kind retry it, instead of holding the lane forever.
+      if (derived.state === 'planned') {
+        finishItem(run, fresh, 'done', 'plan approved but the tree never planted');
+        insertAfter(run, fresh.id, [{
+          goal_id: item.goal_id, node_id: item.node_id, kind: 'replant', title: node.title,
+          est_minutes: cfg.est.replant, attempt: fresh.attempt,
+          why: `inserted after #${fresh.position} — plan approved, tree never planted`,
+        }]);
+        continue;
+      }
+      // REVIEW (node #682) — `finish` items ARE a running tree, so they wait;
+      // a plan/replan whose node is still an untouched `set` leaf means the cue
+      // itself went unanswered. Re-ask, then fail + park.
+      if (item.kind !== 'finish' && derived.state === 'set' && node.plan_state === 'none') {
+        nagOrFail(run, fresh, item.kind);
+      }
       continue; // still working
     }
 
@@ -1523,35 +1577,60 @@ function syncItems(run: NightRunRow): void {
         expandPredicted(run, fresh);
         continue;
       }
-      failIfIgnored(run, fresh, 'decompose');
+      nagOrFail(run, fresh, 'decompose');
       continue;
     }
     if (item.kind === 'classify') {
       if (node.leaf_kind !== 'none' || node.state === 'parked') { finishItem(run, fresh, 'done', `leaf_kind=${node.leaf_kind}, state=${node.state}`); continue; }
-      failIfIgnored(run, fresh, 'classify');
+      nagOrFail(run, fresh, 'classify');
       continue;
     }
     if (item.kind === 'weigh_in') {
       if (node.review_state !== 'awaiting_jarvis') { finishItem(run, fresh, 'done', `review_state=${node.review_state}`); continue; }
-      failIfIgnored(run, fresh, 'weigh_in');
+      nagOrFail(run, fresh, 'weigh_in');
       continue;
     }
     if (item.kind === 'unblock') {
       if (node.state === 'parked') { finishItem(run, fresh, 'failed', node.parked_reason ?? 'parked during the unblock pass'); continue; }
       if (derived.cache !== 'blocked') { finishItem(run, fresh, 'done', `tree ${derived.tree_id ?? '?'} is no longer blocked`); continue; }
-      failIfIgnored(run, fresh, 'unblock');
+      nagOrFail(run, fresh, 'unblock');
       continue;
     }
   }
 }
 
-/** A cue posted twice with no proof → the item failed and the node is parked. */
-function failIfIgnored(run: NightRunRow, item: NightItemRow, kind: string): void {
-  if (cueCount(item.id) < 2) return;
-  const spent = elapsedMinutes(item.started_at, nowMs());
-  if (spent < Math.max(2, item.est_minutes)) return;
-  finishItem(run, item, 'failed', `${kind} cue ignored twice`);
-  parkNode(run, item, `night shift: ${kind} cue ignored twice`);
+/** When did we last put a cue for this item into the orchestrator thread? */
+function lastCueAtMs(item: NightItemRow): number {
+  const row = sqliteDb.prepare(
+    `SELECT created_at FROM night_events WHERE item_id = ? AND kind = 'item_started' ORDER BY id DESC LIMIT 1`,
+  ).get(item.id) as { created_at: string } | undefined;
+  return sqliteToMs(row?.created_at) ?? sqliteToMs(item.started_at) ?? nowMs();
+}
+
+/** REVIEW (node #682) — THE re-ask window, mirroring autopilot §15.4.
+ *
+ *  Before this, a model-kind item went `running` exactly once and was NEVER
+ *  cued again: `fillLanes` only ever picks `queued` rows, so `secondAsk` could
+ *  not become true and the contract's "cue posted twice and still no proof →
+ *  fail + park" (§4.1) was unreachable. An orchestrator turn that died, was
+ *  dropped, or simply did not do the step held its lane until morning — three
+ *  of those and the whole night was silently over with the driver reporting
+ *  "running". Now: no proof after `recue_minutes` → ask once more (second ask);
+ *  still nothing after another `recue_minutes` → fail the item and park the
+ *  node, which frees the lane and surfaces it in the morning report. */
+function nagOrFail(run: NightRunRow, item: NightItemRow, kind: string): void {
+  const waited = Math.max(0, Math.round((nowMs() - lastCueAtMs(item)) / 60_000));
+  if (waited < run.config.recue_minutes) return;
+  if (cueCount(item.id) >= 2) {
+    finishItem(run, item, 'failed', `${kind} cue ignored twice`);
+    parkNode(run, item, `night shift: ${kind} cue ignored twice`);
+    return;
+  }
+  const trees = new Map<number, GoalTree>();
+  const tree = getGoalTree(item.goal_id);
+  if (!tree) { finishItem(run, item, 'failed', 'goal tree is gone'); return; }
+  trees.set(item.goal_id, tree);
+  runModelItem(run, item, item.lane ?? 1, listNightItems(run.id).length, trees);
 }
 
 /** §2.2 predicted→expanded: the real children take the placeholder's block. */
@@ -1585,6 +1664,12 @@ function expandPredicted(run: NightRunRow, decomposeItem: NightItemRow): void {
 
 export interface NightHold { reason: string; detail: string }
 
+/** Governor holds that mean "the subscription is spent", not "wait a while". */
+const BUDGET_EXHAUSTED_HOLDS: ReadonlySet<string> = new Set([
+  'governor:claude_all_accounts_full',
+  'governor:weekly_ceiling',
+]);
+
 export function nightHoldReason(run: NightRunRow, logging = false): NightHold | null {
   if (getSetting(SETTING_ENABLED) === '0') return { reason: 'disabled', detail: 'settings-KV night_shift_enabled = 0' };
   if (fs.existsSync(NIGHT_STOP_FILE)) return { reason: 'stop_file', detail: NIGHT_STOP_FILE };
@@ -1610,7 +1695,9 @@ function runnable(run: NightRunRow, item: NightItemRow, running: NightItemRow[],
   if (blocking.length) return { ok: false, why: `waits on #${blocking[0].id} ${blocking[0].title}`.slice(0, 160) };
   if (isServerKind(item.kind)) return { ok: true, why: '' };          // §12.4 — no lane, no caps
   if (item.kind === 'finish') return { ok: true, why: '' };           // §12.7 — already running
-  const par = goalParallel(getRawGoal(item.goal_id)!, run.config);
+  const goalRow = getRawGoal(item.goal_id);
+  if (!goalRow) return { ok: false, why: 'goal is gone' };
+  const par = goalParallel(goalRow, run.config);
   const busy = running.filter((r) => r.goal_id === item.goal_id && r.kind !== 'finish');
   if (busy.length >= par) return { ok: false, why: `goal #${item.goal_id} already at its parallel cap (${par})` };
   const mine = topAncestorId(ix, node.id);
@@ -1765,7 +1852,13 @@ export async function tickNightShift(reason = 'loop'): Promise<void> {
     const hold = nightHoldReason(after, true);
     if (hold) {
       noteHold(after, hold.reason, hold.detail);
-      if (after.mode === 'until_budget' && hold.reason === 'governor:claude_all_accounts_full') {
+      // REVIEW (node #682) — `claude_all_accounts_full` is the MULTI-account
+      // verdict only; with a single enabled account (B disabled, say) the
+      // governor says `weekly_ceiling` instead and `until_budget` would have run
+      // until morning regardless. `five_hour_ceiling` is deliberately NOT here —
+      // that window resets, it is the pacing loop, not the end of the budget —
+      // and neither is `usage_stale`/`kevin_active`, which are transient.
+      if (after.mode === 'until_budget' && BUDGET_EXHAUSTED_HOLDS.has(hold.reason)) {
         stopNightRun(after.id, 'budget', 'system');
       }
       return;
@@ -1961,9 +2054,11 @@ function needsYouFor(run: NightRunRow | null): NightNeedsYou[] {
     if (!tree || !goal) continue;
     const live = tree.nodes.filter((n) => n.state !== 'discarded');
     for (const n of live) {
-      if (n.state === 'set' && n.leaf_kind === 'human') out.push({ goal_id: gid, node_id: n.id, title: n.title, reason: 'human' });
-      else if (n.state === 'parked') out.push({ goal_id: gid, node_id: n.id, title: n.title, reason: 'parked' });
+      // One row per node — a parked node that is ALSO awaiting a weigh-in used
+      // to appear twice in Kevin's morning queue.
       if (n.review_state === 'awaiting_jarvis') out.push({ goal_id: gid, node_id: n.id, title: n.title, reason: 'awaiting_weigh_in' });
+      else if (n.state === 'set' && n.leaf_kind === 'human') out.push({ goal_id: gid, node_id: n.id, title: n.title, reason: 'human' });
+      else if (n.state === 'parked') out.push({ goal_id: gid, node_id: n.id, title: n.title, reason: 'parked' });
     }
     if (live.length && live.every((n) => n.state === 'done' || n.state === 'parked' || (n.state === 'check' && n.parent_id == null))) {
       out.push({ goal_id: gid, node_id: null, title: goal.title, reason: 'root_ready_to_verify' });
@@ -2134,6 +2229,8 @@ export function buildNightShiftReport(runId: number): { markdown: string; path: 
 // ---------------------------------------------------------------------------
 
 const NIGHT_CUE_HEADER = /^\[night item #(\d+) of (\d+) · lane (\d+)\]/;
+/** The autopilot header composeCueText puts on line 2 — the authoritative goal id. */
+const AUTOPILOT_CUE_HEADER = /^\[autopilot goal #(\d+) — /m;
 
 /** Does this turn input look like one of our own cues? Returns the item id. */
 export function nightCueItem(turnInput: string | undefined): NightItemRow | null {
@@ -2142,7 +2239,18 @@ export function nightCueItem(turnInput: string | undefined): NightItemRow | null
   if (!m) return null;
   const run = latestNightRun();
   if (!run) return null;
-  return listNightItems(run.id).find((i) => i.position === Number(m[1])) ?? null;
+  const items = listNightItems(run.id);
+  // REVIEW (node #682) — `position` is MUTABLE (an insert or a Kevin move
+  // re-packs the list), and a cue can sit in the thread queue behind another
+  // turn, so matching on position alone could hand the orchestrator a DIFFERENT
+  // goal's tree than the one its cue names. The autopilot header on line 2 is
+  // immutable, so prefer it and fall back to position.
+  const g = AUTOPILOT_CUE_HEADER.exec(turnInput);
+  const byPos = items.find((i) => i.position === Number(m[1])) ?? null;
+  if (!g) return byPos;
+  const goalId = Number(g[1]);
+  if (byPos && byPos.goal_id === goalId) return byPos;
+  return items.find((i) => i.goal_id === goalId && i.status === 'running') ?? byPos;
 }
 
 export function nightShiftContextBlock(externalId: string, turnInput?: string): string {
@@ -2173,10 +2281,15 @@ export function nightShiftContextBlock(externalId: string, turnInput?: string): 
     let out = `${lines.join('\n')}\n`;
     // On a cue turn, hand the model the cued goal's tree with the SAME markers
     // a goal chat gets (§6.1) — that is what makes the `goals` tool usable here.
+    // The goal the cue NAMES always wins over the item we matched (see
+    // nightCueItem) — the snapshot must never describe a different goal.
+    const body = turnInput ? turnInput.split('\n').slice(1).join('\n') : undefined;
+    const named = turnInput && NIGHT_CUE_HEADER.test(turnInput.trimStart())
+      ? AUTOPILOT_CUE_HEADER.exec(turnInput) : null;
     const cued = nightCueItem(turnInput);
-    if (cued) {
-      const body = turnInput ? turnInput.split('\n').slice(1).join('\n') : undefined;
-      out += renderGoalTreeSnapshot(cued.goal_id, { turn_input: body, include_node_chats: false });
+    const cuedGoalId = named ? Number(named[1]) : cued?.goal_id ?? null;
+    if (cuedGoalId != null) {
+      out += renderGoalTreeSnapshot(cuedGoalId, { turn_input: body, include_node_chats: false });
     }
     return out;
   } catch (err) {

@@ -783,6 +783,94 @@ await check('NS-23', '§8.2 stats: buildNightStats parses a commit-sha token nea
   await post(`/night/runs/${statsRunId}/stop`, {});
 });
 
+// ── REVIEW (node #682) — the two defects the review found, pinned ─────────
+
+await check('NS-24', 'an unanswered model cue is RE-ASKED after recue_minutes and then fails + parks the node, freeing its lane (it used to hold the lane until morning)', async () => {
+  const gNag = await mkGoal('Sim goal nag', 'its one unclassified node gets decided');
+  const nagNode = await mkNode(gNag, 'N1 node nobody answers for');
+  await acceptNode(gNag, nagNode);
+  const planned = await post('/night/plan', { mode: 'until_stop', goal_ids: [gNag], config: { lanes: 1, recue_minutes: 5 } });
+  assert.equal(planned.status, 200, JSON.stringify(planned.json));
+  const nagRun = planned.json.run.id;
+  assert.equal(night.getNightRun(nagRun).config.recue_minutes, 5, 'recue_minutes did not round-trip through the config');
+  assert.equal((await post(`/night/runs/${nagRun}/start`, {})).status, 200);
+
+  await tick('nag-fill');
+  const item = itemsOf(nagRun).find((i) => i.node_id === nagNode && i.status === 'running');
+  assert.ok(item, 'the decompose item never started');
+  assert.equal(itemCues(nagRun, item.id).length, 1, 'expected exactly one cue so far');
+
+  // Nothing happens for less than the window: no nag.
+  const t0 = Date.now();
+  night.__setNightShiftTestOverrides({ governor: () => ({ allow: true, reason: 'ok', detail: 'sim' }), now: () => t0 + 2 * 60_000 });
+  await tick('nag-too-soon');
+  assert.equal(itemCues(nagRun, item.id).length, 1, 're-asked before recue_minutes had elapsed');
+  assert.equal(itemsOf(nagRun).find((i) => i.id === item.id).status, 'running');
+
+  // Past the window → ONE second ask, same lane, same item.
+  night.__setNightShiftTestOverrides({ governor: () => ({ allow: true, reason: 'ok', detail: 'sim' }), now: () => t0 + 6 * 60_000 });
+  await tick('nag-second-ask');
+  const cues = itemCues(nagRun, item.id);
+  assert.equal(cues.length, 2, `expected a second ask, got ${cues.length} cue(s)`);
+  assert.match(cues[1].text.split('\n')[1], /\(second ask\)$/, cues[1].text.split('\n')[1]);
+  const midway = itemsOf(nagRun).find((i) => i.id === item.id);
+  assert.equal(midway.status, 'running', 'the item should still be running after the second ask');
+  assert.equal(midway.lane, item.lane, 'the second ask jumped lanes');
+
+  // Still ignored → fail + park, and the lane comes back.
+  night.__setNightShiftTestOverrides({ governor: () => ({ allow: true, reason: 'ok', detail: 'sim' }), now: () => t0 + 20 * 60_000 });
+  await tick('nag-fail');
+  const done = itemsOf(nagRun).find((i) => i.id === item.id);
+  assert.equal(done.status, 'failed', `expected the ignored item to fail, got ${done.status}`);
+  assert.match(done.result_summary ?? '', /ignored twice/);
+  assert.equal(done.lane, null, 'a failed item still holds its lane');
+  assert.equal((await nodeById(gNag, nagNode)).state, 'parked', 'the node was not parked after two ignored cues');
+  assert.equal(itemCues(nagRun, item.id).length, 2, 'a third cue was posted');
+
+  night.__setNightShiftTestOverrides({ governor: () => ({ allow: true, reason: 'ok', detail: 'sim' }) });
+  await post(`/night/runs/${nagRun}/stop`, {});
+});
+
+await check('NS-25', '§12.12: a locked row keeps its ABSOLUTE position when an insertion above it would have collided with it, and the list stays contiguous', async () => {
+  const lockGoals = [];
+  for (let i = 1; i <= 5; i += 1) {
+    const g = await mkGoal(`Sim goal lock-${i}`, 'its one leaf lands');
+    const leaf = await mkNode(g, `L${i} leaf`, { leaf_kind: 'machine' });
+    await acceptNode(g, leaf);
+    lockGoals.push(g);
+  }
+  const spare = await mkGoal('Sim goal lock-spare', 'two extra leaves to insert');
+  const s1 = await mkNode(spare, 'S1 spare leaf', { leaf_kind: 'machine' });
+  const s2 = await mkNode(spare, 'S2 spare leaf', { leaf_kind: 'machine' });
+  await acceptNode(spare, s1);
+  await acceptNode(spare, s2);
+
+  const planned = await post('/night/plan', { mode: 'until_stop', goal_ids: lockGoals, config: { lanes: 1 } });
+  assert.equal(planned.status, 200, JSON.stringify(planned.json));
+  const lockRun = planned.json.run.id;
+  assert.equal(itemsOf(lockRun).length, 5, `expected 5 items, got ${itemsOf(lockRun).length}`);
+
+  // Lock the row at position 5 — the one an insert at #3 would have run into.
+  const tail = itemAt(lockRun, 5);
+  assert.equal((await post(`/night/runs/${lockRun}/items/${tail.id}/move`, { position: 5 })).status, 200);
+  assert.equal(itemsOf(lockRun).find((i) => i.id === tail.id).locked, 1, 'move did not lock the row');
+
+  const anchorItem = itemAt(lockRun, 2);
+  for (const nodeId of [s1, s2]) {
+    const added = await post(`/night/runs/${lockRun}/items`, { goal_id: spare, node_id: nodeId, after_item_id: anchorItem.id });
+    assert.equal(added.status, 201, JSON.stringify(added.json));
+  }
+
+  const after = itemsOf(lockRun);
+  assert.equal(after.length, 7, `expected 7 items after two inserts, got ${after.length}`);
+  assert.equal(after.find((i) => i.id === tail.id).position, 5, 'the locked row did not keep its absolute position through the insertion');
+  const positions = after.map((i) => i.position);
+  assert.equal(positions.join(','), positions.map((_, idx) => idx + 1).join(','), `positions are not contiguous 1..N: ${positions.join(',')}`);
+  assert.equal(new Set(positions).size, positions.length, 'two rows share a position');
+  const inserted = after.filter((i) => i.goal_id === spare).map((i) => i.position).sort((x, y) => x - y);
+  assert.equal(inserted.join(','), '3,4', `inserted rows landed at ${inserted.join(',')}, expected 3,4`);
+});
+
 } catch (err) {
   console.error('\n[night-sim] FATAL', err);
   results.push({ id: 'FATAL', description: 'sim crashed', pass: false, error: String(err?.stack ?? err) });

@@ -58,7 +58,7 @@ let nightOwns: NightOwnsFn | null = null;
 export function registerNightShiftOwnership(fn: NightOwnsFn | null): void {
   nightOwns = fn;
 }
-function nightShiftOwnsGoal(goalId: number): boolean {
+export function nightShiftOwnsGoal(goalId: number): boolean {
   if (!nightOwns) return false;
   try { return nightOwns(goalId); } catch { return false; }
 }

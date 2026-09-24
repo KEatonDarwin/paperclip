@@ -827,7 +827,9 @@ export function planNight(input: {
   }
   const cfg = normalizeNightConfig(input.config);
   const mode: NightRunMode = input.mode === 'until_budget' ? 'until_budget' : 'until_stop';
-  const at = nowMs();
+  // §3.4 — the lane sim runs at minute resolution, so the anchor is the top of
+  // the current minute (two plans in the same minute are byte-identical).
+  const at = Math.floor(nowMs() / 60_000) * 60_000;
   const goals = scopeGoals(input.goal_ids);
   const needsYou: NightNeedsYou[] = [];
   const trees = new Map<number, GoalTree>();
@@ -940,7 +942,7 @@ export function resimulateEtas(run: NightRunRow): string | null {
   for (const it of items) {
     if (!OPEN_STATUSES.has(it.status) && it.node_id != null) ctx.settledAt.set(it.node_id, 0);
   }
-  const at = nowMs();
+  const at = Math.floor(nowMs() / 60_000) * 60_000;   // minute resolution, like planNight
   const draftById = new Map<number, ItemDraft>();
   const open = items.filter((it) => OPEN_STATUSES.has(it.status));
   const rows: SimRow[] = [];

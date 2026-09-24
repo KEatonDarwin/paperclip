@@ -1,6 +1,10 @@
 import { Router, type Request } from "express";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
+
+const execFileAsync = promisify(execFile);
 import type { Db } from "@paperclipai/db";
 import { agents as agentsTable, companies, heartbeatRuns } from "@paperclipai/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
@@ -2605,6 +2609,64 @@ export function agentRoutes(db: Db) {
     const password = typeof req.body.password === "string" ? req.body.password : "";
     const valid = await chats.checkPassword(chatId, agent.companyId, password);
     res.json({ valid });
+  });
+
+  router.post("/agents/:id/chats/:chatId/generate-title", async (req, res) => {
+    const id = req.params.id as string;
+    const chatId = req.params.chatId as string;
+    const agent = await svc.getById(id);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    assertCompanyAccess(req, agent.companyId);
+    assertBoard(req);
+
+    const chat = await chats.getChat(chatId, agent.companyId);
+    if (!chat) {
+      res.status(404).json({ error: "Chat not found" });
+      return;
+    }
+
+    const messages = await chats.getMessages(chatId, agent.companyId);
+    const visibleMessages = messages
+      .filter((m) => m.role !== "system")
+      .slice(0, 6)
+      .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.body.slice(0, 300)}`)
+      .join("\n\n");
+
+    if (!visibleMessages) {
+      res.status(422).json({ error: "No messages to generate title from" });
+      return;
+    }
+
+    let title: string;
+    try {
+      const result = await execFileAsync(
+        "claude",
+        [
+          "--print",
+          "--model", "haiku",
+          "--output-format", "text",
+          "--no-session-persistence",
+          `Generate a short, descriptive title (3-7 words) for this chat conversation. Return ONLY the title text, no quotes, no punctuation at the end.\n\n${visibleMessages}`,
+        ],
+        { timeout: 30_000 },
+      );
+      title = result.stdout.trim().replace(/^["']|["']$/g, "").slice(0, 80);
+    } catch (err) {
+      console.error("[generate-title] claude CLI error:", err);
+      res.status(500).json({ error: "Failed to generate title" });
+      return;
+    }
+
+    if (!title) {
+      res.status(500).json({ error: "Empty title generated" });
+      return;
+    }
+
+    const updated = await chats.updateChat(chatId, agent.companyId, { title });
+    res.json(updated);
   });
 
   // Agent Groups CRUD — /companies/:companyId/agent-groups

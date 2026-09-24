@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Archive, Edit2, Check, X, Lock, LockOpen } from "lucide-react";
+import { Plus, Archive, Edit2, Check, X, Lock, LockOpen, Sparkles, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "../lib/utils";
@@ -14,6 +14,13 @@ interface AgentChatSessionSidebarProps {
   onSelect: (chatId: string) => void;
   onNew: () => void;
   onToggleLock?: (chat: AgentChat) => void;
+}
+
+const STOCK_TITLE_RE = /^(Slack|Cockpit) - \S+/i;
+
+function isStockTitle(title: string | null): boolean {
+  if (!title) return true;
+  return STOCK_TITLE_RE.test(title);
 }
 
 function relativeDate(isoStr: string) {
@@ -42,6 +49,7 @@ export function AgentChatSessionSidebar({
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
+  const [isGeneratingTitles, setIsGeneratingTitles] = useState(false);
 
   const updateChat = useMutation({
     mutationFn: (input: { chatId: string; data: { title?: string; status?: "archived" } }) =>
@@ -68,10 +76,49 @@ export function AgentChatSessionSidebar({
     if (selectedChatId === chatId) onNew();
   };
 
+  const handleGenerateAllTitles = useCallback(async () => {
+    const activeChats = chats.filter((c) => c.status === "active");
+    const untitled = activeChats.filter((c) => isStockTitle(c.title));
+    if (untitled.length === 0 || isGeneratingTitles) return;
+
+    setIsGeneratingTitles(true);
+    try {
+      for (const chat of untitled) {
+        try {
+          await chatsApi.generateTitle(agentId, chat.id);
+          queryClient.invalidateQueries({ queryKey: queryKeys.chats.list(agentId) });
+        } catch {
+          // skip failures, continue with next
+        }
+      }
+    } finally {
+      setIsGeneratingTitles(false);
+    }
+  }, [agentId, chats, isGeneratingTitles, queryClient]);
+
   const activeChats = chats.filter((c) => c.status === "active");
+
+  const untitledCount = activeChats.filter((c) => isStockTitle(c.title)).length;
 
   return (
     <div className="flex flex-col h-full border-r border-border min-w-0">
+      {untitledCount > 0 && (
+        <div className="px-2 py-1.5 border-b border-border/50 shrink-0">
+          <button
+            title={isGeneratingTitles ? "Generating titles…" : `Generate titles for ${untitledCount} untitled chat${untitledCount === 1 ? "" : "s"}`}
+            disabled={isGeneratingTitles}
+            onClick={handleGenerateAllTitles}
+            className="flex items-center gap-1.5 w-full px-2 py-1 rounded text-xs text-muted-foreground hover:text-foreground hover:bg-accent transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isGeneratingTitles ? (
+              <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+            ) : (
+              <Sparkles className="h-3 w-3 shrink-0" />
+            )}
+            <span>{isGeneratingTitles ? "Generating titles…" : `Generate ${untitledCount} title${untitledCount === 1 ? "" : "s"}`}</span>
+          </button>
+        </div>
+      )}
       <div className="flex-1 overflow-y-auto">
         {activeChats.length === 0 && (
           <p className="text-xs text-muted-foreground px-3 py-4">No sessions yet. Start a new chat.</p>

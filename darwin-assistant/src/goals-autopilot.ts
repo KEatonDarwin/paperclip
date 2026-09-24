@@ -114,9 +114,15 @@ export function parseVerdict(resultText: string | null | undefined, hopperStatus
       .filter((g) => g.length > 0);
     if (gaps.length === 1 && /^none\.?$/i.test(gaps[0])) gaps = [];
   }
+  // A PASS that also lists gaps is a PASS. This used to flip to FAIL, which cost
+  // real money on 2026-09-23: nodes #49 and #52 each burned re-plan rounds — a
+  // whole fresh tree apiece — because their verifier said PASS and then helpfully
+  // listed nice-to-haves. The contract (goals-autopilot-verify.ts) is explicit
+  // that the FIRST line's token IS the verdict, so honour it. The gaps are still
+  // kept verbatim as advisory follow-ups (nothing is lost, and they show on the
+  // node), just prefixed so a reader knows they did not block the pass.
   if (verdict === 'PASS' && gaps.length) {
-    verdict = 'FAIL';
-    gaps = ['verifier reported gaps alongside PASS', ...gaps];
+    gaps = gaps.map((g) => `advisory (did not block PASS): ${g}`);
   }
   return { verdict, evidence, gaps };
 }

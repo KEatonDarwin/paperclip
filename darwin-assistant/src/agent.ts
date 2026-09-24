@@ -33,6 +33,7 @@ import { buildGoalThreadContext } from './goals.js';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getOrCreateInternalMcpKey } from './api-keys.js';
+import { refuseModelTurnInScratch } from './sim-guard.js';
 import type { SavedImage } from './image-store.js';
 
 const MAX_TOOL_TURNS = 50;
@@ -1274,6 +1275,17 @@ export async function processMessage(
   messageId?: string,
   images?: SavedImage[],
 ): Promise<string> {
+  // Sim guard (see src/sim-guard.ts). THE chokepoint: every ingress — Slack,
+  // cockpit, webhook, check-in worker, goals/guards/tree cues, the autopilot
+  // driver, the goals tool's seed post — lands here, so one check covers all of
+  // them and every future caller. A scratch database must never spawn a billed
+  // turn. Returns a marker instead of throwing: most call sites are
+  // fire-and-forget `.catch()` and would swallow a throw silently, whereas a
+  // returned string surfaces in the sim's own output.
+  if (refuseModelTurnInScratch(`processMessage(${conversationId})`)) {
+    return '[sim-guard] model turn refused — scratch environment. No tokens were spent.';
+  }
+
   const conv = getOrCreateConversation(conversationId);
 
   // Per-conversation mutex. The get/set pair is synchronous (no await between the

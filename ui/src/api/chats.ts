@@ -63,6 +63,8 @@ export const chatsApi = {
 
   verifyPassword: (agentId: string, chatId: string, password: string) =>
     api.post<{ valid: boolean }>(`${chatBasePath(agentId)}/${encodeURIComponent(chatId)}/verify-password`, { password }),
+  generateTitle: (agentId: string, chatId: string) =>
+    api.post<AgentChat>(`${chatBasePath(agentId)}/${encodeURIComponent(chatId)}/generate-title`, {}),
 };
 
 export interface QuickChatResponse {

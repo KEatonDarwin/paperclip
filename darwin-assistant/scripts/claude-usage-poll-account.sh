@@ -41,11 +41,30 @@ else
 fi
 OUT_FILE="${OUT_FILE:-$DEFAULT_OUT_FILE}"
 
+# --- OAuth fallback (added 2026-09-23 by JARVIS): claude.ai cookie path got Cloudflare-challenged (HTTP 403 HTML).
+# The CLI's own OAuth usage endpoint returns the identical payload. Read-only, no model call, no API key.
+oauth_fallback() {
+  local creds="$1" out="$2"
+  [ -f "$creds" ] || return 1
+  local tok
+  tok=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('claudeAiOauth',{}).get('accessToken',''))" "$creds" 2>/dev/null) || return 1
+  [ -n "$tok" ] || return 1
+  local tmp2 code2
+  tmp2=$(mktemp)
+  code2=$(curl -s -o "$tmp2" -w "%{http_code}" "https://api.anthropic.com/api/oauth/usage" \
+    -H "Authorization: Bearer ${tok}" -H "anthropic-beta: oauth-2025-04-20" -H "Accept: application/json" -H "User-Agent: claude-code/2.0")
+  if [ "$code2" = "200" ] && python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert 'five_hour' in d" "$tmp2" 2>/dev/null; then
+    mv "$tmp2" "$out"; return 0
+  fi
+  rm -f "$tmp2"; return 1
+}
+
+CREDS_FILE="${CREDS_FILE:-${CLAUDE_CONFIG_DIR:-/home/kevin/.claude-${ACCOUNT_KEY}}/.credentials.json}"
+
 UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 
-[ -f "$COOKIE_FILE" ] || exit 0
+if [ ! -f "$COOKIE_FILE" ] || [ -z "$(cat "$COOKIE_FILE")" ]; then oauth_fallback "$CREDS_FILE" "$OUT_FILE"; exit 0; fi
 COOKIE=$(cat "$COOKIE_FILE")
-[ -n "$COOKIE" ] || exit 0
 
 TMP=$(mktemp)
 HTTP_CODE=$(curl -s -o "$TMP" -w "%{http_code}" \
@@ -58,5 +77,6 @@ if [ "$HTTP_CODE" = "200" ]; then
   mv "$TMP" "$OUT_FILE"
 else
   rm -f "$TMP"
+  if oauth_fallback "$CREDS_FILE" "$OUT_FILE"; then logger -t "claude-usage-poll-${ACCOUNT_KEY}" "cookie path HTTP ${HTTP_CODE}; wrote usage via OAuth fallback"; exit 0; fi
   logger -t "claude-usage-poll-${ACCOUNT_KEY}" "poll failed with HTTP ${HTTP_CODE} (cookie likely expired) org=${ORG_ID}"
 fi

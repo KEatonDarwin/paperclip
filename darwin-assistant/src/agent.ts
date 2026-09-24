@@ -1645,9 +1645,17 @@ async function runConversationTurn(
         // finish/hold exactly as today.
         const rescueAccount = swap.account && nextEntry?.eligible ? swap.account : null;
         if (rescueAccount) {
+          // NOTE (review node #701): this rescue deliberately outranks a
+          // per-thread pin. A pin says "route here"; a wall says "here cannot
+          // serve right now". Failing Kevin's turn outright to honour a pin
+          // would be worse than finishing it on the other subscription, and it
+          // matches the rest of the pin contract (a pin never hard-fails a
+          // turn). The pin is NOT cleared — the next turn goes back to the
+          // pinned account — so this is logged loudly rather than silently.
           console.log(
             `[agent] Conversation ${conv.id} hit a Claude usage/rate limit on account '${failedKey ?? 'a'}'; ` +
-              `retrying on account '${rescueAccount.key}' with a fresh session (claude sessions are per-account)`,
+              `retrying on account '${rescueAccount.key}' with a fresh session (claude sessions are per-account)` +
+              `${conv.pinned_claude_account ? ` — this OVERRIDES the thread's pin to '${conv.pinned_claude_account}' for this turn only` : ''}`,
           );
           // Fresh session on account change — a --resume id only resolves inside
           // its own CLAUDE_CONFIG_DIR (node #291 rule); context is rebuilt from

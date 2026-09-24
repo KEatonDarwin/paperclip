@@ -322,6 +322,36 @@ await scenario('(g4) adapter:null clears the pin too', async () => {
   assert.equal(r.json.claude_account, null);
 });
 
+// (g5)/(g6) added by the adversarial review (node #701): picking an account
+// must NOT create a per-thread MODEL override as a side effect — the picker
+// sends `claude_account` alone, and the thread keeps inheriting the global
+// default model.
+await scenario('(g5) account-only PATCH pins without creating a model override', async () => {
+  await patchModel({ adapter: null }); // back to inheriting the global default
+  const before = getConversation(EXT);
+  assert.equal(before.thread_adapter, null);
+  assert.equal(before.thread_model, null);
+
+  const r = await patchModel({ claude_account: 'b' });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.claude_account, 'b');
+  const after = getConversation(EXT);
+  assert.equal(after.pinned_claude_account, 'b');
+  assert.equal(after.thread_adapter, null, 'model override must be untouched');
+  assert.equal(after.thread_model, null, 'model override must be untouched');
+  assert.equal(r.json.model_override.adapter, null);
+});
+
+await scenario('(g6) account-only PATCH with a bad key 400s and changes nothing', async () => {
+  const r = await patchModel({ claude_account: 'nope' });
+  assert.equal(r.status, 400);
+  assert.equal(getConversation(EXT).pinned_claude_account, 'b');
+  // and an account-only clear still works
+  const c = await patchModel({ claude_account: null });
+  assert.equal(c.status, 200);
+  assert.equal(getConversation(EXT).pinned_claude_account, null);
+});
+
 server.close();
 
 // ── report ───────────────────────────────────────────────────────────────

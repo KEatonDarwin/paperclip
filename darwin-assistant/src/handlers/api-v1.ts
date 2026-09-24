@@ -4314,6 +4314,21 @@ export function createApiV1Router(): Router {
       return;
     }
 
+    // ACCOUNT-ONLY CHANGE (adversarial review, node #701): a body carrying
+    // `claude_account` and NO `adapter` touches ONLY the pin and leaves the
+    // model override exactly as it was. Without this the account picker has to
+    // resend the thread's current model, which silently converts a thread that
+    // was inheriting the global default model into one with an explicit
+    // per-thread model override — a side effect of picking a subscription that
+    // nobody asked for, and one that would stop the thread following a later
+    // change to the global default.
+    if (body.adapter === undefined && pinChange.apply) {
+      setThreadClaudeAccount(conv.id, pinChange.key);
+      const refreshed = getConversationById(conv.id) ?? conv;
+      res.json(threadDescriptor(refreshed, req));
+      return;
+    }
+
     if (typeof body.adapter !== 'string' || !adapters[body.adapter]) {
       sendError(res, 400, 'invalid_request', `adapter must be one of ${Object.keys(adapters).join(', ')} (or null to clear)`);
       return;

@@ -606,9 +606,13 @@ function composeMonitorRunPrompt(monitor: MonitorRow): string {
     '- Use only read-only inspection unless Kevin explicitly authorized a write in the monitor prompt.',
     '- Do not make external sends, production changes, data deletions, branch merges, or purchases.',
     '- Use existing JARVIS tools and local CLI/subscription auth only; never use provider API keys or SDKs.',
-    '- Decide pass/fail from the prompt. If you cannot determine the answer, report fail with the ambiguity in detail.',
+    '- Report one of THREE outcomes, and keep them distinct:',
+    '    • "pass"  — the check ran and the thing being monitored is in a GOOD state.',
+    '    • "fail"  — the check RAN FINE but the outcome is BAD (the monitored thing is in a bad state). This is a real-world problem for Kevin to act on.',
+    '    • "error" — the CHECK ITSELF could not complete: a script/query/tool crashed, exited non-zero, timed out, or returned no usable result, so you have NO answer this run.',
+    '- Do NOT report "error" as "fail" or vice-versa. A broken instrument ("we could not get a result") is "error"; a working instrument reporting a bad reading is "fail". If a script it runs prints its own {"status":...} line or exits non-zero, honor that: non-zero exit or no parseable result = "error".',
     '- Your final non-empty line MUST be exactly one JSON object with this shape:',
-    '{"status":"pass|fail","summary":"short human-readable result","detail":"supporting detail"}',
+    '{"status":"pass|fail|error","summary":"short human-readable result","detail":"supporting detail"}',
     '- Do not put markdown fences around the JSON envelope.',
   ].join('\n');
 }

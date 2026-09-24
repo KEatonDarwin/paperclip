@@ -723,8 +723,25 @@ type ProviderUsageWindow = {
 type ClaudeProviderUsage = {
   five_hour: ProviderUsageWindow | null;
   seven_day: ProviderUsageWindow | null;
+  windows: ProviderUsageWindow[];
   model: string | null;
   updated_at: number;
+  stale: boolean;
+};
+
+type CodexResetCredit = {
+  id: string;
+  reset_type: string | null;
+  status: string | null;
+  granted_at: number | null;
+  expires_at: number | null;
+  title: string | null;
+  description: string | null;
+};
+
+type CodexResetCredits = {
+  available_count: number;
+  credits: CodexResetCredit[];
 };
 
 type CodexProviderUsage = {
@@ -733,34 +750,98 @@ type CodexProviderUsage = {
   email: string | null;
   source: string | null;
   updated_at: number;
+  reset_credits?: CodexResetCredits | null;
   error?: string | null;
 };
 
+type ClaudeUsageRawWindow = {
+  utilization?: number;
+  resets_at?: string | null;
+};
+
+type ClaudeUsageRawLimit = {
+  kind?: string | null;
+  group?: string | null;
+  percent?: number | null;
+  severity?: string | null;
+  resets_at?: string | null;
+  scope?: {
+    model?: {
+      id?: string | null;
+      display_name?: string | null;
+    } | null;
+    surface?: string | null;
+  } | null;
+};
+
+type ClaudeUsageRaw = {
+  five_hour?: ClaudeUsageRawWindow | null;
+  seven_day?: ClaudeUsageRawWindow | null;
+  limits?: ClaudeUsageRawLimit[] | null;
+};
+
+const PROVIDER_USAGE_STALE_MS = 3 * 60 * 1000;
+
+function epochSecondsFromIso(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
+
+function claudeRawWindow(
+  label: string,
+  w?: ClaudeUsageRawWindow | null,
+): ProviderUsageWindow | null {
+  if (w?.utilization == null) return null;
+  return {
+    label,
+    used_percentage: w.utilization,
+    resets_at: epochSecondsFromIso(w.resets_at),
+  };
+}
+
+function scopedClaudeLimitWindow(limit: ClaudeUsageRawLimit): ProviderUsageWindow | null {
+  if (limit.kind !== 'weekly_scoped' || limit.group !== 'weekly') return null;
+  if (typeof limit.percent !== 'number') return null;
+  const model = limit.scope?.model?.display_name?.trim();
+  const surface = limit.scope?.surface?.trim();
+  const scope = model || surface;
+  if (!scope) return null;
+  return {
+    label: `${scope} 7-day`,
+    used_percentage: limit.percent,
+    resets_at: epochSecondsFromIso(limit.resets_at),
+    detail: limit.severity && limit.severity !== 'normal' ? limit.severity : null,
+  };
+}
+
+function parseClaudeUsageRaw(raw: ClaudeUsageRaw): Pick<ClaudeProviderUsage, 'five_hour' | 'seven_day' | 'windows'> {
+  const five_hour = claudeRawWindow('5-hour', raw.five_hour);
+  const seven_day = claudeRawWindow('7-day', raw.seven_day);
+  const windows: ProviderUsageWindow[] = [];
+  if (five_hour) windows.push(five_hour);
+  if (seven_day) windows.push(seven_day);
+  for (const limit of raw.limits ?? []) {
+    const scoped = scopedClaudeLimitWindow(limit);
+    if (scoped) windows.push(scoped);
+  }
+  return { five_hour, seven_day, windows };
+}
+
 function readClaudeLiveUsage(): ClaudeProviderUsage | null {
   const LIVE_PATH = '/tmp/claude-usage-live.json';
-  const LIVE_STALE_MS = 3 * 60 * 1000;
   try {
     const st = statSync(LIVE_PATH);
     const ageMs = Date.now() - st.mtimeMs;
-    if (ageMs <= LIVE_STALE_MS) {
-      const raw = JSON.parse(readFileSync(LIVE_PATH, 'utf8')) as {
-        five_hour?: { utilization?: number; resets_at?: string };
-        seven_day?: { utilization?: number; resets_at?: string };
+    const raw = JSON.parse(readFileSync(LIVE_PATH, 'utf8')) as ClaudeUsageRaw;
+    const parsed = parseClaudeUsageRaw(raw);
+    if (parsed.windows.length) {
+      return {
+        ...parsed,
+        model: null,
+        updated_at: Math.floor(st.mtimeMs / 1000),
+        stale: ageMs > PROVIDER_USAGE_STALE_MS,
       };
-      const toWindow = (w?: { utilization?: number; resets_at?: string }) =>
-        w?.utilization != null && w?.resets_at
-          ? { used_percentage: w.utilization, resets_at: Math.floor(new Date(w.resets_at).getTime() / 1000) }
-          : null;
-      const five_hour = toWindow(raw.five_hour);
-      const seven_day = toWindow(raw.seven_day);
-      if (five_hour || seven_day) {
-        return {
-          five_hour,
-          seven_day,
-          model: null,
-          updated_at: Math.floor(st.mtimeMs / 1000),
-        };
-      }
     }
   } catch {
     // fall through to statusline source
@@ -791,8 +872,13 @@ function readClaudeLiveUsage(): ClaudeProviderUsage | null {
     return {
       five_hour: toStatuslineWindow(rl.five_hour),
       seven_day: toStatuslineWindow(rl.seven_day),
+      windows: [
+        ...(toStatuslineWindow(rl.five_hour) ? [{ ...toStatuslineWindow(rl.five_hour)!, label: '5-hour' }] : []),
+        ...(toStatuslineWindow(rl.seven_day) ? [{ ...toStatuslineWindow(rl.seven_day)!, label: '7-day' }] : []),
+      ],
       model: raw.model?.display_name ?? null,
       updated_at: Math.floor(st.mtimeMs / 1000),
+      stale: false,
     };
   } catch {
     return null;
@@ -817,33 +903,27 @@ type ClaudeAccountProviderUsage = ClaudeProviderUsage & {
 function readClaudeAccountsUsage(): ClaudeAccountProviderUsage[] {
   const accounts = listClaudeAccounts();
   if (accounts.length < 2) return [];
-  const STALE_MS = 3 * 60 * 1000;
   let activeKey: string | null = null;
   try {
     activeKey = selectActiveClaudeAccount(claudeFiveHourCeiling()).account?.key ?? null;
   } catch {
     activeKey = null;
   }
-  const toWindow = (w?: { utilization?: number; resets_at?: string }): ProviderUsageWindow | null =>
-    w?.utilization != null && w?.resets_at
-      ? { used_percentage: w.utilization, resets_at: Math.floor(new Date(w.resets_at).getTime() / 1000) }
-      : null;
   return accounts.map((account): ClaudeAccountProviderUsage => {
-    let five_hour: ProviderUsageWindow | null = null;
-    let seven_day: ProviderUsageWindow | null = null;
+    let parsed: Pick<ClaudeProviderUsage, 'five_hour' | 'seven_day' | 'windows'> = {
+      five_hour: null,
+      seven_day: null,
+      windows: [],
+    };
     let updated_at = 0;
+    let stale = true;
     try {
       const file = usageFilePath(account.key);
       const st = statSync(file);
-      if (Date.now() - st.mtimeMs <= STALE_MS) {
-        const raw = JSON.parse(readFileSync(file, 'utf8')) as {
-          five_hour?: { utilization?: number; resets_at?: string };
-          seven_day?: { utilization?: number; resets_at?: string };
-        };
-        five_hour = toWindow(raw.five_hour);
-        seven_day = toWindow(raw.seven_day);
-        updated_at = Math.floor(st.mtimeMs / 1000);
-      }
+      const raw = JSON.parse(readFileSync(file, 'utf8')) as ClaudeUsageRaw;
+      parsed = parseClaudeUsageRaw(raw);
+      updated_at = Math.floor(st.mtimeMs / 1000);
+      stale = Date.now() - st.mtimeMs > PROVIDER_USAGE_STALE_MS;
     } catch {
       // leave windows null — the bar renders "no data" for this account
     }
@@ -852,10 +932,12 @@ function readClaudeAccountsUsage(): ClaudeAccountProviderUsage[] {
       label: account.label,
       active: account.key === activeKey,
       enabled: account.enabled,
-      five_hour,
-      seven_day,
+      five_hour: parsed.five_hour,
+      seven_day: parsed.seven_day,
+      windows: parsed.windows,
       model: null,
       updated_at,
+      stale,
     };
   });
 }
@@ -870,6 +952,10 @@ function readCodexUsage(): CodexProviderUsage | null {
       email?: string | null;
       source?: string | null;
       updated_at?: number;
+      reset_credits?: {
+        available_count?: number | null;
+        credits?: Array<Partial<CodexResetCredit>>;
+      } | null;
       error?: string | null;
     };
     const windows = Array.isArray(raw.windows)
@@ -890,16 +976,127 @@ function readCodexUsage(): CodexProviderUsage | null {
           .filter((w): w is ProviderUsageWindow => w != null)
       : [];
     if (!windows.length && !raw.error) return null;
+    const resetCredits = raw.reset_credits
+      ? {
+          available_count: typeof raw.reset_credits.available_count === 'number'
+            ? Math.max(0, Math.trunc(raw.reset_credits.available_count))
+            : 0,
+          credits: Array.isArray(raw.reset_credits.credits)
+            ? raw.reset_credits.credits
+                .map((credit): CodexResetCredit | null => {
+                  if (typeof credit.id !== 'string' || !credit.id.trim()) return null;
+                  return {
+                    id: credit.id,
+                    reset_type: typeof credit.reset_type === 'string' ? credit.reset_type : null,
+                    status: typeof credit.status === 'string' ? credit.status : null,
+                    granted_at: typeof credit.granted_at === 'number' ? credit.granted_at : null,
+                    expires_at: typeof credit.expires_at === 'number' ? credit.expires_at : null,
+                    title: typeof credit.title === 'string' ? credit.title : null,
+                    description: typeof credit.description === 'string' ? credit.description : null,
+                  };
+                })
+                .filter((credit): credit is CodexResetCredit => credit != null)
+            : [],
+        }
+      : null;
     return {
       windows,
       plan: typeof raw.plan === 'string' ? raw.plan : null,
       email: typeof raw.email === 'string' ? raw.email : null,
       source: typeof raw.source === 'string' ? raw.source : null,
       updated_at: typeof raw.updated_at === 'number' ? raw.updated_at : Math.floor(st.mtimeMs / 1000),
+      reset_credits: resetCredits,
       error: typeof raw.error === 'string' ? raw.error : null,
     };
   } catch {
     return null;
+  }
+}
+
+function codexHome(): string {
+  return process.env.CODEX_HOME?.trim() || `${process.env.HOME || '/home/kevin'}/.codex`;
+}
+
+function codexBin(): string {
+  return process.env.CODEX_BIN?.trim() || '/usr/bin/codex';
+}
+
+function codexAppServerRequest(method: string, params: Record<string, unknown>, timeoutMs = 15_000): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(codexBin(), ['-s', 'read-only', '-a', 'never', 'app-server'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, CODEX_HOME: codexHome() },
+    });
+    let buffer = '';
+    let stderr = '';
+    let settled = false;
+    const finish = (err: Error | null, value?: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (!child.killed) child.kill('SIGTERM');
+      if (err) reject(err);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => {
+      finish(new Error(`codex app-server timed out on ${method}`));
+    }, timeoutMs);
+    child.on('error', (err) => finish(err));
+    child.on('exit', (code) => {
+      if (!settled) finish(new Error(stderr.trim() || `codex app-server exited with code ${code ?? 'unknown'}`));
+    });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      stderr = (stderr + chunk).slice(-4000);
+    });
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      buffer += chunk;
+      while (true) {
+        const newline = buffer.indexOf('\n');
+        if (newline < 0) break;
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        let parsed: { id?: unknown; result?: unknown; error?: unknown };
+        try {
+          parsed = JSON.parse(line) as { id?: unknown; result?: unknown; error?: unknown };
+        } catch {
+          continue;
+        }
+        if (parsed.id === 1) {
+          child.stdin.write(JSON.stringify({ method: 'initialized', params: {} }) + '\n');
+          child.stdin.write(JSON.stringify({ id: 2, method, params }) + '\n');
+        } else if (parsed.id === 2) {
+          if (parsed.error) {
+            const message =
+              typeof parsed.error === 'object' && parsed.error && 'message' in parsed.error
+                ? String((parsed.error as { message?: unknown }).message)
+                : JSON.stringify(parsed.error);
+            finish(new Error(message));
+          } else {
+            finish(null, parsed.result);
+          }
+        }
+      }
+    });
+    child.stdin.write(JSON.stringify({
+      id: 1,
+      method: 'initialize',
+      params: { clientInfo: { name: 'jarvis-provider-usage', version: '0.0.0' } },
+    }) + '\n');
+  });
+}
+
+function startCodexUsagePoll(): void {
+  try {
+    const child = spawn('systemctl', ['start', 'codex-usage-poll.service'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+  } catch {
+    // The next timer tick refreshes it; this is just a fast path.
   }
 }
 
@@ -1241,6 +1438,49 @@ export function createApiV1Router(): Router {
       openai_codex: readCodexUsage(),
       augment: readAugmentUsage(),
     });
+  });
+
+  router.post('/provider-usage/codex/reset', async (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Using a Codex reset requires an admin-scoped key');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const usage = readCodexUsage();
+    const requestedId =
+      typeof body.credit_id === 'string' && body.credit_id.trim()
+        ? body.credit_id.trim()
+        : typeof body.creditId === 'string' && body.creditId.trim()
+          ? body.creditId.trim()
+          : null;
+    const available = usage?.reset_credits?.credits.filter((credit) => credit.status === 'available') ?? [];
+    const creditId = requestedId ?? available[0]?.id ?? null;
+    if (!creditId) {
+      sendError(res, 409, 'no_codex_reset_available', 'No available Codex reset credit found');
+      return;
+    }
+    const idempotencyKey =
+      typeof body.idempotency_key === 'string' && body.idempotency_key.trim()
+        ? body.idempotency_key.trim()
+        : typeof body.idempotencyKey === 'string' && body.idempotencyKey.trim()
+          ? body.idempotencyKey.trim()
+          : `jarvis-codex-reset-${creditId}-${randomUUID()}`;
+    try {
+      const result = await codexAppServerRequest('account/rateLimitResetCredit/consume', {
+        creditId,
+        idempotencyKey,
+      });
+      startCodexUsagePoll();
+      createNotification({
+        severity: 'success',
+        title: 'Codex reset request sent',
+        body: `Codex reset ${creditId.slice(-8)} returned ${JSON.stringify(result)}`,
+        source: 'provider-usage',
+      });
+      res.json({ ok: true, credit_id: creditId, idempotency_key: idempotencyKey, result });
+    } catch (err) {
+      sendError(res, 500, 'codex_reset_failed', err instanceof Error ? err.message : String(err));
+    }
   });
 
   // -- GET /mcp/servers: live MCP Connection Manager list --------------------

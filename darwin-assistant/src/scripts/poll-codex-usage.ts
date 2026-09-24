@@ -16,6 +16,21 @@ type UsageWindowSnapshot = {
   detail?: string | null;
 };
 
+type CodexResetCreditSnapshot = {
+  id: string;
+  reset_type: string | null;
+  status: string | null;
+  granted_at: number | null;
+  expires_at: number | null;
+  title: string | null;
+  description: string | null;
+};
+
+type CodexResetCreditsSnapshot = {
+  available_count: number;
+  credits: CodexResetCreditSnapshot[];
+};
+
 type CodexUsageSnapshot = {
   provider: 'openai_codex';
   updated_at: number;
@@ -23,6 +38,7 @@ type CodexUsageSnapshot = {
   windows: UsageWindowSnapshot[];
   plan: string | null;
   email: string | null;
+  reset_credits?: CodexResetCreditsSnapshot | null;
   error?: string;
 };
 
@@ -62,6 +78,18 @@ type CodexRpcLimit = {
 type CodexRpcRateLimitsResult = {
   rateLimits?: CodexRpcLimit | null;
   rateLimitsByLimitId?: Record<string, CodexRpcLimit> | null;
+  rateLimitResetCredits?: {
+    availableCount?: number | null;
+    credits?: Array<{
+      id?: string | null;
+      resetType?: string | null;
+      status?: string | null;
+      grantedAt?: number | null;
+      expiresAt?: number | null;
+      title?: string | null;
+      description?: string | null;
+    }> | null;
+  } | null;
 };
 
 type CodexRpcAccountResult = {
@@ -107,7 +135,7 @@ class CodexRpcClient {
   private pending = new Map<number, PendingRpcRequest>();
 
   constructor() {
-    this.proc = spawn(CODEX_BIN, ['-s', 'read-only', '-a', 'untrusted', 'app-server'], {
+    this.proc = spawn(CODEX_BIN, ['-s', 'read-only', '-a', 'never', 'app-server'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, CODEX_HOME },
     });
@@ -291,6 +319,32 @@ function maybeAddCredits(windows: UsageWindowSnapshot[], credits: CodexRpcCredit
   });
 }
 
+function buildResetCreditsSnapshot(
+  resetCredits: CodexRpcRateLimitsResult['rateLimitResetCredits'],
+): CodexResetCreditsSnapshot | null {
+  if (!resetCredits) return null;
+  const credits = Array.isArray(resetCredits.credits)
+    ? resetCredits.credits
+        .map((credit): CodexResetCreditSnapshot | null => {
+          if (!credit.id) return null;
+          return {
+            id: credit.id,
+            reset_type: credit.resetType ?? null,
+            status: credit.status ?? null,
+            granted_at: typeof credit.grantedAt === 'number' ? credit.grantedAt : null,
+            expires_at: typeof credit.expiresAt === 'number' ? credit.expiresAt : null,
+            title: credit.title ?? null,
+            description: credit.description ?? null,
+          };
+        })
+        .filter((credit): credit is CodexResetCreditSnapshot => credit != null)
+    : [];
+  return {
+    available_count: Math.max(0, Math.trunc(finiteNumber(resetCredits.availableCount) ?? credits.length)),
+    credits,
+  };
+}
+
 function buildSnapshotFromRpc(limits: CodexRpcRateLimitsResult, account: CodexRpcAccountResult | null): CodexUsageSnapshot {
   const windows: UsageWindowSnapshot[] = [];
   const rootLimit = limits.rateLimits ?? null;
@@ -321,6 +375,7 @@ function buildSnapshotFromRpc(limits: CodexRpcRateLimitsResult, account: CodexRp
     windows,
     plan: account?.account?.planType ?? rootLimit?.planType ?? null,
     email: account?.account?.email ?? null,
+    reset_credits: buildResetCreditsSnapshot(limits.rateLimitResetCredits),
   };
 }
 

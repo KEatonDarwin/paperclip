@@ -12,6 +12,7 @@ import {
   upsertClaudeAccount,
   listClaudeAccounts,
   usageFilePath,
+  findClaudeAccount,
 } from '../claude-accounts.js';
 import {
   getOrCreateConversation,
@@ -25,6 +26,7 @@ import {
   updateSessionState,
   addTurn,
   setThreadModelOverride,
+  setThreadClaudeAccount,
   listAllConversations,
   deriveSource,
   renameConversation,
@@ -656,6 +658,11 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     // model_override reflects the explicit per-thread choice (null when inheriting
     // the global default); runtime is the resolved descriptor actually in effect.
     model_override: { adapter: conv.thread_adapter, model: conv.thread_model },
+    // Per-thread Claude ACCOUNT pin (tree-b32ef869): a `claude_accounts` key
+    // ('a'/'b'/…) Kevin picked in the model dropdown, or null for Auto
+    // (least-used selection). Independent of model_override so switching models
+    // inside the claude adapter keeps the pin.
+    claude_account: conv.pinned_claude_account ?? null,
     runtime: getAdapterRuntimeDescriptor(adapter.id, model),
     locked: !!conv.password_hash,
   };
@@ -4509,12 +4516,54 @@ export function createApiV1Router(): Router {
     }
     const conv = result;
 
-    const body = (req.body ?? {}) as { adapter?: unknown; model?: unknown };
+    const body = (req.body ?? {}) as { adapter?: unknown; model?: unknown; claude_account?: unknown };
     const adapters = getAdapters();
 
-    // Clear the override → inherit the global default.
+    // -- Per-thread Claude ACCOUNT pin (tree-b32ef869) ------------------------
+    // Optional `claude_account`: a `claude_accounts` registry key ('a'/'b'/…)
+    // to pin this thread to that subscription, or null to clear the pin (Auto /
+    // least-used, today's behavior). Validated BEFORE anything is written so a
+    // bad key never half-applies a model change. Omitted entirely → the pin is
+    // left exactly as it was, which keeps every existing caller byte-identical.
+    let pinChange: { apply: true; key: string | null } | { apply: false } = { apply: false };
+    if (body.claude_account !== undefined) {
+      if (body.claude_account === null) {
+        pinChange = { apply: true, key: null };
+      } else if (typeof body.claude_account !== 'string' || !findClaudeAccount(body.claude_account)) {
+        sendError(
+          res,
+          400,
+          'invalid_request',
+          `claude_account must be one of ${listClaudeAccounts().map((a) => a.key).join(', ')} (or null to clear the pin)`,
+        );
+        return;
+      } else {
+        pinChange = { apply: true, key: body.claude_account.trim() };
+      }
+    }
+
+    // Clear the override → inherit the global default. Clearing the adapter also
+    // clears any account pin: the pin only means anything under `claude`, and
+    // leaving a stale pin behind on a thread that just went back to Auto-adapter
+    // would silently re-apply the next time it resolved to claude.
     if (body.adapter === null) {
       setThreadModelOverride(conv.id, null, null);
+      setThreadClaudeAccount(conv.id, null);
+      const refreshed = getConversationById(conv.id) ?? conv;
+      res.json(threadDescriptor(refreshed, req));
+      return;
+    }
+
+    // ACCOUNT-ONLY CHANGE (adversarial review, node #701): a body carrying
+    // `claude_account` and NO `adapter` touches ONLY the pin and leaves the
+    // model override exactly as it was. Without this the account picker has to
+    // resend the thread's current model, which silently converts a thread that
+    // was inheriting the global default model into one with an explicit
+    // per-thread model override — a side effect of picking a subscription that
+    // nobody asked for, and one that would stop the thread following a later
+    // change to the global default.
+    if (body.adapter === undefined && pinChange.apply) {
+      setThreadClaudeAccount(conv.id, pinChange.key);
       const refreshed = getConversationById(conv.id) ?? conv;
       res.json(threadDescriptor(refreshed, req));
       return;
@@ -4536,6 +4585,7 @@ export function createApiV1Router(): Router {
     }
 
     setThreadModelOverride(conv.id, adapter.id, model);
+    if (pinChange.apply) setThreadClaudeAccount(conv.id, pinChange.key);
     const refreshed = getConversationById(conv.id) ?? conv;
     res.json(threadDescriptor(refreshed, req));
   });
@@ -6081,6 +6131,10 @@ export function createApiV1Router(): Router {
         five_hour: usage.five_hour,
         weekly: usage.weekly,
         stale: usage.stale,
+        // Non-null when Claude reports the subscription locked out of a window.
+        // Surfaced so the model dropdown can say WHY an account is ineligible
+        // rather than just greying it out.
+        locked_reason: usage.locked_reason,
         eligible,
       })),
     });

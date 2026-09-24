@@ -24,7 +24,7 @@ import {
   type TurnRow,
   type TurnMetadata,
 } from './conversation-db.js';
-import { selectActiveClaudeAccount, claudeFiveHourCeiling, listClaudeAccounts, type ClaudeAccount } from './claude-accounts.js';
+import { selectActiveClaudeAccount, claudeFiveHourCeiling, listClaudeAccounts, decideClaudeAccountForTurn, type ClaudeAccount } from './claude-accounts.js';
 import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent, type StreamEndEvent, type ToolCallEvent } from './sse-bus.js';
 import { buildGroupChatContext } from './group-chat-context.js';
 import { buildQuickChatContext } from './quick-chat-profiles.js';
@@ -1411,36 +1411,35 @@ async function runConversationTurn(
   let activeClaudeAccount: ClaudeAccount | null = null;
   if (adapter.id === 'claude') {
     const selection = selectActiveClaudeAccount(claudeFiveHourCeiling());
-    activeClaudeAccount = selection.account;
     // LEGACY-SESSION GUARD (2026-09-17): threads created before multi-Claude have a
     // NULL session_account but their `claude --resume` id lives in account 'a'
     // (~/.claude, the pre-multi-claude default). Coalesce to 'a' when a live
-    // session exists so the stickiness guard below protects them from being
-    // routed to another account and hard-failing the resume ("error before JARVIS
-    // replied" — hit cockpit:35b7b447 / conv 1875). New threads always persist
-    // their real account, so this only ever affects pre-multi-claude threads, and
-    // every one of those lives in 'a'. De-mines all legacy threads with no DB write.
+    // session exists so the stickiness guard inside the decision protects them
+    // from being routed to another account and hard-failing the resume ("error
+    // before JARVIS replied" — hit cockpit:35b7b447 / conv 1875). New threads
+    // always persist their real account, so this only ever affects
+    // pre-multi-claude threads, and every one of those lives in 'a'. De-mines all
+    // legacy threads with no DB write.
     const storedAccount = conv.session_account || (sessionId ? 'a' : null);
-    if (sessionId && storedAccount && activeClaudeAccount && storedAccount !== activeClaudeAccount.key) {
-      // STICKINESS (adversarial review, node #296): a live session stays on the
-      // account it was created under for as long as that account is still
-      // ELIGIBLE (enabled, metered, under the 5h ceiling). Without this, two
-      // accounts hovering near each other in usage would flip the least-used
-      // pick every turn, dropping the native session (and replaying the whole
-      // transcript) each time — the opposite of what native resume buys us.
-      // New threads (no session yet) still spread by least-used, so parallel
-      // throughput across accounts is unaffected. The stored account only loses
-      // the session once it genuinely can't serve (over ceiling / stale /
-      // disabled / removed) — that is the real swap moment.
-      const stored = selection.perAccount.find((e) => e.account.key === storedAccount);
-      if (stored?.eligible) {
-        activeClaudeAccount = stored.account;
-      } else {
-        console.log(
-          `[agent] Conversation ${conv.id} switching Claude accounts (${storedAccount} -> ${activeClaudeAccount.key}); starting a fresh session (claude session ids are per-account)`,
-        );
-        sessionId = null;
-      }
+    // PIN > STICKINESS > LEAST-USED, in one pure decision (tree-b32ef869). See
+    // decideClaudeAccountForTurn for the full rationale of each precedence rule.
+    const decision = decideClaudeAccountForTurn({
+      pinnedKey: conv.pinned_claude_account ?? null,
+      sessionId,
+      storedAccount,
+      selection,
+    });
+    activeClaudeAccount = decision.account;
+    if (decision.pinIgnoredReason) {
+      console.log(
+        `[agent] Conversation ${conv.id} is pinned to Claude account '${conv.pinned_claude_account}' but that account is ${decision.pinIgnoredReason === 'disabled' ? 'disabled' : 'not in the registry'}; falling back to '${activeClaudeAccount?.key ?? 'none'}'`,
+      );
+    }
+    if (decision.dropSession) {
+      console.log(
+        `[agent] Conversation ${conv.id} switching Claude accounts (${storedAccount} -> ${activeClaudeAccount?.key ?? 'none'})${decision.source === 'pin' ? ' on an explicit per-thread pin' : ''}; starting a fresh session (claude session ids are per-account)`,
+      );
+      sessionId = null;
     }
   }
   // Runtime handed to every runClaude call this turn, carrying the resolved
@@ -1646,9 +1645,17 @@ async function runConversationTurn(
         // finish/hold exactly as today.
         const rescueAccount = swap.account && nextEntry?.eligible ? swap.account : null;
         if (rescueAccount) {
+          // NOTE (review node #701): this rescue deliberately outranks a
+          // per-thread pin. A pin says "route here"; a wall says "here cannot
+          // serve right now". Failing Kevin's turn outright to honour a pin
+          // would be worse than finishing it on the other subscription, and it
+          // matches the rest of the pin contract (a pin never hard-fails a
+          // turn). The pin is NOT cleared — the next turn goes back to the
+          // pinned account — so this is logged loudly rather than silently.
           console.log(
             `[agent] Conversation ${conv.id} hit a Claude usage/rate limit on account '${failedKey ?? 'a'}'; ` +
-              `retrying on account '${rescueAccount.key}' with a fresh session (claude sessions are per-account)`,
+              `retrying on account '${rescueAccount.key}' with a fresh session (claude sessions are per-account)` +
+              `${conv.pinned_claude_account ? ` — this OVERRIDES the thread's pin to '${conv.pinned_claude_account}' for this turn only` : ''}`,
           );
           // Fresh session on account change — a --resume id only resolves inside
           // its own CLAUDE_CONFIG_DIR (node #291 rule); context is rebuilt from

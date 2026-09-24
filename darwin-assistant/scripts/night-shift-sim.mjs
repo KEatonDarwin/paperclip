@@ -267,6 +267,23 @@ await post(`/goals/${gCheck}/autopilot`, { on: true });   // auto-approves the p
   await waitFor('gCheck leaf -> check', async () => (await nodeById(gCheck, gCheckLeaf))?.state === 'check');
 }
 
+// GREADY: a goal whose only leaf is FULLY DONE (not just `check`) before the
+// plan is even taken, so it shows up in needs_you as root_ready_to_verify both
+// at plan time (NS-1b-adjacent) and on the live board mid-run (NS-18).
+const gReady = await mkGoal('Sim goal ready', 'its only leaf is already fully verified');
+const gReadyLeaf = await mkNode(gReady, 'R1 leaf done before plan', { leaf_kind: 'machine' });
+await acceptNode(gReady, gReadyLeaf);
+await post(`/goals/${gReady}/autopilot`, { on: true });
+{
+  const d = await dispatchLeaf(gReady, gReadyLeaf);
+  await finishBuilds(gReady, gReadyLeaf, d);
+  await post(`/hopper-nodes/${d.verifyId}/finish`, { outcome: 'done', result: 'VERDICT: PASS\nevidence:\n- already fully built\ngaps:\n- none' });
+  await waitFor('gReady leaf -> check', async () => (await nodeById(gReady, gReadyLeaf))?.state === 'check');
+  const v = await post(`/goals/${gReady}/nodes/${gReadyLeaf}/verify`, { passed: true, note: 'pre-verified before the night plan', actor: 'jarvis' });
+  if (v.status !== 200) throw new Error(`verify gReadyLeaf failed: ${JSON.stringify(v.json)}`);
+  await waitFor('gReady leaf -> done', async () => (await nodeById(gReady, gReadyLeaf))?.state === 'done');
+}
+
 let runId = -1;
 await check('NS-0', 'POST /night/plan returns a planned run with items, an eta_end and a PLAN-READY cue', async () => {
   const r = await post('/night/plan', { mode: 'until_stop', config: { lanes: 4 } });
@@ -292,7 +309,7 @@ await check('NS-1b', 'human leaves are never items; every set node with no child
   assert.equal(preds[0].est_minutes, 3 * 60, 'placeholder est is not predicted_children × planEst');
 });
 
-await check('NS-2', 'move locks the item, shifts unlocked neighbours and re-sims ETAs; a later insertion never moves it', async () => {
+await check('NS-2', 'move locks the item, shifts unlocked neighbours and re-sims ETAs; a later insertion after a locked row walks past it instead of moving it', async () => {
   const before = itemsOf(runId);
   const target = before[before.length - 1];
   const moved = await post(`/night/runs/${runId}/items/${target.id}/move`, { position: 2 });
@@ -310,6 +327,9 @@ await check('NS-2', 'move locks the item, shifts unlocked neighbours and re-sims
   assert.equal(ins.json.item.kind, 'plan', 'the manual add did not derive kind=plan from a set machine leaf');
   const after2 = itemsOf(runId);
   assert.equal(after2.find((i) => i.id === target.id).position, 2, 'a locked row lost its absolute position to an insertion');
+  // anchor is #1, so a naive insert would land at #2 — but #2 is the locked
+  // `target` row, so the insert must walk past it and land at #3 instead.
+  assert.equal(ins.json.item.position, 3, 'inserting right after a locked row landed ON it instead of walking past it');
 });
 
 await check('NS-16', 'skip: a queued item skips and is never picked; a running item 409s', async () => {
@@ -338,6 +358,22 @@ await check('NS-3', 'start: every included goal is adopted onto autopilot and pr
   assert.equal(prior3.config.tick_minutes, 7);
   const adopted = (await get(`/goals/${g3}`)).json.goal.autopilot_config;
   assert.equal(adopted.parallel, 2, 'goalPar did not preserve the goal\'s own parallel (§12.6)');
+});
+
+await check('NS-18', 'a goal that has nothing left (root fully done before/during the run) lands in needs_you as root_ready_to_verify on the live board', async () => {
+  const b = await get('/night/board');
+  assert.equal(b.status, 200, JSON.stringify(b.json));
+  const hit = b.json.needs_you.find((n) => n.goal_id === gReady && n.reason === 'root_ready_to_verify');
+  assert.ok(hit, `no root_ready_to_verify entry for gReady in needs_you: ${JSON.stringify(b.json.needs_you)}`);
+  assert.equal(hit.node_id, null, 'root_ready_to_verify should be a goal-level entry (node_id null)');
+});
+
+await check('NS-19', 'only one run may be active at a time: a second POST /night/plan while this one is running 409s night_run_active', async () => {
+  const dupe = await post('/night/plan', { mode: 'until_stop' });
+  assert.equal(dupe.status, 409, JSON.stringify(dupe.json));
+  assert.equal(dupe.json.error?.code, 'night_run_active', JSON.stringify(dupe.json));
+  // the original run must be completely unaffected by the refused plan attempt
+  assert.equal(night.getNightRun(runId).status, 'running');
 });
 
 await check('NS-4', 'lane fill: concurrent lanes across goals, but never two lanes on the same branch and never past a goal\'s parallel cap', async () => {
@@ -474,6 +510,27 @@ await check('NS-9', 'a decompose that lands expands its placeholder IN PLACE int
   for (const k of kids) assert.ok(k.position >= slot && k.position <= slot + 3, `child landed at #${k.position}, outside the placeholder block near #${slot}`);
   const locked = after.filter((i) => i.locked === 1);
   for (const l of locked) assert.equal(l.position, itemsOf(runId).find((i) => i.id === l.id).position, 'a locked row moved during expansion');
+});
+
+await check('NS-22', 'until_stop + a governor hold: the driver WAITS (never stops), records hold/hold_clear on the board, and resumes filling lanes once the override allows again', async () => {
+  assert.equal(night.getNightRun(runId).mode, 'until_stop', 'this scenario needs an until_stop run');
+  const holdCountBefore = sqliteDb.prepare(`SELECT COUNT(*) AS n FROM night_events WHERE run_id = ? AND kind = 'hold'`).get(runId).n;
+  night.__setNightShiftTestOverrides({
+    governor: () => ({ allow: false, reason: 'claude_5h_ceiling', detail: 'sim hold for NS-22' }),
+  });
+  await tick('held');
+  assert.equal(night.getNightRun(runId).status, 'running', 'an until_stop hold incorrectly ended the run');
+  const holdCountAfter = sqliteDb.prepare(`SELECT COUNT(*) AS n FROM night_events WHERE run_id = ? AND kind = 'hold'`).get(runId).n;
+  assert.ok(holdCountAfter > holdCountBefore, 'no hold event was recorded for the governor hold');
+  const held = await get('/night/board');
+  assert.equal(held.json.hold?.reason, 'governor:claude_5h_ceiling', `board does not reflect the active hold: ${JSON.stringify(held.json.hold)}`);
+  night.__setNightShiftTestOverrides({ governor: () => ({ allow: true, reason: 'ok', detail: 'sim' }) });
+  await tick('resumed');
+  const clearCount = sqliteDb.prepare(`SELECT COUNT(*) AS n FROM night_events WHERE run_id = ? AND kind = 'hold_clear'`).get(runId).n;
+  assert.ok(clearCount >= 1, 'no hold_clear event was recorded once the governor allowed again');
+  const resumed = await get('/night/board');
+  assert.equal(resumed.json.hold, null, `board still shows a hold after it cleared: ${JSON.stringify(resumed.json.hold)}`);
+  assert.equal(night.getNightRun(runId).status, 'running', 'the run should still be running after resuming from a hold');
 });
 
 await check('NS-10', 'pause is total: no new picks AND the hopper engine skips the run\'s pending nodes while a non-run tree still dispatches', async () => {
@@ -631,6 +688,99 @@ await check('NS-17', 'the per-turn context block renders for cockpit:night-shift
   assert.match(block, /<\/night_shift>/);
   assert.equal(night.nightShiftContextBlock('cockpit:goal-1'), '', 'the block leaked into a goal thread');
   assert.equal(night.nightShiftContextBlock('slack:whatever'), '');
+});
+
+// Both prior runs (runId, budgetRun) are stopped by now, so a fresh isolated
+// run is free to plan (§1's one-active-run rule). Kept fully separate from
+// runId's item list on purpose: NS-20's moves permanently `locked` several
+// rows, and doing that against the shared runId polluted makeRoom's
+// walk-past-locked-rows logic for the still-in-flight FAIL/blocked/decompose
+// scenarios (NS-7 et al) the first time this was tried.
+await check('NS-20', 'move clamps to [1,N] (§12.12) on its own isolated run: explicit position 1, explicit position N (the tail), and both over- and under-range values clamp instead of erroring', async () => {
+  const moveGoals = [];
+  for (let i = 1; i <= 5; i += 1) {
+    const g = await mkGoal(`Sim goal move-${i}`, 'its one leaf lands');
+    const leaf = await mkNode(g, `M${i} leaf`, { leaf_kind: 'machine' });
+    await acceptNode(g, leaf);
+    moveGoals.push(g);
+  }
+  const planned = await post('/night/plan', { mode: 'until_stop', goal_ids: moveGoals, config: { lanes: 1 } });
+  assert.equal(planned.status, 200, JSON.stringify(planned.json));
+  const moveRunId = planned.json.run.id;
+  assert.ok(itemsOf(moveRunId).length >= 5, `expected >=5 items for the move-clamp scenario, got ${itemsOf(moveRunId).length}`);
+
+  const items = itemsOf(moveRunId);
+  const unlocked = items.filter((i) => !i.locked);
+  assert.ok(unlocked.length >= 4, `need >=4 unlocked items for this scenario, got ${unlocked.length}`);
+
+  const a = unlocked[0];
+  const toFirst = await post(`/night/runs/${moveRunId}/items/${a.id}/move`, { position: 1 });
+  assert.equal(toFirst.status, 200, JSON.stringify(toFirst.json));
+  assert.equal(itemAt(moveRunId, 1).id, a.id, 'move to position 1 did not land at position 1');
+  assert.equal(itemAt(moveRunId, 1).locked, 1, 'move to position 1 did not lock the item');
+
+  const b = itemsOf(moveRunId).find((i) => !i.locked && i.id !== a.id);
+  assert.ok(b, 'no second unlocked item to move to the tail');
+  const tailPos = itemsOf(moveRunId).length;
+  const toLast = await post(`/night/runs/${moveRunId}/items/${b.id}/move`, { position: tailPos });
+  assert.equal(toLast.status, 200, JSON.stringify(toLast.json));
+  assert.equal(itemAt(moveRunId, tailPos).id, b.id, 'move to position N did not land at the last slot');
+
+  const c = itemsOf(moveRunId).find((i) => !i.locked && i.id !== a.id && i.id !== b.id);
+  assert.ok(c, 'no third unlocked item to exercise the over-range clamp');
+  const n1 = itemsOf(moveRunId).length;
+  const over = await post(`/night/runs/${moveRunId}/items/${c.id}/move`, { position: n1 + 500 });
+  assert.equal(over.status, 200, JSON.stringify(over.json));
+  assert.equal(itemsOf(moveRunId).find((i) => i.id === c.id).position, n1, 'a position far past N did not clamp to N');
+
+  const d = itemsOf(moveRunId).find((i) => !i.locked && ![a.id, b.id, c.id].includes(i.id));
+  assert.ok(d, 'no fourth unlocked item to exercise the under-range clamp');
+  const under = await post(`/night/runs/${moveRunId}/items/${d.id}/move`, { position: -50 });
+  assert.equal(under.status, 200, JSON.stringify(under.json));
+  assert.equal(itemsOf(moveRunId).find((i) => i.id === d.id).position, 1, 'a negative position did not clamp to 1');
+
+  const positions = itemsOf(moveRunId).map((i) => i.position).sort((x, y) => x - y);
+  assert.equal(positions.join(','), positions.map((_, idx) => idx + 1).join(','), 'positions are not a contiguous 1..N permutation after clamped moves');
+
+  const bogus404 = await post(`/night/runs/${moveRunId}/items/999999/move`, { position: 1 });
+  assert.equal(bogus404.status, 404, JSON.stringify(bogus404.json));
+  // moveRunId is left `planned` (never started) on purpose — §1's own rule is
+  // that a stale planned run is silently REPLACED by the next `/night/plan`
+  // call (never 409s), which NS-23's plan call below exercises for free.
+});
+
+await check('NS-23', '§8.2 stats: buildNightStats parses a commit-sha token near a commit hint AND sums N-tests-passed footers out of the real hopper node results', async () => {
+  const gStats = await mkGoal('Sim goal stats', 'its leaf is built with parseable worker footers');
+  const gStatsLeaf = await mkNode(gStats, 'Z1 leaf with commit + test footers', { leaf_kind: 'machine' });
+  await acceptNode(gStats, gStatsLeaf);
+  const planned = await post('/night/plan', { mode: 'until_stop', goal_ids: [gStats], config: { lanes: 1 } });
+  assert.equal(planned.status, 200, JSON.stringify(planned.json));
+  const statsRunId = planned.json.run.id;
+  const started = await post(`/night/runs/${statsRunId}/start`, {});
+  assert.equal(started.status, 200, JSON.stringify(started.json));
+  await tick('stats-fill');
+  const item = night.listNightItems(statsRunId).find((i) => i.status === 'running' && i.kind === 'plan');
+  assert.ok(item, 'no plan item is running for the isolated stats scenario');
+  const d = await dispatchLeaf(gStats, gStatsLeaf, [
+    { title: 'build one', spec: 'implement it' },
+    { title: 'build two', spec: 'add coverage' },
+  ]);
+  await tick('stats-stamp');
+  const [b1, b2] = d.buildIds;
+  await waitFor('build one running', async () => (await overlay(gStats, gStatsLeaf, b1)) === 'running');
+  await post(`/hopper-nodes/${b1}/finish`, { outcome: 'done', result: 'implemented and pushed as commit a1b2c3d4e5f6 to origin/main.' });
+  await waitFor('build two running', async () => (await overlay(gStats, gStatsLeaf, b2)) === 'running');
+  await post(`/hopper-nodes/${b2}/finish`, { outcome: 'done', result: '12 tests passed in the suite; 3 tests passed in a second file.' });
+  await waitFor(`VERIFY ${d.verifyId} running`, async () => (await overlay(gStats, gStatsLeaf, d.verifyId)) === 'running');
+  await post(`/hopper-nodes/${d.verifyId}/finish`, { outcome: 'done', result: 'VERDICT: PASS\nevidence:\n- shipped\ngaps:\n- none' });
+  await waitFor('gStatsLeaf -> check', async () => (await nodeById(gStats, gStatsLeaf))?.state === 'check');
+  await tick('stats-verdict');
+  const stats = night.buildNightStats(night.getNightRun(statsRunId));
+  assert.equal(stats.commits, 1, `expected exactly 1 parsed commit (one node carries a commit-shaped token), got ${stats.commits}`);
+  assert.equal(stats.tests, 15, `expected 12+3=15 parsed tests, got ${stats.tests}`);
+  assert.equal(stats.trees_spawned, 1, 'expected exactly one tree spawned in the isolated stats run');
+  assert.ok(stats.verify.pass >= 1, 'the VERDICT PASS was not counted in stats.verify.pass');
+  await post(`/night/runs/${statsRunId}/stop`, {});
 });
 
 } catch (err) {

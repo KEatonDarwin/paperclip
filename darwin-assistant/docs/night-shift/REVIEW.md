@@ -202,9 +202,14 @@ lock he set earlier. Worth knowing, not worth surprising him with an insertion-s
   sees a slightly stale tree. Only ever conservative (an under-settled tree picks fewer items), and
   self-corrects on the next 30s tick.
 - `nightHoldReason(run, logging)` ignores `logging` (`void logging`).
-- Pre-existing, NOT from this branch: `goals:sim` V03-6d is flaky (160/161). Verified by re-running
-  it with `src/tree-cue.ts` reverted to HEAD~1 — it fails identically, so it is not caused by the
-  tree-cue change.
+- `goals:sim` V03-6d failed at 160/161 during this review. Confirmed NOT from this branch by
+  re-running with `src/tree-cue.ts` reverted to HEAD~1 — it failed identically. Root cause was
+  found and fixed elsewhere the same day (env leakage: the login shell exports
+  `HOPPER_ENGINE_SLOTS=2` and `goals-sim.ts` used `?? '8'`, which only applies when the var is
+  UNSET). Cherry-picked that one-file harness fix (`0fe45967b`) onto this branch so the deploy
+  doesn't carry a red sim: **161/161**. V03-6d is the tree-cue routing check, so its passing WITH
+  finding 3's change in place is also direct evidence that the night-ownership suppression leaves
+  normal goal/node cue routing untouched.
 - UI: the 3-column shell is percentage-width with `shrink-0`, so a phone-width viewport degrades to
   three very narrow columns rather than stacking. Functional, not pretty — which is the bar the
   review brief set.
@@ -216,7 +221,7 @@ lock he set earlier. Worth knowing, not worth surprising him with an insertion-s
 | `npm run build` (tsc) | clean |
 | `npm run night:sim` | **28/28** (was 26/26; NS-24 + NS-25 added) |
 | `npm run night:check` (live-DB copy, temp port) | **6/6** |
-| `npm run goals:sim` | 160/161 — pre-existing V03-6d flake, reproduced with tree-cue reverted |
+| `npm run goals:sim` | **161/161** after cherry-picking the `goals-sim.ts` slot-floor fix (`0fe45967b`); 160/161 before it, reproduced with tree-cue reverted |
 | `npm run goals:autopilot-check` | 57/57 |
 | `npm run goals:autopilot-sim` | all PASS |
 | `npm run goals:review-checks` | 14/14 |
@@ -231,4 +236,9 @@ NS-24 and NS-25 both fail — then returns to 28/28 when restored.
 ## Files touched by this review
 
 `src/night-shift.ts` · `src/turn-admission.ts` · `src/tree-cue.ts` · `src/goals-autopilot.ts`
-(export only) · `scripts/night-shift-sim.mjs` · `docs/night-shift/REVIEW.md`
+(export only) · `scripts/night-shift-sim.mjs` · `docs/night-shift/REVIEW.md` · `scripts/goals-sim.ts`
+(cherry-picked harness fix)
+
+**For node #683 (DOCS+PUSH):** `NightRunConfig` gained `recue_minutes` (default 10, 1–120) —
+`skills/night-shift/CONTRACT.md` §1 and §4.1 should record it alongside the now-reachable
+"cue posted twice → fail + park" transition.

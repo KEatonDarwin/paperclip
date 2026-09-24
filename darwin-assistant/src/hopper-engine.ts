@@ -63,7 +63,16 @@ export interface HopperNodeRow {
   updated_at: string;
 }
 
-const MAX_SLOTS = Math.max(1, parseInt(process.env.HOPPER_ENGINE_SLOTS ?? '2', 10) || 2);
+// TOTAL WORKER SLOTS — live-settable (Kevin, 2026-09-24: "I need a way to
+// manually control this so I can turn it way up when I need to"). Was a
+// module-load env constant, which meant the one dial he most wanted to turn
+// required a service restart. Settings-KV wins over env; uncached, so a change
+// lands on the very next tick.
+function maxSlots(): number {
+  const raw = getSetting('hopper_slots')?.trim() || process.env.HOPPER_ENGINE_SLOTS;
+  const n = parseInt(raw ?? '', 10);
+  return Number.isFinite(n) && n >= 1 ? Math.min(n, 12) : 2;
+}
 const LEASE_MINUTES = Math.max(5, parseInt(process.env.HOPPER_ENGINE_LEASE_MIN ?? '30', 10) || 30);
 const MAX_ATTEMPTS = 2;
 // Default worker loadout when a node has no planner-assigned model. Settings-KV
@@ -564,7 +573,7 @@ export function startHopperEngine(processMessage: (input: string, conversationId
   processMessageRef = processMessage;
   setInterval(() => void dispatchTick('interval'), 60_000).unref?.();
   queueMicrotask(() => void dispatchTick('startup'));
-  console.log(`[hopper-engine] started · slots=${MAX_SLOTS} lease=${LEASE_MINUTES}m maxAttempts=${MAX_ATTEMPTS}`);
+  console.log(`[hopper-engine] started · slots=${maxSlots()} lease=${LEASE_MINUTES}m maxAttempts=${MAX_ATTEMPTS}`);
 }
 
 const spawnTaskInsert = sqliteDb.prepare(`
@@ -771,7 +780,7 @@ export async function dispatchTick(reason: string): Promise<void> {
     //    a maxed Claude window holds claude leaves while auggie/codex leaves in
     //    the same tree still dispatch (lease recovery above always runs; running
     //    workers are never interrupted). Held node = skip it, try the next.
-    let free = MAX_SLOTS - (runningCountStmt.get()?.n ?? 0);
+    let free = maxSlots() - (runningCountStmt.get()?.n ?? 0);
     if (free <= 0) return;
     // While Kevin is active, non-Claude lanes stay open (separate plans) but
     // narrowed by gov_concurrency_cap so the box he's working on isn't hosting

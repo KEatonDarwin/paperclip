@@ -33,7 +33,7 @@ import { getSetting, setSetting } from './conversation-db.js';
 // the single function all five call sites funnel through — and the SAME
 // candidate function is used by hopper-governor's Claude lane, so the selector
 // and the governor can never disagree about which account a worker lands on.
-import { throttleClaudeCandidates } from './throttle.js';
+import { throttleClaudeCandidates, hardWeeklyCeiling, readThrottleDials } from './throttle.js';
 
 /** A single Claude subscription JARVIS can route work to. */
 export interface ClaudeAccount {
@@ -381,6 +381,25 @@ export function isAccountEligible(
   return true;
 }
 
+/**
+ * The account a FOCUS mode (`throttle_claude_mode` = 'a' | 'b') names, or null
+ * in every other mode.
+ *
+ * REVIEW FIX (node #719): under a focus mode whose account cannot serve,
+ * `selectActiveClaudeAccount` correctly returns `account: null` and refuses to
+ * spill (CONTRACT §4.3/§4.5) — but the SPAWN layer read that null as "no opinion"
+ * and left `CLAUDE_CONFIG_DIR` unset, which resolves to `~/.claude`, i.e.
+ * account 'a' (its `config_dir` is null in the live registry). So `B only` with
+ * B spent silently ran on A — the one subscription the mode exists to protect.
+ * The spawn layer now pins the config dir to the FOCUSED account instead: the
+ * turn fails on the account Kevin focused rather than quietly spending the other.
+ */
+export function focusedClaudeAccount(): ClaudeAccount | null {
+  const mode = readThrottleDials().throttle_claude_mode;
+  if (mode !== 'a' && mode !== 'b') return null;
+  return findClaudeAccount(mode);
+}
+
 /** Look one account up in the registry by key. Null when it isn't registered. */
 export function findClaudeAccount(key: string | null | undefined): ClaudeAccount | null {
   if (!key || !key.trim()) return null;
@@ -391,6 +410,12 @@ export function findClaudeAccount(key: string | null | undefined): ClaudeAccount
 export function selectActiveClaudeAccount(ceiling: number, opts?: SelectAccountOptions): AccountSelection {
   const excludeKey = opts?.exclude ?? null;
   const accounts = listClaudeAccounts();
+  // REVIEW FIX (node #719): in HARD weekly mode the governor already refuses an
+  // account whose own weekly window is over `gov_weekly_ceiling`; this selector
+  // did not, so the two disagreed and a worker could be spawned onto exactly the
+  // account the hard stop-loss had closed. `null` in soft mode (the default), so
+  // the default path is byte-identical.
+  const weeklyCeiling = hardWeeklyCeiling();
   // WEEKLY GATE (tree-b32ef869 item 7 — long-standing bug, live on 2026-09-24):
   // the selector only ever looked at the 5h window, so an account whose WEEKLY
   // window was spent (100%) still read as eligible and kept winning the
@@ -401,7 +426,7 @@ export function selectActiveClaudeAccount(ceiling: number, opts?: SelectAccountO
   // now lives in isAccountEligible() so the governor applies the same one.
   const perAccount: AccountUsageEntry[] = accounts.map((account) => {
     const usage = readAccountUsage(account.key);
-    return { account, usage, eligible: isAccountEligible(account, usage, { ceiling, exclude: excludeKey }) };
+    return { account, usage, eligible: isAccountEligible(account, usage, { ceiling, exclude: excludeKey, weeklyCeiling }) };
   });
 
   // ⚡ THROTTLE §4.2 — filter then rank. `exclude` is applied BEFORE the mode

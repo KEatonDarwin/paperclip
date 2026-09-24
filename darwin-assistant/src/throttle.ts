@@ -215,6 +215,50 @@ export function readThrottleDials(): ThrottleDials {
   };
 }
 
+/**
+ * A byte-for-byte mirror of hopper-governor's `getGovernorSetting()` key/env
+ * precedence (settings-KV `gov_<name>` → env `GOV_<NAME>` → legacy env). It
+ * exists so a value the SELECTOR gates on can never differ from the value the
+ * GOVERNOR gates on: `readStopLoss()` above is a DISPLAY reader and deliberately
+ * clamps to the ≤98 rail, which would be the wrong number to gate with.
+ */
+function governorSettingRaw(name: string, legacyEnvKeys: string[] = []): string | null {
+  const key = name.startsWith('gov_') ? name : `gov_${name}`;
+  const kv = getSetting(key)?.trim();
+  if (kv) return kv;
+  const envKey = key.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+  const primary = process.env[envKey]?.trim();
+  if (primary) return primary;
+  for (const legacy of legacyEnvKeys) {
+    const v = process.env[legacy]?.trim();
+    if (v) return v;
+  }
+  return null;
+}
+
+/**
+ * The weekly ceiling an account must stay UNDER to be selectable, or `null` when
+ * weekly mode is `soft` (soft never blocks below 100).
+ *
+ * REVIEW FIX (node #719, §4.6 anti-drift): in `hard` weekly mode the governor's
+ * Claude lane excluded an account whose own weekly window was over the ceiling,
+ * but `selectActiveClaudeAccount` did not — it only ever looked at weekly ≥ 100.
+ * Verified on a scratch DB: hard mode, ceiling 30, account a at weekly 40 and
+ * account b at 20 → the governor reported OPEN on **b** while the selector
+ * returned **a**, so dispatch proceeded and the worker ran on the account that
+ * was already past the hard stop-loss. That is both the exact "worker spawns
+ * onto an account that cannot serve it" failure §4.6 exists to prevent AND a
+ * silent bypass of a stop-loss Kevin set. Soft mode (the default) returns null,
+ * so the default path is untouched.
+ */
+export function hardWeeklyCeiling(): number | null {
+  const mode = governorSettingRaw('weekly_mode', ['HOPPER_GOV_WEEKLY_MODE'])?.toLowerCase();
+  if (mode !== 'hard') return null;
+  const raw = governorSettingRaw('weekly_ceiling', ['HOPPER_GOV_WEEKLY_CEILING']);
+  const n = raw != null ? parseInt(raw, 10) : NaN;
+  return Number.isFinite(n) && n >= 0 ? n : 30;
+}
+
 /** §1.2 — the pre-existing stop-loss keys, SURFACED (not re-defaulted) here. */
 export interface ThrottleStopLoss {
   gov_5h_ceiling: number;

@@ -107,6 +107,7 @@ const governor = await import(path.join(dist, 'hopper-governor.js'));
 const accounts = await import(path.join(dist, 'claude-accounts.js'));
 const notifications = await import(path.join(dist, 'notifications.js'));
 const simGuard = await import(path.join(dist, 'sim-guard.js'));
+const throttleStatusModule = await import(path.join(dist, 'throttle-status.js'));
 // Side-effect import: goals.ts owns the goals/goal_nodes DDL; the per-goal cap
 // is a reverse lookup through goal_nodes, and throttle.ts deliberately does NOT
 // import goals.ts (that would be a cycle), so the tables need creating here.
@@ -865,6 +866,87 @@ await check('AC-17', 'PATCH/preset with a non-admin key -> 403 + nothing written
   const p3 = await http('PATCH', '/throttle', { token: adminKey, body: { hopper_slots: 9 } });
   assert.equal(p3.status, 200);
   assert.equal(getSetting('hopper_slots'), '9');
+});
+
+// ==============================================================================
+// REVIEW REGRESSIONS (node #719) — three defects found by the adversarial review
+// and fixed on this branch. Each one FAILED before its fix.
+// ==============================================================================
+await check('R-1', 'hard weekly mode: selector and governor agree (a hard stop-loss is not bypassed)', () => {
+  resetSettings();
+  setAccounts(TWO_ACCOUNTS);
+  setSetting('gov_weekly_mode', 'hard');
+  setSetting('gov_weekly_ceiling', '30');
+  setSetting('gov_5h_ceiling', '90');
+  writeUsage('a', 10, 40); // 5h fine, weekly 40 >= the HARD ceiling 30
+  writeUsage('b', 50, 20); // healthy
+  const sel = accounts.selectActiveClaudeAccount(accounts.claudeFiveHourCeiling());
+  const v = governor.governorCheck('claude');
+  assert.equal(sel.account?.key, 'b', 'selector must not pick the account the hard weekly ceiling closed');
+  assert.equal(v.active_account, 'b');
+  assert.equal(sel.account?.key ?? null, v.active_account ?? null, 'no drift in hard mode');
+  // soft mode (the default) is unchanged: weekly only blocks at 100.
+  setSetting('gov_weekly_mode', 'soft');
+  const soft = accounts.selectActiveClaudeAccount(accounts.claudeFiveHourCeiling());
+  assert.equal(soft.account?.key, 'a', 'soft mode still picks least-used a — default path untouched');
+});
+await check('R-2', 'focus mode does not leak to the default account at the SPAWN layer', () => {
+  resetSettings();
+  setAccounts(TWO_ACCOUNTS);
+  setSetting('throttle_claude_mode', 'b');
+  writeUsage('a', 10, 5);
+  writeUsage('b', 10, 100); // b weekly-spent -> focus HOLD
+  assert.equal(accounts.selectActiveClaudeAccount(90).account, null, 'selector holds (never spills to a)');
+  const focused = accounts.focusedClaudeAccount();
+  assert.equal(focused?.key, 'b', 'the spawn layer resolves the FOCUSED account, not ~/.claude (= account a)');
+  assert.equal(focused?.config_dir, '/tmp/sim-fake-b', 'and its own config dir, so the other subscription is never touched');
+  setSetting('throttle_claude_mode', 'auto');
+  assert.equal(accounts.focusedClaudeAccount(), null, 'inert in every non-focus mode');
+});
+await check('R-3', 'the composed status tells the truth when the governor is holding', async () => {
+  resetSettings();
+  setAccounts(TWO_ACCOUNTS);
+  writeUsage('a', 99, 5);
+  writeUsage('b', 99, 5); // both over the 5h ceiling -> Claude lane shut
+  wipeWork();
+  setSetting('hopper_slots', '4');
+  makeTree(1);
+  const bare = throttle.throttleStatus(); // no inputs: cannot see the governor
+  const full = throttleStatusModule.fullThrottleStatus();
+  assert.equal(bare.hold.dispatching, true, 'sanity: the bare payload genuinely cannot see the hold');
+  assert.equal(full.hold.dispatching, false, 'the composed payload reports the real hold');
+  assert.ok(full.accounts.length === 2, 'and carries the account views');
+  // and the HTTP route agrees with the composed helper both surfaces now use.
+  const r = await http('GET', '/throttle', { token: plainKey });
+  assert.equal(r.json.hold.dispatching, false);
+  assert.equal(r.json.hold.reason, full.hold.reason);
+});
+
+await check('R-4', 'a null-model node is judged on its EFFECTIVE model, not the empty column', async () => {
+  resetSettings();
+  setAccounts(null);
+  writeUsage('a', 95, 5); // over the 5h ceiling -> capacity hold
+  writeProviderUsage(process.env.CODEX_USAGE_FILE, 10);
+  writeProviderUsage(process.env.AUGGIE_USAGE_FILE, 10);
+  setSetting('throttle_provider_fallback', 'on');
+  setSetting('hopper_worker_model', 'claude-opus-5'); // the default loadout IS frontier
+  wipeWork();
+  setSetting('hopper_slots', '4');
+  const t = makeTree(1);
+  sqliteDb.prepare(`UPDATE hopper_nodes SET model = NULL WHERE id = ?`).run(t.nodeIds[0]);
+  await dispatch();
+  const row = node(t.nodeIds[0]);
+  assert.equal(row.adapter, 'claude', 'a null-model node on an opus default is never demoted to a worker tier');
+  assert.equal(row.throttle_reroute, null);
+  // and with a non-frontier default the same node DOES reroute, proving the
+  // check reads the effective model rather than just refusing everything.
+  setSetting('hopper_worker_model', 'claude-sonnet-5');
+  wipeWork();
+  const t2 = makeTree(1);
+  sqliteDb.prepare(`UPDATE hopper_nodes SET model = NULL WHERE id = ?`).run(t2.nodeIds[0]);
+  await dispatch();
+  assert.equal(node(t2.nodeIds[0]).adapter, 'codex', 'a sonnet default still reroutes normally');
+  sqliteDb.prepare(`DELETE FROM settings WHERE key = 'hopper_worker_model'`).run();
 });
 
 // -- no-process-spawned guard (§9 environment rule) ---------------------------

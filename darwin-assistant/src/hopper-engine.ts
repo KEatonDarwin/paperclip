@@ -858,7 +858,16 @@ export async function dispatchTick(reason: string): Promise<void> {
         // are out") may be rerouted to the next metered pool with headroom. The
         // rewrite happens on a PENDING node, before claimStmt: a running worker
         // is never re-provisioned (§5.3).
-        const outcome = throttleRerouteFor(node, verdict.reason, (p) => {
+        // §5.1 rule 5 operates on the EFFECTIVE model, not the raw column.
+        // A node with `model = null` spawns on defaultWorkerModel() — which is
+        // `hopper_worker_model`, and falls back to env HOPPER_WORKER_MODEL
+        // (claude-opus-5 on this box). Testing `node.model` raw would see an
+        // empty string, skip the frontier refusal, and silently demote an
+        // Opus-default review node onto a codex worker tier — exactly the
+        // "green review that reviewed nothing" the rule exists to prevent
+        // (review node #719).
+        const effectiveModel = node.model ?? defaultWorkerModel();
+        const outcome = throttleRerouteFor({ adapter: node.adapter, model: effectiveModel }, verdict.reason, (p) => {
           // The provider name IS a valid adapter label (providerFor('codex') ===
           // 'codex'), so the per-adapter verdict cache is reused as-is.
           let v = verdicts.get(p);
@@ -870,12 +879,12 @@ export async function dispatchTick(reason: string): Promise<void> {
         });
         if (outcome.kind === 'refused') {
           console.log(
-            `[throttle] node ${node.id} reroute_refused: ${outcome.why} (model ${node.model ?? 'default'}) — holding on ${verdict.reason}`,
+            `[throttle] node ${node.id} reroute_refused: ${outcome.why} (model ${effectiveModel ?? 'default'}) — holding on ${verdict.reason}`,
           );
           continue;
         }
         if (outcome.kind !== 'reroute') continue;
-        const line = rerouteAuditLine('claude', outcome.provider, verdict.reason, node.model, outcome.model);
+        const line = rerouteAuditLine('claude', outcome.provider, verdict.reason, effectiveModel, outcome.model);
         setNode(node.id, { adapter: outcome.adapter, model: outcome.model, throttle_reroute: line });
         console.log(`[throttle] reroute node ${node.id} ${line}`);
         notifyReroute(node.id, outcome.provider, verdict.reason);

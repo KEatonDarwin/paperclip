@@ -234,10 +234,9 @@ import {
   getHopperHistory,
   type NewNodeInput,
 } from '../hopper-engine.js';
-import { governorStatus, governorStatusAll, kevinActive, concurrencyCap, providerFor, type GovernorProvider } from '../hopper-governor.js';
+import { governorStatus, governorStatusAll } from '../hopper-governor.js';
 // ⚡ THROTTLE — Kevin's manual control surface (skills/throttle/CONTRACT.md §7.3).
 import {
-  throttleStatus,
   normalizeThrottlePatch,
   writeThrottleUpdates,
   enforceAdmissionFloor,
@@ -245,12 +244,11 @@ import {
   listThrottlePresets,
   seedThrottlePresets,
   clampGovernorNumeric,
-  overrideFor,
-  readStopLoss,
-  runningWorkerAdapters,
-  type ThrottleAccountView,
-  type ThrottleProviderView,
 } from '../throttle.js';
+// ONE composition of the governor + account views, shared with the `throttle`
+// persona tool — a bare throttleStatus() with no inputs reports "dispatching"
+// regardless of the real governor state (review node #719).
+import { fullThrottleStatus } from '../throttle-status.js';
 import {
   buildSpawnMonitorSnapshot,
   buildSpawnMonitorTreeDetail,
@@ -3544,60 +3542,8 @@ export function createApiV1Router(): Router {
   // edited presets (§6.2).
   seedThrottlePresets();
 
-  /** Composes the governor + account views GET /throttle needs (§7.1: throttle.ts
-   *  cannot import them — hopper-governor and claude-accounts both import IT). */
-  function composeThrottleInputs(): {
-    providers: Partial<Record<GovernorProvider, ThrottleProviderView>>;
-    accounts: ThrottleAccountView[];
-    daytime: { active: boolean; cap: number; nonClaudeRunning: number };
-  } {
-    const all = governorStatusAll();
-    const stopLoss = readStopLoss();
-    const ceilingFor: Record<GovernorProvider, number | null> = {
-      claude: stopLoss.gov_5h_ceiling,
-      codex: stopLoss.gov_codex_ceiling,
-      auggie: stopLoss.gov_auggie_ceiling,
-      devin: null,
-    };
-    const providers: Partial<Record<GovernorProvider, ThrottleProviderView>> = {};
-    for (const [name, v] of Object.entries(all) as [GovernorProvider, (typeof all)[GovernorProvider]][]) {
-      providers[name] = {
-        allow: v.allow,
-        reason: v.reason,
-        detail: v.detail,
-        usage: name === 'claude' ? (v.five_hour ?? null) : (v.provider_usage ?? null),
-        ceiling: ceilingFor[name],
-        override: overrideFor(name),
-      };
-    }
-
-    const ceiling = claudeFiveHourCeiling();
-    const selection = selectActiveClaudeAccount(ceiling);
-    const accounts: ThrottleAccountView[] = selection.perAccount.map(({ account, usage, eligible }) => ({
-      key: account.key,
-      label: account.label,
-      enabled: account.enabled,
-      five_hour: usage.five_hour,
-      weekly: usage.weekly,
-      stale: usage.stale,
-      locked_reason: usage.locked_reason,
-      eligible,
-      active: selection.account?.key === account.key,
-      five_hour_resets_at: usage.five_hour_resets_at,
-      weekly_resets_at: usage.weekly_resets_at,
-      five_hour_ceiling: ceiling,
-    }));
-
-    // The non-Claude daytime cap, so the hold line can name it honestly.
-    const active = kevinActive();
-    const nonClaudeRunning = active
-      ? runningWorkerAdapters().filter((a) => providerFor(a ?? 'claude') !== 'claude').length
-      : 0;
-    return { providers, accounts, daytime: { active, cap: concurrencyCap(), nonClaudeRunning } };
-  }
-
   router.get('/throttle', (_req: AuthedRequest, res) => {
-    res.json(throttleStatus(composeThrottleInputs()));
+    res.json(fullThrottleStatus());
   });
 
   router.patch('/throttle', (req: AuthedRequest, res) => {
@@ -3624,7 +3570,7 @@ export function createApiV1Router(): Router {
     // Spread the GET body FIRST so `admission` is the live AdmissionStatus the UI
     // renders; `admission_raised` reports whether this write moved the floor.
     res.json({
-      ...throttleStatus(composeThrottleInputs()),
+      ...fullThrottleStatus(),
       ok: true,
       updated: Object.keys(patch.updates),
       clamped: patch.clamped,
@@ -3650,7 +3596,7 @@ export function createApiV1Router(): Router {
     }
     void dispatchTick('throttle_preset_applied');
     res.json({
-      ...throttleStatus(composeThrottleInputs()),
+      ...fullThrottleStatus(),
       ok: true,
       preset: result.name,
       updated: result.updated,

@@ -24,7 +24,7 @@ import {
   type TurnRow,
   type TurnMetadata,
 } from './conversation-db.js';
-import { selectActiveClaudeAccount, claudeFiveHourCeiling, listClaudeAccounts, decideClaudeAccountForTurn, type ClaudeAccount } from './claude-accounts.js';
+import { selectActiveClaudeAccount, claudeFiveHourCeiling, listClaudeAccounts, decideClaudeAccountForTurn, focusedClaudeAccount, type ClaudeAccount } from './claude-accounts.js';
 import { noteWorkerSpawnAccount } from './throttle.js';
 import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent, type StreamEndEvent, type ToolCallEvent } from './sse-bus.js';
 import { buildGroupChatContext } from './group-chat-context.js';
@@ -1060,7 +1060,21 @@ export async function runClaude(
   let activeClaudeAccountKey: string | null = null;
   if (adapter.id === 'claude') {
     const provided = runtime && 'claudeAccount' in runtime ? (runtime.claudeAccount ?? null) : undefined;
-    const account = provided !== undefined ? provided : selectActiveClaudeAccount(claudeFiveHourCeiling()).account;
+    let account = provided !== undefined ? provided : selectActiveClaudeAccount(claudeFiveHourCeiling()).account;
+    // ⚡ THROTTLE §4.3 (review node #719) — under a FOCUS mode ('a'/'b') a null
+    // selection means "the focused account cannot serve right now". Falling
+    // through with env untouched is NOT neutral: no CLAUDE_CONFIG_DIR resolves
+    // to ~/.claude, which IS account 'a' (config_dir null in the registry). So
+    // `B only` with B spent would quietly run on A — the exact spill a focus
+    // mode exists to prevent, and the irreversible direction (a hold is undone
+    // with one click; a spent window is not). Pin the focused account instead.
+    if (!account) {
+      const focused = focusedClaudeAccount();
+      if (focused) {
+        account = focused;
+        console.log(`[agent] claude focus mode '${focused.key}' has no headroom; staying on '${focused.key}' rather than spilling to the default account`);
+      }
+    }
     if (account) {
       activeClaudeAccountKey = account.key;
       if (account.config_dir) {

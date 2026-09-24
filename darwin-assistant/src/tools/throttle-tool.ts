@@ -1,12 +1,17 @@
 import type { ToolDef } from './index.js';
 import {
-  throttleStatus,
   normalizeThrottlePatch,
   writeThrottleUpdates,
   enforceAdmissionFloor,
   applyThrottlePreset,
   listThrottlePresets,
 } from '../throttle.js';
+// The COMPOSED status (governor verdicts + account views). A bare
+// `throttleStatus()` in throttle.ts takes those as an argument and, with none supplied, reports
+// `dispatching: true` and an empty account list no matter how hard the governor
+// is holding — which is precisely the question this tool exists to answer
+// ("why is nothing running?"). Review node #719.
+import { fullThrottleStatus } from '../throttle-status.js';
 import { dispatchTick } from '../hopper-engine.js';
 
 // ⚡ THROTTLE (CONTRACT §7.5) — the dials Kevin turns himself.
@@ -53,7 +58,7 @@ export const throttle: ToolDef = {
   execute: async (args) => {
     const op = typeof args.operation === 'string' ? args.operation : '';
 
-    if (op === 'status') return throttleStatus();
+    if (op === 'status') return fullThrottleStatus();
 
     if (op === 'preset') {
       const name = typeof args.name === 'string' ? args.name.trim() : '';
@@ -61,7 +66,7 @@ export const throttle: ToolDef = {
       const result = applyThrottlePreset(name);
       if (!result.ok) return { error: result.error?.message ?? 'preset could not be applied', valid: result.error?.valid };
       void dispatchTick('throttle_preset_applied');
-      return { ok: true, preset: result.name, updated: result.updated, clamped: result.clamped, status: throttleStatus() };
+      return { ok: true, preset: result.name, updated: result.updated, clamped: result.clamped, status: fullThrottleStatus() };
     }
 
     if (op === 'set') {
@@ -72,7 +77,7 @@ export const throttle: ToolDef = {
       writeThrottleUpdates(patch.updates);
       const admission = enforceAdmissionFloor();
       void dispatchTick('throttle_changed');
-      return { ok: true, updated: Object.keys(patch.updates), clamped: patch.clamped, admission_raised: admission, status: throttleStatus() };
+      return { ok: true, updated: Object.keys(patch.updates), clamped: patch.clamped, admission_raised: admission, status: fullThrottleStatus() };
     }
 
     return { error: `unknown operation: ${op || '(none)'}` };

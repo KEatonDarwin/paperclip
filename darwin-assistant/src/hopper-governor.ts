@@ -1,7 +1,13 @@
 import { statSync, readFileSync } from 'node:fs';
 import { sqliteDb, getSetting } from './conversation-db.js';
 import { createNotification } from './notifications.js';
-import { listClaudeAccounts, readAccountUsage } from './claude-accounts.js';
+import { listClaudeAccounts, readAccountUsage, isAccountEligible, type AccountUsageEntry } from './claude-accounts.js';
+// ⚡ THROTTLE: the account MODE (§4.6) and Kevin's per-pool override (§6.4). The
+// candidate set + pick MUST come from throttleClaudeCandidates — if the mode were
+// applied only in claude-accounts.ts, this lane would report OPEN because B has
+// headroom while the selector returned A (focused, spent), and a worker would
+// spawn onto an account that cannot serve it. Worse than the bug it fixes.
+import { throttleClaudeCandidates, focusHoldDetail, overrideFor, type OverrideState } from './throttle.js';
 
 // HOPPER GOVERNOR v2 — the subscription throttle for overnight autonomous runs
 // (Kevin, 2026-09-06: "meter the connection and run all night"; upgraded
@@ -144,9 +150,15 @@ export interface GovernorVerdict {
     | 'kevin_active'
     | 'provider_ceiling'
     // Every enabled Claude account is over its 5h ceiling (multi-account only).
-    | 'claude_all_accounts_full';
+    | 'claude_all_accounts_full'
+    // ⚡ THROTTLE §4.3/§4.6: throttle_claude_mode focuses ONE account ('a'/'b')
+    // and that account cannot serve right now. A focus mode holds by design
+    // rather than spilling onto the other subscription — `ordered` spills.
+    | 'claude_focus_account_full';
   detail: string;
   provider: GovernorProvider;
+  /** ⚡ THROTTLE §6.4: this pool's `gov_override_*` state, when not 'auto'. */
+  override?: OverrideState;
   five_hour?: number | null;
   weekly?: number | null;
   provider_usage?: number | null;
@@ -305,8 +317,34 @@ export function governorStatusAll(): Record<GovernorProvider, GovernorVerdict> {
 function evaluate(provider: GovernorProvider, opts?: GovernorOptions): GovernorVerdict {
   const CONFIG = currentConfig();
 
+  // ⚡ THROTTLE §6.4 — `gov_override_{provider}` WINS OVER EVERYTHING, and is
+  // consulted before any other gate (including HOPPER_GOV_ENABLED: an explicit
+  // pause must outrank "the governor is switched off").
+  //   off  → hold every NEW claim on this pool; running workers are untouched,
+  //          which is exactly what the drain pattern in
+  //          scripts/throttle-slots-restart.sh depends on.
+  //   on   → bypass the ceilings and the Kevin-active gate, but NOT staleness —
+  //          the override says "spend it", not "fly blind".
+  //   auto / missing / empty / anything unrecognised → EXACTLY today's behaviour.
+  //          That default is what makes this safe to deploy.
+  // NOTE: until this shipped, nothing in src/ read these keys at all, so
+  // `gov_override_claude=off` could sit in settings-KV doing nothing. Resetting
+  // it to `auto` is part of the deploy, not an afterthought (CONTRACT §0).
+  const override = overrideFor(provider);
+  if (override === 'off') {
+    return {
+      allow: false,
+      reason: 'provider_ceiling',
+      detail: `gov_override_${provider}=off — Kevin paused this pool`,
+      provider,
+      override,
+      config: CONFIG,
+    };
+  }
+  const bypass = override === 'on';
+
   if (!ENABLED) {
-    return { allow: true, reason: 'disabled', detail: 'governor disabled via HOPPER_GOV_ENABLED=0', provider, config: CONFIG };
+    return { allow: true, reason: 'disabled', detail: 'governor disabled via HOPPER_GOV_ENABLED=0', provider, override, config: CONFIG };
   }
 
   if (provider !== 'claude') {
@@ -329,11 +367,12 @@ function evaluate(provider: GovernorProvider, opts?: GovernorOptions): GovernorV
         reason: 'usage_stale',
         detail: `${provider} usage snapshot ${staleMinutes == null ? 'unreadable' : `${Math.round(staleMinutes)}m stale`}`,
         provider,
+        override,
         provider_usage: used,
         config: CONFIG,
       };
     }
-    if (used != null && used >= ceiling) {
+    if (used != null && used >= ceiling && !bypass) {
       notifyOnce(
         `provider_ceiling:${provider}`,
         'info',
@@ -345,6 +384,7 @@ function evaluate(provider: GovernorProvider, opts?: GovernorOptions): GovernorV
         reason: 'provider_ceiling',
         detail: `${provider} usage ${used}% ≥ ${ceiling}%`,
         provider,
+        override,
         provider_usage: used,
         config: CONFIG,
       };
@@ -352,8 +392,9 @@ function evaluate(provider: GovernorProvider, opts?: GovernorOptions): GovernorV
     return {
       allow: true,
       reason: 'ok',
-      detail: `${provider} usage ${used ?? '?'}% (ceiling ${ceiling}%), clear to dispatch — Claude ceilings do not apply`,
+      detail: `${provider} usage ${used ?? '?'}% (ceiling ${ceiling}%), clear to dispatch — Claude ceilings do not apply${bypass ? ` (gov_override_${provider}=on)` : ''}`,
       provider,
+      override,
       provider_usage: used,
       config: CONFIG,
     };
@@ -372,11 +413,12 @@ function evaluate(provider: GovernorProvider, opts?: GovernorOptions): GovernorV
     enabledAccounts[0].config_dir === null;
 
   if (isDefaultSingle) {
-    const v = evaluateClaudeLegacy(CONFIG, opts);
+    const v = evaluateClaudeLegacy(CONFIG, opts, bypass);
     const acct = enabledAccounts[0];
     // Additive only — the gating decision above is untouched.
     return {
       ...v,
+      override,
       active_account: acct.key,
       claude_accounts: [
         { key: acct.key, five_hour: v.five_hour ?? null, weekly: v.weekly ?? null, active: v.allow },
@@ -384,7 +426,7 @@ function evaluate(provider: GovernorProvider, opts?: GovernorOptions): GovernorV
     };
   }
 
-  return evaluateClaudeAccounts(CONFIG, enabledAccounts, opts);
+  return { ...evaluateClaudeAccounts(CONFIG, enabledAccounts, opts, bypass), override };
 }
 
 /**
@@ -393,7 +435,7 @@ function evaluate(provider: GovernorProvider, opts?: GovernorOptions): GovernorV
  * Kevin-active in order. Kept verbatim so the default single-account path is
  * byte-identical to before the multi-account feature existed.
  */
-function evaluateClaudeLegacy(CONFIG: GovernorConfig, opts?: GovernorOptions): GovernorVerdict {
+function evaluateClaudeLegacy(CONFIG: GovernorConfig, opts?: GovernorOptions, bypass = false): GovernorVerdict {
   const provider: GovernorProvider = 'claude';
   const { fiveHour, weekly, staleMinutes } = readUsage();
   const FIVE_HOUR_CEILING = CONFIG.five_hour_ceiling;
@@ -419,7 +461,7 @@ function evaluateClaudeLegacy(CONFIG: GovernorConfig, opts?: GovernorOptions): G
 
   // Weekly ceiling runs BEFORE the Kevin-active exception (contract: weekly
   // is the hard overnight/workweek budget and isn't waived by the 5h waiver).
-  if (weekly != null && weekly >= WEEKLY_CEILING) {
+  if (weekly != null && weekly >= WEEKLY_CEILING && !bypass) {
     const soft = CONFIG.weekly_mode === 'soft';
     notifyOnce(
       'weekly',
@@ -440,7 +482,7 @@ function evaluateClaudeLegacy(CONFIG: GovernorConfig, opts?: GovernorOptions): G
     }
   }
 
-  if (fiveHour != null && fiveHour >= FIVE_HOUR_CEILING) {
+  if (fiveHour != null && fiveHour >= FIVE_HOUR_CEILING && !bypass) {
     return {
       allow: false,
       reason: 'five_hour_ceiling',
@@ -452,7 +494,7 @@ function evaluateClaudeLegacy(CONFIG: GovernorConfig, opts?: GovernorOptions): G
     };
   }
 
-  if (!opts?.ignoreKevinActive && kevinActive()) {
+  if (!bypass && !opts?.ignoreKevinActive && kevinActive()) {
     // 2026-09-11: "it's OK to use Claude while I'm here" below half the 5h
     // window burned. Unknown utilization never grants the waiver — it holds
     // exactly like an at/above-threshold reading would.
@@ -494,7 +536,12 @@ function evaluateClaudeLegacy(CONFIG: GovernorConfig, opts?: GovernorOptions): G
  * with 5h headroom are all over their weekly budget. Weekly is still honored
  * per soft/hard mode, exactly as the single-account gate does.
  */
-function evaluateClaudeAccounts(CONFIG: GovernorConfig, accounts: ReturnType<typeof listClaudeAccounts>, opts?: GovernorOptions): GovernorVerdict {
+function evaluateClaudeAccounts(
+  CONFIG: GovernorConfig,
+  accounts: ReturnType<typeof listClaudeAccounts>,
+  opts?: GovernorOptions,
+  bypass = false,
+): GovernorVerdict {
   const provider: GovernorProvider = 'claude';
   const ceiling = CONFIG.five_hour_ceiling;
   const weeklyCeil = CONFIG.weekly_ceiling;
@@ -513,25 +560,27 @@ function evaluateClaudeAccounts(CONFIG: GovernorConfig, accounts: ReturnType<typ
     };
   }
 
-  const entries = accounts.map((account) => ({ account, usage: readAccountUsage(account.key) }));
-
   // Accounts with real, current 5h headroom. In hard weekly mode an account is
   // also blocked when its own weekly window is spent (soft mode never blocks).
-  const withHeadroom = entries.filter(
-    (e) =>
-      !e.usage.stale &&
-      e.usage.five_hour != null &&
-      e.usage.five_hour < ceiling &&
-      (soft || e.usage.weekly == null || e.usage.weekly < weeklyCeil),
-  );
+  // isAccountEligible() is the SHARED predicate (claude-accounts.ts) — this lane
+  // used to carry its own copy, which lacked the weekly-spent and locked gates
+  // and so could call an unusable account OPEN. An `on` override bypasses the
+  // ceilings (but never staleness), so it only needs the readable check.
+  const entries: AccountUsageEntry[] = accounts.map((account) => {
+    const usage = readAccountUsage(account.key);
+    const eligible = bypass
+      ? !usage.stale && usage.five_hour != null
+      : isAccountEligible(account, usage, { ceiling, weeklyCeiling: soft ? null : weeklyCeil });
+    return { account, usage, eligible };
+  });
 
-  // Least-used eligible account (strict < keeps registry order on ties).
-  let selected: (typeof entries)[number] | null = null;
-  for (const e of withHeadroom) {
-    if (selected == null || (e.usage.five_hour as number) < (selected.usage.five_hour as number)) {
-      selected = e;
-    }
-  }
+  // ⚡ THROTTLE §4.6 — ONE candidate function, shared with the selector. Its
+  // `forSpawn` stays false here: the governor asks "is the lane open", it does
+  // not launch anything, so it must never consume the split cursor's turn.
+  const plan = throttleClaudeCandidates(entries, { forSpawn: false });
+  const withHeadroom = plan.eligible;
+  const picked = plan.rank(withHeadroom);
+  const selected = picked ? (entries.find((e) => e.account.key === picked.key) ?? null) : null;
 
   const claude_accounts: ClaudeAccountView[] = entries.map((e) => ({
     key: e.account.key,
@@ -560,7 +609,7 @@ function evaluateClaudeAccounts(CONFIG: GovernorConfig, accounts: ReturnType<typ
       );
     }
     // Kevin-active waiver still applies globally, keyed to the account we'd run on.
-    if (!opts?.ignoreKevinActive && kevinActive()) {
+    if (!bypass && !opts?.ignoreKevinActive && kevinActive()) {
       const maxActive = CONFIG.kevin_active_claude_max_5h;
       const waived = s.usage.five_hour != null && s.usage.five_hour < maxActive;
       if (!waived) {
@@ -583,6 +632,17 @@ function evaluateClaudeAccounts(CONFIG: GovernorConfig, accounts: ReturnType<typ
   }
 
   // No account has headroom — pick the most accurate hold reason.
+  // ⚡ THROTTLE §4.3: under a FOCUS mode the honest reason is that the ONE
+  // account Kevin focused on cannot serve — reporting "all accounts full" would
+  // point him at the ceilings when the dial to turn is the mode.
+  if (plan.focusKey) {
+    return withPayload({
+      allow: false,
+      reason: 'claude_focus_account_full',
+      detail: focusHoldDetail(plan.focusKey, entries),
+    });
+  }
+
   const readable = entries.filter((e) => !e.usage.stale && e.usage.five_hour != null);
   if (readable.length === 0) {
     notifyOnce(

@@ -234,7 +234,23 @@ import {
   getHopperHistory,
   type NewNodeInput,
 } from '../hopper-engine.js';
-import { governorStatus, governorStatusAll } from '../hopper-governor.js';
+import { governorStatus, governorStatusAll, kevinActive, concurrencyCap, providerFor, type GovernorProvider } from '../hopper-governor.js';
+// ⚡ THROTTLE — Kevin's manual control surface (skills/throttle/CONTRACT.md §7.3).
+import {
+  throttleStatus,
+  normalizeThrottlePatch,
+  writeThrottleUpdates,
+  enforceAdmissionFloor,
+  applyThrottlePreset,
+  listThrottlePresets,
+  seedThrottlePresets,
+  clampGovernorNumeric,
+  overrideFor,
+  readStopLoss,
+  runningWorkerAdapters,
+  type ThrottleAccountView,
+  type ThrottleProviderView,
+} from '../throttle.js';
 import {
   buildSpawnMonitorSnapshot,
   buildSpawnMonitorTreeDetail,
@@ -3495,7 +3511,10 @@ export function createApiV1Router(): Router {
           sendError(res, 400, 'invalid_setting', `${key} must be a non-negative integer (0–100000)`);
           return;
         }
-        updates[key] = String(Math.trunc(n));
+        // ⚡ THROTTLE §1.3 rule 7: route the ceilings through the SAME clamp the
+        // throttle uses, so the ≤98 stop-loss rail ("a window at 100% is a wall,
+        // not a budget") cannot be walked around via this older panel.
+        updates[key] = String(clampGovernorNumeric(key, n));
       }
     }
     if (!Object.keys(updates).length) {
@@ -3507,6 +3526,132 @@ export function createApiV1Router(): Router {
     const raw: Record<string, string | null> = {};
     for (const key of GOVERNOR_SETTING_KEYS) raw[key] = getSetting(key);
     res.json({ ok: true, updated: Object.keys(updates), effective: governorStatus('claude').config, raw });
+  });
+
+  // == ⚡ THROTTLE ==============================================================
+  // Kevin's manual control over the autonomous work rate (skills/throttle/
+  // CONTRACT.md). Four dials + a preset button: total workers · per-goal cap ·
+  // which account/provider runs it · stop-loss. Every dial is settings-KV read
+  // uncached, so a change lands on the next dispatch tick — never a restart.
+  //
+  // GET is read-only and side-effect free (it must NOT raise the admission floor
+  // or advance the split cursor). PATCH/preset are admin-scoped, all-or-nothing,
+  // and share ONE validation chokepoint with every other write path.
+
+  /** Composes the governor + account views GET /throttle needs (§7.1: throttle.ts
+   *  cannot import them — hopper-governor and claude-accounts both import IT). */
+  function composeThrottleInputs(): {
+    providers: Partial<Record<GovernorProvider, ThrottleProviderView>>;
+    accounts: ThrottleAccountView[];
+    daytime: { active: boolean; cap: number; nonClaudeRunning: number };
+  } {
+    const all = governorStatusAll();
+    const stopLoss = readStopLoss();
+    const ceilingFor: Record<GovernorProvider, number | null> = {
+      claude: stopLoss.gov_5h_ceiling,
+      codex: stopLoss.gov_codex_ceiling,
+      auggie: stopLoss.gov_auggie_ceiling,
+      devin: null,
+    };
+    const providers: Partial<Record<GovernorProvider, ThrottleProviderView>> = {};
+    for (const [name, v] of Object.entries(all) as [GovernorProvider, (typeof all)[GovernorProvider]][]) {
+      providers[name] = {
+        allow: v.allow,
+        reason: v.reason,
+        detail: v.detail,
+        usage: name === 'claude' ? (v.five_hour ?? null) : (v.provider_usage ?? null),
+        ceiling: ceilingFor[name],
+        override: overrideFor(name),
+      };
+    }
+
+    const ceiling = claudeFiveHourCeiling();
+    const selection = selectActiveClaudeAccount(ceiling);
+    const accounts: ThrottleAccountView[] = selection.perAccount.map(({ account, usage, eligible }) => ({
+      key: account.key,
+      label: account.label,
+      enabled: account.enabled,
+      five_hour: usage.five_hour,
+      weekly: usage.weekly,
+      stale: usage.stale,
+      locked_reason: usage.locked_reason,
+      eligible,
+      active: selection.account?.key === account.key,
+      five_hour_resets_at: usage.five_hour_resets_at,
+      weekly_resets_at: usage.weekly_resets_at,
+      five_hour_ceiling: ceiling,
+    }));
+
+    // The non-Claude daytime cap, so the hold line can name it honestly.
+    const active = kevinActive();
+    const nonClaudeRunning = active
+      ? runningWorkerAdapters().filter((a) => providerFor(a ?? 'claude') !== 'claude').length
+      : 0;
+    return { providers, accounts, daytime: { active, cap: concurrencyCap(), nonClaudeRunning } };
+  }
+
+  router.get('/throttle', (_req: AuthedRequest, res) => {
+    seedThrottlePresets(); // idempotent; never overwrites Kevin's edited presets
+    res.json(throttleStatus(composeThrottleInputs()));
+  });
+
+  router.patch('/throttle', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Changing the throttle requires an admin-scoped key');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const patch = normalizeThrottlePatch(body);
+    if (patch.error) {
+      sendError(res, 400, patch.error.code, patch.error.message);
+      return;
+    }
+    if (!Object.keys(patch.updates).length) {
+      sendError(res, 400, 'invalid_request', 'No recognized throttle settings in body');
+      return;
+    }
+    writeThrottleUpdates(patch.updates);
+    // §2.2 call site 1 — raise admission before anything can be dispatched
+    // against the new slot count, then kick a tick (same fire-and-forget shape
+    // PATCH /hopper-engine/settings already uses).
+    const admission = enforceAdmissionFloor();
+    void dispatchTick('throttle_changed');
+    // Spread the GET body FIRST so `admission` is the live AdmissionStatus the UI
+    // renders; `admission_raised` reports whether this write moved the floor.
+    res.json({
+      ...throttleStatus(composeThrottleInputs()),
+      ok: true,
+      updated: Object.keys(patch.updates),
+      clamped: patch.clamped,
+      admission_raised: admission,
+    });
+  });
+
+  router.post('/throttle/preset', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Applying a throttle preset requires an admin-scoped key');
+      return;
+    }
+    const name = typeof (req.body ?? {}).name === 'string' ? String(req.body.name).trim() : '';
+    if (!name) {
+      sendError(res, 400, 'invalid_request', `name is required. Valid presets: ${Object.keys(listThrottlePresets()).join(', ')}`);
+      return;
+    }
+    const result = applyThrottlePreset(name);
+    if (!result.ok) {
+      const code = result.error?.code ?? 'invalid_request';
+      sendError(res, code === 'unknown_preset' ? 404 : 400, code, `${result.error?.message ?? 'preset could not be applied'}${result.error?.valid ? ` — valid presets: ${result.error.valid.join(', ')}` : ''}`);
+      return;
+    }
+    void dispatchTick('throttle_preset_applied');
+    res.json({
+      ...throttleStatus(composeThrottleInputs()),
+      ok: true,
+      preset: result.name,
+      updated: result.updated,
+      clamped: result.clamped,
+      admission_raised: result.admission,
+    });
   });
 
   // Decision memory — real settled-node outcomes by model, for the planner to

@@ -29,6 +29,11 @@
 
 import { statSync, readFileSync } from 'node:fs';
 import { getSetting, setSetting } from './conversation-db.js';
+// ⚡ THROTTLE (§4.1/§4.6): the account MODE is applied at this one chokepoint —
+// the single function all five call sites funnel through — and the SAME
+// candidate function is used by hopper-governor's Claude lane, so the selector
+// and the governor can never disagree about which account a worker lands on.
+import { throttleClaudeCandidates } from './throttle.js';
 
 /** A single Claude subscription JARVIS can route work to. */
 export interface ClaudeAccount {
@@ -63,6 +68,14 @@ export interface AccountUsage {
    * unchanged.
    */
   locked_reason: string | null;
+  /**
+   * ⚡ THROTTLE §7.2 (additive): when the 5-hour / 7-day windows reset, straight
+   * out of the same payload this function already parses. It was being dropped
+   * on the floor; the throttle panel shows a reset countdown beside each
+   * account. Null when absent/unreadable. No existing consumer changes.
+   */
+  five_hour_resets_at: string | null;
+  weekly_resets_at: string | null;
 }
 
 /** One account paired with its live usage + whether it's eligible right now. */
@@ -232,6 +245,8 @@ interface UsageWindow {
   utilization?: number | null;
   /** Claude's own lockout marker for this window; null/absent when healthy. */
   locked_reason?: string | null;
+  /** ISO 8601 instant this window rolls over (throttle §7.2). */
+  resets_at?: string | null;
 }
 
 /**
@@ -255,14 +270,24 @@ export function readAccountUsage(key: string): AccountUsage {
       (typeof parsed.seven_day?.locked_reason === 'string' && parsed.seven_day.locked_reason.trim()
         ? parsed.seven_day.locked_reason.trim()
         : null);
+    const iso = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v.trim() : null);
     return {
       five_hour: parsed.five_hour?.utilization ?? null,
       weekly: parsed.seven_day?.utilization ?? null,
       stale: ageMinutes > staleMinutesCeiling(),
       locked_reason: locked,
+      five_hour_resets_at: iso(parsed.five_hour?.resets_at),
+      weekly_resets_at: iso(parsed.seven_day?.resets_at),
     };
   } catch {
-    return { five_hour: null, weekly: null, stale: true, locked_reason: null };
+    return {
+      five_hour: null,
+      weekly: null,
+      stale: true,
+      locked_reason: null,
+      five_hour_resets_at: null,
+      weekly_resets_at: null,
+    };
   }
 }
 
@@ -276,6 +301,14 @@ export interface SelectAccountOptions {
    * `null`/omitted = no exclusion → byte-identical to the single-arg call.
    */
   exclude?: string | null;
+  /**
+   * ⚡ THROTTLE §4.4: true only when this selection is about to launch a real
+   * hopper WORKER. It selects `split` mode's strict-alternation ranking; every
+   * other mode ignores it. Kevin's own interactive turns leave it false and rank
+   * least-used under `split`, because alternating his chat turns would drop
+   * native `--resume` sessions (session ids are per-account) for no benefit.
+   */
+  forSpawn?: boolean;
 }
 
 /**
@@ -308,6 +341,46 @@ function isWeeklySpent(weekly: number | null): boolean {
   return weekly != null && weekly >= 100;
 }
 
+/** Inputs for {@link isAccountEligible}. */
+export interface AccountEligibilityOptions {
+  /** The 5h ceiling to compare against (`claudeFiveHourCeiling()` normally). */
+  ceiling: number;
+  /** Key to treat as ineligible (the rate-limit rescue's just-failed account). */
+  exclude?: string | null;
+  /**
+   * Extra gate for the governor's HARD weekly mode: an account whose own weekly
+   * window is at/above this ceiling is ineligible. `null`/omitted = soft mode
+   * (weekly never blocks below 100), which is the selector's own behaviour and
+   * the default.
+   */
+  weeklyCeiling?: number | null;
+}
+
+/**
+ * THE one definition of "can this account serve a turn right now".
+ *
+ * Extracted (2026-09-24, throttle §4.6) because there were TWO: this file's
+ * selector and hopper-governor's `withHeadroom`. They differed — the governor
+ * lacked the weekly-spent and locked gates — so the governor could report OPEN
+ * on an account the selector already considered unusable. That is precisely the
+ * "a worker spawns onto an account that cannot serve it" failure the throttle's
+ * account modes would otherwise amplify. Same predicate, both sides, one place.
+ */
+export function isAccountEligible(
+  account: ClaudeAccount,
+  usage: AccountUsage,
+  opts: AccountEligibilityOptions,
+): boolean {
+  if (opts.exclude && account.key === opts.exclude) return false;
+  if (!account.enabled) return false;
+  if (usage.stale) return false;
+  if (usage.five_hour == null || usage.five_hour >= opts.ceiling) return false;
+  if (isWeeklySpent(usage.weekly)) return false;
+  if (usage.locked_reason != null) return false;
+  if (opts.weeklyCeiling != null && usage.weekly != null && usage.weekly >= opts.weeklyCeiling) return false;
+  return true;
+}
+
 /** Look one account up in the registry by key. Null when it isn't registered. */
 export function findClaudeAccount(key: string | null | undefined): ClaudeAccount | null {
   if (!key || !key.trim()) return null;
@@ -318,30 +391,31 @@ export function findClaudeAccount(key: string | null | undefined): ClaudeAccount
 export function selectActiveClaudeAccount(ceiling: number, opts?: SelectAccountOptions): AccountSelection {
   const excludeKey = opts?.exclude ?? null;
   const accounts = listClaudeAccounts();
+  // WEEKLY GATE (tree-b32ef869 item 7 — long-standing bug, live on 2026-09-24):
+  // the selector only ever looked at the 5h window, so an account whose WEEKLY
+  // window was spent (100%) still read as eligible and kept winning the
+  // least-used pick, sending every turn at an account that could not serve. A
+  // spent weekly window, or a lock Claude reports directly, makes an account
+  // ineligible for AUTO selection. An explicit per-thread pin still routes there
+  // (agent.ts) — that is Kevin's call to make, not the selector's. The predicate
+  // now lives in isAccountEligible() so the governor applies the same one.
   const perAccount: AccountUsageEntry[] = accounts.map((account) => {
     const usage = readAccountUsage(account.key);
-    const eligible =
-      account.key !== excludeKey &&
-      account.enabled &&
-      !usage.stale &&
-      usage.five_hour != null &&
-      usage.five_hour < ceiling &&
-      // WEEKLY GATE (tree-b32ef869 item 7 — long-standing bug, live on
-      // 2026-09-24): the selector only ever looked at the 5h window, so an
-      // account whose WEEKLY window was spent (100%) still read as eligible
-      // and kept winning the least-used pick, sending every turn at an account
-      // that could not serve. A spent weekly window, or a lock Claude reports
-      // directly, now makes an account ineligible for AUTO selection. An
-      // explicit per-thread pin still routes there (agent.ts) — that is Kevin's
-      // call to make, not the selector's.
-      !isWeeklySpent(usage.weekly) &&
-      usage.locked_reason == null;
-    return { account, usage, eligible };
+    return { account, usage, eligible: isAccountEligible(account, usage, { ceiling, exclude: excludeKey }) };
   });
+
+  // ⚡ THROTTLE §4.2 — filter then rank. `exclude` is applied BEFORE the mode
+  // filter (it is baked into `eligible` above and re-applied to the fallback
+  // pools below), so a mid-flight rate-limit rescue always leaves the account
+  // that just hit the wall even under a focus mode naming it. At the default
+  // mode `auto` the filter is the identity function and the ranking is
+  // least-used, i.e. byte-identical to before the throttle existed.
+  const plan = throttleClaudeCandidates(perAccount, { forSpawn: opts?.forSpawn === true });
 
   const pickLowest = (pool: AccountUsageEntry[]): ClaudeAccount | null => {
     let best: AccountUsageEntry | null = null;
     for (const e of pool) {
+      if (e.usage.five_hour == null) continue;
       if (best == null || (e.usage.five_hour as number) < (best.usage.five_hour as number)) {
         best = e; // strict < keeps the earlier (registry-order) entry on ties
       }
@@ -349,7 +423,18 @@ export function selectActiveClaudeAccount(ceiling: number, opts?: SelectAccountO
     return best?.account ?? null;
   };
 
-  let account = pickLowest(perAccount.filter((e) => e.eligible));
+  let account = plan.rank(plan.eligible);
+
+  // §4.3 — FOCUS MODE HOLDS. 'a'/'b' are focus modes: Kevin picks "A only"
+  // precisely to keep the other subscription untouched. Silently spilling onto B
+  // would defeat the only reason to choose a focus mode, and it errs in the
+  // irreversible direction (a hold is undone with one click; a spent weekly
+  // window is not). He already has a first-class "A first, then B" — that is
+  // `ordered`, which does spill. So: no eligible focused account ⇒ null, and no
+  // fallback, rather than reaching for the other subscription.
+  if (plan.focusKey) {
+    return { account, allNames: accounts.map((a) => a.key), perAccount };
+  }
 
   if (account == null) {
     // Fallback: every eligible slot is exhausted/stale. Still hand back something
@@ -357,7 +442,7 @@ export function selectActiveClaudeAccount(ceiling: number, opts?: SelectAccountO
     // enabled account, else nothing (all disabled). The excluded key is dropped
     // from both fallback pools so a rescue never returns to the account that
     // just hit the wall.
-    const enabledReadable = perAccount.filter(
+    const enabledReadable = plan.narrow(perAccount).filter(
       (e) => e.account.enabled && e.account.key !== excludeKey && e.usage.five_hour != null,
     );
     // Prefer a fallback that isn't weekly-spent/locked — those genuinely cannot
@@ -369,7 +454,7 @@ export function selectActiveClaudeAccount(ceiling: number, opts?: SelectAccountO
     account =
       pickLowest(servable) ??
       pickLowest(enabledReadable) ??
-      accounts.find((a) => a.enabled && a.key !== excludeKey) ??
+      plan.narrow(perAccount).find((e) => e.account.enabled && e.account.key !== excludeKey)?.account ??
       null;
   }
 

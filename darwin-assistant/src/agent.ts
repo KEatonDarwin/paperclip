@@ -25,6 +25,7 @@ import {
   type TurnMetadata,
 } from './conversation-db.js';
 import { selectActiveClaudeAccount, claudeFiveHourCeiling, listClaudeAccounts, decideClaudeAccountForTurn, type ClaudeAccount } from './claude-accounts.js';
+import { noteWorkerSpawnAccount } from './throttle.js';
 import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent, type StreamEndEvent, type ToolCallEvent } from './sse-bus.js';
 import { buildGroupChatContext } from './group-chat-context.js';
 import { buildQuickChatContext } from './quick-chat-profiles.js';
@@ -1410,7 +1411,11 @@ async function runConversationTurn(
   // adapter check above. Single-account default (config_dir null) never trips this.
   let activeClaudeAccount: ClaudeAccount | null = null;
   if (adapter.id === 'claude') {
-    const selection = selectActiveClaudeAccount(claudeFiveHourCeiling());
+    // ⚡ THROTTLE §4.4: a hopper worker thread IS a real worker spawn, so it gets
+    // `split` mode's strict alternation; Kevin's own threads rank least-used so
+    // alternating never drops his native --resume session (ids are per-account).
+    const forSpawn = conv.external_id.startsWith('cockpit:hopper-node-');
+    const selection = selectActiveClaudeAccount(claudeFiveHourCeiling(), { forSpawn });
     // LEGACY-SESSION GUARD (2026-09-17): threads created before multi-Claude have a
     // NULL session_account but their `claude --resume` id lives in account 'a'
     // (~/.claude, the pre-multi-claude default). Coalesce to 'a' when a live
@@ -1430,6 +1435,11 @@ async function runConversationTurn(
       selection,
     });
     activeClaudeAccount = decision.account;
+    // Advance the split cursor exactly once per real worker spawn, AFTER the
+    // account is decided. A pin decided it ⇒ not the mode's turn to alternate.
+    if (forSpawn && decision.source === 'auto' && activeClaudeAccount) {
+      noteWorkerSpawnAccount(activeClaudeAccount.key);
+    }
     if (decision.pinIgnoredReason) {
       console.log(
         `[agent] Conversation ${conv.id} is pinned to Claude account '${conv.pinned_claude_account}' but that account is ${decision.pinIgnoredReason === 'disabled' ? 'disabled' : 'not in the registry'}; falling back to '${activeClaudeAccount?.key ?? 'none'}'`,

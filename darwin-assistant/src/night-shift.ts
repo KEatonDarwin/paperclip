@@ -1381,7 +1381,10 @@ function invalidatePausedCache(): void { pausedCache = null; }
 
 /** Tree ids belonging to open items of a PAUSED run. Cached per write. */
 export function nightShiftPausedTreeIds(): ReadonlySet<string> {
-  if (pausedCache && nowMs() - pausedCache.at < 5_000) return pausedCache.ids;
+  // 1s, not 5s: the window this TTL opens is "a cue turn already in flight when
+  // Kevin hit Pause plants a tree" — the write that would invalidate the cache
+  // happens on the goal node, not on us, so only the clock closes it.
+  if (pausedCache && nowMs() - pausedCache.at < 1_000) return pausedCache.ids;
   const ids = new Set<string>();
   const paused = sqliteDb.prepare(`SELECT id FROM night_runs WHERE status = 'paused'`).all() as Array<{ id: number }>;
   for (const r of paused) {
@@ -1502,7 +1505,7 @@ function applyVerdict(run: NightRunRow, item: NightItemRow, node: GoalNodeRow): 
 
 /** §4.1 P0 sync — reconcile every running item against live goal/tree state.
  *  Runs on EVERY tick, held or paused or not. Zero model calls. */
-function syncItems(run: NightRunRow): void {
+function syncItems(run: NightRunRow, canCue: boolean): void {
   const cfg = run.config;
   for (const item of listNightItems(run.id)) {
     if (item.status !== 'running') continue;
@@ -1559,7 +1562,7 @@ function syncItems(run: NightRunRow): void {
       // a plan/replan whose node is still an untouched `set` leaf means the cue
       // itself went unanswered. Re-ask, then fail + park.
       if (item.kind !== 'finish' && derived.state === 'set' && node.plan_state === 'none') {
-        nagOrFail(run, fresh, item.kind);
+        nagOrFail(run, fresh, item.kind, canCue);
       }
       continue; // still working
     }
@@ -1577,23 +1580,23 @@ function syncItems(run: NightRunRow): void {
         expandPredicted(run, fresh);
         continue;
       }
-      nagOrFail(run, fresh, 'decompose');
+      nagOrFail(run, fresh, 'decompose', canCue);
       continue;
     }
     if (item.kind === 'classify') {
       if (node.leaf_kind !== 'none' || node.state === 'parked') { finishItem(run, fresh, 'done', `leaf_kind=${node.leaf_kind}, state=${node.state}`); continue; }
-      nagOrFail(run, fresh, 'classify');
+      nagOrFail(run, fresh, 'classify', canCue);
       continue;
     }
     if (item.kind === 'weigh_in') {
       if (node.review_state !== 'awaiting_jarvis') { finishItem(run, fresh, 'done', `review_state=${node.review_state}`); continue; }
-      nagOrFail(run, fresh, 'weigh_in');
+      nagOrFail(run, fresh, 'weigh_in', canCue);
       continue;
     }
     if (item.kind === 'unblock') {
       if (node.state === 'parked') { finishItem(run, fresh, 'failed', node.parked_reason ?? 'parked during the unblock pass'); continue; }
       if (derived.cache !== 'blocked') { finishItem(run, fresh, 'done', `tree ${derived.tree_id ?? '?'} is no longer blocked`); continue; }
-      nagOrFail(run, fresh, 'unblock');
+      nagOrFail(run, fresh, 'unblock', canCue);
       continue;
     }
   }
@@ -1618,7 +1621,11 @@ function lastCueAtMs(item: NightItemRow): number {
  *  "running". Now: no proof after `recue_minutes` → ask once more (second ask);
  *  still nothing after another `recue_minutes` → fail the item and park the
  *  node, which frees the lane and surfaces it in the morning report. */
-function nagOrFail(run: NightRunRow, item: NightItemRow, kind: string): void {
+function nagOrFail(run: NightRunRow, item: NightItemRow, kind: string, canCue: boolean): void {
+  // A re-ask IS new work and a fail+park IS a state change, so neither may
+  // happen while the run is paused or the governor is holding: the item simply
+  // waits, exactly like a queued one. (P0's fact reconciliation still runs.)
+  if (!canCue) return;
   const waited = Math.max(0, Math.round((nowMs() - lastCueAtMs(item)) / 60_000));
   if (waited < run.config.recue_minutes) return;
   if (cueCount(item.id) >= 2) {
@@ -1844,12 +1851,14 @@ export async function tickNightShift(reason = 'loop'): Promise<void> {
     const run = activeNightRun();
     if (!run) { driver.idleTicks = 0; return; }
 
-    // P0 always runs — facts keep reconciling even when paused or held.
-    syncItems(run);
+    // The gate is evaluated BEFORE P0 so P0 knows whether it may cue: fact
+    // reconciliation always runs (paused or held), but the re-ask/park half
+    // only when the run is genuinely open for new work.
+    const hold = run.status === 'running' ? nightHoldReason(run, true) : null;
+    syncItems(run, run.status === 'running' && !hold);
     const after = getNightRun(run.id)!;
     if (after.status !== 'running') return;
 
-    const hold = nightHoldReason(after, true);
     if (hold) {
       noteHold(after, hold.reason, hold.detail);
       // REVIEW (node #682) — `claude_all_accounts_full` is the MULTI-account

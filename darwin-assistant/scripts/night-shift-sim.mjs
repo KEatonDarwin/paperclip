@@ -785,7 +785,7 @@ await check('NS-23', '§8.2 stats: buildNightStats parses a commit-sha token nea
 
 // ── REVIEW (node #682) — the two defects the review found, pinned ─────────
 
-await check('NS-24', 'an unanswered model cue is RE-ASKED after recue_minutes and then fails + parks the node, freeing its lane (it used to hold the lane until morning)', async () => {
+await check('NS-24', 'an unanswered model cue is RE-ASKED after recue_minutes (never while paused or held) and then fails + parks the node, freeing its lane (it used to hold the lane until morning)', async () => {
   const gNag = await mkGoal('Sim goal nag', 'its one unclassified node gets decided');
   const nagNode = await mkNode(gNag, 'N1 node nobody answers for');
   await acceptNode(gNag, nagNode);
@@ -807,7 +807,19 @@ await check('NS-24', 'an unanswered model cue is RE-ASKED after recue_minutes an
   assert.equal(itemCues(nagRun, item.id).length, 1, 're-asked before recue_minutes had elapsed');
   assert.equal(itemsOf(nagRun).find((i) => i.id === item.id).status, 'running');
 
-  // Past the window → ONE second ask, same lane, same item.
+  // Past the window but PAUSED → still no re-ask (a nag is new work).
+  assert.equal((await post(`/night/runs/${nagRun}/pause`, {})).status, 200);
+  night.__setNightShiftTestOverrides({ governor: () => ({ allow: true, reason: 'ok', detail: 'sim' }), now: () => t0 + 6 * 60_000 });
+  await tick('nag-while-paused');
+  assert.equal(itemCues(nagRun, item.id).length, 1, 'a paused run re-asked an item');
+  assert.equal((await post(`/night/runs/${nagRun}/resume`, {})).status, 200);
+
+  // Past the window but the governor is HOLDING → still no re-ask.
+  night.__setNightShiftTestOverrides({ governor: () => ({ allow: false, reason: 'usage_stale', detail: 'sim hold' }), now: () => t0 + 6 * 60_000 });
+  await tick('nag-while-held');
+  assert.equal(itemCues(nagRun, item.id).length, 1, 'a held run re-asked an item');
+
+  // Past the window, open for work → ONE second ask, same lane, same item.
   night.__setNightShiftTestOverrides({ governor: () => ({ allow: true, reason: 'ok', detail: 'sim' }), now: () => t0 + 6 * 60_000 });
   await tick('nag-second-ask');
   const cues = itemCues(nagRun, item.id);

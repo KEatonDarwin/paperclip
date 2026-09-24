@@ -285,11 +285,15 @@ try {
     const v = ap.parseVerdict('VERDICT: PASS\ngaps:\n- none', 'split');
     assert.ok(v.gaps[0].startsWith('no verdict'));
   });
-  await check('AP-6f', 'PASS with a real gap alongside it is downgraded to FAIL', () => {
+  // Changed 2026-09-24: a PASS that also lists gaps STAYS a PASS. The old
+  // downgrade invented re-plan rounds — goal-5 nodes #49 and #52 each burned a
+  // whole tree because the verifier passed and then listed nice-to-haves. The
+  // contract says the FIRST line's token is the verdict; gaps survive as advisory.
+  await check('AP-6f', 'PASS with a real gap alongside it STAYS a PASS (gaps kept as advisory)', () => {
     const v = ap.parseVerdict('VERDICT: PASS\nevidence:\n- looked\ngaps:\n- one real gap');
-    assert.equal(v.verdict, 'FAIL');
-    assert.equal(v.gaps[0], 'verifier reported gaps alongside PASS');
-    assert.equal(v.gaps[1], 'one real gap');
+    assert.equal(v.verdict, 'PASS');
+    assert.equal(v.gaps.length, 1);
+    assert.equal(v.gaps[0], 'advisory (did not block PASS): one real gap');
   });
   await check('AP-6g', 'a lone "- none" gap bullet parses to an empty gaps array', () => {
     assert.deepEqual(ap.parseVerdict('VERDICT: FAIL\ngaps:\n- none').gaps, []);

@@ -54,6 +54,15 @@ export interface AccountUsage {
   weekly: number | null;
   /** True when the usage file is missing or older than the staleness threshold. */
   stale: boolean;
+  /**
+   * Non-null when Claude itself reports this subscription as locked out of a
+   * window (the `locked_reason` the usage payload carries on `five_hour` /
+   * `seven_day`). A locked account cannot serve a turn no matter what the
+   * percentages say, so it is never AUTO-selected (a manual pin still wins —
+   * see agent.ts). Null on every healthy account, so the normal path is
+   * unchanged.
+   */
+  locked_reason: string | null;
 }
 
 /** One account paired with its live usage + whether it's eligible right now. */
@@ -221,6 +230,8 @@ export function usageFilePath(key: string): string {
 
 interface UsageWindow {
   utilization?: number | null;
+  /** Claude's own lockout marker for this window; null/absent when healthy. */
+  locked_reason?: string | null;
 }
 
 /**
@@ -236,13 +247,22 @@ export function readAccountUsage(key: string): AccountUsage {
       five_hour?: UsageWindow | null;
       seven_day?: UsageWindow | null;
     };
+    // A lock on EITHER window means the account can't serve right now.
+    const locked =
+      (typeof parsed.five_hour?.locked_reason === 'string' && parsed.five_hour.locked_reason.trim()
+        ? parsed.five_hour.locked_reason.trim()
+        : null) ??
+      (typeof parsed.seven_day?.locked_reason === 'string' && parsed.seven_day.locked_reason.trim()
+        ? parsed.seven_day.locked_reason.trim()
+        : null);
     return {
       five_hour: parsed.five_hour?.utilization ?? null,
       weekly: parsed.seven_day?.utilization ?? null,
       stale: ageMinutes > staleMinutesCeiling(),
+      locked_reason: locked,
     };
   } catch {
-    return { five_hour: null, weekly: null, stale: true };
+    return { five_hour: null, weekly: null, stale: true, locked_reason: null };
   }
 }
 
@@ -278,6 +298,23 @@ export interface SelectAccountOptions {
  * the first enabled (non-excluded) account. Returns account=null only when every
  * account is disabled/excluded.
  */
+/**
+ * A weekly window is "spent" at 100% utilization. Unknown (null) is NOT treated
+ * as spent — a missing weekly number must never take an otherwise-healthy
+ * account out of rotation (the 5h + staleness gates already cover unreadable
+ * usage), which keeps every pre-existing single-account path byte-identical.
+ */
+function isWeeklySpent(weekly: number | null): boolean {
+  return weekly != null && weekly >= 100;
+}
+
+/** Look one account up in the registry by key. Null when it isn't registered. */
+export function findClaudeAccount(key: string | null | undefined): ClaudeAccount | null {
+  if (!key || !key.trim()) return null;
+  const k = key.trim();
+  return listClaudeAccounts().find((a) => a.key === k) ?? null;
+}
+
 export function selectActiveClaudeAccount(ceiling: number, opts?: SelectAccountOptions): AccountSelection {
   const excludeKey = opts?.exclude ?? null;
   const accounts = listClaudeAccounts();
@@ -285,7 +322,20 @@ export function selectActiveClaudeAccount(ceiling: number, opts?: SelectAccountO
     const usage = readAccountUsage(account.key);
     const eligible =
       account.key !== excludeKey &&
-      account.enabled && !usage.stale && usage.five_hour != null && usage.five_hour < ceiling;
+      account.enabled &&
+      !usage.stale &&
+      usage.five_hour != null &&
+      usage.five_hour < ceiling &&
+      // WEEKLY GATE (tree-b32ef869 item 7 — long-standing bug, live on
+      // 2026-09-24): the selector only ever looked at the 5h window, so an
+      // account whose WEEKLY window was spent (100%) still read as eligible
+      // and kept winning the least-used pick, sending every turn at an account
+      // that could not serve. A spent weekly window, or a lock Claude reports
+      // directly, now makes an account ineligible for AUTO selection. An
+      // explicit per-thread pin still routes there (agent.ts) — that is Kevin's
+      // call to make, not the selector's.
+      !isWeeklySpent(usage.weekly) &&
+      usage.locked_reason == null;
     return { account, usage, eligible };
   });
 
@@ -310,8 +360,102 @@ export function selectActiveClaudeAccount(ceiling: number, opts?: SelectAccountO
     const enabledReadable = perAccount.filter(
       (e) => e.account.enabled && e.account.key !== excludeKey && e.usage.five_hour != null,
     );
-    account = pickLowest(enabledReadable) ?? accounts.find((a) => a.enabled && a.key !== excludeKey) ?? null;
+    // Prefer a fallback that isn't weekly-spent/locked — those genuinely cannot
+    // serve, so reaching for one is strictly worse than reaching for an account
+    // that is merely over its 5h ceiling (which resets in hours, not days). If
+    // every fallback is spent we still hand one back rather than nothing, so the
+    // "always try something" contract is unchanged.
+    const servable = enabledReadable.filter((e) => !isWeeklySpent(e.usage.weekly) && e.usage.locked_reason == null);
+    account =
+      pickLowest(servable) ??
+      pickLowest(enabledReadable) ??
+      accounts.find((a) => a.enabled && a.key !== excludeKey) ??
+      null;
   }
 
   return { account, allNames: accounts.map((a) => a.key), perAccount };
+}
+
+// ─── PER-TURN ACCOUNT DECISION (tree-b32ef869) ────────────────────────────────
+// The whole "which account does THIS turn run on, and do we have to drop the
+// native session to get there" decision, as one pure function so it can be unit
+// tested without spawning a CLI. src/agent.ts's runConversationTurn is the only
+// caller; it previously carried this logic inline.
+
+/** What {@link decideClaudeAccountForTurn} needs to know about the thread. */
+export interface ClaudeAccountTurnInput {
+  /** `conversations.pinned_claude_account` — Kevin's explicit pick, or null for Auto. */
+  pinnedKey: string | null;
+  /** The thread's live `claude --resume` id, or null when there is no session yet. */
+  sessionId: string | null;
+  /**
+   * `conversations.session_account`, already coalesced by the caller for legacy
+   * threads (null session_account + a live session ⇒ 'a', the pre-multi-claude
+   * default). Null = unknown/non-claude ⇒ no forced session drop.
+   */
+  storedAccount: string | null;
+  /** The live least-used selection for this moment. */
+  selection: AccountSelection;
+}
+
+export interface ClaudeAccountTurnDecision {
+  /** The account to run on (null only when nothing is usable at all). */
+  account: ClaudeAccount | null;
+  /** True when the caller must null out its session id and start fresh. */
+  dropSession: boolean;
+  /** 'pin' when an explicit per-thread pin decided it, else 'auto'. */
+  source: 'pin' | 'auto';
+  /** Why a present pin was ignored (null when there was no pin, or it applied). */
+  pinIgnoredReason: 'unknown_account' | 'disabled' | null;
+}
+
+/**
+ * Resolve the Claude account for one turn.
+ *
+ * Precedence: an explicit per-thread PIN > session stickiness > least-used.
+ *
+ * A pin wins even when the pinned account is over its 5h ceiling — the ceiling
+ * paces unattended workers, and a pin is a human instruction on a human turn
+ * (hopper workers stay gated by the governor, which this never touches). A pin
+ * also outranks session stickiness, since otherwise a thread with a live
+ * session could never be moved to the other subscription; moving means dropping
+ * the session, because `claude --resume` ids live inside one account's
+ * CLAUDE_CONFIG_DIR.
+ *
+ * A pin naming an account that is no longer registered, or is disabled, is
+ * IGNORED (reported via `pinIgnoredReason`) and the normal selection applies —
+ * a stale pin must never hard-fail a turn.
+ *
+ * With `pinnedKey: null` this is byte-identical to the pre-pin behavior.
+ */
+export function decideClaudeAccountForTurn(input: ClaudeAccountTurnInput): ClaudeAccountTurnDecision {
+  const { sessionId, storedAccount, selection } = input;
+  let account = selection.account;
+  let source: 'pin' | 'auto' = 'auto';
+  let pinIgnoredReason: ClaudeAccountTurnDecision['pinIgnoredReason'] = null;
+
+  const pinnedKey = input.pinnedKey?.trim() || null;
+  if (pinnedKey) {
+    const pinned = findClaudeAccount(pinnedKey);
+    if (!pinned) pinIgnoredReason = 'unknown_account';
+    else if (!pinned.enabled) pinIgnoredReason = 'disabled';
+    else {
+      account = pinned;
+      source = 'pin';
+    }
+  }
+
+  let dropSession = false;
+  if (sessionId && storedAccount && account && storedAccount !== account.key) {
+    // STICKINESS: a live session stays on the account it was created under for
+    // as long as that account is still eligible — unless a pin says otherwise.
+    const stored = selection.perAccount.find((e) => e.account.key === storedAccount);
+    if (stored?.eligible && source !== 'pin') {
+      account = stored.account;
+    } else {
+      dropSession = true;
+    }
+  }
+
+  return { account, dropSession, source, pinIgnoredReason };
 }

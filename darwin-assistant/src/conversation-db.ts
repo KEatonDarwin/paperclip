@@ -130,6 +130,14 @@ for (const col of [
   // stale session and start fresh. Null = unknown/legacy or a non-Claude session
   // (single-account default stays null-safe → byte-identical behavior).
   'session_account TEXT',
+  // Per-thread Claude ACCOUNT pin (tree-b32ef869). A `claude_accounts` registry
+  // key ('a'/'b'/…) that Kevin picked by hand in the model dropdown, meaning
+  // "run THIS thread on THIS subscription". Null = Auto — the least-used
+  // selector decides, byte-identical to before this column existed. Distinct
+  // from session_account, which merely RECORDS where the live session happens
+  // to live; a pin is an explicit human instruction and outranks both the
+  // selector and session stickiness (see agent.ts runConversationTurn).
+  'pinned_claude_account TEXT',
 ]) {
   try { db.exec(`ALTER TABLE conversations ADD COLUMN ${col}`); } catch {}
 }
@@ -169,6 +177,9 @@ export interface ConversationRow {
   // Multi-Claude (tree-44d2ff4a): the `claude_accounts` key the live session was
   // created under (null = unknown/legacy or non-Claude). See updateSessionState.
   session_account: string | null;
+  // Per-thread Claude account pin (tree-b32ef869): a `claude_accounts` key
+  // Kevin chose explicitly, or null for Auto (least-used selection).
+  pinned_claude_account: string | null;
 }
 
 /**
@@ -260,6 +271,14 @@ const stmts = {
   setThreadModelOverride: db.prepare<[string | null, string | null, number]>(
     `UPDATE conversations
      SET thread_adapter = ?, thread_model = ?, updated_at = datetime('now')
+     WHERE id = ?`,
+  ),
+  // Per-thread Claude account pin (tree-b32ef869). Stored independently of
+  // thread_adapter/thread_model so switching models WITHIN the claude adapter
+  // keeps the pin.
+  setThreadClaudeAccount: db.prepare<[string | null, number]>(
+    `UPDATE conversations
+     SET pinned_claude_account = ?, updated_at = datetime('now')
      WHERE id = ?`,
   ),
   closeConversation: db.prepare<[string]>(
@@ -410,6 +429,17 @@ export function setThreadModelOverride(
   model: string | null,
 ): void {
   stmts.setThreadModelOverride.run(adapterId, model, conversationId);
+}
+
+/**
+ * Pin this thread to one Claude account (a `claude_accounts` registry key), or
+ * pass null to clear the pin and go back to Auto (least-used selection).
+ * Deliberately separate from setThreadModelOverride: the pin must survive a
+ * model change inside the claude adapter, and clearing the adapter override
+ * clears the pin explicitly at the call site (the route), not implicitly here.
+ */
+export function setThreadClaudeAccount(conversationId: number, accountKey: string | null): void {
+  stmts.setThreadClaudeAccount.run(accountKey, conversationId);
 }
 
 export function closeConversation(externalId: string): void {

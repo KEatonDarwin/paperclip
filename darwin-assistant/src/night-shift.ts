@@ -477,8 +477,12 @@ function fmtDuration(mins: number | null): string {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 function parsePlan(node: Pick<GoalNodeRow, 'plan'> | null | undefined): PlanJson | null {
-  if (!node?.plan) return null;
-  try { return JSON.parse(node.plan) as PlanJson; } catch { return null; }
+  // `GoalNodeRow.plan` is a parsed PlanJson per CONTRACT §3.0, but tolerate a
+  // raw JSON string too — older reads shipped it unparsed.
+  const raw: unknown = node?.plan;
+  if (!raw) return null;
+  if (typeof raw === 'object') return raw as PlanJson;
+  try { return JSON.parse(raw as string) as PlanJson; } catch { return null; }
 }
 function planEst(cfg: NightRunConfig): number {
   return Math.max(cfg.est.plan_build_min, cfg.est.plan_build_per_node * cfg.predicted_nodes);

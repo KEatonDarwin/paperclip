@@ -173,6 +173,14 @@ async function check(id: string, description: string, fn: () => void | Promise<v
 }
 
 // ── dispatch helpers — drive a real machine leaf through the real hopper ───
+/** CONTRACT §3.0: a read `GoalNodeRow.plan` is a parsed PlanJson. Older reads
+ *  shipped the raw JSON string; accept either so this sim tests the contract,
+ *  not one particular serialization. */
+function readPlan(raw: any): any {
+  if (!raw) return null;
+  return typeof raw === 'string' ? JSON.parse(raw) : raw;
+}
+
 async function nodeById(goalId: number, nodeId: number): Promise<any> {
   const t = await get(`/goals/${goalId}?include_discarded=1`);
   return t.json.nodes.find((n: any) => n.id === nodeId);
@@ -201,7 +209,7 @@ async function dispatchLeaf(
   if (planned.status !== 200) throw new Error(`propose_plan failed (${planned.status}): ${JSON.stringify(planned.json)}`);
   const treeId: string = planned.json.tree.id;
   const gnode = await nodeById(goalId, nodeId);
-  const plan = JSON.parse(gnode.plan);
+  const plan = readPlan(gnode.plan);
   const verifyId: number = plan.verify_hopper_node_id;
   const buildIds: number[] = (planned.json.hopper_nodes as any[]).map((h) => h.id).filter((id) => id !== verifyId);
   for (const bid of buildIds) {
@@ -406,7 +414,7 @@ try {
     m1TreeId = treeId; m1VerifyId = verifyId;
     const n = await nodeById(g1, m1);
     assert.equal(n.state, 'working');
-    const plan = JSON.parse(n.plan);
+    const plan = readPlan(n.plan);
     assert.equal(plan.nodes.length, 2, JSON.stringify(plan.nodes.map((x: any) => x.title)));
     assert.equal(plan.nodes[1].title, `VERIFY: ${n.title}`);
     assert.equal(plan.nodes[1].model, 'claude-opus-5');
@@ -849,7 +857,7 @@ try {
     });
     assert.equal(planned.status, 200, JSON.stringify(planned.json));
     const gnode = await nodeById(g5, u1);
-    const plan = JSON.parse(gnode.plan);
+    const plan = readPlan(gnode.plan);
     const buildId = (planned.json.hopper_nodes as any[]).map((h) => h.id).find((id) => id !== plan.verify_hopper_node_id);
     await waitFor(`build ${buildId} running`, async () => (await overlayStatus(g5, u1, buildId)) === 'running');
     const fin = await post(`/hopper-nodes/${buildId}/finish`, { outcome: 'blocked', result: 'toolchain missing' });

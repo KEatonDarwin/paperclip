@@ -166,8 +166,12 @@ function cfgOf(goal: GoalRow): AutopilotConfig {
 }
 
 function parsePlan(node: Pick<GoalNodeRow, 'plan'>): PlanJson | null {
-  if (!node.plan) return null;
-  try { return JSON.parse(node.plan) as PlanJson; } catch { return null; }
+  // `GoalNodeRow.plan` is a parsed PlanJson per CONTRACT §3.0, but tolerate a
+  // raw JSON string too — older reads shipped it unparsed.
+  const raw: unknown = node.plan;
+  if (!raw) return null;
+  if (typeof raw === 'object') return raw as PlanJson;
+  try { return JSON.parse(raw as string) as PlanJson; } catch { return null; }
 }
 
 /** settled(n) for the ORDERING walk (§15.4). `working` counts: a leaf that

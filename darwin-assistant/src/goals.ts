@@ -192,8 +192,13 @@ export interface GoalNodeDbRow {
   updated_at: string;
 }
 
-/** Public node shape — raw row + derived depth/child_count/path (CONTRACT §3.0). */
-export interface GoalNodeRow extends Omit<GoalNodeDbRow, 'autopilot_verdict'> {
+/** Public node shape — raw row + derived depth/child_count/path (CONTRACT §3.0).
+ *  NOTE `plan` is PARSED here: the DB column is JSON text, but CONTRACT §3.0
+ *  types the public row as `plan: PlanJson | null`. It was shipping as a raw
+ *  string, which crashed the cockpit's Plan card mid-render (it does
+ *  `plan.nodes.length`) and took the whole /goals/<id> page down. */
+export interface GoalNodeRow extends Omit<GoalNodeDbRow, 'autopilot_verdict' | 'plan'> {
+  plan: PlanJson | null;
   autopilot_verdict: AutopilotVerdict | null;
   depth: number;
   child_count: number;
@@ -443,6 +448,19 @@ function normLeafKind(value: unknown): LeafKind {
 // ---------------------------------------------------------------------------
 
 /** v0.4 §15.1 — raw JSON column → AutopilotVerdict (null on missing/garbage). */
+/** Parse the stored `plan` JSON text into the PlanJson the CONTRACT promises.
+ *  Returns null on malformed JSON rather than throwing — a bad row must never
+ *  break a whole-tree read. */
+export function parsePlanJson(raw: string | null | undefined): PlanJson | null {
+  if (!raw) return null;
+  try {
+    const v: unknown = JSON.parse(raw);
+    return v && typeof v === 'object' ? (v as PlanJson) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function parseVerdictJson(raw: string | null | undefined): AutopilotVerdict | null {
   if (!raw) return null;
   try {
@@ -496,7 +514,7 @@ function buildDerivedNodes(goalTitle: string, rawNodes: GoalNodeDbRow[]): GoalNo
   const out: GoalNodeRow[] = [];
   function walk(parentId: number | null): void {
     for (const n of childrenOf.get(parentId) ?? []) {
-      out.push({ ...n, autopilot_verdict: parseVerdictJson(n.autopilot_verdict), depth: depthOf(n), child_count: childCountOf.get(n.id) ?? 0, path: pathOf(n) });
+      out.push({ ...n, plan: parsePlanJson(n.plan), autopilot_verdict: parseVerdictJson(n.autopilot_verdict), depth: depthOf(n), child_count: childCountOf.get(n.id) ?? 0, path: pathOf(n) });
       walk(n.id);
     }
   }

@@ -62,12 +62,31 @@ process.env.GOALS_VAULT_ROOT = VAULT;
 delete process.env.ANTHROPIC_API_KEY;
 
 // ── the no-spawn proof (SHIFTS.md §4) ──────────────────────────────────────
+// A global `pgrep -c claude` is racy on this box: jarvis.service workers
+// (including whichever one is RUNNING this suite) start and stop constantly,
+// so the count moves for reasons that have nothing to do with the suite.
+// What the rail actually forbids is THIS SUITE spawning a model call — and any
+// process the suite spawns is a descendant of this node process. Count those.
 function claudeProcs() {
-  try { return Number(execFileSync('bash', ['-lc', 'pgrep -c claude || true'], { encoding: 'utf8' }).trim()) || 0; }
-  catch { return 0; }
+  try {
+    const out = execFileSync('ps', ['-eo', 'pid=,ppid=,comm='], { encoding: 'utf8' });
+    const rows = out.trim().split('\n').map((l) => l.trim().split(/\s+/, 3));
+    const kids = new Map();
+    for (const [pid, ppid] of rows) {
+      if (!kids.has(ppid)) kids.set(ppid, []);
+      kids.get(ppid).push(pid);
+    }
+    const mine = new Set();
+    const stack = [String(process.pid)];
+    while (stack.length) {
+      const p = stack.pop();
+      for (const c of kids.get(p) ?? []) { if (!mine.has(c)) { mine.add(c); stack.push(c); } }
+    }
+    return rows.filter(([pid, , comm]) => mine.has(pid) && /claude/i.test(comm ?? '')).length;
+  } catch { return 0; }
 }
 const CLAUDE_BEFORE = claudeProcs();
-console.log(`[shifts-check] scratch DB: ${DB_PATH} · claude procs before: ${CLAUDE_BEFORE}`);
+console.log(`[shifts-check] scratch DB: ${DB_PATH} · claude procs (suite descendants) before: ${CLAUDE_BEFORE}`);
 
 const distDir = path.join(repoRoot, 'dist');
 const express = (await import('express')).default;

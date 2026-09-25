@@ -1,5 +1,5 @@
 import { runClaude } from './agent.js';
-import { getTurns, type ConversationRow } from './conversation-db.js';
+import { getTurnsLean as getTurns, type ConversationRow } from './conversation-db.js';
 import { getLatestThreadSummary } from './thread-summaries.js';
 
 // DAR-741 — AI-mediated natural-language search over cockpit threads. Kevin

@@ -14,7 +14,7 @@ import {
   addTurn,
   closeConversation as dbCloseConversation,
   touchConversation,
-  getTurns,
+  getTurnsLean,
   countTurns,
   getSetting,
   getAutonomyLevel,
@@ -1385,7 +1385,7 @@ async function runConversationTurn(
   );
   const runtime = resolveConversationRuntime(conv);
   const adapter = runtime.adapter;
-  const turns = getTurns(conv.id);
+  const turns = getTurnsLean(conv.id);
   const toolContext: ToolExecutionContext = {
     conversationId: conv.id,
     externalId: conv.external_id,

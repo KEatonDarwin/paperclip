@@ -1,5 +1,5 @@
 import { runClaude } from './agent.js';
-import { getTurns, type ConversationRow, type TurnRow } from './conversation-db.js';
+import { getTurnsLean as getTurns, type ConversationRow, type TurnRow } from './conversation-db.js';
 import { createThreadSummary, type ThreadSummaryRow } from './thread-summaries.js';
 
 // DAR-740 — generate a point-in-time "what's done / in progress / next"

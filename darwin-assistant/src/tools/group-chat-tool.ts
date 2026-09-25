@@ -1,5 +1,5 @@
 import type { ToolDef } from './index.js';
-import { getConversationById, listConversationsByGroup, getTurns } from '../conversation-db.js';
+import { getConversationById, listConversationsByGroup, getTurnsLean as getTurns } from '../conversation-db.js';
 import { getLatestThreadSummary } from '../thread-summaries.js';
 
 // DAR-742 — group-chat-only tool. Only usable from inside a group's cover

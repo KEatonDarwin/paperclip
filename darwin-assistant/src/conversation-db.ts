@@ -293,6 +293,17 @@ const stmts = {
   getTurns: db.prepare<[number], TurnRow>(
     `SELECT * FROM turns WHERE conversation_id = ? ORDER BY turn_index ASC`,
   ),
+  // Same rows WITHOUT the claude_input/claude_output debug blobs (avg ~400KB per
+  // worker turn). Prompt composition never reads them, and on a 400+-turn thread
+  // SELECT * pulls tens of MB into the heap per processed turn — the allocator
+  // behind the 2026-09-25 jarvis.service heap-OOM crash loop.
+  getTurnsLean: db.prepare<[number], TurnRow>(
+    `SELECT id, conversation_id, turn_index, role, content, tool_name, tool_args,
+            tool_result, created_at, timing_ms, input_tokens, output_tokens,
+            cache_read_tokens, cache_write_tokens, model,
+            NULL AS claude_input, NULL AS claude_output, error_detail, images
+     FROM turns WHERE conversation_id = ? ORDER BY turn_index ASC`,
+  ),
   listActiveConversations: db.prepare<[], ConversationRow>(
     `SELECT * FROM conversations WHERE status = 'active' ORDER BY updated_at DESC`,
   ),
@@ -536,6 +547,13 @@ export function reconcileInterruptedRuns(): number {
 
 export function getTurns(conversationId: number): TurnRow[] {
   return stmts.getTurns.all(conversationId);
+}
+
+/** getTurns without the claude_input/claude_output debug blobs — use anywhere
+ *  the transcript is composed or scanned (prompt building, summaries, search);
+ *  the debug columns come back as NULL. */
+export function getTurnsLean(conversationId: number): TurnRow[] {
+  return stmts.getTurnsLean.all(conversationId);
 }
 
 export function listActiveConversations(): ConversationRow[] {

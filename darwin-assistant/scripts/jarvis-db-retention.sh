@@ -29,7 +29,7 @@ q(){ sqlite3 -cmd '.timeout 15000' "$DB" "$1"; }
 size(){ echo $(( $(stat -c %s "$DB") / 1048576 ))MB; }
 
 say "=== retention start db=$(size) wal=$(( $(stat -c %s "$DB-wal" 2>/dev/null || echo 0) / 1048576 ))MB windows: input ${INPUT_DAYS}d output ${OUTPUT_DAYS}d worker ${WORKER_DAYS}d"
-EPHEMERAL="(c.external_id LIKE 'cockpit:hopper-node-%' OR c.external_id LIKE 'quick:%' OR c.external_id LIKE 'checkin:%')"
+EPHEMERAL="(c.external_id LIKE 'cockpit:hopper-node-%' OR c.external_id LIKE 'quick:%' OR c.external_id LIKE 'checkin:%' OR c.external_id = 'cockpit:night-shift' OR c.external_id LIKE 'cockpit:shift-%')"
 
 sweep(){ # $1 label  $2 column  $3 where-clause (rows still holding data)
   local label="$1" col="$2" where="$3" n total=0

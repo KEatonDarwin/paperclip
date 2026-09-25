@@ -6,7 +6,7 @@
 # What it nulls (ONLY these two debug columns; conversation `content`,
 # tool_args/tool_result and thread membership are never touched):
 #   claude_input   older than INPUT_DAYS   (default 2)  — no runtime reader
-#   claude_output  older than OUTPUT_DAYS  (default 14) — read only by the
+#   claude_output  older than OUTPUT_DAYS  (default 4) — read only by the
 #                  collapsible "thinking steps" view in the cockpit
 #   both columns   older than WORKER_DAYS  (default 1)  on ephemeral threads
 #                  (cockpit:hopper-node-*, quick:*, checkin:*) — nobody opens
@@ -21,7 +21,7 @@
 set -u
 DB="${JARVIS_DB_PATH:-/home/kevin/paperclip/darwin-assistant/jarvis.db}"
 LOG=/tmp/jarvis-db-retention.log
-INPUT_DAYS="${INPUT_DAYS:-2}"; OUTPUT_DAYS="${OUTPUT_DAYS:-14}"; WORKER_DAYS="${WORKER_DAYS:-1}"
+INPUT_DAYS="${INPUT_DAYS:-2}"; OUTPUT_DAYS="${OUTPUT_DAYS:-4}"; WORKER_DAYS="${WORKER_DAYS:-1}"
 BATCH="${BATCH:-200}"
 VACUUM=0; [ "${1:-}" = "--vacuum" ] && VACUUM=1
 say(){ echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
@@ -46,6 +46,18 @@ sweep "claude_input>${INPUT_DAYS}d"  claude_input  "t.created_at < datetime('now
 sweep "claude_output>${OUTPUT_DAYS}d" claude_output "t.created_at < datetime('now','-${OUTPUT_DAYS} days')"
 sweep "worker claude_input>${WORKER_DAYS}d"  claude_input  "t.created_at < datetime('now','-${WORKER_DAYS} days') AND $EPHEMERAL"
 sweep "worker claude_output>${WORKER_DAYS}d" claude_output "t.created_at < datetime('now','-${WORKER_DAYS} days') AND $EPHEMERAL"
+
+# Legacy claude_input backstop: new turns spool to disk (conversation-db.ts,
+# 2026-09-25), so anything still in the column is old — null it all.
+sweep "claude_input legacy (any age)" claude_input "1=1"
+
+# Disk debug spool (claude_input lives here now): keep 3 days, then delete.
+SPOOL_DIR="${JARVIS_DEBUG_SPOOL_DIR:-/home/kevin/jarvis-debug-spool}"
+if [ -d "$SPOOL_DIR" ]; then
+  removed=$(find "$SPOOL_DIR" -type f -mtime +3 -print -delete | wc -l)
+  find "$SPOOL_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null
+  say "  debug spool: removed $removed file(s) older than 3d ($(du -sh "$SPOOL_DIR" 2>/dev/null | cut -f1) remaining)"
+fi
 
 q "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null
 say "checkpointed; freelist=$(q 'PRAGMA freelist_count;') pages db=$(size)"

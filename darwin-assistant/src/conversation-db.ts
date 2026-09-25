@@ -1,4 +1,5 @@
 import Database, { type Database as DatabaseType } from 'better-sqlite3';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -462,6 +463,27 @@ export function closeConversation(externalId: string): void {
   }
 }
 
+// claude_input (the full composed stdin prompt, ~400KB+ per worker turn — the
+// injected memory file alone is ~440KB) has ZERO readers anywhere in the
+// codebase; it was a write-only archive that made the debug columns 91% of the
+// turns table and fed the 2026-09-25 heap-OOM. New turns spool it to disk
+// instead of the DB (greppable, swept by jarvis-db-retention.sh after 3 days).
+// Set JARVIS_DEBUG_INPUT_DB=1 to restore the old in-DB persistence.
+const DEBUG_SPOOL_DIR = process.env.JARVIS_DEBUG_SPOOL_DIR
+  ?? '/home/kevin/jarvis-debug-spool';
+const DEBUG_INPUT_TO_DB = process.env.JARVIS_DEBUG_INPUT_DB === '1';
+
+function spoolClaudeInput(conversationId: number, turnIndex: number, text: string): void {
+  try {
+    const day = new Date().toISOString().slice(0, 10);
+    const dir = path.join(DEBUG_SPOOL_DIR, day);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `conv${conversationId}-turn${turnIndex}.in.txt`);
+    // Fire-and-forget: a spool failure must never block or fail the turn write.
+    fs.writeFile(file, text, () => {});
+  } catch { /* never let debug capture break the hot path */ }
+}
+
 export function addTurn(
   conversationId: number,
   role: string,
@@ -473,13 +495,18 @@ export function addTurn(
 ): number {
   const maxRow = stmts.getMaxTurnIndex.get(conversationId);
   const nextIndex = (maxRow?.max_idx ?? -1) + 1;
+  let claudeInputForDb: string | null = null;
+  if (metadata?.claudeInput != null) {
+    if (DEBUG_INPUT_TO_DB) claudeInputForDb = metadata.claudeInput;
+    else spoolClaudeInput(conversationId, nextIndex, metadata.claudeInput);
+  }
   const info = stmts.insertTurn.run(
     conversationId, nextIndex, role, content,
     toolName ?? null, toolArgs ?? null, toolResult ?? null,
     metadata?.timingMs ?? null, metadata?.inputTokens ?? null,
     metadata?.outputTokens ?? null, metadata?.cacheReadTokens ?? null,
     metadata?.cacheWriteTokens ?? null, metadata?.model ?? null,
-    metadata?.claudeInput ?? null, metadata?.claudeOutput ?? null,
+    claudeInputForDb, metadata?.claudeOutput ?? null,
     metadata?.errorDetail ?? null, metadata?.images ?? null,
   );
   stmts.touchConversation.run(conversationId);
@@ -503,8 +530,11 @@ export function addTurn(
       cache_read_tokens: metadata?.cacheReadTokens ?? null,
       cache_write_tokens: metadata?.cacheWriteTokens ?? null,
       model: metadata?.model ?? null,
-      claude_input: metadata?.claudeInput ?? null,
-      claude_output: metadata?.claudeOutput ?? null,
+      // Never broadcast the debug blobs over SSE — up to ~800KB per turn event,
+      // fanned out to every connected client; the cockpit debug drawer fetches
+      // server-parsed steps on demand instead.
+      claude_input: null,
+      claude_output: null,
       images: metadata?.images ?? null,
     },
   } satisfies TurnEvent);

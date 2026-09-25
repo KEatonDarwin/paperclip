@@ -47,7 +47,8 @@
     "notepad:markers-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-markers-check.db node scripts/notepad-markers-check.mjs",
     "notepad:speak-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-speak-check.db node scripts/notepad-speak-check.mjs",
     "notepad:marker-route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-marker-route-check.db node scripts/notepad-marker-route-check.mjs",
-    "notepad:dossier-sources-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-dossier-sources-check.db node scripts/notepad-dossier-sources-check.mjs"
+    "notepad:dossier-sources-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-dossier-sources-check.db node scripts/notepad-dossier-sources-check.mjs",
+    "notepad:dossier-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-dossier-check.db node scripts/notepad-dossier-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

@@ -243,7 +243,7 @@ function extractBranch(text: string | null | undefined): string | null {
   return generic ? generic[0] : null;
 }
 
-const KNOWN_REPOS = [
+export const KNOWN_REPOS = [
   'darwin-assistant',
   'jarvis-command-center',
   'DarwinIntakeSystem',
@@ -270,6 +270,34 @@ function extractRepo(text: string | null | undefined): string | null {
     if (new RegExp(`\\b${escapeRegExp(name)}\\b`, 'i').test(text)) return name;
   }
   return null;
+}
+
+// Multi-match variants of the extractors above, exported for the dossier
+// composer's (node #107) output validator: it needs EVERY branch/repo
+// token a piece of free text names, not just the first, so it can check
+// each one against the evidence corpus before trusting a model's prose.
+// Reuses the exact same patterns/list as the single-match extractors above
+// rather than re-declaring them, so the two can never drift apart.
+
+export function extractAllBranchTokens(text: string | null | undefined): string[] {
+  if (!text) return [];
+  const out = new Set<string>();
+  for (const m of text.matchAll(new RegExp(EXPLICIT_BRANCH_LABEL.source, 'gi'))) {
+    if (m[1]) out.add(m[1].replace(/[,.;:)]+$/, ''));
+  }
+  for (const m of text.matchAll(new RegExp(BRANCH_SHAPE.source, 'gi'))) {
+    out.add(m[0]);
+  }
+  return [...out];
+}
+
+export function extractAllRepoTokens(text: string | null | undefined): string[] {
+  if (!text) return [];
+  const out: string[] = [];
+  for (const name of KNOWN_REPOS) {
+    if (new RegExp(`\\b${escapeRegExp(name)}\\b`, 'i').test(text)) out.push(name);
+  }
+  return out;
 }
 
 function errMsg(err: unknown): string {

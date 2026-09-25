@@ -1,6 +1,8 @@
+import { execFile } from 'node:child_process';
 import { getSetting } from './conversation-db.js';
 import { normalizeLineText, unscannedLines } from './notepad.js';
 import { isScratchEnv, scratchReason } from './sim-guard.js';
+import { extractJsonObject } from './tools/ux-reviewer/vision-critique.js';
 
 // The cheap gate (docs/notepad/LINE-IDENTITY.md §5, node #61's "settle-and-
 // reread pass" / "the cheap gate: did a complete thought just land?"). This
@@ -148,4 +150,199 @@ export function assertModelSpawnAllowed(): void {
       `this function with a real spawn. Set JARVIS_SIM=0 and point JARVIS_DB_PATH at the live ` +
       `jarvis.db only if you genuinely intend to spend tokens.`,
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The model half of the gate (§5's node #61 "cheap gate" continued): for
+// each candidate that survived the deterministic prefilter above, answer
+// EXACTLY one question -- did a complete thought just land on this line?
+// Nothing about importance, urgency, or what kind of line it is -- that
+// judgement belongs to node #62, not here.
+// ─────────────────────────────────────────────────────────────────────────
+
+const CLAUDE_BIN = process.env.UX_REVIEWER_CLAUDE_BIN || 'claude';
+const DEFAULT_GATE_MODEL = 'claude-haiku-4-5-20251001';
+const DEFAULT_GATE_TIMEOUT_MS = 20 * 1000;
+
+/** Why a gate verdict has the value it does. */
+export type GateVerdictReason = 'model' | 'prefilter' | 'fallback';
+
+/** One line's gate verdict: did a complete thought just land here? */
+export interface GateVerdict {
+  line_id: number;
+  complete_thought: boolean;
+  reason: GateVerdictReason;
+}
+
+function gateModelSetting(): string {
+  const raw = getSetting('notepad_gate_model');
+  return raw && raw.trim() ? raw.trim() : DEFAULT_GATE_MODEL;
+}
+
+/**
+ * The real CLI spawn -- NO API KEYS (deletes ANTHROPIC_API_KEY from the
+ * child env), same `claude -p <prompt> --output-format json --model <id>`
+ * shape as jarvis-brief.ts/smart-todos-decompose.ts/workbench.ts. Re-asserts
+ * the guard defensively at the actual spawn site (belt-and-suspenders --
+ * runNotepadGate below is what actually gates whether this function is ever
+ * reached at all, since that check has to happen OUTSIDE its own try/catch
+ * to propagate loudly rather than becoming a per-line fallback).
+ */
+function defaultRunOneShot(prompt: string): Promise<string> {
+  assertModelSpawnAllowed();
+  const model = gateModelSetting();
+  const env = { ...process.env };
+  delete env.ANTHROPIC_API_KEY;
+  return new Promise((resolve, reject) => {
+    execFile(
+      CLAUDE_BIN,
+      ['-p', prompt, '--output-format', 'json', '--model', model],
+      { timeout: DEFAULT_GATE_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, env },
+      (err, stdout, stderr) => {
+        if (err && !stdout) {
+          reject(new Error(`notepad gate call failed: ${err.message}${stderr ? ` | ${stderr.slice(0, 300)}` : ''}`));
+          return;
+        }
+        try {
+          const envelope = JSON.parse(stdout.trim()) as { result?: string };
+          resolve(typeof envelope.result === 'string' ? envelope.result : stdout);
+        } catch {
+          resolve(stdout);
+        }
+      },
+    );
+  });
+}
+
+/** Reject `promise` with a timeout error after `ms`, without leaking the timer. */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`notepad gate call timed out after ${ms}ms`)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+function buildGatePrompt(candidates: GateCandidate[]): string {
+  const lines = candidates.map((c) => `- line_id ${c.line_id}: ${JSON.stringify(c.text)}`).join('\n');
+  return [
+    'You are a fast, cheap filter for a notepad app. For each line below, answer',
+    'EXACTLY ONE question: did a COMPLETE THOUGHT just land on this line, as opposed',
+    'to a fragment that is still being typed or trails off mid-sentence?',
+    '',
+    'This is NOT a judgement of importance, urgency, or what kind of line it is --',
+    'a grocery item ("milk, eggs, bread") and a business-critical decision both',
+    'count as a complete thought if they read as a finished statement. A line like',
+    '"and then we should" or "call the" is NOT complete -- it trails off mid-thought.',
+    '',
+    '=== LINES ===',
+    lines,
+    '=== END LINES ===',
+    '',
+    'Return ONLY a JSON object -- no markdown fences, no prose before or after --',
+    'with EXACTLY this shape, one entry per line_id above, in any order:',
+    '{"verdicts": [{"line_id": 123, "complete_thought": true}, {"line_id": 456, "complete_thought": false}]}',
+  ].join('\n');
+}
+
+/**
+ * Parse the model's raw response into a map of line_id -> complete_thought.
+ * Defensive by construction: an unparseable response, a non-object/non-array
+ * shape, a malformed entry, or an entry whose line_id was never one of the
+ * candidates we actually asked about all get SKIPPED rather than trusted --
+ * they simply leave that line_id absent from the returned map. The caller
+ * (runNotepadGate) treats "absent from the map" as reason:'fallback' for
+ * that one line, which is what makes both "the whole response was garbage"
+ * and "the response omitted one line" fail the exact same safe way.
+ */
+function parseGateResponse(raw: string, candidates: GateCandidate[]): Map<number, boolean> {
+  const map = new Map<number, boolean>();
+  const validIds = new Set(candidates.map((c) => c.line_id));
+  const parsed = extractJsonObject(raw) as { verdicts?: unknown } | null;
+  const verdicts = parsed && Array.isArray(parsed.verdicts) ? parsed.verdicts : null;
+  if (!verdicts) return map;
+  for (const entry of verdicts) {
+    if (!entry || typeof entry !== 'object') continue;
+    const e = entry as Record<string, unknown>;
+    const lineId = typeof e.line_id === 'number' ? e.line_id : NaN;
+    const completeThought = typeof e.complete_thought === 'boolean' ? e.complete_thought : null;
+    if (!Number.isFinite(lineId) || completeThought === null) continue; // malformed entry -- ignored
+    if (!validIds.has(lineId)) continue; // an id we never asked about -- ignored, never trusted
+    map.set(lineId, completeThought);
+  }
+  return map;
+}
+
+/**
+ * Run the model half of the gate for `day`: prefilter first (disposed lines
+ * never reach the model -- returned here as complete_thought:false,
+ * reason:'prefilter' so a caller sees the full picture in one place rather
+ * than having to cross-reference prefilterGateCandidates separately), then
+ * ONE batched model call over every surviving candidate.
+ *
+ * Fails toward SILENCE, never noise: any failure mode on the model call --
+ * spawn error, timeout, non-JSON, wrong shape, an omitted line_id -- resolves
+ * that line to complete_thought:false, reason:'fallback'. It never throws
+ * for a model-call failure. A missed thought costs Kevin one line he can
+ * re-type; a false yes wakes the whole re-read-and-act chain on a fragment
+ * and trains him to ignore it, which is the worse failure by far.
+ *
+ * The ONE exception to "never throws": opts.runOneShot is the injection seam
+ * a caller (a sim) uses to stub the model call entirely, so it never touches
+ * the real CLI and never needs assertModelSpawnAllowed() to pass. Without a
+ * stub, this function calls assertModelSpawnAllowed() itself -- deliberately
+ * BEFORE the try/catch below, not merely inside defaultRunOneShot -- so that
+ * under a scratch DB it throws loudly and synchronously OUT of this
+ * function, rather than being caught and silently downgraded to an
+ * all-fallback verdict that would read as a passing sim. A sim that forgot
+ * to stub this seam must fail loudly, not quietly.
+ */
+export async function runNotepadGate(
+  day: string,
+  opts?: { runOneShot?: (prompt: string) => Promise<string>; timeoutMs?: number },
+): Promise<GateVerdict[]> {
+  const { candidates, disposed } = prefilterGateCandidates(day);
+  const verdicts: GateVerdict[] = disposed
+    .filter((d): d is typeof d & { line_id: number } => d.line_id !== null)
+    .map((d) => ({ line_id: d.line_id, complete_thought: false, reason: 'prefilter' as const }));
+
+  if (candidates.length === 0) return verdicts;
+
+  const usingDefaultSpawn = !opts?.runOneShot;
+  if (usingDefaultSpawn) {
+    // Outside the try/catch on purpose -- see the doc comment above.
+    assertModelSpawnAllowed();
+  }
+  const runOneShot = opts?.runOneShot ?? defaultRunOneShot;
+  const timeoutMs = opts?.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
+  const prompt = buildGatePrompt(candidates);
+
+  let modelVerdicts: Map<number, boolean>;
+  try {
+    const raw = await withTimeout(runOneShot(prompt), timeoutMs);
+    modelVerdicts = parseGateResponse(raw, candidates);
+  } catch {
+    // Spawn failure, non-zero exit, or a timeout -- every candidate in this
+    // batch falls back below.
+    modelVerdicts = new Map();
+  }
+
+  for (const c of candidates) {
+    const verdict = modelVerdicts.get(c.line_id);
+    verdicts.push(
+      verdict === undefined
+        ? { line_id: c.line_id, complete_thought: false, reason: 'fallback' }
+        : { line_id: c.line_id, complete_thought: verdict, reason: 'model' },
+    );
+  }
+
+  return verdicts;
 }

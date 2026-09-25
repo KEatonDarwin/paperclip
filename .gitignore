@@ -52,6 +52,9 @@ tests/release-smoke/playwright-report/
 .claude/worktrees/
 .worktrees
 
+# darwin-assistant notepad dossier caches (orientation store, not source)
+darwin-assistant/.cache/
+
 # darwin-assistant runtime DB (SQLite, not source)
 darwin-assistant/jarvis.db
 darwin-assistant/jarvis.db-shm

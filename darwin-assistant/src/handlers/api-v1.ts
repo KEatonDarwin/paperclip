@@ -256,6 +256,10 @@ import {
 // persona tool — a bare throttleStatus() with no inputs reports "dispatching"
 // regardless of the real governor state (review node #719).
 import { fullThrottleStatus } from '../throttle-status.js';
+// 🛑 Work switch — the stop-all / per-lane gate (src/work-switch.ts). DB-free by
+// design so it still answers when jarvis.db is locked.
+import { LANE_KEYS, laneDef, resetAllLanes, resumeAll, setLane, stopAll } from '../work-switch.js';
+import { runWorkCli, workSwitchPayload } from '../work-switch-ops.js';
 import {
   buildSpawnMonitorSnapshot,
   buildSpawnMonitorTreeDetail,
@@ -3671,6 +3675,78 @@ export function createApiV1Router(): Router {
       clamped: result.clamped,
       admission_raised: result.admission,
     });
+  });
+
+  // == 🛑 WORK SWITCH =========================================================
+  // Kevin's stop-all / per-lane kill switch. The switch itself mutates NOTHING
+  // else — no slots, no ceilings, no provider overrides — so a stop is fully
+  // reversible and every dial stays where he left it. Impure operations (killing
+  // in-flight workers, stopping in-flight timer services) are delegated to the
+  // `jarvis-work` CLI so there is exactly ONE implementation of them.
+  router.get('/work-switch', (_req: AuthedRequest, res) => {
+    res.json(workSwitchPayload());
+  });
+
+  router.post('/work-switch', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Changing the work switch requires an admin-scoped key');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const op = typeof body.op === 'string' ? body.op : '';
+    const by = typeof body.by === 'string' && body.by.trim() ? String(body.by).trim() : 'cockpit';
+    const reason = typeof body.reason === 'string' && body.reason.trim() ? String(body.reason).trim() : undefined;
+    const lanes = Array.isArray(body.lanes)
+      ? body.lanes.filter((l): l is string => typeof l === 'string')
+      : typeof body.lane === 'string' ? [body.lane] : [];
+
+    try {
+      switch (op) {
+        case 'stop_all': {
+          stopAll(by, reason);
+          // Order matters: the flag is set FIRST so nothing can be re-dispatched
+          // into the gap while we are killing what is already running.
+          const killed = body.kill === true ? runWorkCli(['kill-workers']) : null;
+          const hardStopped = body.hard === true ? runWorkCli(['stop', '-r', reason ?? 'hard stop']) : null;
+          res.json({ ...workSwitchPayload(), ok: true, op, killed, hard: hardStopped });
+          return;
+        }
+        case 'resume_all':
+          resumeAll(by, reason);
+          void dispatchTick('work_switch_resumed');
+          res.json({ ...workSwitchPayload(), ok: true, op });
+          return;
+        case 'reset_all_lanes':
+          resetAllLanes(by, reason);
+          void dispatchTick('work_switch_reset');
+          res.json({ ...workSwitchPayload(), ok: true, op });
+          return;
+        case 'lane_off':
+        case 'lane_on': {
+          if (!lanes.length) {
+            sendError(res, 400, 'invalid_request', `lane (or lanes[]) is required. Known lanes: ${LANE_KEYS.join(', ')}`);
+            return;
+          }
+          const unknown = lanes.filter((l) => !laneDef(l));
+          if (unknown.length) {
+            sendError(res, 400, 'unknown_lane', `unknown lane(s): ${unknown.join(', ')} — known: ${LANE_KEYS.join(', ')}`);
+            return;
+          }
+          for (const l of lanes) setLane(l, op === 'lane_on', by, reason);
+          if (op === 'lane_on') void dispatchTick('work_switch_lane_on');
+          res.json({ ...workSwitchPayload(), ok: true, op, lanes });
+          return;
+        }
+        case 'kill_workers':
+          res.json({ ...workSwitchPayload(), ok: true, op, killed: runWorkCli(['kill-workers']) });
+          return;
+        default:
+          sendError(res, 400, 'invalid_request', 'op must be one of: stop_all, resume_all, reset_all_lanes, lane_off, lane_on, kill_workers');
+          return;
+      }
+    } catch (err) {
+      sendError(res, 500, 'work_switch_failed', err instanceof Error ? err.message : String(err));
+    }
   });
 
   // Decision memory — real settled-node outcomes by model, for the planner to

@@ -144,6 +144,7 @@ import { deployControl } from './deploy-control.js';
 // provider + the autopilot stand-down probe and starts its driver.
 import { nightShift } from './night-shift-tool.js';
 import { throttle } from './throttle-tool.js';
+import { workSwitch } from './work-switch-tool.js';
 
 function instrumentTool(tool: ToolDef): ToolDef {
   return {
@@ -217,6 +218,7 @@ export const ALL_TOOLS: ToolDef[] = [
   deployControl,
   nightShift,
   throttle,
+  workSwitch,
 ].map(instrumentTool);
 
 export const TOOL_MAP: Map<string, ToolDef> = new Map(

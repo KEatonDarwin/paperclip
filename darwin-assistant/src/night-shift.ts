@@ -69,6 +69,7 @@ import {
   type TreeIndex,
 } from './goals-autopilot.js';
 import { VAULT_ROOT } from './goals-autopilot-verify.js';
+import { laneStopped } from './work-switch.js';
 
 // ---------------------------------------------------------------------------
 // Constants + knobs
@@ -2366,6 +2367,9 @@ export function nightWaitingReason(): string | null { return lastWaiting; }
 
 export async function tickNightShift(reason = 'loop'): Promise<void> {
   if (driver.ticking) { driver.pendingKick = true; return; }
+  // WORK SWITCH: the shift driver is the thing that cues the orchestrator, so a
+  // stopped lane means no cue, no re-ask, no re-plan.
+  if (laneStopped('night')) return;
   driver.ticking = true;
   try {
     setSetting(SETTING_HEARTBEAT, nowIso());

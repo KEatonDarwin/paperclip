@@ -15,6 +15,7 @@ import {
   notifyReroute,
   setThrottlePausedTreesProvider,
 } from './throttle.js';
+import { laneHoldReason } from './work-switch.js';
 
 // HOPPER ENGINE — the autonomous work-tree executor (designed 2026-09-06 with
 // Kevin; worker-model details hashed out in cockpit:worker-engine-design-2026-09-06).
@@ -756,10 +757,24 @@ export function retryHopperNode(id: number): HopperNodeRow | null {
 }
 
 let ticking = false;
+/** Dedupe the held-dispatch log line so a long stop doesn't spam the journal. */
+let lastHopperHold: string | null = null;
 
 /** The dispatcher. Plain code, no model calls: requeue expired leases, then fill free slots. */
 export async function dispatchTick(reason: string): Promise<void> {
   if (ticking || !processMessageRef) return; // no re-entrancy; engine not started = no-op
+  // WORK SWITCH: a stopped hopper does NOTHING — not even lease recovery, because
+  // the retry path sets nodes back to `pending`, which is itself work being born
+  // (that is exactly how node 861 kept re-arming itself on 2026-09-25).
+  {
+    const hold = laneHoldReason('hopper');
+    if (hold) {
+      if (hold !== lastHopperHold) { console.log(`[hopper-engine] dispatch held — ${hold}`); lastHopperHold = hold; }
+      ticking = false;
+      return;
+    }
+    if (lastHopperHold) { console.log('[hopper-engine] dispatch released — work switch back on'); lastHopperHold = null; }
+  }
   ticking = true;
   try {
     // 1) Expired leases → non-destructive recovery (max MAX_ATTEMPTS, then park).

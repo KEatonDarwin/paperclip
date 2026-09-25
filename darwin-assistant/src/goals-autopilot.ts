@@ -49,6 +49,7 @@ import {
   type PlanJson,
 } from './goals.js';
 import { VAULT_ROOT } from './goals-autopilot-verify.js';
+import { laneStopped } from './work-switch.js';
 
 // NIGHT SHIFT §4.5 — night-shift.ts imports this module (predicates, cue text,
 // verdict parser), so we must NOT import it back. It registers its ownership
@@ -757,6 +758,7 @@ function autopilotGoalIds(): number[] {
 
 /** Every autopilot goal that is due (tick_minutes elapsed or a pending kick). */
 export async function tickAll(reason = 'loop'): Promise<void> {
+  if (laneStopped('autopilot')) return; // WORK SWITCH
   for (const goalId of autopilotGoalIds()) {
     const s = stateFor(goalId);
     const goal = getRawGoal(goalId);

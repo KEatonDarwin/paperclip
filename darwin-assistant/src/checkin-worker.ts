@@ -4,6 +4,7 @@ import { processMessage } from './agent.js';
 import { isMuted } from './mute-check.js';
 import { createNotification, type NotificationAction } from './notifications.js';
 import { getConversation, getOrCreateConversation, addTurn, updateSessionState, renameConversation } from './conversation-db.js';
+import { laneStopped } from './work-switch.js';
 
 const POLL_INTERVAL_MS = 60_000;
 const CHECKIN_CONV_PREFIX = 'ephemeral:checkin:';
@@ -127,6 +128,10 @@ function ensureCheckinNotificationsConversationId(): number {
 }
 
 async function processDueCheckins(slackApp: App): Promise<void> {
+  // WORK SWITCH: do not FIRE check-ins while the lane is off. ensureShepherdQueued()
+  // deliberately keeps running in the caller so the shepherd chain cannot die while
+  // paused (the 17-day death of 2026-07-22 is not worth re-earning).
+  if (laneStopped('shepherd')) return;
   const due = await query<CheckinRow>(
     `UPDATE jarvis_checkins
      SET status = 'fired'

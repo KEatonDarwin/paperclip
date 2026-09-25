@@ -39,7 +39,8 @@
     "throttle:check": "npm run build && JARVIS_DB_PATH=/tmp/throttle-check.db JARVIS_SIM=1 node scripts/throttle-check.mjs",
     "throttle:route-check": "npm run build && JARVIS_DB_PATH=/tmp/throttle-route-check.db JARVIS_SIM=1 node scripts/throttle-route-check.mjs",
     "throttle:sim": "npm run build && JARVIS_DB_PATH=/tmp/throttle-sim.db JARVIS_SIM=1 node scripts/throttle-sim.mjs",
-    "night:shifts-check": "npm run build && node scripts/night-shift-shifts-check.mjs"
+    "night:shifts-check": "npm run build && node scripts/night-shift-shifts-check.mjs",
+    "work-switch:check": "node scripts/work-switch-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

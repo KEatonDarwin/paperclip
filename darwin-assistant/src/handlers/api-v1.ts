@@ -74,6 +74,7 @@ import {
   type NotepadLineState,
 } from '../notepad.js';
 import { activeNotepadMarkers, dismissNotepadMarker, getNotepadMarker } from '../notepad-markers.js';
+import { openNotepadHandoff } from '../notepad-handoff.js';
 import {
   listNotifications,
   unreadNotificationCount,
@@ -1709,6 +1710,32 @@ export function createApiV1Router(): Router {
     dismissNotepadMarker(lineId);
     const day = getNotepadLineDay(lineId) ?? todayNotepadDate();
     res.json(notepadDayWithMarkers(day));
+  });
+
+  // Open (or re-open) the handoff thread for a marker — "clicking a marker
+  // opens a thread that is already working" (node #869). Find-or-create,
+  // deterministic per line_id; on first open the thread is seeded with a
+  // dossier-composed prompt and the turn dispatches. A second call is a pure
+  // read: same thread_ext, created:false, no second seed message.
+  router.post('/notepad/markers/:lineId/open', (req: AuthedRequest, res) => {
+    const lineId = Number(req.params.lineId);
+    if (!Number.isInteger(lineId) || lineId <= 0) {
+      sendError(res, 400, 'invalid_line_id', 'lineId must be a positive integer');
+      return;
+    }
+    const marker = getNotepadMarker(lineId);
+    if (!marker) {
+      sendError(res, 404, 'marker_not_found', `no notepad marker on line '${lineId}'`);
+      return;
+    }
+    openNotepadHandoff(lineId)
+      .then((result) => {
+        res.status(result.created ? 201 : 200).json(result);
+      })
+      .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        sendError(res, 500, 'notepad_handoff_failed', message);
+      });
   });
 
   const NOTEPAD_LINE_STATES: NotepadLineState[] = ['seen', 'acted', 'dismissed'];

@@ -16,6 +16,22 @@
 //       ordinal leftover-pairing had, found in the node #713 review.
 //   (h) a note of thousands of identical lines stays off the O(n^2) path.
 //
+// Adversarial hardening pass (node #803), added on top of (a)-(h):
+//   (1) duplicate identical lines: editing/deleting one occurrence leaves the
+//       other occurrences' ids untouched.
+//   (2) a contiguous block of lines moved across a note keeps every id.
+//   (3) SPLIT — one line becomes two: the LEADING fragment (the one left
+//       occupying the original line's position) keeps the id; the trailing
+//       fragment is new.
+//   (4) MERGE — two lines become one: the FIRST (topmost) line's id survives;
+//       the second is deleted.
+//   (5) reword AND re-indent the same line in the same save: same id.
+//   (6) an autosave burst (many successive single-char-appended saves) holds
+//       one id for the whole burst.
+//   (7) whitespace-only lines (blank / spaces / tab, including two adjacent
+//       blanks) get stable, distinct ids and round-trip byte-for-byte, even
+//       across an edit that shifts their indices.
+//
 //   npm run build && JARVIS_DB_PATH=/tmp/notepad-check.db node scripts/notepad-check.mjs
 
 import assert from 'node:assert/strict';
@@ -213,6 +229,198 @@ check('empty save: day still appears in the pager (touched, not deleted)', listN
   const ms = Date.now() - t0;
   check('(h) 3000 identical lines + append round-trips correctly', after.lines.length === 3001 && after.text === same.concat(['---']).join('\n'));
   check(`(h) that save stayed off the O(n^2) path (${ms}ms < 250ms)`, ms < 250);
+}
+
+// -- (1a) DUPLICATE IDENTICAL LINES: edit one occurrence, others keep ids -----
+{
+  const D = '2026-10-01';
+  const first = putNotepadDay(D, ['start', '- follow up', 'middle', '- follow up', '- follow up', 'end'].join('\n'));
+  const dupIdsBefore = first.lines.filter((l) => l.text === '- follow up').map((l) => l.id);
+  const otherIdsBefore = first.lines.filter((l) => l.text !== '- follow up').map((l) => l.id);
+  check('(1a) initial save: 3 distinct duplicate ids', new Set(dupIdsBefore).size === 3);
+
+  const after = putNotepadDay(D, ['start', '- follow up', 'middle', '- follow up', '- follow up EDITED', 'end'].join('\n'));
+  const stillDup = after.lines.filter((l) => l.text === '- follow up');
+  check('(1a) editing one duplicate: exactly 2 unedited duplicates remain', stillDup.length === 2);
+  check('(1a) editing one duplicate: the other duplicates kept ORIGINAL ids', stillDup.every((l) => dupIdsBefore.includes(l.id)));
+  const editedLine = after.lines.find((l) => l.text === '- follow up EDITED');
+  check(
+    '(1a) the edited line is the one that changed (kept one of the original 3 ids, not a fresh insert)',
+    !!editedLine && dupIdsBefore.includes(editedLine.id)
+  );
+  check(
+    '(1a) non-duplicate lines untouched',
+    after.lines.filter((l) => !l.text.startsWith('- follow up')).every((l) => otherIdsBefore.includes(l.id))
+  );
+}
+
+// -- (1b) DUPLICATE IDENTICAL LINES: delete one of three, two survive --------
+{
+  const D = '2026-10-02';
+  const first = putNotepadDay(D, ['start', '- follow up', 'middle', '- follow up', '- follow up', 'end'].join('\n'));
+  const dupIdsBefore = first.lines.filter((l) => l.text === '- follow up').map((l) => l.id);
+  check('(1b) initial save: 3 distinct duplicate ids', new Set(dupIdsBefore).size === 3);
+
+  const after = putNotepadDay(D, ['start', '- follow up', 'middle', '- follow up', 'end'].join('\n'));
+  const dupIdsAfter = after.lines.filter((l) => l.text === '- follow up').map((l) => l.id);
+  check('(1b) delete one duplicate out of three: exactly 2 survivors', dupIdsAfter.length === 2);
+  check('(1b) delete one duplicate out of three: no id collision among survivors', new Set(dupIdsAfter).size === 2);
+  check(
+    '(1b) delete one duplicate out of three: survivors are drawn from the original 3 ids',
+    dupIdsAfter.every((id) => dupIdsBefore.includes(id))
+  );
+  check('(1b) delete one duplicate out of three: total line count is 5', after.lines.length === 5);
+}
+
+// -- (2) BLOCK REORDER: move a 3-line block from top to bottom of a 10-line note
+{
+  const D = '2026-10-03';
+  const lines = ['L0', 'L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7', 'L8', 'L9'];
+  const first = putNotepadDay(D, lines.join('\n'));
+  const idOf = Object.fromEntries(first.lines.map((l) => [l.text, l.id]));
+  check('(2) initial save: 10 distinct ids', new Set(Object.values(idOf)).size === 10);
+
+  const reordered = ['L3', 'L4', 'L5', 'L6', 'L7', 'L8', 'L9', 'L0', 'L1', 'L2'];
+  const after = putNotepadDay(D, reordered.join('\n'));
+  check(
+    '(2) block reorder: every one of the 10 lines kept its original id',
+    reordered.every((text, i) => after.lines[i].id === idOf[text])
+  );
+  check('(2) block reorder: exact text order preserved', after.text === reordered.join('\n'));
+  check('(2) block reorder: still 10 lines total (nothing deleted+reinserted)', after.lines.length === 10);
+}
+
+// -- (3) SPLIT: one line becomes two — leading fragment keeps the id ---------
+{
+  const D = '2026-10-04';
+  const first = putNotepadDay(D, ['a', 'Hello world', 'b'].join('\n'));
+  const idOf = Object.fromEntries(first.lines.map((l) => [l.text, l.id]));
+
+  const after = putNotepadDay(D, ['a', 'Hello', 'world', 'b'].join('\n'));
+  check('(3) split: 4 lines now', after.lines.length === 4);
+  const helloLine = after.lines.find((l) => l.text === 'Hello');
+  const worldLine = after.lines.find((l) => l.text === 'world');
+  // DECISION (see the comment on applyLineDiff in src/notepad.ts): the
+  // LEADING fragment — the one left occupying the original line's position —
+  // keeps the original id; the trailing fragment is a genuinely new line.
+  check("(3) split: the LEADING fragment (\"Hello\") keeps the original line's id", helloLine?.id === idOf['Hello world']);
+  check('(3) split: the trailing fragment ("world") gets a brand-new id', worldLine && worldLine.id !== idOf['Hello world']);
+  check(
+    '(3) split: surrounding lines untouched',
+    after.lines.find((l) => l.text === 'a').id === idOf.a && after.lines.find((l) => l.text === 'b').id === idOf.b
+  );
+}
+
+// -- (4) MERGE: two lines become one — first line's id survives -------------
+{
+  const D = '2026-10-05';
+  const first = putNotepadDay(D, ['a', 'Hello', 'world', 'b'].join('\n'));
+  const idOf = Object.fromEntries(first.lines.map((l) => [l.text, l.id]));
+
+  const after = putNotepadDay(D, ['a', 'Hello world', 'b'].join('\n'));
+  check('(4) merge: 3 lines now', after.lines.length === 3);
+  const merged = after.lines.find((l) => l.text === 'Hello world');
+  // DECISION (see the comment on applyLineDiff in src/notepad.ts): the FIRST
+  // (topmost) of the two merged lines keeps its id; the second is deleted.
+  check("(4) merge: exactly one id survives, and it is the FIRST line's id", merged?.id === idOf.Hello);
+  check("(4) merge: the second line's id is gone", !after.lines.some((l) => l.id === idOf.world));
+  check(
+    '(4) merge: surrounding lines untouched',
+    after.lines.find((l) => l.text === 'a').id === idOf.a && after.lines.find((l) => l.text === 'b').id === idOf.b
+  );
+}
+
+// -- (5) REWORD + RE-INDENT the same line in the same save -------------------
+{
+  const D = '2026-10-06';
+  const first = putNotepadDay(D, ['a', 'original text', 'c'].join('\n'));
+  const idOf = Object.fromEntries(first.lines.map((l) => [l.text, l.id]));
+
+  const after = putNotepadDay(D, ['a', '    reworded text', 'c'].join('\n'));
+  const line = after.lines.find((l) => l.text === '    reworded text');
+  check('(5) reword+re-indent in one save: same id', !!line && line.id === idOf['original text']);
+  check('(5) reword+re-indent in one save: raw indented text stored exactly', line?.text === '    reworded text');
+  check(
+    '(5) reword+re-indent in one save: surrounding lines untouched',
+    after.lines.find((l) => l.text === 'a').id === idOf.a && after.lines.find((l) => l.text === 'c').id === idOf.c
+  );
+}
+
+// -- (6) AUTOSAVE BURST: ~14 successive single-char-appended saves ----------
+{
+  const D = '2026-10-07';
+  const first = putNotepadDay(D, ['before', 'typing', 'after'].join('\n'));
+  const idOf = Object.fromEntries(first.lines.map((l) => [l.text, l.id]));
+  const typingId = idOf.typing;
+  const beforeId = idOf.before;
+  const afterId = idOf.after;
+
+  let text = 'typing';
+  let burstOk = true;
+  for (let i = 0; i < 14; i++) {
+    text += String.fromCharCode(97 + (i % 26));
+    const saved = putNotepadDay(D, ['before', text, 'after'].join('\n'));
+    const typingLine = saved.lines.find((l) => l.idx === 1);
+    if (!typingLine || typingLine.id !== typingId) burstOk = false;
+    if (saved.lines.find((l) => l.text === 'before')?.id !== beforeId) burstOk = false;
+    if (saved.lines.find((l) => l.text === 'after')?.id !== afterId) burstOk = false;
+  }
+  check('(6) autosave burst: one line held ONE id across 14 successive one-char saves', burstOk);
+  const finalNote = getNotepadDay(D);
+  check('(6) autosave burst: final text round-trips exactly', finalNote.text === ['before', text, 'after'].join('\n'));
+}
+
+// -- (7) WHITESPACE-ONLY LINES: blank / spaces / tab, incl. two adjacent blanks
+{
+  const D = '2026-10-08';
+  const initial = ['keep1', '', '', '   ', '\t', 'keep2'];
+  const first = putNotepadDay(D, initial.join('\n'));
+  check('(7) initial save: 6 lines including whitespace-only ones', first.lines.length === 6);
+  check('(7) initial save round-trips byte-for-byte (blank vs spaces vs tab distinct)', first.text === initial.join('\n'));
+  const idsBefore = first.lines.map((l) => l.id);
+  check('(7) 6 distinct ids to start', new Set(idsBefore).size === 6);
+  const whitespaceIdsBefore = first.lines.filter((l) => l.text.trim() === '').map((l) => l.id);
+  check(
+    '(7) 4 distinct whitespace-only ids (2 blank + spaces + tab), none collapsed together',
+    new Set(whitespaceIdsBefore).size === 4
+  );
+
+  // Unrelated edit elsewhere in the note; whitespace lines/positions untouched.
+  const edited = ['keep1-edited', '', '', '   ', '\t', 'keep2'];
+  const after = putNotepadDay(D, edited.join('\n'));
+  check('(7) unrelated edit: text round-trips byte-for-byte', after.text === edited.join('\n'));
+  check('(7) unrelated edit: still 6 lines (no whitespace line collapsed or duplicated)', after.lines.length === 6);
+  const whitespaceIdsAfter = after.lines.filter((l) => l.text.trim() === '').map((l) => l.id);
+  check('(7) unrelated edit: still 4 distinct whitespace-only ids', new Set(whitespaceIdsAfter).size === 4);
+  check(
+    '(7) unrelated edit: whitespace-only ids are the SAME set as before (stable across an unrelated edit)',
+    whitespaceIdsAfter.length === whitespaceIdsBefore.length && whitespaceIdsAfter.every((id) => whitespaceIdsBefore.includes(id))
+  );
+  check(
+    '(7) unrelated edit: reworded line kept its own id',
+    after.lines.find((l) => l.text === 'keep1-edited')?.id === first.lines.find((l) => l.text === 'keep1').id
+  );
+  check(
+    '(7) unrelated edit: keep2 untouched',
+    after.lines.find((l) => l.text === 'keep2')?.id === first.lines.find((l) => l.text === 'keep2').id
+  );
+
+  // A further edit that SHIFTS the whitespace block's indices (insert above it).
+  const shifted = ['keep1-edited', 'INSERTED', '', '', '   ', '\t', 'keep2'];
+  const after2 = putNotepadDay(D, shifted.join('\n'));
+  check('(7) index-shifting edit: text round-trips byte-for-byte', after2.text === shifted.join('\n'));
+  check('(7) index-shifting edit: 7 lines now', after2.lines.length === 7);
+  const whitespaceIdsAfter2 = after2.lines.filter((l) => l.text.trim() === '').map((l) => l.id);
+  check(
+    '(7) index-shifting edit: still exactly 4 distinct whitespace-only ids, no collapse/loss',
+    new Set(whitespaceIdsAfter2).size === 4 && whitespaceIdsAfter2.length === 4
+  );
+  check(
+    '(7) index-shifting edit: the 4 whitespace ids are the SAME set as before (survived the shift)',
+    whitespaceIdsAfter2.every((id) => whitespaceIdsBefore.includes(id))
+  );
+  const insertedLine = after2.lines.find((l) => l.text === 'INSERTED');
+  check('(7) index-shifting edit: the inserted line got a brand-new id', !!insertedLine && !idsBefore.includes(insertedLine.id));
 }
 
 // -- days pager ----------------------------------------------------------------

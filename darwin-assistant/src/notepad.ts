@@ -193,6 +193,18 @@ function applyLineDiff(day: string, oldLines: NotepadLineRow[], newTexts: string
     // Nearest-index pairing: build every (old, new) candidate, then claim the
     // closest pairs first. A line reworded in place is always nearer to its
     // own old row than to a row that was deleted somewhere else in the note.
+    //
+    // This same mechanism, with no special-casing, is what decides SPLIT and
+    // MERGE:
+    //   - SPLIT (one line becomes two): the fragment left occupying the
+    //     original line's index has distance 0 and wins the pairing, so the
+    //     LEADING fragment keeps the original id; the trailing fragment has
+    //     no old candidate left to claim and becomes a genuine insert.
+    //   - MERGE (two lines become one): the merged line lands at the FIRST
+    //     source line's old index, which is distance 0 away, so the FIRST
+    //     (topmost) line's id survives; the second source line is left
+    //     unclaimed and is deleted.
+    // See scripts/notepad-check.mjs cases (3) and (4) for the proof.
     const pairs: Array<[number, number, number]> = []; // [distance, oldPos, newPos]
     for (let a = 0; a < leftoverOld.length; a++) {
       for (let b = 0; b < leftoverNewIdxs.length; b++) {

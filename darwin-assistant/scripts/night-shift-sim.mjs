@@ -107,7 +107,14 @@ const post = (p, body = {}, token = adminKey) => req('POST', p, { token, body })
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function cueCalls() { return globalThis.__goalsCueCalls ?? []; }
-function nightCues() { return cueCalls().filter((c) => c.externalId === 'cockpit:night-shift'); }
+// SHIFTS v1 §3.1 — every cue for a run goes to THAT RUN'S thread
+// (`cockpit:shift-<id>`); `cockpit:night-shift` is only the lobby and the
+// fallback for runs planned before per-shift threads existed.
+function shiftExt(runId) { return `cockpit:shift-${runId}`; }
+function nightCues(runId) {
+  const wanted = runId == null ? null : shiftExt(runId);
+  return cueCalls().filter((c) => (wanted ? c.externalId === wanted : /^cockpit:(shift-\d+|night-shift)$/.test(c.externalId)));
+}
 function itemCues(runId, itemId) { return cueCalls().filter((c) => (c.correlationKey ?? '').startsWith(`night:${runId}:${itemId}:`)); }
 
 async function tick(reason = 'sim') { await night.tickNightShift(reason); await sleep(60); }
@@ -160,7 +167,10 @@ async function dispatchLeaf(goalId, nodeId, builds = [{ title: 'build it', spec:
   if (planned.status !== 200) throw new Error(`propose_plan failed: ${JSON.stringify(planned.json)}`);
   const treeId = planned.json.tree.id;
   const gnode = await nodeById(goalId, nodeId);
-  const plan = JSON.parse(gnode.plan);
+  // `GoalNodeRow.plan` is a PARSED PlanJson per goals CONTRACT §3.0 — tolerate
+  // both shapes. It used to be a raw string; `JSON.parse` on the object threw
+  // `"[object Object]" is not valid JSON` and crashed the whole sim at NS-2.
+  const plan = typeof gnode.plan === 'string' ? JSON.parse(gnode.plan) : gnode.plan;
   const verifyId = plan.verify_hopper_node_id;
   const buildIds = planned.json.hopper_nodes.map((h) => h.id).filter((id) => id !== verifyId);
   return { treeId, verifyId, buildIds };
@@ -293,7 +303,7 @@ await check('NS-0', 'POST /night/plan returns a planned run with items, an eta_e
   assert.ok(r.json.items.length >= 5, `expected ≥5 items, got ${r.json.items.length}`);
   assert.ok(r.json.eta_end, 'no eta_end');
   await sleep(80);
-  const ready = nightCues().find((c) => c.correlationKey === `night:${runId}:plan-ready`);
+  const ready = nightCues(runId).find((c) => c.correlationKey === `night:${runId}:plan-ready`);
   assert.ok(ready, 'no PLAN-READY cue');
   assert.ok(ready.text.startsWith(`[night-shift PLAN READY run #${runId} —`), ready.text.slice(0, 80));
 });
@@ -402,7 +412,7 @@ await check('NS-6a', 'a model item cues into cockpit:night-shift with the night 
   const lines = cues[0].text.split('\n');
   assert.match(lines[0], new RegExp(`^\\[night item #${item.position} of \\d+ · lane \\d+\\]$`), lines[0]);
   assert.match(lines[1], new RegExp(`^\\[autopilot goal #${item.goal_id} — (PLAN|REPLAN) #${item.node_id} `), lines[1]);
-  assert.equal(cues[0].externalId, 'cockpit:night-shift');
+  assert.equal(cues[0].externalId, shiftExt(runId), 'the item cue must land in THIS shift\'s own thread, not the lobby');
 });
 
 await check('NS-5', 'server kinds (verify) run inline on the first tick without occupying a lane', async () => {
@@ -611,7 +621,7 @@ await check('NS-15', 'GET /night/board returns every §5 field; the kiosk token 
   for (const k of ['run', 'items', 'lanes', 'stats', 'needs_you', 'budget', 'hold', 'heartbeat', 'thread_ext']) {
     assert.ok(k in b.json, `board is missing ${k}`);
   }
-  assert.equal(b.json.thread_ext, 'cockpit:night-shift');
+  assert.equal(b.json.thread_ext, shiftExt(b.json.run.id), 'the board points at the ACTIVE shift\'s own thread');
   assert.equal(b.json.lanes.length, b.json.run.config.lanes);
   assert.ok(b.json.needs_you.some((n) => n.node_id === g1Human && n.reason === 'human'), 'the human leaf is not in needs_you');
   assert.ok(b.json.stats.items.done >= 1, 'stats show no completed items');
@@ -666,7 +676,7 @@ await check('NS-12', 'stop/wrap: running items → skipped, prior autopilot flag
   for (const section of ['# 🌙 Night Shift', '## The plan as generated', '## What actually happened', '## Stats', '## Per goal', '## Needs you', '## Holds', "## The orchestrator's read", '<details><summary>event trail</summary>']) {
     assert.ok(md.includes(section), `report is missing "${section}"`);
   }
-  const wrap = nightCues().find((c) => c.correlationKey === `night:${runId}:wrap`);
+  const wrap = nightCues(runId).find((c) => c.correlationKey === `night:${runId}:wrap`);
   assert.ok(wrap, 'no wrap cue posted');
   assert.match(wrap.text, /\[night-shift run #\d+ (STOPPED|COMPLETE) —/);
 });
@@ -681,11 +691,22 @@ await check('NS-14b', 'after the run stops the per-goal autopilot driver ticks t
   assert.ok(after >= before, 'the per-goal driver regressed');
 });
 
-await check('NS-17', 'the per-turn context block renders for cockpit:night-shift only', () => {
+await check('NS-17', 'the per-turn context block renders for a shift thread and the lobby only; an ENDED session answers about ITS OWN run', () => {
+  const latest = night.latestNightRun();
   const block = night.nightShiftContextBlock('cockpit:night-shift');
   assert.match(block, /^<night_shift run_id="\d+" status="/, block.slice(0, 120));
-  assert.match(block, /lanes: L1/);
   assert.match(block, /<\/night_shift>/);
+  // SHIFTS v1 §3.1 — a shift's OWN thread answers about that run forever.
+  const own = night.nightShiftContextBlock(`cockpit:shift-${latest.id}`);
+  assert.match(own, new RegExp(`^<night_shift run_id="${latest.id}" `), own.slice(0, 160));
+  // An ended session says so and does not render live lane/budget state (that
+  // belongs to whatever is running NOW, not to this record).
+  if (latest.status === 'stopped' || latest.status === 'complete') {
+    assert.match(own, /This shift ENDED/);
+    assert.ok(!/^lanes: /m.test(own), 'an ended session rendered live lane state');
+  } else {
+    assert.match(own, /^lanes: L1/m);
+  }
   assert.equal(night.nightShiftContextBlock('cockpit:goal-1'), '', 'the block leaked into a goal thread');
   assert.equal(night.nightShiftContextBlock('slack:whatever'), '');
 });

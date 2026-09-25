@@ -199,7 +199,10 @@ await check('CHK-board', 'GET /night/board before Start: every §5 field present
   for (const k of ['run', 'items', 'lanes', 'stats', 'needs_you', 'budget', 'hold', 'heartbeat', 'thread_ext']) {
     assert.ok(k in b.json, `board is missing "${k}"`);
   }
-  assert.equal(b.json.thread_ext, 'cockpit:night-shift');
+  // SHIFTS v1 §3.1 — the board points at the ACTIVE shift's OWN thread; the
+  // lobby is only the fallback for a run planned before per-shift threads.
+  assert.equal(b.json.thread_ext, `cockpit:shift-${runId}`);
+  assert.equal(b.json.run.thread_ext, `cockpit:shift-${runId}`, 'the run row did not record its own thread');
   assert.equal(b.json.run.id, runId);
   assert.equal(b.json.lanes.length, b.json.run.config.lanes);
   // Nothing has RUN yet (Start hasn't been called), so every activity stat

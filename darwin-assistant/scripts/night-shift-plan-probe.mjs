@@ -18,6 +18,23 @@ process.env.HOPPER_GOV_ENABLED = '0';
 const night = await import(path.join(distDir, 'night-shift.js'));
 const { sqliteDb } = await import(path.join(distDir, 'conversation-db.js'));
 
+// SHIFTS v1 — NORMALISE THE THROWAWAY COPY.
+//
+// `planNight` 409s while a run is planned/running/paused, and the live DB very
+// often HAS one (that is the point of the feature). The probe then failed with
+// `night_run_active` and every downstream check cascaded — a suite that goes
+// red because Kevin happened to start a shift is not testing anything. This is
+// a `.backup()` COPY on the home disk; closing its runs touches nothing real.
+const stale = sqliteDb
+  .prepare("SELECT id FROM night_runs WHERE status IN ('planned','running','paused')")
+  .all();
+if (stale.length) {
+  sqliteDb
+    .prepare("UPDATE night_runs SET status = 'stopped', ended_at = datetime('now'), stop_reason = 'kevin' WHERE status IN ('planned','running','paused')")
+    .run();
+  console.error(`[plan-probe] normalised ${stale.length} live run(s) on the copy → stopped`);
+}
+
 const shape = (items) => items.map((i) => ({
   position: i.position, kind: i.kind, goal_id: i.goal_id, node_id: i.node_id,
   title: i.title, est_minutes: i.est_minutes, why: i.why, eta: i.eta_at,

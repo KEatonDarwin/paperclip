@@ -878,7 +878,30 @@ function simulateLanes(
   };
 
   const settle = (r: SimRow): void => {
-    if (r.draft.node_id != null) ctx.settledAt.set(r.draft.node_id, r.end);
+    if (r.draft.node_id == null) return;
+    ctx.settledAt.set(r.draft.node_id, r.end);
+    // §3.3.1 — roll the settle up: a parent is settled when its whole live
+    // subtree is, at the moment the last of it lands. Same rule as the planner's
+    // `settleAncestors`, expressed in simulated minutes instead of a set.
+    const ix = ctx.ix.get(r.draft.goal_id);
+    if (!ix) return;
+    let cur = ix.byId.get(r.draft.node_id)?.parent_id;
+    while (cur != null) {
+      const parent = ix.byId.get(cur);
+      if (!parent || ctx.settledAt.has(parent.id)) break;
+      const kids = (ix.childrenOf.get(parent.id) ?? []).filter((c) => c.state !== 'discarded');
+      if (!kids.length) break;
+      let latest = 0;
+      let all = true;
+      for (const c of kids) {
+        const at = ctx.settledAt.get(c.id);
+        if (at == null) { all = false; break; }
+        latest = Math.max(latest, at);
+      }
+      if (!all) break;
+      ctx.settledAt.set(parent.id, latest);
+      cur = parent.parent_id;
+    }
   };
 
   const sameSubtreeBusy = (r: SimRow): boolean => {
@@ -966,7 +989,13 @@ function simContext(goalIds: number[], cfg: NightRunConfig, trees: Map<number, G
     ctx.ix.set(gid, ix);
     const goal = getRawGoal(gid);
     ctx.goalPar.set(gid, goal ? goalParallel(goal, cfg) : cfg.per_goal_parallel);
-    for (const n of tree.nodes) if (isSettled(n)) ctx.settledAt.set(n.id, 0);
+    // SHIFTS v1 §3.3.1 — the LANE SIM needs the same parent-settle closure the
+    // planner and the driver use. `readyTime` returns null while any
+    // `earlierOf` node has no settle time, so an already-decomposed parent
+    // (never `isSettled`, never a row of its own) left every later sibling
+    // unschedulable — they landed in the list with `eta_at` NULL and the sim
+    // broke out of its loop with work still queued.
+    for (const id of settledClosure(ix)) ctx.settledAt.set(id, 0);
   }
   return ctx;
 }
@@ -1234,7 +1263,7 @@ function insertAfter(run: NightRunRow, afterItemId: number | null, specs: Insert
 export function assertRunOpen(run: NightRunRow, what: string): void {
   if (run.status === 'stopped' || run.status === 'complete') {
     throw new NightError(409, 'night_run_ended',
-      `shift #${run.id} ${run.status}${run.ended_at ? ` ${ctStamp(run.ended_at)} CT` : ''} — ${what} is not possible on a finished session (it is a record now). Plan a new shift.`);
+      `shift #${run.id} ${run.status}${run.ended_at ? ` ${ctStamp(run.ended_at)}` : ''} — ${what} is not possible on a finished session (it is a record now). Plan a new shift.`);
   }
 }
 
@@ -2007,8 +2036,13 @@ function expandPredicted(run: NightRunRow, decomposeItem: NightItemRow): void {
 /** Hard ceiling on tail re-plans per run, so a pathological goal can never spin
  *  the driver forever. Settings-KV `night_max_replans` (default 50). */
 function maxReplans(): number {
-  const raw = Number(getSetting('night_max_replans'));
-  return Number.isFinite(raw) && raw >= 0 ? Math.min(500, Math.floor(raw)) : 50;
+  // NOTE: `getSetting` returns null when unset and `Number(null)` is 0 — which
+  // is finite and >= 0, so a naive guard here silently pinned the ceiling at
+  // ZERO and disabled continuous mode entirely. Check the STRING first.
+  const raw = (getSetting('night_max_replans') ?? '').trim();
+  if (!raw) return 50;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.min(500, Math.floor(n)) : 50;
 }
 
 function replanCount(runId: number): number {
@@ -2955,7 +2989,7 @@ export function nightShiftContextBlock(externalId: string, turnInput?: string): 
     }
     if (!isActive) {
       lines.push(
-        `This shift ENDED${run.ended_at ? ` ${ctStamp(run.ended_at)} CT` : ''}${run.stop_reason ? ` (${run.stop_reason})` : ''}. It is the record of that session: answer questions about what it did, and do NOT start, pause, move or skip anything on it — those ops will be refused.`,
+        `This shift ENDED${run.ended_at ? ` ${ctStamp(run.ended_at)}` : ''}${run.stop_reason ? ` (${run.stop_reason})` : ''}. It is the record of that session: answer questions about what it did, and do NOT start, pause, move or skip anything on it — those ops will be refused.`,
       );
     }
     const firstOpen = items.findIndex((i) => OPEN_STATUSES.has(i.status));

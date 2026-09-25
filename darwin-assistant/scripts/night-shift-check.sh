@@ -50,6 +50,17 @@ if [ ! -f "$DB_COPY" ]; then
   exit 2
 fi
 
+# SHIFTS v1 — NORMALISE THE THROWAWAY COPY. `POST /night/plan` 409s while a run
+# is planned/running/paused, and the live DB very often HAS one (that is the
+# point of the feature), which made all six checks cascade to red for no reason
+# of their own. The night thread is dropped for the same reason: CHK-thread
+# asserts created=true on the FIRST call. This is a .backup() copy; nothing
+# real is touched.
+sqlite3 "$DB_COPY" \
+  "UPDATE night_runs SET status='stopped', ended_at=datetime('now'), stop_reason='kevin' WHERE status IN ('planned','running','paused');
+   DELETE FROM conversations WHERE external_id = 'cockpit:night-shift';" \
+  || echo "[night-check] WARNING: could not normalise the DB copy" >&2
+
 export JARVIS_DB_PATH="$DB_COPY"
 export GOALS_VAULT_ROOT="$VAULT_DIR"
 export NIGHT_SHIFT_STOP_FILE="$STOP_FILE"

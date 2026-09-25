@@ -457,6 +457,103 @@ await check('SH-8', '§3.4 the night_shift tool: plan takes config+brief+label; 
   await post(`/night/runs/${planned.run.id}/stop`).catch(() => {});
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ADVERSARIAL REVIEW regressions (node #833) — one per defect the review fixed.
+// Each is mutation-tested: reverting its fix makes exactly this check fail.
+// ═══════════════════════════════════════════════════════════════════════════
+
+await check('SH-RV1', 'REVIEW: the `shift:<run>:seed` cue is an AUTOMATED turn — the shift seed cannot spawn opus outside the concurrency ceiling', async () => {
+  const admission = await import(pathToFileURL(path.join(repoRoot, 'dist/turn-admission.js')).href);
+  // The key planNight actually mints (night-shift.ts seedRunThreadIfNew).
+  assert.equal(admission.isAutomatedTurn(`cockpit:shift-${r2Run}`, `shift:${r2Run}:seed`), true,
+    'the shift-thread SEED cue is not gated by turn-admission — it would spawn claude outside max_concurrent_auto_turns');
+  // The keys that were already gated must stay gated (no regression).
+  assert.equal(admission.isAutomatedTurn(`cockpit:shift-${r2Run}`, `night:${r2Run}:wrap`), true);
+  assert.equal(admission.isAutomatedTurn(`cockpit:shift-${r2Run}`, `night:${r2Run}:plan-ready`), true);
+  // …and Kevin's own turn in that same thread must still go straight through.
+  assert.equal(admission.isAutomatedTurn(`cockpit:shift-${r2Run}`, undefined), false,
+    "Kevin's own turn in a shift thread must never be gated");
+});
+
+await check('SH-RV2', 'REVIEW: per-goal minutes ROUND, they do not CAST-truncate — the Sessions list and the session summary report the SAME number', async () => {
+  // julianday() is a float: (jd(end) - jd(start)) * 1440 for a clean 13-minute
+  // window comes out 12.99999…, so CAST(… AS INTEGER) truncated it to 12 while
+  // nightRunSummary() computed 13 in JS with Math.round. The Sessions table and
+  // the session drawer therefore disagreed about the one number Kevin asked for
+  // ("how long did you work on X"), and a 1-minute item vanished entirely.
+  const items = night.listNightItems(r2Run);
+  assert.ok(items.length, 'no items to probe');
+  // Isolate the arithmetic: exactly ONE item carries a window.
+  sqliteDb.prepare(`UPDATE night_items SET started_at = NULL, finished_at = NULL WHERE run_id = ?`).run(r2Run);
+  const probe = items[0];
+  sqliteDb.prepare(
+    `UPDATE night_items SET started_at = '2026-09-25T04:00:00.000Z', finished_at = '2026-09-25T04:13:00.000Z' WHERE id = ?`,
+  ).run(probe.id);
+  const listed = (await get('/night/runs?limit=50')).json.runs.find((x) => x.id === r2Run);
+  const summed = (await get(`/night/runs/${r2Run}`)).json.summary;
+  const gl = listed.goals.find((g) => g.goal_id === probe.goal_id);
+  const gs = summed.goals.find((g) => g.goal_id === probe.goal_id);
+  assert.ok(gl && gs, 'the probed goal is missing from one of the two surfaces');
+  assert.equal(gl.minutes, 13,
+    `a 13-minute item reads ${gl.minutes}m on the Sessions list (truncation, not rounding)`);
+  assert.equal(gl.minutes, gs.minutes,
+    `Sessions list says ${gl.minutes}m but the session summary says ${gs.minutes}m for goal ${probe.goal_id}`);
+});
+
+await check('SH-RV3', 'REVIEW: a spent re-plan ceiling stops the shift `stuck`, never `complete` — a drained list is not a finished goal', async () => {
+  const { setSetting } = await import(path.join(distDir, 'conversation-db.js'));
+  const gx = await mkGoal('GX — ceiling probe');
+  const nx = await mkNode(gx, 'X1 open machine work', { leaf_kind: 'machine' });
+  const r = await post('/night/plan', { mode: 'until_stop', goal_ids: [gx], config: { lanes: 1 } });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  const runId = r.json.run.id;
+  assert.equal((await post(`/night/runs/${runId}/start`)).status, 200);
+  // Burn the ceiling (settings-KV night_max_replans) with synthetic history…
+  setSetting('night_max_replans', '2');
+  for (let i = 0; i < 3; i += 1) {
+    sqliteDb.prepare(`INSERT INTO night_events (run_id, actor, kind, text) VALUES (?, 'system', 'replanned_tail', 'probe')`).run(runId);
+  }
+  assert.equal(night.replanCeilingReached(runId), true, 'the ceiling probe did not take');
+  // …drain the list while #X1 is still genuinely open machine work.
+  for (const it of night.listNightItems(runId)) {
+    sqliteDb.prepare(`UPDATE night_items SET status = 'done', finished_at = datetime('now') WHERE id = ?`).run(it.id);
+  }
+  assert.notEqual(nodeState(nx), 'done', 'the probe node settled — the test no longer proves anything');
+  await tick('ceiling');
+  const run = night.getNightRun(runId);
+  assert.notEqual(run.stop_reason, 'complete',
+    'the shift reported `complete` with open machine work because it had merely run out of re-plans');
+  assert.equal(run.stop_reason, 'stuck', `expected stuck, got ${run.status}/${run.stop_reason}`);
+  const ev = sqliteDb.prepare(
+    `SELECT text FROM night_events WHERE run_id = ? AND kind = 'hold' ORDER BY id DESC LIMIT 1`,
+  ).get(runId);
+  assert.match(ev?.text ?? '', /re-plan ceiling/, 'the stop did not say WHY it stopped');
+  setSetting('night_max_replans', '50');
+});
+
+await check('SH-RV4', 'REVIEW: re-planning before Start archives + renames the superseded shift thread — no live-looking orphan orchestrator', async () => {
+  const gy = await mkGoal('GY — replan orphan probe');
+  await mkNode(gy, 'Y1 machine leaf', { leaf_kind: 'machine' });
+  const p1 = await post('/night/plan', { mode: 'until_stop', goal_ids: [gy], config: { lanes: 1 } });
+  assert.equal(p1.status, 200, JSON.stringify(p1.json));
+  const runA = p1.json.run.id;
+  const extA = `cockpit:shift-${runA}`;
+  const convA = sqliteDb.prepare(`SELECT id, title, status FROM conversations WHERE external_id = ?`).get(extA);
+  assert.ok(convA, 'the first plan did not create its shift thread');
+  // Re-plan before Start — the normal "tweak the sheet, hit Plan again" loop.
+  const p2 = await post('/night/plan', { mode: 'until_stop', goal_ids: [gy], config: { lanes: 1 } });
+  assert.equal(p2.status, 200, JSON.stringify(p2.json));
+  const runB = p2.json.run.id;
+  assert.notEqual(runB, runA, 'the re-plan did not replace the planned run');
+  assert.ok(!night.getNightRun(runA), 'the replaced run row survived');
+  const convA2 = sqliteDb.prepare(`SELECT title, status FROM conversations WHERE external_id = ?`).get(extA);
+  assert.equal(convA2?.status, 'archived',
+    `the superseded shift thread is still "${convA2?.status}" — a live-looking orchestrator for a run that no longer exists`);
+  assert.match(convA2?.title ?? '', /superseded/, `the superseded thread still reads "${convA2?.title}"`);
+  const convB = sqliteDb.prepare(`SELECT status FROM conversations WHERE external_id = ?`).get(`cockpit:shift-${runB}`);
+  assert.ok(convB && convB.status !== 'archived', "the NEW run's thread must exist and be live");
+});
+
 await check('SH-9', 'NO MODEL CALLS: not one claude process was spawned by this suite', () => {
   const after = claudeProcs();
   assert.ok(after <= CLAUDE_BEFORE, `claude processes went from ${CLAUDE_BEFORE} to ${after} — the suite spawned a real model call`);

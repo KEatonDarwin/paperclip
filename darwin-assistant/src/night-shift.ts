@@ -21,7 +21,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { sqliteDb, getConversation, getOrCreateConversation, renameConversation, getSetting, setSetting, setThreadModelOverride } from './conversation-db.js';
+import { sqliteDb, getConversation, getOrCreateConversation, renameConversation, setConversationStatus, getSetting, setSetting, setThreadModelOverride } from './conversation-db.js';
 import { sseBus, type NightRunEvent, type NightItemEvent } from './sse-bus.js';
 import { createNotification } from './notifications.js';
 import { registerTreeStatusListener, getHopperTree, getHopperNode, setNightShiftPausedTreesProvider, listTreeNodes } from './hopper-engine.js';
@@ -1050,6 +1050,14 @@ export function planNight(input: {
   simulateLanes(simRows, cfg, ctx);
 
   // Persist — replace any un-started `planned` run (re-planning before Start is normal).
+  // REVIEW (node #833) — that replaced run already owns a `cockpit:shift-<id>`
+  // thread (created + seeded at ITS plan time). Deleting the run row alone
+  // left that thread in the sidebar as a live-looking orchestrator for a run
+  // that no longer exists: its context block silently degrades to nothing and
+  // every night_shift op in it 404s. Capture it here; after the new run lands
+  // we rename it so it reads as history and archive it out of the sidebar.
+  const supersededThread = live && live.status === 'planned'
+    ? { id: live.id, ext: live.thread_ext } : null;
   const tx = sqliteDb.transaction(() => {
     if (live && live.status === 'planned') {
       sqliteDb.prepare(`DELETE FROM night_items WHERE run_id = ?`).run(live.id);
@@ -1079,6 +1087,20 @@ export function planNight(input: {
     return runId;
   });
   const runId = tx();
+
+  // REVIEW (node #833) — retire the replaced plan's orphan thread (see above).
+  // Never fatal: an archive failure must not fail the plan.
+  if (supersededThread?.ext && supersededThread.ext !== shiftThreadExt(runId)) {
+    try {
+      const conv = getConversation(supersededThread.ext);
+      if (conv) {
+        renameConversation(conv.id, `🌙 Shift #${supersededThread.id} — superseded by re-plan (now #${runId})`);
+        setConversationStatus(conv.id, 'archived');
+      }
+    } catch (err) {
+      console.warn('[night-shift] could not archive the superseded shift thread', err);
+    }
+  }
 
   let run = getNightRun(runId)!;
   const items = listNightItems(runId);
@@ -2068,8 +2090,18 @@ function replanCount(runId: number): number {
  * A `done` row is NOT suppressive: a node that finished `plan` and moved to
  * `check` genuinely needs a NEW `verify` row, and that is the whole point.
  */
+/** REVIEW (node #833) — did this run burn its re-plan ceiling? The driver has
+ *  to tell "the planner found nothing" (→ genuinely `complete`) apart from "I am
+ *  no longer allowed to ask" (→ NOT complete; there may be a mountain of open
+ *  work). Both used to come back as `replanTail() === 0`, so a long shift that
+ *  drained its list 50 times reported `complete` with the goal unfinished —
+ *  precisely the false-completion SHIFTS.md §3.3 exists to kill. */
+export function replanCeilingReached(runId: number): boolean {
+  return replanCount(runId) >= maxReplans();
+}
+
 export function replanTail(run: NightRunRow, actor: 'system' | 'jarvis' = 'system'): number {
-  if (replanCount(run.id) >= maxReplans()) return 0;
+  if (replanCeilingReached(run.id)) return 0;
   const cfg = run.config;
   const at = Math.floor(nowMs() / 60_000) * 60_000;
   const existing = listNightItems(run.id);
@@ -2380,7 +2412,21 @@ export async function tickNightShift(reason = 'loop'): Promise<void> {
     // budget, not on a momentarily empty list.
     if (!open.length) {
       const appended = replanTail(after);
-      if (!appended) { stopNightRun(after.id, 'complete', 'system'); return; }
+      if (!appended) {
+        // REVIEW (node #833) — only the PLANNER coming up empty means complete.
+        // A spent re-plan ceiling means we stopped being allowed to look, which
+        // is a `stuck` (it bells red and names the ceiling) — never a `complete`
+        // that tells Kevin his goal is finished when it is not.
+        if (replanCeilingReached(after.id)) {
+          insertNightEvent(after.id, null, 'system', 'hold',
+            `re-plan ceiling reached (${maxReplans()} tail re-plans, settings-KV night_max_replans) — the list is drained but the planner was not consulted again. Raise night_max_replans or plan a new shift.`,
+            { replan_ceiling: maxReplans() });
+          stopNightRun(after.id, 'stuck', 'system');
+          return;
+        }
+        stopNightRun(after.id, 'complete', 'system');
+        return;
+      }
       const refilled = fillLanes(getNightRun(after.id)!);
       started += refilled.started;
       waiting = refilled.waiting ?? waiting;
@@ -2644,8 +2690,14 @@ const itemAggStmt = sqliteDb.prepare(
           SUM(CASE WHEN status = 'failed'  THEN 1 ELSE 0 END) AS failed,
           SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped,
           SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
+          -- REVIEW (node #833): ROUND, do not CAST-truncate. julianday() is a
+          -- float, so a clean 30-minute item comes out 29.999999… and CAST to
+          -- INTEGER truncates it to 29 (a 7-minute item reads 6 — a 14% lie).
+          -- nightRunSummary() computes the same number in JS with Math.round,
+          -- so truncating here made the Sessions table and the session drawer
+          -- disagree about the one number Kevin actually asked for.
           SUM(CASE WHEN started_at IS NOT NULL AND finished_at IS NOT NULL
-                   THEN MAX(0, CAST((julianday(finished_at) - julianday(started_at)) * 1440 AS INTEGER))
+                   THEN MAX(0, CAST(ROUND((julianday(finished_at) - julianday(started_at)) * 1440) AS INTEGER))
                    ELSE 0 END)                                AS minutes
      FROM night_items
     GROUP BY run_id, goal_id`,

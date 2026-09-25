@@ -75,7 +75,7 @@ function claudeProcessCount() {
 const spawnsBefore = claudeProcessCount();
 
 const distDir = path.join(__dirname, '..', 'dist');
-const { putNotepadDay } = await import(path.join(distDir, 'notepad.js'));
+const { putNotepadDay, getNotepadDay, markLineActed } = await import(path.join(distDir, 'notepad.js'));
 const { runNotepadPass } = await import(path.join(distDir, 'notepad-pass.js'));
 const { sqliteDb } = await import(path.join(distDir, 'conversation-db.js'));
 
@@ -106,6 +106,7 @@ function saveAtTick(day, text, tick) {
 let totalProbes = 0;
 let totalSettles = 0;
 let totalGateCalls = 0; // counts stub INVOCATIONS across the whole file, not verdicts
+let totalReconciled = 0; // counts lines that surfaced as surfaced_kind === 'reconcile' across the whole file
 
 function countedStub(verdictFor) {
   return async (prompt) => {
@@ -206,6 +207,7 @@ let gateCallsAtStartOfD;
   const result = await runNotepadPass(DAY_D, { now: pastBoundary, runOneShot: stubA });
 
   check('(D) settle still fires for a junk-only note', result.settle !== null);
+  if (result.settle) totalSettles += 1;
   check('(D) gate is non-null (the prefilter ran) but empty of real candidates', Array.isArray(result.gate) && result.gate.every((v) => v.reason === 'prefilter'));
   check('(D) worth_reviewing is false', result.worth_reviewing === false);
   check('(D) review stayed null — nothing worth assembling the whole note for', result.review === null);
@@ -261,6 +263,7 @@ const DAY_G = '2026-09-30';
   ]);
 
   const settledCount = results.filter((r) => r.settle !== null).length;
+  totalSettles += settledCount;
   check('(G) exactly one of the 3 concurrent racers observed the settle', settledCount === 1, `got ${settledCount}`);
   check(
     '(G) exactly one gate call across the whole concurrent group',
@@ -270,13 +273,116 @@ const DAY_G = '2026-09-30';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// (H) — the whole-note assertion + the reconcile/action_ref block. Every
+// other section above proves the DEBOUNCE (one pass per settle); this one
+// proves the HANDOFF is actually the whole note, per the module doc's step
+// 3 ("the whole note, in order, every line's ledger history pinned to it"),
+// and that a line already ACTED in a prior cycle re-surfaces as a RECONCILE
+// against its ORIGINAL action_ref (never a fresh first_look, never a second
+// action) when its text changes -- while an untouched acted line stays
+// silent. A single sentence appearing somewhere in `review.lines` (as (B)
+// checks) does not exercise any of this.
+// ═══════════════════════════════════════════════════════════════════════════
+const DAY_H = '2026-10-01';
+{
+  const L1 = 'Email the vendor about overdue invoice'; // acted, left UNCHANGED -> must stay silent
+  const L2 = 'Call the bank about the wire transfer'; // acted, then EDITED -> must reconcile
+  const L3 = 'Renew the office lease before it expires'; // brand-new complete thought -> first_look
+  const L4 = 'ok'; // junk -> present in the whole note, never a gate candidate
+  const ACTION_REF_L1 = 'thread:vendor-email-abc123';
+  const ACTION_REF_L2 = 'thread:bank-wire-xyz789';
+
+  saveAtTick(DAY_H, [L1, L2, L3, L4].join('\n'), 4000);
+  const { lines: linesH } = getNotepadDay(DAY_H);
+  const [l1, l2, l3, l4] = linesH;
+
+  // Simulate a prior cycle's consumer (node #62, out of scope here) having
+  // already acted on L1 and L2 before this pass ever runs.
+  markLineActed(l1.id, ACTION_REF_L1);
+  markLineActed(l2.id, ACTION_REF_L2);
+
+  // Edit ONLY L2's text. L1, L3, L4 are re-saved byte-identical.
+  const L2_EDITED = 'Call the bank about the wire transfer -- ask about the fee';
+  saveAtTick(DAY_H, [L1, L2_EDITED, L3, L4].join('\n'), 4010);
+
+  const gateCallsBeforeH = totalGateCalls;
+  const stubH = countedStub((prompt) => {
+    const ids = [...prompt.matchAll(/line_id (\d+)/g)].map((m) => Number(m[1]));
+    return ids.map((line_id) => ({ line_id, complete_thought: true }));
+  });
+
+  const pastBoundary = tickDate(4010 + 20 + 1);
+  const result = await runNotepadPass(DAY_H, { now: pastBoundary, runOneShot: stubH });
+
+  check('(H) settle fires for the edit', result.settle !== null);
+  if (result.settle) totalSettles += 1;
+  check(
+    '(H) both L2 (reconcile) and L3 (first_look) went through the SAME single batched gate call',
+    totalGateCalls === gateCallsBeforeH + 1,
+    `got ${totalGateCalls - gateCallsBeforeH} calls`,
+  );
+  check('(H) worth_reviewing is true', result.worth_reviewing === true);
+  check('(H) review was assembled', result.review !== null);
+
+  if (result.review) {
+    const { review } = result;
+    totalReconciled += review.lines.filter((l) => l.surfaced_kind === 'reconcile').length;
+
+    // ── whole-note assertion: the handoff is the ENTIRE note, in document
+    // order, not just the line(s) the gate flagged. ──────────────────────────
+    check('(H) whole-note: review contains all 4 lines of the note', review.lines.length === 4, `got ${review.lines.length}`);
+    check('(H) whole-note: counts.total matches the line count', review.counts.total === 4, `got ${review.counts.total}`);
+    check(
+      '(H) whole-note: document order preserved (idx 0..3)',
+      review.lines.every((l, i) => l.idx === i),
+    );
+    check(
+      '(H) whole-note: the rendered block contains every line\'s CURRENT text',
+      [L1, L2_EDITED, L3, L4].every((t) => review.rendered.includes(t)),
+    );
+
+    // ── reconcile/action_ref block: L2 carries its ORIGINAL action_ref and
+    // surfaces as a reconcile, never a bare first_look or a second action. ──
+    const l2Review = review.lines.find((l) => l.line_id === l2.id);
+    check('(H) reconcile: L2 state is still acted (not reset by the edit)', l2Review?.state === 'acted');
+    check('(H) reconcile: L2 kept its ORIGINAL action_ref', l2Review?.action_ref === ACTION_REF_L2);
+    check('(H) reconcile: L2 is surfaced', l2Review?.surfaced === true);
+    check('(H) reconcile: L2 surfaced_kind is reconcile, not first_look', l2Review?.surfaced_kind === 'reconcile');
+    check(
+      '(H) reconcile: the rendered line carries the RECONCILE tag with the original action_ref',
+      review.rendered.includes(`[RECONCILE — was ACTED -> ${ACTION_REF_L2}, text changed since] ${L2_EDITED}`),
+    );
+
+    // ── L1 (acted, byte-identical) must stay silent -- proves the pass never
+    // re-litigates a settled decision just because the DAY changed elsewhere. ─
+    const l1Review = review.lines.find((l) => l.line_id === l1.id);
+    check('(H) L1 (acted, unchanged) does not resurface', l1Review?.surfaced === false && l1Review?.surfaced_kind === null);
+    check(
+      '(H) L1 (acted, unchanged) still renders plain ACTED, no RECONCILE tag',
+      review.rendered.includes(`[ACTED -> ${ACTION_REF_L1}] ${L1}`) &&
+        !review.rendered.includes(`RECONCILE — was ACTED -> ${ACTION_REF_L1}`),
+    );
+
+    // ── L3 (brand-new complete thought) surfaces as first_look alongside L2's
+    // reconcile, both flagged complete_thought in the same gate verdict set. ─
+    const l3Review = review.lines.find((l) => l.line_id === l3.id);
+    check('(H) L3 (new, unseen) surfaced as first_look', l3Review?.surfaced === true && l3Review?.surfaced_kind === 'first_look');
+
+    // ── L4 (junk) is present in the whole-note handoff even though it never
+    // reached the model -- the whole note, not just what the gate flagged. ──
+    const l4Review = review.lines.find((l) => l.line_id === l4.id);
+    check('(H) L4 (junk) is still present in the whole-note review', l4Review !== undefined && l4Review.text === L4);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // (F) — zero real claude processes were ever spawned by this whole run.
 // ═══════════════════════════════════════════════════════════════════════════
 const spawnsAfter = claudeProcessCount();
 check('(F) zero net claude processes spawned across the entire run', spawnsAfter <= spawnsBefore, `before=${spawnsBefore} after=${spawnsAfter}`);
 
 console.log(
-  `\nprobes: ${totalProbes}  settles: ${totalSettles}  gate calls: ${totalGateCalls}  violations: ${failed ? 'yes' : 0}`,
+  `\nprobes: ${totalProbes}  settles: ${totalSettles}  gate calls: ${totalGateCalls}  reconciled: ${totalReconciled}  violations: ${failed ? 'yes' : 0}`,
 );
 console.log(failed ? '\nFAILED' : '\nALL PASS');
 process.exit(failed ? 1 : 0);

@@ -145,6 +145,7 @@ import { deployControl } from './deploy-control.js';
 import { nightShift } from './night-shift-tool.js';
 import { throttle } from './throttle-tool.js';
 import { workSwitch } from './work-switch-tool.js';
+import { health } from './health-tool.js';
 
 function instrumentTool(tool: ToolDef): ToolDef {
   return {
@@ -219,6 +220,7 @@ export const ALL_TOOLS: ToolDef[] = [
   nightShift,
   throttle,
   workSwitch,
+  health,
 ].map(instrumentTool);
 
 export const TOOL_MAP: Map<string, ToolDef> = new Map(

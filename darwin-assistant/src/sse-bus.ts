@@ -20,6 +20,7 @@ import type { IntelItem, IntelRun } from './intel-desk.js';
 import type { GoalSummary, GoalNodeRow, FocusRow } from './goals.js';
 import type { GoalGuardRow } from './goals-guards.js';
 import type { NightRunRow, NightItemRow } from './night-shift.js';
+import type { HealthSample, HealthPoint, HealthEvent } from './health-monitor.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -349,6 +350,21 @@ export interface NightItemEvent {
   item: NightItemRow;
 }
 
+// 🩺 COCKPIT HEALTH — the box sampler. Global like GoalEvent (no conversationId).
+// `health_sample` fires every tick and deliberately carries BOTH shapes: the full
+// sample (tiles + status rows) and its HealthPoint (append straight onto a chart
+// series, no client-side transform). `health_event` is a spike/release crossing.
+export interface HealthSampleEvent {
+  type: 'health_sample';
+  sample: HealthSample;
+  point: HealthPoint;
+}
+export interface HealthEventEvent {
+  type: 'health_event';
+  action: 'created' | 'updated';
+  event: HealthEvent;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
@@ -362,7 +378,8 @@ export type SSEEvent =
   | WorkstreamEvent | MonitorEvent | MonitorRunEvent | FoundryProjectEvent | FoundryModuleEvent
   | IntelRunEvent | IntelItemEvent | WorkbenchProposalEvent
   | GoalEvent | GoalNodeEvent | GoalFocusEvent | GoalGuardEvent
-  | NightRunEvent | NightItemEvent;
+  | NightRunEvent | NightItemEvent
+  | HealthSampleEvent | HealthEventEvent;
 
 // ---------------------------------------------------------------------------
 // THE GLOBAL-STREAM EVENT CONTRACT — one list, server-owned.
@@ -400,6 +417,7 @@ export const GLOBAL_STREAM_EVENT_TYPES = [
   'intel_run', 'intel_item',
   'goal', 'goal_node', 'goal_focus', 'goal_guard',
   'night_run', 'night_item',   // Night Shift (node #679/#680): board + /night live updates
+  'health_sample', 'health_event',   // Cockpit Health (node #858): live /health charts + spike markers
 ] as const satisfies readonly SSEEvent['type'][];
 
 export type GlobalStreamEventType = (typeof GLOBAL_STREAM_EVENT_TYPES)[number];

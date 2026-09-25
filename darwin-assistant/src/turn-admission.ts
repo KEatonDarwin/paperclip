@@ -34,6 +34,10 @@ const AUTOMATED_KEY_PREFIXES = [
   // while up to `hopper_slots` workers are already live, so it was doing
   // exactly what the `night:` line above was added to stop. Same bug, new key.
   'shift:',
+  // COCKPIT HEALTH (node #858): a spike cue mints `health:<event_id>`. It is one
+  // turn per spike per cooldown, but it fires exactly when the box is already
+  // under load — precisely the moment an ungated extra turn hurts most.
+  'health:',
 ];
 
 export function isAutomatedTurn(externalId: string, correlationKey?: string): boolean {

@@ -3707,7 +3707,7 @@ export function createApiV1Router(): Router {
           // Order matters: the flag is set FIRST so nothing can be re-dispatched
           // into the gap while we are killing what is already running.
           const killed = body.kill === true ? runWorkCli(['kill-workers']) : null;
-          const hardStopped = body.hard === true ? runWorkCli(['stop', '-r', reason ?? 'hard stop']) : null;
+          const hardStopped = body.hard === true ? runWorkCli(['stop', '--hard', '-r', reason ?? 'hard stop']) : null;
           res.json({ ...workSwitchPayload(), ok: true, op, killed, hard: hardStopped });
           return;
         }

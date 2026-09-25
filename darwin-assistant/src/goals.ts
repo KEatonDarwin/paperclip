@@ -620,6 +620,20 @@ type AutopilotKickFn = (goalId: number) => void;
 /** Sync gates only (disabled / stop_file / governor) — for the §15.10 `held:` attribute. */
 type AutopilotHoldFn = (goalId: number) => string | null;
 let autopilotPreview: AutopilotPreviewFn | null = null;
+// Re-entrancy guard for the autopilot preview. `nextAction` (the registered
+// preview) builds the goal tree via getGoalTree(), and getGoalTree() composes
+// toGoalSummary(), which asks for the preview again — an unbounded recursion on
+// every autopilot goal that only stopped at the V8 stack limit (~2,400 nested
+// tree rebuilds per call: 3–4 s of synchronous CPU, ~650 MB of sqlite reads and
+// ~3 GB of heap churn PER getGoalTree, measured 2026-09-25 on goal #6). While a
+// preview is already computing, nested summaries report `autopilot_next: null`
+// instead of recursing; the outermost caller still gets the real preview.
+let autopilotPreviewDepth = 0;
+function runAutopilotPreview(goalId: number): AutopilotNextAction | null {
+  if (!autopilotPreview || autopilotPreviewDepth > 0) return null;
+  autopilotPreviewDepth += 1;
+  try { return autopilotPreview(goalId); } catch { return null; } finally { autopilotPreviewDepth -= 1; }
+}
 let autopilotKick: AutopilotKickFn | null = null;
 let autopilotHold: AutopilotHoldFn | null = null;
 export function registerAutopilotHooks(hooks: { preview?: AutopilotPreviewFn; kick?: AutopilotKickFn; hold?: AutopilotHoldFn }): void {
@@ -635,9 +649,7 @@ function toGoalSummary(row: GoalRow): GoalSummary {
   const focus = getFocusRaw(row.id);
   const lastEvent = lastEventAtStmt.get(row.id) as { created_at: string } | undefined;
   let autopilotNext: AutopilotNextAction | null = null;
-  if (row.autopilot === 1 && autopilotPreview) {
-    try { autopilotNext = autopilotPreview(row.id); } catch { autopilotNext = null; }
-  }
+  if (row.autopilot === 1) autopilotNext = runAutopilotPreview(row.id);
   return {
     ...row,
     counts: computeCounts(row.id),
@@ -3068,7 +3080,7 @@ export function renderGoalTreeSnapshot(
       const held = autopilotHold ? autopilotHold(goalId) : null;
       if (held) nextAttr = `held:${held}`;
       else if (autopilotPreview) {
-        const next = autopilotPreview(goalId);
+        const next = runAutopilotPreview(goalId);
         nextAttr = next?.action ? `${next.action} #${next.node_id ?? 0}` : `wait:${next?.reason ?? 'idle'}`;
       }
       autopilotAttrs = ` autopilot="1"${nextAttr ? ` autopilot_next="${escapeAttr(nextAttr)}"` : ''}`;

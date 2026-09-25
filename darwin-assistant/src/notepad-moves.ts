@@ -24,6 +24,11 @@ import { extractJsonObject } from './tools/ux-reviewer/vision-critique.js';
 //   - the model is instructed, explicitly, that omission IS the answer for
 //     everything it is not confident about -- there is no "none" kind to
 //     emit, because emitting anything at all is the noisy path.
+//   - the prompt's silence instruction is a request, not a guarantee -- if
+//     an over-eager model returns a validly-shaped move for every single
+//     candidate anyway, capMoves() below enforces the "handful, not one per
+//     line" noise budget as a hard invariant of this module's OUTPUT,
+//     independent of what the model actually said.
 //
 // This module makes exactly one model call (one sonnet one-shot) per
 // invocation, batched over every candidate line, mirroring notepad-gate.ts's
@@ -52,7 +57,9 @@ export interface NotepadMove {
  *    call was made at all.
  *  - 'model'          -- the model call completed; `moves` is whatever it
  *    validly proposed (often empty -- an empty response is a correct,
- *    common answer, not a failure).
+ *    common answer, not a failure), CAPPED to the noise budget
+ *    (settings-KV `notepad_moves_max_per_day`, default 5) if the model
+ *    over-proposed -- see capMoves() below.
  *  - 'fallback'        -- the model call itself failed (spawn error,
  *    non-zero exit, timeout); `moves` is forced empty regardless of what a
  *    partial/garbled response might have contained.
@@ -70,9 +77,24 @@ const CLAUDE_BIN = process.env.UX_REVIEWER_CLAUDE_BIN || 'claude';
 const DEFAULT_MOVES_MODEL = 'claude-sonnet-5';
 const DEFAULT_MOVES_TIMEOUT_MS = 30 * 1000;
 
+// Goal #62's whole point: "a normal day produces a handful of markers, not
+// one per line." The prompt ASKS the model to stay silent, but a prompt is
+// not an invariant -- an over-eager or misbehaving model can still return a
+// well-formed, validly-shaped move for every single candidate. This cap is
+// what makes the noise budget true regardless of what the model actually
+// does, the same way the four-kind/one-per-line checks in
+// parseMovesResponse hold regardless of what the model returns.
+const DEFAULT_MAX_MOVES_PER_DAY = 5;
+
 function movesModelSetting(): string {
   const raw = getSetting('notepad_moves_model');
   return raw && raw.trim() ? raw.trim() : DEFAULT_MOVES_MODEL;
+}
+
+function movesMaxPerDaySetting(): number {
+  const raw = getSetting('notepad_moves_max_per_day');
+  const n = raw ? parseInt(raw, 10) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_MOVES_PER_DAY;
 }
 
 /**
@@ -206,6 +228,28 @@ function parseMovesResponse(raw: string, candidateIds: ReadonlySet<number>): Not
 }
 
 /**
+ * Enforce the noise budget: even a fully-valid, well-formed response from an
+ * over-eager model (one entry per candidate, every kind legal, every reason
+ * non-empty) must still come out as a HANDFUL of moves, not one per line --
+ * per goal #62's own acceptance bar. `parseMovesResponse` already guarantees
+ * shape/dedup/candidate-membership; this is the layer above it that
+ * guarantees COUNT, independent of anything the model actually said.
+ *
+ * When `moves` is within budget, it passes through untouched (order
+ * preserved). When it overflows, the survivors are the ones whose lines
+ * come FIRST in document order -- the same "read top to bottom" order the
+ * whole-note prompt itself renders -- so which moves survive a truncation
+ * is deterministic and reproducible, never an artifact of whatever order
+ * the model happened to list them in.
+ */
+function capMoves(moves: NotepadMove[], candidates: ReviewLine[]): NotepadMove[] {
+  const max = movesMaxPerDaySetting();
+  if (moves.length <= max) return moves;
+  const docOrder = new Map(candidates.map((c, i) => [c.line_id, i]));
+  return [...moves].sort((a, b) => (docOrder.get(a.line_id) ?? 0) - (docOrder.get(b.line_id) ?? 0)).slice(0, max);
+}
+
+/**
  * Decide the speaking-bar moves for `day`: is there a real move on any
  * currently-surfaced line, and which of the four kinds?
  *
@@ -255,7 +299,7 @@ export async function decideNotepadMoves(
 
   try {
     const raw = await withTimeout(runOneShot(prompt), timeoutMs);
-    const moves = parseMovesResponse(raw, candidateIds);
+    const moves = capMoves(parseMovesResponse(raw, candidateIds), candidates);
     return { day, candidate_count: candidates.length, moves, outcome: 'model' };
   } catch {
     // Spawn failure, non-zero exit, or a timeout -- forced total silence

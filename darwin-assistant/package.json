@@ -37,7 +37,8 @@
     "notepad:check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-check.db node scripts/notepad-check.mjs",
     "notepad:sim": "npm run build && JARVIS_DB_PATH=/tmp/notepad-sim.db node scripts/notepad-sim.mjs",
     "notepad:state-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-state-check.db node scripts/notepad-state-check.mjs",
-    "notepad:replay-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-replay-check.db node scripts/notepad-replay-check.mjs"
+    "notepad:replay-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-replay-check.db node scripts/notepad-replay-check.mjs",
+    "notepad:settle-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-settle-check.db node scripts/notepad-settle-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

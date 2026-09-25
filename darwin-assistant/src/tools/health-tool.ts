@@ -5,6 +5,7 @@ import {
   listHealthEvents,
   ackHealthEvent,
   workloadRows,
+  downsamplePoints,
   listHealthEventsInWindow,
   isHealthWindow,
   type HealthWindow,
@@ -72,13 +73,23 @@ export const health: ToolDef = {
       const metrics = typeof args.metrics === 'string' && args.metrics.trim() !== ''
         ? args.metrics.split(',').map((m) => m.trim()).filter(Boolean)
         : ['cpu', 'mem', 'lag', 'disk', 'db', 'claude'];
+      // A model-facing cap. Raw windows are 5 s apart, so '1h' is 720 points —
+      // returning them whole spends most of a context window on the tool JARVIS
+      // calls when the box is already struggling. Bucketing keeps the peaks
+      // (every `*_max` survives aggregatePoints), which is the part that matters
+      // when you are reading a spike. Charts use the HTTP route and still get
+      // every point.
+      const MAX_TOOL_POINTS = 240;
+      const points = downsamplePoints(series.points, MAX_TOOL_POINTS);
       return {
         window: raw,
         resolution: series.resolution,
         from: series.from,
         to: series.to,
         metrics,
-        points: series.points,
+        points,
+        points_total: series.points.length,
+        downsampled: points.length < series.points.length,
         events: listHealthEventsInWindow(series.from, series.to),
       };
     }

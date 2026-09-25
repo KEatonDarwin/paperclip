@@ -856,6 +856,26 @@ export function aggregatePoints(bucketTs: string, points: HealthPoint[]): Health
   };
 }
 
+/**
+ * Squash a series to at most `max` points for a model-facing caller (review
+ * #861). `series` on a 1h window returns 720 raw points — ~360 KB of JSON, most
+ * of a 100k context, spent on the one tool JARVIS reaches for when Kevin says
+ * the box is slow. Bucketing preserves shape AND peaks, because aggregatePoints
+ * carries every `*_max` forward: a 400 ms lag spike inside a squashed bucket is
+ * still visible as lag_p99_ms_max. The HTTP route is untouched — the chart wants
+ * every point.
+ */
+export function downsamplePoints(points: HealthPoint[], max: number): HealthPoint[] {
+  if (max < 1 || points.length <= max) return points;
+  const size = Math.ceil(points.length / max);
+  const out: HealthPoint[] = [];
+  for (let i = 0; i < points.length; i += size) {
+    const chunk = points.slice(i, i + size);
+    out.push(chunk.length === 1 ? chunk[0]! : aggregatePoints(chunk[0]!.ts, chunk));
+  }
+  return out;
+}
+
 function bucketKey(iso: string, unit: '1m' | '1h'): string {
   const d = new Date(iso);
   if (!Number.isFinite(d.getTime())) return iso;
@@ -875,6 +895,15 @@ const upsertBucketStmt = sqliteDb.prepare<[string, string, string]>(
    ON CONFLICT(kind, ts) WHERE kind != 'raw' DO UPDATE SET json = excluded.json`,
 );
 
+/** Newest bucket already written at this resolution — the watermark the
+ *  incremental rollup resumes from. Null when none exists yet. */
+function lastBucketTs(kind: '1m' | '1h'): string | null {
+  try {
+    const row = sqliteDb.prepare(`SELECT MAX(ts) AS m FROM health_samples WHERE kind = ?`).get(kind) as { m: string | null } | undefined;
+    return row?.m ?? null;
+  } catch { return null; }
+}
+
 /**
  * Roll COMPLETE buckets forward: raw → 1m, 1m → 1h. Only buckets strictly
  * older than the current one are written, so a partial minute is never frozen.
@@ -885,9 +914,27 @@ export function rollup(nowMs = Date.now()): { m1: number; h1: number } {
   let m1 = 0, h1 = 0;
   try {
     const currentMinute = bucketKey(new Date(nowMs).toISOString(), '1m');
-    const rawRows = sqliteDb.prepare<[], { ts: string; json: string }>(
-      `SELECT ts, json FROM health_samples WHERE kind = 'raw' ORDER BY ts ASC`,
-    ).all();
+    // INCREMENTAL, and this is load-bearing (review #861, measured). Reading
+    // every raw row cost 550-700 ms of SYNCHRONOUS event-loop time at the
+    // retention limits this design specifies (17,280 raw rows averaging 5,167
+    // bytes + 43,200 1-minute rows), and it re-aggregated all 1,440 minute
+    // buckets and all 720 hour buckets identically on EVERY pass. On the slow
+    // cadence that is a self-inflicted ~600 ms stall every 5 minutes, forever —
+    // over the p99 lag threshold this page ships with (health_lag_ms=500), on
+    // the one process whose event-loop lag is the headline metric, with a
+    // workload snapshot that would show nothing unusual running. The monitor
+    // would have tripped its own spike and blamed whatever workers were up.
+    // So: only look at buckets at or after the newest one already rolled. The
+    // newest bucket is re-read on purpose (cheap, ~12 rows) so the upsert stays
+    // idempotent if a pass was interrupted mid-bucket.
+    const rawFrom = lastBucketTs('1m');
+    const rawRows = rawFrom
+      ? sqliteDb.prepare<[string], { ts: string; json: string }>(
+        `SELECT ts, json FROM health_samples WHERE kind = 'raw' AND ts >= ? ORDER BY ts ASC`,
+      ).all(rawFrom)
+      : sqliteDb.prepare<[], { ts: string; json: string }>(
+        `SELECT ts, json FROM health_samples WHERE kind = 'raw' ORDER BY ts ASC`,
+      ).all();
     const byMinute = new Map<string, HealthPoint[]>();
     for (const r of rawRows) {
       const key = bucketKey(r.ts, '1m');
@@ -903,9 +950,14 @@ export function rollup(nowMs = Date.now()): { m1: number; h1: number } {
     }
 
     const currentHour = bucketKey(new Date(nowMs).toISOString(), '1h');
-    const minuteRows = sqliteDb.prepare<[], { ts: string; json: string }>(
-      `SELECT ts, json FROM health_samples WHERE kind = '1m' ORDER BY ts ASC`,
-    ).all();
+    const minuteFrom = lastBucketTs('1h');
+    const minuteRows = minuteFrom
+      ? sqliteDb.prepare<[string], { ts: string; json: string }>(
+        `SELECT ts, json FROM health_samples WHERE kind = '1m' AND ts >= ? ORDER BY ts ASC`,
+      ).all(minuteFrom)
+      : sqliteDb.prepare<[], { ts: string; json: string }>(
+        `SELECT ts, json FROM health_samples WHERE kind = '1m' ORDER BY ts ASC`,
+      ).all();
     const byHour = new Map<string, HealthPoint[]>();
     for (const r of minuteRows) {
       const key = bucketKey(r.ts, '1h');
@@ -1181,6 +1233,52 @@ function postHealthCue(text: string, correlationKey: string): void {
 }
 
 /**
+ * Re-adopt spikes left open by a previous process (review #861).
+ *
+ * `metricState` lives in memory, so a restart DURING a spike orphaned its row:
+ * nothing was left holding `event_id`, so the metric could never emit its
+ * `release` and `resolved_at` stayed NULL forever. `openHealthEvents()` feeds
+ * /health/now and the spikes panel, so a spike from a crash days ago would have
+ * rendered as CURRENTLY OPEN for the rest of the box's life — and this box had
+ * a restart loop the same day this page was built. Adopt the newest unresolved
+ * spike per metric so the next under-threshold sample closes it properly, and
+ * close out any older duplicates as superseded.
+ */
+export function rehydrateSpikeState(nowIso = new Date().toISOString()): { adopted: number; superseded: number } {
+  const out = { adopted: 0, superseded: 0 };
+  try {
+    const rows = sqliteDb.prepare(
+      `SELECT id, metric, ts FROM health_events WHERE kind = 'spike' AND resolved_at IS NULL ORDER BY id ASC`,
+    ).all() as { id: number; metric: string; ts: string }[];
+    const newest = new Map<HealthMetric, { id: number; ts: string }>();
+    for (const r of rows) {
+      if (!METRICS.includes(r.metric as HealthMetric)) continue;
+      const metric = r.metric as HealthMetric;
+      const prev = newest.get(metric);
+      if (prev) {
+        // An older open row for the same metric can only exist if a process died
+        // between spikes; it is superseded, not live.
+        try {
+          sqliteDb.prepare(`UPDATE health_events SET resolved_at = ? WHERE id = ?`).run(r.ts, prev.id);
+          out.superseded += 1;
+        } catch { /* non-fatal */ }
+      }
+      newest.set(metric, { id: r.id, ts: r.ts });
+    }
+    for (const [metric, row] of newest) {
+      const state = stateFor(metric);
+      state.event_id = row.id;
+      const t = Date.parse(row.ts);
+      state.over_since = Number.isFinite(t) ? t : Date.parse(nowIso);
+      out.adopted += 1;
+    }
+  } catch (err) {
+    console.error('[health] could not rehydrate the spike state', err);
+  }
+  return out;
+}
+
+/**
  * The state machine. Called on every sample; writes at most one spike row per
  * metric per crossing, at most one cue per metric per cooldown, and one release
  * row when the metric comes back under.
@@ -1196,7 +1294,16 @@ export function evaluateSpikes(sample: HealthSample, nowMs = Date.parse(sample.t
     const value = metricValue(sample, metric);
     const threshold = thresholdFor(t, metric);
     const state = stateFor(metric);
-    const over = value != null && value > threshold;
+
+    // UNKNOWN IS NOT RECOVERED (review #861). cpuPct() returns null whenever two
+    // samples land inside one jiffy — which is exactly what a forced
+    // POST /health/sample landing behind a scheduled tick does. Treating that
+    // null as "back under threshold" wrote a `release` row and stamped
+    // resolved_at on a spike that was still happening: the page would tell Kevin
+    // the box recovered, mid-spike, because someone refreshed it. Carry the
+    // state instead and wait for a sample that actually measured something.
+    if (value == null) continue;
+    const over = value > threshold;
 
     if (over) {
       if (state.over_since == null) state.over_since = nowMs;
@@ -1489,6 +1596,7 @@ function armSampleTimer(): void {
 export function startHealthMonitor(): void {
   if (sampleTimer) return;
   ensureHistogram();
+  rehydrateSpikeState();                  // a restart mid-spike must still release
   prevCpu = cpuTotals();                  // prime the delta so sample #2 has CPU
   try { refreshClaudeProcs(); } catch { /* non-fatal */ }
   armSampleTimer();

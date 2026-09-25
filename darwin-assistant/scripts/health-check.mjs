@@ -488,6 +488,142 @@ check('the bucket upsert prepares against the PARTIAL index', () => {
     'the upsert conflict target must repeat the partial index predicate');
 });
 
+// ── 8) REVIEW #861 REGRESSIONS ──────────────────────────────────────────────
+// Each of these is a defect the adversarial review found and fixed; each fails
+// if the fix is reverted (mutation-tested).
+console.log('\n8) review #861 regressions');
+
+check('R-1 rollup is INCREMENTAL — a second pass does not re-roll every bucket', () => {
+  // DEFECT: rollup() read EVERY raw row and re-aggregated EVERY bucket on every
+  // pass. Measured at the retention limits this design specifies (17,280 raw
+  // rows @ 5,167 B + 43,200 1m rows) that was 550–700 ms of synchronous
+  // event-loop time every 5 minutes — over the page's own 500 ms p99 lag
+  // threshold, on the process whose lag is the headline metric.
+  sqliteDb.prepare(`DELETE FROM health_samples`).run();
+  const base = Date.parse('2026-09-20T08:00:00.000Z');
+  const ins = sqliteDb.prepare(`INSERT INTO health_samples (ts, kind, json) VALUES (?, 'raw', ?)`);
+  for (let m = 0; m < 6; m += 1) {
+    for (let k = 0; k < 4; k += 1) {
+      const ts = new Date(base + m * 60_000 + k * 5_000).toISOString();
+      const s = JSON.parse(JSON.stringify(s1));
+      s.ts = ts;
+      ins.run(ts, JSON.stringify(s));
+    }
+  }
+  const now = base + 6 * 60_000 + 30_000;         // the 7th minute is "current"
+  const first = H.rollup(now);
+  assert.equal(first.m1, 6, `first pass should roll all 6 complete minutes, got ${first.m1}`);
+  const second = H.rollup(now);
+  assert.equal(second.m1, 1,
+    `a second pass must only revisit the watermark bucket, not re-roll all 6 (got ${second.m1}) — ` +
+    'that O(retention) re-scan is the self-inflicted event-loop stall');
+  // Correctness is not traded away for the speed: the buckets are still right.
+  assert.equal(Number(sqliteDb.prepare(`SELECT COUNT(*) c FROM health_samples WHERE kind='1m'`).get().c), 6);
+
+  // …and the 1m→1h leg is incremental on the same watermark.
+  const insM = sqliteDb.prepare(`INSERT OR REPLACE INTO health_samples (ts, kind, json) VALUES (?, '1m', ?)`);
+  for (const hour of ['06', '07']) {
+    for (let m = 0; m < 3; m += 1) {
+      const ts = `2026-09-20T${hour}:0${m}:00.000Z`;
+      insM.run(ts, JSON.stringify(H.aggregatePoints(ts, [H.toPoint(s1)])));
+    }
+  }
+  const h1First = H.rollup(now);
+  assert.equal(h1First.h1, 2, `first pass should roll both complete hours, got ${h1First.h1}`);
+  const h1Second = H.rollup(now);
+  assert.equal(h1Second.h1, 1,
+    `a second pass must only revisit the newest hour, not re-roll every hour (got ${h1Second.h1})`);
+});
+
+check('R-2 an UNKNOWN metric value is not treated as recovered', () => {
+  // DEFECT: cpuPct() returns null when two samples land inside one jiffy —
+  // exactly what a forced POST /health/sample behind a scheduled tick does.
+  // `over = value != null && ...` made null fall through to the release branch,
+  // so the page announced the box had recovered in the middle of a live spike.
+  sqliteDb.prepare(`DELETE FROM health_events`).run();
+  H.__resetHealthSpikeState();
+  const B = Date.parse('2026-09-25T12:00:00.000Z');
+  H.evaluateSpikes(sampleAt(B, 95), B);
+  const spiked = H.evaluateSpikes(sampleAt(B + 31_000, 96), B + 31_000);
+  assert.equal(spiked.spikes.length, 1, 'setup: the spike should have opened');
+  const openId = spiked.spikes[0].id;
+
+  const unknown = sampleAt(B + 36_000, null);     // cpu.pct === null
+  const r = H.evaluateSpikes(unknown, B + 36_000);
+  assert.equal(r.releases.length, 0, 'a null reading must not emit a release');
+  assert.equal(countEvents('release', 'cpu'), 0, 'a null reading must not write a release row');
+  assert.equal(sqliteDb.prepare(`SELECT resolved_at FROM health_events WHERE id = ?`).get(openId).resolved_at, null,
+    'a null reading must not resolve a spike that is still happening');
+
+  // A real under-threshold reading still releases normally.
+  const back = H.evaluateSpikes(sampleAt(B + 60_000, 12), B + 60_000);
+  assert.equal(back.releases.length, 1, 'a genuine recovery must still release');
+  assert.ok(sqliteDb.prepare(`SELECT resolved_at FROM health_events WHERE id = ?`).get(openId).resolved_at,
+    'a genuine recovery must resolve the spike row');
+});
+
+check('R-3 a spike orphaned by a restart is re-adopted and can still release', () => {
+  // DEFECT: metricState is in-memory, so a restart mid-spike left resolved_at
+  // NULL forever. openHealthEvents() feeds /health/now and the spikes panel, so
+  // a spike from a crash days ago rendered as CURRENTLY OPEN for good — on a box
+  // that had a restart loop the same day this page was built.
+  sqliteDb.prepare(`DELETE FROM health_events`).run();
+  H.__resetHealthSpikeState();
+  const C = Date.parse('2026-09-25T13:00:00.000Z');
+  H.evaluateSpikes(sampleAt(C, 95), C);
+  const opened = H.evaluateSpikes(sampleAt(C + 31_000, 95), C + 31_000);
+  assert.equal(opened.spikes.length, 1, 'setup: spike opened');
+
+  H.__resetHealthSpikeState();                     // ← the restart
+  assert.equal(H.openHealthEvents().length, 1, 'setup: the row is orphaned and still open');
+
+  const adopted = H.rehydrateSpikeState();
+  assert.equal(adopted.adopted, 1, 'the open spike must be re-adopted on start');
+
+  const r = H.evaluateSpikes(sampleAt(C + 90_000, 10), C + 90_000);
+  assert.equal(r.releases.length, 1, 'an adopted spike must release when the metric comes back under');
+  assert.equal(H.openHealthEvents().length, 0, 'nothing should still read as open');
+});
+
+check('R-3b rehydrate supersedes older duplicate open spikes for a metric', () => {
+  sqliteDb.prepare(`DELETE FROM health_events`).run();
+  H.__resetHealthSpikeState();
+  const ins = sqliteDb.prepare(
+    `INSERT INTO health_events (ts, kind, metric, value, threshold, cued) VALUES (?, 'spike', 'cpu', 95, 80, 0)`,
+  );
+  ins.run('2026-09-25T01:00:00.000Z');
+  ins.run('2026-09-25T02:00:00.000Z');
+  const r = H.rehydrateSpikeState();
+  assert.equal(r.adopted, 1, 'only the newest row is live');
+  assert.equal(r.superseded, 1, 'the older orphan must be closed, not left open forever');
+  assert.equal(H.openHealthEvents().length, 1);
+});
+
+check('R-4 the model-facing series is capped but keeps its peaks', () => {
+  // DEFECT: `health series {window:"1h"}` returned 720 raw points — ~360 KB of
+  // JSON into the turn, on the one tool JARVIS reaches for when the box is
+  // already struggling.
+  const pts = [];
+  for (let i = 0; i < 720; i += 1) {
+    pts.push({
+      ts: new Date(Date.parse('2026-09-25T09:00:00.000Z') + i * 5000).toISOString(), n: 1,
+      cpu_pct: 20, cpu_pct_max: 20, load1: 1, mem_pct: 30, mem_pct_max: 30,
+      rss_mb: 100, rss_mb_max: 100, lag_p50_ms: 1,
+      lag_p99_ms: i === 500 ? 900 : 4, lag_p99_ms_max: i === 500 ? 900 : 4, lag_max_ms: 5,
+      disk_root_pct: 40, disk_db_pct: 40, db_bytes: 1, db_wal_bytes: 0, db_freelist_pct: 0,
+      db_writes_per_min: 1, db_writes_per_min_max: 1, api_per_min: 1, api_per_min_max: 1,
+      claude_procs: 1, claude_procs_max: 1, workers: 1, workers_max: 1,
+      turns_active: 1, turns_active_max: 1,
+    });
+  }
+  const out = H.downsamplePoints(pts, 240);
+  assert.ok(out.length <= 240, `expected <=240 points, got ${out.length}`);
+  assert.ok(out.length > 100, 'downsampling must not collapse the shape away');
+  assert.equal(Math.max(...out.map((p) => p.lag_p99_ms_max)), 900,
+    'the 900 ms lag peak must survive the squash — a smoothed-away spike is the whole failure mode');
+  assert.deepEqual(H.downsamplePoints(pts.slice(0, 10), 240).length, 10, 'a short series is returned untouched');
+});
+
 console.log(`\n[health-check] ${pass} passed, ${fails.length} failed`);
 if (fails.length) { for (const f of fails) console.log(`  - ${f}`); process.exit(1); }
 console.log('[health-check] PASS');

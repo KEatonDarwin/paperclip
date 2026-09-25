@@ -137,6 +137,12 @@ import {
   listNightItems,
   moveNightItem,
   nightEtaEnd,
+  // SHIFTS v1 §3.4 — the Sessions surface.
+  listNightRuns,
+  listNightEvents,
+  nightRunSummary,
+  runThreadExt,
+  type NightRunStatus,
   pauseNightRun,
   planNight,
   resumeNightRun,
@@ -2618,15 +2624,39 @@ export function createApiV1Router(): Router {
     try { res.json(buildNightBoard()); } catch (err) { sendNightError(res, err); }
   });
 
+  // SHIFTS v1 §3.2 — `brief` (Kevin's instruction, verbatim, ≤2000 chars) and
+  // `label` (≤80) are what turn a run into a SESSION he can find again.
   router.post('/night/plan', (req: AuthedRequest, res) => {
-    const body = (req.body ?? {}) as { mode?: unknown; goal_ids?: unknown; config?: unknown };
+    const body = (req.body ?? {}) as { mode?: unknown; goal_ids?: unknown; config?: unknown; brief?: unknown; label?: unknown };
     try {
       res.json(planNight({
         mode: body.mode as NightRunMode | undefined,
         goal_ids: Array.isArray(body.goal_ids) ? (body.goal_ids as unknown[]).map(Number) : undefined,
         config: body.config,
+        brief: typeof body.brief === 'string' ? body.brief : undefined,
+        label: typeof body.label === 'string' ? body.label : undefined,
         actor: 'kevin',
       }));
+    } catch (err) { sendNightError(res, err); }
+  });
+
+  // SHIFTS v1 §3.4 — the Sessions table. Literal path, so it is registered
+  // BEFORE `/night/runs/:id` and can never be swallowed as an :id.
+  router.get('/night/runs', (req: AuthedRequest, res) => {
+    try {
+      const limitRaw = Number(req.query.limit);
+      const statusRaw = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+      const valid = new Set(['planned', 'running', 'paused', 'stopped', 'complete']);
+      if (statusRaw && !valid.has(statusRaw)) {
+        sendError(res, 400, 'night_status_invalid', `status must be one of ${[...valid].join(', ')}`);
+        return;
+      }
+      res.json({
+        runs: listNightRuns({
+          limit: Number.isFinite(limitRaw) ? limitRaw : 50,
+          status: statusRaw ? (statusRaw as NightRunStatus) : null,
+        }),
+      });
     } catch (err) { sendNightError(res, err); }
   });
 
@@ -2638,7 +2668,14 @@ export function createApiV1Router(): Router {
     const id = parseInt(String(req.params.id), 10);
     const run = getNightRun(id);
     if (!run) { sendError(res, 404, 'night_run_not_found', 'night run not found'); return; }
-    res.json({ run, items: listNightItems(id), eta_end: nightEtaEnd(id) });
+    // SHIFTS v1 §3.4 — `summary` makes "how long did you work on X two days
+    // ago" one call instead of a scroll through the report.
+    res.json({
+      run, items: listNightItems(id), eta_end: nightEtaEnd(id),
+      events: listNightEvents(id),
+      summary: nightRunSummary(id),
+      thread_ext: runThreadExt(run),
+    });
   });
 
   router.post('/night/runs/:id/start', (req: AuthedRequest, res) => {

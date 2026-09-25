@@ -26,6 +26,11 @@ import { sseBus, type NightRunEvent, type NightItemEvent } from './sse-bus.js';
 import { createNotification } from './notifications.js';
 import { registerTreeStatusListener, getHopperTree, getHopperNode, setNightShiftPausedTreesProvider, listTreeNodes } from './hopper-engine.js';
 import { governorCheck, governorStatusAll, type GovernorVerdict } from './hopper-governor.js';
+// SHIFTS v1 §3.2 — the dial snapshot. throttle-status.ts imports throttle /
+// hopper-governor / claude-accounts and is imported by nobody they import, so
+// this keeps the one-directional rule intact.
+import { fullThrottleStatus } from './throttle-status.js';
+import { readThrottleDials } from './throttle.js';
 import {
   AUTOPILOT_DEFAULTS,
   GoalError,
@@ -82,6 +87,8 @@ const KICK_COALESCE_MS = (() => {
   return Number.isFinite(n) && n >= 0 ? n : 1_000;
 })();
 const CT = 'America/Chicago';
+/** Triple-backtick fence used around Kevin's verbatim brief in seeds/context. */
+const BRIEF_FENCE = '`'.repeat(3);
 
 // ---------------------------------------------------------------------------
 // §1 Types
@@ -141,6 +148,56 @@ export const NIGHT_DEFAULTS: NightRunConfig = {
 
 export interface PriorAutopilotEntry { autopilot: 0 | 1; config: AutopilotConfig | null }
 
+/** SHIFTS v1 §3.2 — "everything about the run" in one JSON column. Zero new
+ *  instrumentation: the throttle already knows all of this, we just freeze it. */
+export interface NightDialsSnapshot {
+  at: string;
+  preset: string | null;
+  hopper_slots: number | null;
+  max_per_goal: number | null;
+  max_per_tree: number | null;
+  claude_mode: string | null;
+  claude_order: string[];
+  provider_order: string[];
+  stop_loss: { five_hour: number | null; weekly: number | null; weekly_mode: string | null; kevin_active_max_5h: number | null } | null;
+  accounts: Array<{ key: string; label: string; enabled: boolean; five_hour: number | null; weekly: number | null; active: boolean }>;
+  /** Set when the snapshot could not be taken (the throttle read threw). */
+  error?: string;
+}
+
+/** SHIFTS v1 §3.4 — one row of the Sessions table. */
+export interface NightRunListRow {
+  id: number;
+  label: string | null;
+  brief: string | null;
+  status: NightRunStatus;
+  mode: NightRunMode;
+  goal_ids: number[];
+  lanes: number;
+  per_goal_parallel: number;
+  planned_at: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  duration_min: number | null;
+  stop_reason: NightStopReason | null;
+  thread_ext: string | null;
+  report_path: string | null;
+  items: { total: number; done: number; failed: number; skipped: number; running: number };
+  goals: Array<{ goal_id: number; title: string | null; minutes: number; items_done: number }>;
+}
+
+/** SHIFTS v1 §3.4 — "how long did you work on X two days ago", in one call. */
+export interface NightRunSummary {
+  run_id: number;
+  duration_min: number | null;
+  goals: Array<{ goal_id: number; title: string | null; minutes: number; items: number; items_done: number; items_failed: number }>;
+  nodes: Array<{ goal_id: number; node_id: number; title: string; minutes: number; items: number; kinds: string[]; verified_done: boolean }>;
+  trees_planted: string[];
+  nodes_verified_done: number;
+  nodes_parked: number;
+  items_failed: number;
+}
+
 export interface NightRunRow {
   id: number;
   status: NightRunStatus;
@@ -148,6 +205,15 @@ export interface NightRunRow {
   config: NightRunConfig;
   goal_ids: number[];
   prior_autopilot: Record<string, PriorAutopilotEntry>;
+  /** SHIFTS v1 §3.1 — this session's OWN orchestrator thread (`cockpit:shift-<id>`).
+   *  Null only for runs planned before Shifts v1; those fall back to the lobby. */
+  thread_ext: string | null;
+  /** SHIFTS v1 §3.2 — Kevin's instruction for this shift, verbatim (≤2000 chars). */
+  brief: string | null;
+  /** SHIFTS v1 §3.2 — a short human name for the session (≤80 chars). */
+  label: string | null;
+  /** SHIFTS v1 §3.2 — the throttle dials + account meters as they stood at Start. */
+  dials_at_start: NightDialsSnapshot | null;
   planned_at: string | null;
   started_at: string | null;
   paused_at: string | null;
@@ -238,6 +304,15 @@ export class NightError extends Error {
 const LAZY_COLUMNS: Array<{ table: string; column: string; ddl: string }> = [
   // Additive columns land here as the schema evolves; the try/catch swallows
   // "duplicate column name" so this is safe on every boot.
+  //
+  // SHIFTS v1 (skills/night-shift/SHIFTS.md §3.1/§3.2): a run IS a session, so
+  // it owns its own orchestrator thread, carries Kevin's brief + a label, and
+  // freezes the throttle dials at Start. Every one is nullable — a run planned
+  // before this build reads back exactly as it did.
+  { table: 'night_runs', column: 'thread_ext', ddl: 'TEXT' },
+  { table: 'night_runs', column: 'brief', ddl: 'TEXT' },
+  { table: 'night_runs', column: 'label', ddl: 'TEXT' },
+  { table: 'night_runs', column: 'dials_at_start', ddl: 'TEXT' },
 ];
 
 export function ensureNightShiftTables(): void {
@@ -332,6 +407,10 @@ function parseRun(raw: Record<string, unknown> | undefined): NightRunRow | null 
     config: normalizeNightConfig(parseJson<Partial<NightRunConfig>>(raw.config as string, {})),
     goal_ids: parseJson<number[]>(raw.goal_ids as string, []),
     prior_autopilot: parseJson<Record<string, PriorAutopilotEntry>>(raw.prior_autopilot as string, {}),
+    thread_ext: (raw.thread_ext as string | null) ?? null,
+    brief: (raw.brief as string | null) ?? null,
+    label: (raw.label as string | null) ?? null,
+    dials_at_start: parseJson<NightDialsSnapshot | null>(raw.dials_at_start as string, null),
   };
 }
 
@@ -495,6 +574,33 @@ export function isServerKind(kind: NightItemKind): boolean { return SERVER_KINDS
 
 /** The top-level ancestor of a node (the child of the goal root it hangs off).
  *  Two items "share an ancestor below the goal root" iff these match. */
+/** SHIFTS v1 §3.3.3 — the DRIVER's half of the parent-settle fix.
+ *
+ *  `runnable()` blocks an item while any `earlierOf` node is not `isSettled`.
+ *  A parent that has been decomposed is `set` with children — never settled —
+ *  so it blocked every later sibling FOREVER even after its whole subtree was
+ *  done. That is exactly how run #1 died: item #9 (`decompose` node #23) sat
+ *  on "waits on #22", a node whose children #73–#77 had all long since
+ *  settled, for 20 idle ticks and then `stuck`.
+ *
+ *  A parent whose live children are ALL settled IS settled for ordering
+ *  purposes (the `verify` server kind settles it for real a moment later).
+ *  Computed bottom-up over the DFS array so one pass reaches a fixpoint; only
+ *  ever makes MORE things runnable, and only when the subtree beneath is
+ *  genuinely finished. */
+export function settledClosure(ix: TreeIndex): Set<number> {
+  const settled = new Set<number>();
+  for (const n of ix.nodes) if (isSettled(n)) settled.add(n.id);
+  // Reverse DFS order = children before parents.
+  for (let i = ix.nodes.length - 1; i >= 0; i -= 1) {
+    const n = ix.nodes[i];
+    if (settled.has(n.id) || n.state === 'discarded') continue;
+    const kids = (ix.childrenOf.get(n.id) ?? []).filter((c) => c.state !== 'discarded');
+    if (kids.length && kids.every((c) => settled.has(c.id))) settled.add(n.id);
+  }
+  return settled;
+}
+
 function topAncestorId(ix: TreeIndex, nodeId: number): number {
   let cur = ix.byId.get(nodeId);
   if (!cur) return nodeId;
@@ -523,6 +629,10 @@ export interface NightPlanPreview {
   run: NightRunRow;
   items: NightItemRow[];
   eta_end: string | null;
+  /** SHIFTS v1 §3.2 — non-fatal notes about the plan (e.g. the throttle's
+   *  per-goal cap is tighter than the parallelism asked for). An empty array
+   *  means "nothing to flag". */
+  warnings: string[];
 }
 
 function scopeGoals(goalIds?: number[] | null): GoalRow[] {
@@ -553,6 +663,31 @@ function simulateGoal(
   const pEst = planEst(cfg);
   const earlierOk = (n: GoalNodeRow): boolean =>
     earlierOf(ix, n).every((x) => isSettled(x) || simSettled.has(x.id));
+  /** SHIFTS v1 §3.3.1 — THE fix for "the plan stops after four items".
+   *
+   *  `earlierOf` is recursive: a later sibling of a PARENT waits on that
+   *  parent. But a parent with children is rule 11 ("no item") and `isSettled`
+   *  is false for a `set` node — so once we planned work inside a subtree, the
+   *  parent never settled, and every later sibling AND every later top-level
+   *  branch was silently dropped. Goal 6 planned 4 items while #99, #100 and
+   *  #62–#65 were all open. Walking up after each node and settling any
+   *  ancestor whose live children are ALL settled-or-simulated-settled closes
+   *  it. DFS order (parent before children, subtree contiguous) is what makes
+   *  this safe: a parent can only go settled after its whole subtree is
+   *  visited, so it can never settle early and let a sibling jump the queue.
+   *  A childless node is never settled this way — it has to earn it by
+   *  emitting an item. */
+  const settleAncestors = (n: GoalNodeRow): void => {
+    let cur = n.parent_id != null ? ix.byId.get(n.parent_id) : undefined;
+    while (cur) {
+      if (simSettled.has(cur.id) || isSettled(cur)) { cur = cur.parent_id != null ? ix.byId.get(cur.parent_id) : undefined; continue; }
+      const kids = (ix.childrenOf.get(cur.id) ?? []).filter((c) => c.state !== 'discarded');
+      if (!kids.length) break;
+      if (!kids.every((c) => isSettled(c) || simSettled.has(c.id))) break;
+      simSettled.add(cur.id);
+      cur = cur.parent_id != null ? ix.byId.get(cur.parent_id) : undefined;
+    }
+  };
   const push = (n: GoalNodeRow | null, kind: NightItemKind, est: number, title: string, whyKind: string, parent?: ItemDraft): ItemDraft => {
     const d: ItemDraft = {
       goal_id: goal.id, node_id: n?.id ?? null, kind, title,
@@ -566,41 +701,48 @@ function simulateGoal(
 
   for (const n of tree.nodes) {
     if (n.state === 'discarded') continue;
+    // §3.3.1 — whatever this node emits (or doesn't), roll the settle up.
+    try { visit(n); } finally { settleAncestors(n); }
+  }
+
+  /** One node's rule cascade — first matching rule wins. Extracted so the
+   *  ancestor settle-up above runs on every exit path, `continue` included. */
+  function visit(n: GoalNodeRow): void {
     // 1 — a blocked tree.
     if (n.state === 'working' && n.tree_status_cache === 'blocked') {
       push(n, 'unblock', cfg.est.unblock, n.title, `tree ${n.tree_id ?? '?'} is blocked`);
-      continue;
+      return;
     }
     // 2 — already in flight: finish it.
     if (n.state === 'working') {
       const tree_ = n.tree_id ? getHopperTree(n.tree_id) : null;
       const est = Math.max(5, pEst - elapsedMinutes(tree_?.created_at, at));
       push(n, 'finish', est, n.title, `already in flight (${n.tree_id ?? 'no tree'}) — finish floats`);
-      continue;
+      return;
     }
     // 3 — a tree that landed: verify it (server action).
     if (n.state === 'check') {
       push(n, 'verify', cfg.est.verify, n.title, 'node is in `check`');
-      continue;
+      return;
     }
     // 4 — plan approved, plant failed: replant (server action).
     if (n.state === 'planned') {
       push(n, 'replant', cfg.est.replant, n.title, 'plan approved but the tree never planted');
-      continue;
+      return;
     }
     // 5 — Kevin changed it; weigh in.
     if (n.review_state === 'awaiting_jarvis') {
       push(n, 'weigh_in', cfg.est.weigh_in, n.title, 'Kevin edited/moved this — awaiting your take');
       needsYou.push({ goal_id: goal.id, node_id: n.id, title: n.title, reason: 'awaiting_weigh_in' });
-      continue;
+      return;
     }
-    if (ancestorsBlock(ix, n)) continue;
+    if (ancestorsBlock(ix, n)) return;
     // 6 — the next runnable machine leaf.
     if (n.state === 'set' && n.leaf_kind === 'machine' && n.plan_state === 'none' && earlierOk(n)) {
       const retry = n.autopilot_attempts > 0;
       push(n, retry ? 'replan' as NightItemKind : 'plan', pEst, n.title,
         retry ? `attempt ${n.autopilot_attempts + 1} of ${cfg.max_attempts} after a FAIL` : 'next runnable machine leaf');
-      continue;
+      return;
     }
     // 7/8 — an unclassified set node with no children.
     if (n.state === 'set' && n.leaf_kind === 'none' && n.child_count === 0 && n.promoted_to_goal_id == null && earlierOk(n)) {
@@ -611,17 +753,17 @@ function simulateGoal(
       } else {
         push(n, 'classify', cfg.est.classify, n.title, `at max_depth ${cfg.max_depth}`);
       }
-      continue;
+      return;
     }
     // 9 — a human leaf is Kevin's, never an item.
     if (n.state === 'set' && n.leaf_kind === 'human') {
       needsYou.push({ goal_id: goal.id, node_id: n.id, title: n.title, reason: 'human' });
-      continue;
+      return;
     }
     // 10 — parked.
     if (n.state === 'parked') {
       needsYou.push({ goal_id: goal.id, node_id: n.id, title: n.title, reason: 'parked' });
-      continue;
+      return;
     }
     // 11 — done / a parent with children / anything else: no item.
   }
@@ -831,6 +973,10 @@ function simContext(goalIds: number[], cfg: NightRunConfig, trees: Map<number, G
 
 export function planNight(input: {
   mode?: NightRunMode; goal_ids?: number[]; config?: unknown; actor?: 'kevin' | 'jarvis' | 'system';
+  /** SHIFTS v1 §3.2 — Kevin's instruction for this shift, verbatim. */
+  brief?: string | null;
+  /** SHIFTS v1 §3.2 — a short human name for the session. */
+  label?: string | null;
 } = {}): NightPlanPreview {
   const live = activeNightRun();
   if (live && live.status !== 'planned') {
@@ -838,6 +984,10 @@ export function planNight(input: {
   }
   const cfg = normalizeNightConfig(input.config);
   const mode: NightRunMode = input.mode === 'until_budget' ? 'until_budget' : 'until_stop';
+  // SHIFTS v1 §3.2 — Kevin's brief is stored VERBATIM (trimmed + capped, never
+  // reworded); the label is the session's short name on the Sessions table.
+  const brief = typeof input.brief === 'string' && input.brief.trim() ? input.brief.trim().slice(0, 2000) : null;
+  const label = typeof input.label === 'string' && input.label.trim() ? input.label.trim().slice(0, 80) : null;
   // §3.4 — the lane sim runs at minute resolution, so the anchor is the top of
   // the current minute (two plans in the same minute are byte-identical).
   const at = Math.floor(nowMs() / 60_000) * 60_000;
@@ -878,8 +1028,8 @@ export function planNight(input: {
       sqliteDb.prepare(`DELETE FROM night_runs WHERE id = ?`).run(live.id);
     }
     const info = sqliteDb.prepare(
-      `INSERT INTO night_runs (status, mode, config, goal_ids, prior_autopilot, planned_at) VALUES ('planned', ?, ?, ?, '{}', ?)`,
-    ).run(mode, JSON.stringify(cfg), JSON.stringify(ranked.map((r) => r.goal.id)), nowIso());
+      `INSERT INTO night_runs (status, mode, config, goal_ids, prior_autopilot, planned_at, brief, label) VALUES ('planned', ?, ?, ?, '{}', ?, ?, ?)`,
+    ).run(mode, JSON.stringify(cfg), JSON.stringify(ranked.map((r) => r.goal.id)), nowIso(), brief, label);
     const runId = Number(info.lastInsertRowid);
     const insert = sqliteDb.prepare(
       `INSERT INTO night_items (run_id, position, goal_id, node_id, parent_item_id, kind, title, why, est_minutes, eta_at)
@@ -901,21 +1051,38 @@ export function planNight(input: {
   });
   const runId = tx();
 
-  const run = getNightRun(runId)!;
+  let run = getNightRun(runId)!;
   const items = listNightItems(runId);
   const etaEnd = items.reduce<string | null>((acc, it) => (it.eta_at && (!acc || it.eta_at > acc) ? it.eta_at : acc), null);
+
+  // SHIFTS v1 §3.2 — the throttle's per-goal cap WINS at dispatch, so say so
+  // here rather than silently under-delivering the parallelism Kevin asked for.
+  const warnings: string[] = [];
+  try {
+    const cap = readThrottleDials().throttle_max_per_goal;
+    if (cap > 0 && cfg.per_goal_parallel > cap) {
+      warnings.push(
+        `per_goal_parallel ${cfg.per_goal_parallel} is above the throttle's per-goal cap of ${cap} — the throttle wins at dispatch, so at most ${cap} worker(s) will run on one goal. Raise throttle_max_per_goal on /settings/governor if you meant it.`,
+      );
+    }
+  } catch { /* advisory only; a throttle read failure never blocks a plan */ }
+
+  // SHIFTS v1 §3.1 — the session's own thread exists from PLAN time, so Kevin
+  // can brief it and argue with the order before Start.
+  seedRunThreadIfNew(run);
+  run = getNightRun(runId)!;
   insertNightEvent(runId, null, input.actor ?? 'kevin', 'run_planned',
     `Planned ${items.length} item(s) across ${run.goal_ids.length} goal(s); list ends ~${ctTime(etaEnd)} CT.`,
-    { items: items.length, goals: run.goal_ids, eta_end: etaEnd, needs_you: needsYou.length });
+    { items: items.length, goals: run.goal_ids, eta_end: etaEnd, needs_you: needsYou.length, warnings });
   emitRun('planned', run);                                   // §12.15 — ONE event, not 42
   postPlanReadyCue(run, items, etaEnd);
-  return { run, items, eta_end: etaEnd };
+  return { run, items, eta_end: etaEnd, warnings };
 }
 
 /** §6.2 — the one place a model touches the order before Start. Never blocks it. */
 function postPlanReadyCue(run: NightRunRow, items: NightItemRow[], etaEnd: string | null): void {
   try {
-    seedNightThreadIfNew();
+    const ext = seedRunThreadIfNew(run);
     const top = items.slice(0, 12).map((it) => `#${it.position} G${it.goal_id} ${it.node_id != null ? `#${it.node_id} ` : ''}${it.title} · ${it.kind} · ${it.est_minutes}m — ${it.why}`);
     const text = [
       `[night-shift PLAN READY run #${run.id} — ${items.length} items, est until ${ctTime(etaEnd)}]`,
@@ -925,7 +1092,7 @@ function postPlanReadyCue(run: NightRunRow, items: NightItemRow[], etaEnd: strin
       ...top,
       items.length > 12 ? `… (+${items.length - 12} more)` : '',
     ].filter(Boolean).join('\n');
-    postCue(NIGHT_THREAD_EXT, text, `night:${run.id}:plan-ready`, 'night-shift');
+    postCue(ext, text, `night:${run.id}:plan-ready`, 'night-shift');
   } catch (err) {
     console.error('[night-shift] plan-ready cue failed', err);
   }
@@ -1061,9 +1228,20 @@ function insertAfter(run: NightRunRow, afterItemId: number | null, specs: Insert
   return out.map((r) => getItem(r.id)!);
 }
 
+/** SHIFTS v1 §3.1 — a finished session is a RECORD. Reading it is always fine;
+ *  reordering or adding to it is not, and the error has to say why rather than
+ *  quietly mutating a run that ended two days ago. */
+export function assertRunOpen(run: NightRunRow, what: string): void {
+  if (run.status === 'stopped' || run.status === 'complete') {
+    throw new NightError(409, 'night_run_ended',
+      `shift #${run.id} ${run.status}${run.ended_at ? ` ${ctStamp(run.ended_at)} CT` : ''} — ${what} is not possible on a finished session (it is a record now). Plan a new shift.`);
+  }
+}
+
 export function moveNightItem(runId: number, itemId: number, position: number, actor: 'kevin' | 'jarvis' = 'kevin'): NightItemRow[] {
   const run = getNightRun(runId);
   if (!run) throw new NightError(404, 'night_run_not_found', 'night run not found');
+  assertRunOpen(run, 'moving an item');
   const item = getItem(itemId);
   if (!item || item.run_id !== runId) throw new NightError(404, 'night_item_not_found', 'night item not found');
   const items = listNightItems(runId);
@@ -1085,6 +1263,9 @@ export function moveNightItem(runId: number, itemId: number, position: number, a
 }
 
 export function skipNightItem(runId: number, itemId: number, actor: 'kevin' | 'jarvis' = 'kevin'): NightItemRow {
+  const run = getNightRun(runId);
+  if (!run) throw new NightError(404, 'night_run_not_found', 'night run not found');
+  assertRunOpen(run, 'skipping an item');
   const item = getItem(itemId);
   if (!item || item.run_id !== runId) throw new NightError(404, 'night_item_not_found', 'night item not found');
   if (item.status !== 'queued') {
@@ -1100,6 +1281,7 @@ export function skipNightItem(runId: number, itemId: number, actor: 'kevin' | 'j
 export function addNightItem(runId: number, goalId: number, nodeId: number, afterItemId?: number | null, actor: 'kevin' | 'jarvis' = 'jarvis'): NightItemRow {
   const run = getNightRun(runId);
   if (!run) throw new NightError(404, 'night_run_not_found', 'night run not found');
+  assertRunOpen(run, 'adding an item');
   const tree = getGoalTree(goalId);
   const node = tree?.nodes.find((n) => n.id === nodeId);
   if (!tree || !node) throw new NightError(404, 'goal_node_not_found', 'goal node not found');
@@ -1186,23 +1368,158 @@ export function ensureNightThread(): { external_id: string; created: boolean; se
 }
 export const getOrCreateNightThread = ensureNightThread;
 
-/** REVIEW (node #682) — seed the thread the moment WE create it.
- *
- *  `ensureNightThread()` only RETURNS the seed text; the cockpit posts it on
- *  first open. But `planNight` / `startNightRun` both create the thread too —
- *  so a night planned from the tool or a curl (no /night tab open) got a
- *  PLAN-READY cue in a thread with no persona at all, and the UI, seeing
- *  `created:false` later, would never seed it. Same failure as the un-seeded
- *  goal-1 chat. Posting it as a cue is idempotent by construction: it only ever
- *  fires on the turn the conversation is born. */
-function seedNightThreadIfNew(): void {
+// ---------------------------------------------------------------------------
+// SHIFTS v1 §3.1 — the PER-SHIFT orchestrator thread
+//
+// `cockpit:night-shift` is now the LOBBY: it exists so there is always a thread
+// to open when no shift is running, and it is the fallback for the runs that
+// predate this column. Every NEW run gets `cockpit:shift-<id>` at PLAN time —
+// before Start — so Kevin can brief it, argue with the order, and come back to
+// it days later and ask "how long did you work on X". One session, one chat.
+// ---------------------------------------------------------------------------
+
+const SETTING_THREAD_MODEL = 'night_thread_model';
+
+export function shiftThreadExt(runId: number): string { return `cockpit:shift-${runId}`; }
+
+/** The run id a `cockpit:shift-<id>` thread belongs to, or null. */
+export function runIdForThread(externalId: string): number | null {
+  const m = /^cockpit:shift-(\d+)$/.exec(externalId.trim());
+  if (!m) return null;
+  const id = Number(m[1]);
+  return Number.isFinite(id) ? id : null;
+}
+
+/** Where this run's cues go. Null `thread_ext` = a pre-Shifts run → the lobby. */
+export function runThreadExt(run: NightRunRow): string { return run.thread_ext ?? NIGHT_THREAD_EXT; }
+
+function shiftLabel(run: NightRunRow): string {
+  if (run.label && run.label.trim()) return run.label.trim().slice(0, 80);
+  const first = run.goal_ids[0];
+  const g = first != null ? getRawGoal(first) : null;
+  return (g?.title ?? `${run.goal_ids.length} goal(s)`).slice(0, 80);
+}
+
+function composeShiftSeed(run: NightRunRow): string {
+  const goals = run.goal_ids.map((gid) => {
+    const g = getRawGoal(gid);
+    return `- goal #${gid}${g ? ` — ${g.title}` : ''}`;
+  });
+  const dials = readDialsSnapshot();
+  const throttleLine = dials.error
+    ? 'Throttle: unreadable at plan time.'
+    : `Throttle: preset ${dials.preset ?? '—'} · ${dials.hopper_slots ?? '—'} worker slots · per-goal cap ${dials.max_per_goal ?? '—'} · claude mode ${dials.claude_mode ?? '—'}${dials.claude_order.length ? ` (${dials.claude_order.join(',')})` : ''}.`;
+  const briefBlock = run.brief && run.brief.trim()
+    ? [
+        "Kevin's brief for this shift (verbatim — it outranks your own judgement about what to work on):",
+        BRIEF_FENCE,
+        run.brief.trim(),
+        BRIEF_FENCE,
+      ].join('\n')
+    : 'Kevin left no brief for this shift — work the list as planned.';
+  return [
+    `You are the orchestrator for SHIFT #${run.id} — ${shiftLabel(run)}.`,
+    '',
+    "A shift is ONE session of work: this thread, this ordered list, this run row. It may be an overnight night shift or a focused daytime push — the machinery is identical. A deterministic server-side driver picks the next item off a FROZEN ordered list and posts it here as a cue; you do exactly that one step on that one node and stop. The list, the lanes, the pausing and the budget are the server's job — never yours.",
+    '',
+    briefBlock,
+    '',
+    `Goals in this shift:\n${goals.join('\n') || '- (none resolved)'}`,
+    `Lanes: ${run.config.lanes} · per-goal parallel: ${run.config.per_goal_parallel} · mode: ${run.mode}.`,
+    throttleLine,
+    '',
+    'Rules for every cue turn:',
+    '- Kevin may be asleep. Never end a turn on a question. If a step genuinely needs him, `park` the node with a reason and `log` it — the report surfaces it.',
+    '- Do the ONE step the cue names, on the ONE node it names. Do not wander the tree, do not start other goals, do not add work to the shift.',
+    '- Reply in ≤4 lines, then exactly one `log` op (one sentence: what you decided and why). The report is built from those lines.',
+    '- The `goals` tool needs an explicit `goal_id` here (this is not a goal chat). The cue header tells you which goal.',
+    '- Use `night_shift` for the list itself: `status` to see where you are, `log` for your own read, `move`/`skip` only if Kevin asks you in this thread.',
+    '',
+    'Kevin may talk to you here at any time — answer him with the list in context. He can pause, resume, reorder and stop from the /night board; you never do any of that on your own. Once this shift ends, this thread stays: it is the record of this session and he can come back to it days later.',
+    '',
+    "The model for this thread is Kevin's manual pick (the picker in this window's header). It starts on Opus 5.",
+  ].join('\n');
+}
+
+/** §3.1 — find-or-create THIS run's thread, mirroring ensureNightThread. The
+ *  model override is applied ONCE at creation; after that the picker is Kevin's.
+ *  Idempotent: safe to call on every plan, start and cue. */
+export function ensureRunThread(run: NightRunRow): { external_id: string; created: boolean; seed_text: string | null } {
+  const ext = shiftThreadExt(run.id);
+  const existed = !!getConversation(ext);
+  const conv = getOrCreateConversation(ext);
+  if (!existed) {
+    try { renameConversation(conv.id, `🌙 Shift #${run.id} — ${shiftLabel(run)}`); }
+    catch (err) { console.warn('[night-shift] could not label the shift thread', err); }
+    try {
+      const model = (getSetting(SETTING_THREAD_MODEL) ?? '').trim() || 'claude-opus-5';
+      setThreadModelOverride(conv.id, 'claude', model);
+    } catch (err) {
+      console.warn('[night-shift] could not set the shift thread model override', err);
+    }
+  }
+  if (run.thread_ext !== ext) setRun(run.id, { thread_ext: ext });
+  return { external_id: ext, created: !existed, seed_text: existed ? null : composeShiftSeed(run) };
+}
+
+/** Create + SEED in one call (the 2-step pattern: create the thread, then post
+ *  the seed as a cue). Idempotent by construction — the seed only ever fires on
+ *  the turn the conversation is born. */
+function seedRunThreadIfNew(run: NightRunRow): string {
   try {
-    const t = ensureNightThread();
-    if (t.created && t.seed_text) postCue(NIGHT_THREAD_EXT, t.seed_text, 'night:seed', 'night-shift');
+    const t = ensureRunThread(run);
+    if (t.created && t.seed_text) postCue(t.external_id, t.seed_text, `shift:${run.id}:seed`, 'night-shift');
+    return t.external_id;
   } catch (err) {
-    console.error('[night-shift] orchestrator seed failed', err);
+    console.error('[night-shift] shift thread seed failed', err);
+    return runThreadExt(run);
   }
 }
+
+// ---------------------------------------------------------------------------
+// SHIFTS v1 §3.2 — the dial snapshot
+// ---------------------------------------------------------------------------
+
+/** Read the ⚡ Throttle dials + account meters. Never throws: a snapshot is a
+ *  record, not a gate — a throttle read that fails must not stop a shift. */
+export function readDialsSnapshot(): NightDialsSnapshot {
+  const empty: NightDialsSnapshot = {
+    at: nowIso(), preset: null, hopper_slots: null, max_per_goal: null, max_per_tree: null,
+    claude_mode: null, claude_order: [], provider_order: [], stop_loss: null, accounts: [],
+  };
+  try {
+    const st = fullThrottleStatus();
+    return {
+      at: nowIso(),
+      preset: st.dials.throttle_preset ?? null,
+      hopper_slots: st.dials.hopper_slots ?? null,
+      max_per_goal: st.dials.throttle_max_per_goal ?? null,
+      max_per_tree: st.dials.throttle_max_per_tree ?? null,
+      claude_mode: st.dials.throttle_claude_mode ?? null,
+      claude_order: [...(st.dials.throttle_claude_order ?? [])],
+      provider_order: [...(st.dials.throttle_provider_order ?? [])],
+      stop_loss: {
+        five_hour: st.stop_loss?.gov_5h_ceiling ?? null,
+        weekly: st.stop_loss?.gov_weekly_ceiling ?? null,
+        weekly_mode: st.stop_loss?.gov_weekly_mode ?? null,
+        kevin_active_max_5h: st.stop_loss?.gov_kevin_active_claude_max_5h ?? null,
+      },
+      accounts: (st.accounts ?? []).map((a) => ({
+        key: a.key, label: a.label, enabled: a.enabled,
+        five_hour: a.five_hour ?? null, weekly: a.weekly ?? null, active: a.active,
+      })),
+    };
+  } catch (err) {
+    return { ...empty, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+
+// SHIFTS v1 §3.1 — the lobby's own seed-on-create (REVIEW node #682's
+// `seedNightThreadIfNew`) moved to `seedRunThreadIfNew`, which does the same
+// thing for the run's OWN thread. The lobby is now only created by
+// `POST /night/thread` when there is no run at all, and the cockpit posts its
+// seed on first open exactly as it always did.
 
 // ---------------------------------------------------------------------------
 // §2.1 Run lifecycle
@@ -1228,7 +1545,7 @@ function registerCommitment(run: NightRunRow): void {
     sqliteDb.prepare(
       `INSERT INTO watch_commitments (subject, thread_ext, check_type, check_ref, due_at, status)
        VALUES (?,?,?,?,?,'open')`,
-    ).run(`Night Shift run #${run.id} wraps by morning with a report`, NIGHT_THREAD_EXT, 'manual', `night_run:${run.id}`, due);
+    ).run(`Night Shift run #${run.id} wraps by morning with a report`, runThreadExt(run), 'manual', `night_run:${run.id}`, due);
   } catch (err) {
     console.warn('[night-shift] commitment registration skipped', err);
   }
@@ -1254,9 +1571,11 @@ export function startNightRun(runId: number, actor: 'kevin' | 'jarvis' = 'kevin'
     if (!goal) continue;
     prior[String(gid)] = { autopilot: goal.autopilot, config: goal.autopilot_config ?? null };
   }
+  // SHIFTS v1 §3.2 — freeze the dials as they stood the moment work began.
   const updated = setRun(runId, {
     status: 'running', started_at: nowIso(), paused_at: null,
     prior_autopilot: JSON.stringify(prior),
+    dials_at_start: JSON.stringify(readDialsSnapshot()),
   });
   // Adopt: every included goal runs on the night's models while the run owns it.
   for (const gid of updated.goal_ids) {
@@ -1268,8 +1587,8 @@ export function startNightRun(runId: number, actor: 'kevin' | 'jarvis' = 'kevin'
       console.warn(`[night-shift] could not adopt goal #${gid} onto autopilot:`, err instanceof Error ? err.message : err);
     }
   }
-  seedNightThreadIfNew();
-  registerCommitment(updated);
+  seedRunThreadIfNew(updated);
+  registerCommitment(getNightRun(runId)!);
   insertNightEvent(runId, null, actor, 'run_started',
     `Night run #${runId} started (${updated.mode}, ${updated.config.lanes} lanes, ${updated.goal_ids.length} goals).`,
     { goal_ids: updated.goal_ids, lanes: updated.config.lanes, mode: updated.mode });
@@ -1354,7 +1673,7 @@ export function stopNightRun(
     `Night run #${runId} ${finalStatus} (${reason}).`, { reason, report_path: reportPath });
   const stats = buildNightStats(updated);
   try {
-    postCue(NIGHT_THREAD_EXT,
+    postCue(runThreadExt(updated),
       [`[night-shift run #${runId} ${finalStatus.toUpperCase()} — ${reason}]`,
        `${stats.items.done} done · ${stats.items.failed} failed · ${stats.items.blocked} blocked · ${stats.items.skipped} skipped · ${stats.trees_spawned} trees.`,
        reportPath ? `Report: ${reportPath}` : 'Report could not be written — say so in your summary.',
@@ -1671,6 +1990,136 @@ function expandPredicted(run: NightRunRow, decomposeItem: NightItemRow): void {
   else resimulateEtas(getNightRun(run.id)!);
 }
 
+
+// ---------------------------------------------------------------------------
+// SHIFTS v1 §3.3.2 — CONTINUOUS MODE: re-plan the tail in place
+//
+// The old driver stopped `complete` the instant the frozen list drained, even
+// when the goals it owned still had open machine work — which is how a daytime
+// shift ended ten minutes after it started. A shift now keeps going: when
+// nothing is open, re-run the deterministic planner against CURRENT tree state
+// and APPEND whatever it finds as a fresh tail. The list is still frozen in the
+// sense that matters (nothing re-sorts, locked rows never move); it just grows.
+// `complete` now means what it says: the simulate pass yields nothing, for
+// every goal in the shift.
+// ---------------------------------------------------------------------------
+
+/** Hard ceiling on tail re-plans per run, so a pathological goal can never spin
+ *  the driver forever. Settings-KV `night_max_replans` (default 50). */
+function maxReplans(): number {
+  const raw = Number(getSetting('night_max_replans'));
+  return Number.isFinite(raw) && raw >= 0 ? Math.min(500, Math.floor(raw)) : 50;
+}
+
+function replanCount(runId: number): number {
+  const row = sqliteDb.prepare(
+    `SELECT COUNT(*) AS n FROM night_events WHERE run_id = ? AND kind = 'replanned_tail'`,
+  ).get(runId) as { n: number } | undefined;
+  return row?.n ?? 0;
+}
+
+/**
+ * Re-simulate every included goal and append the drafts this run has not
+ * already scheduled. Returns the number of rows appended (0 = genuinely out of
+ * work, which is the ONLY thing that may end a run `complete`).
+ *
+ * Suppression rules, in order:
+ *  - a draft whose (node_id, kind) already has a queued/running row — it IS
+ *    already scheduled;
+ *  - a draft whose (node_id, kind) has a `skipped` row — Kevin skipped it (or
+ *    the wrap did); re-adding it would override him;
+ *  - a draft whose (node_id, kind) has a `failed` row — it already had its
+ *    attempts and was parked; the planner would re-emit it forever otherwise;
+ *  - `predicted` placeholders whose decompose draft was itself suppressed.
+ * A `done` row is NOT suppressive: a node that finished `plan` and moved to
+ * `check` genuinely needs a NEW `verify` row, and that is the whole point.
+ */
+export function replanTail(run: NightRunRow, actor: 'system' | 'jarvis' = 'system'): number {
+  if (replanCount(run.id) >= maxReplans()) return 0;
+  const cfg = run.config;
+  const at = Math.floor(nowMs() / 60_000) * 60_000;
+  const existing = listNightItems(run.id);
+  const blockedKey = new Set<string>();
+  for (const it of existing) {
+    if (it.node_id == null) continue;
+    if (it.status === 'queued' || it.status === 'running' || it.status === 'skipped' || it.status === 'failed') {
+      blockedKey.add(`${it.node_id}:${it.kind}`);
+    }
+  }
+  const lastPos = existing.reduce((m, i) => Math.max(m, i.position), 0);
+  const specs: Array<InsertSpec & { parent_of?: number }> = [];
+  const needsYou: NightNeedsYou[] = [];
+  for (const gid of run.goal_ids) {
+    const goal = getRawGoal(gid);
+    const tree = getGoalTree(gid);
+    if (!goal || !tree) continue;
+    const drafts = simulateGoal(goal, tree, cfg, at, needsYou);
+    const keptDrafts = new Set<ItemDraft>();
+    for (const d of drafts) {
+      if (d.kind === 'predicted') {
+        // A placeholder only rides along if its decompose draft was kept.
+        if (!d.parent_draft || !keptDrafts.has(d.parent_draft)) continue;
+      } else {
+        if (d.node_id == null) continue;
+        if (blockedKey.has(`${d.node_id}:${d.kind}`)) continue;
+        blockedKey.add(`${d.node_id}:${d.kind}`);
+      }
+      keptDrafts.add(d);
+      specs.push({
+        goal_id: d.goal_id, node_id: d.node_id, kind: d.kind, title: d.title,
+        est_minutes: d.est_minutes,
+        why: `re-planned tail — ${d.why_kind}`.slice(0, 300),
+      });
+    }
+  }
+  if (!specs.length) return 0;
+
+  // Append after the last position. `insertAfter` handles locks + eta re-sim;
+  // passing the last item id keeps predicted parent links resolvable.
+  const tail = existing.length ? existing[existing.length - 1].id : null;
+  const inserted = insertAfter(run, tail, specs);
+  // Re-link the predicted placeholders to the decompose rows they follow.
+  for (let i = 0; i < inserted.length; i += 1) {
+    if (inserted[i].kind !== 'predicted') continue;
+    const prev = inserted[i - 1];
+    if (prev && prev.kind === 'decompose') setItem(inserted[i].id, { parent_item_id: prev.id });
+  }
+  insertNightEvent(run.id, null, actor, 'replanned_tail',
+    `List drained but ${specs.length} item(s) of machine work remain — appended after #${lastPos}.`,
+    { appended: specs.length, goals: run.goal_ids });
+  console.log(`[night-shift] run #${run.id} re-planned a tail of ${specs.length} item(s)`);
+  return inserted.length;
+}
+
+/** SHIFTS v1 §3.3.3 — a `predicted` placeholder whose parent decompose item is
+ *  already finished must be expanded or pruned IN THE SAME TICK, never waited
+ *  on. `expandPredicted` only ever fires on the tick the decompose item
+ *  transitions to done; a placeholder orphaned any other way (the decompose
+ *  failed, was skipped at a wrap, or the run was restarted mid-transition) sat
+ *  `queued` forever and counted as "open work" — so the run could neither
+ *  complete nor make progress, which is half of the run #1 stuck state. */
+function prunePredicted(run: NightRunRow): number {
+  let touched = 0;
+  for (const ph of listNightItems(run.id)) {
+    if (ph.kind !== 'predicted' || ph.status !== 'queued') continue;
+    const parent = ph.parent_item_id != null ? getItem(ph.parent_item_id) : null;
+    if (!parent) {
+      setItem(ph.id, { status: 'skipped', finished_at: nowIso(), result_summary: 'parent_already_expanded: the decompose item is gone' });
+      insertNightEvent(run.id, ph.id, 'system', 'item_skipped', `#${ph.position} predicted — parent item is gone`);
+      touched += 1;
+      continue;
+    }
+    if (parent.status === 'queued' || parent.status === 'running') continue;   // still legitimately waiting
+    if (parent.status === 'done') { expandPredicted(run, parent); touched += 1; continue; }
+    // failed / blocked / skipped / expanded — there are no children coming.
+    setItem(ph.id, { status: 'skipped', finished_at: nowIso(), result_summary: `parent_already_expanded: decompose item #${parent.position} is ${parent.status}` });
+    insertNightEvent(run.id, ph.id, 'system', 'item_skipped',
+      `#${ph.position} predicted — parent #${parent.position} is ${parent.status}, nothing to expand`, { reason: 'parent_already_expanded' });
+    touched += 1;
+  }
+  return touched;
+}
+
 // -- §4.2 gates -------------------------------------------------------------
 
 export interface NightHold { reason: string; detail: string }
@@ -1702,7 +2151,9 @@ function runnable(run: NightRunRow, item: NightItemRow, running: NightItemRow[],
   if (!tree || !node) return { ok: false, why: 'node is gone' };
   const ix = indexTree(tree.nodes);
   if (ancestorsBlock(ix, node)) return { ok: false, why: 'an ancestor is a ghost or parked' };
-  const blocking = earlierOf(ix, node).filter((x) => !isSettled(x));
+  // §3.3.3 — a fully-settled parent no longer blocks its later siblings.
+  const settled = settledClosure(ix);
+  const blocking = earlierOf(ix, node).filter((x) => !settled.has(x.id));
   if (blocking.length) return { ok: false, why: `waits on #${blocking[0].id} ${blocking[0].title}`.slice(0, 160) };
   if (isServerKind(item.kind)) return { ok: true, why: '' };          // §12.4 — no lane, no caps
   if (item.kind === 'finish') return { ok: true, why: '' };           // §12.7 — already running
@@ -1790,7 +2241,7 @@ function runModelItem(run: NightRunRow, item: NightItemRow, lane: number, total:
   setItem(item.id, { status: 'running', lane, started_at: item.started_at ?? nowIso() });
   insertNightEvent(run.id, item.id, 'system', 'item_started',
     `#${item.position} ${item.kind} lane ${lane} — ${item.title}`, { kind: item.kind, lane, second_ask: secondAsk });
-  postCue(NIGHT_THREAD_EXT, text, `night:${run.id}:${item.id}:${cueCount(item.id)}`, 'night-shift');
+  postCue(runThreadExt(run), text, `night:${run.id}:${item.id}:${cueCount(item.id)}`, 'night-shift');
   insertGoalEvent(item.goal_id, node.id, 'system', 'autopilot_cue', text.split('\n')[1] ?? text.split('\n')[0], {
     action, node_id: node.id, correlation: `night:${run.id}:${item.id}`, night_run: run.id, night_item: item.id,
   });
@@ -1860,6 +2311,10 @@ export async function tickNightShift(reason = 'loop'): Promise<void> {
     // only when the run is genuinely open for new work.
     const hold = run.status === 'running' ? nightHoldReason(run, true) : null;
     syncItems(run, run.status === 'running' && !hold);
+    // SHIFTS v1 §3.3.3 — orphaned placeholders are resolved in the SAME tick as
+    // the reconciliation that orphaned them, never left to be "waited on".
+    // Runs paused/held too: it is pure fact-keeping, no cue, no model call.
+    prunePredicted(run);
     const after = getNightRun(run.id)!;
     if (after.status !== 'running') return;
 
@@ -1878,18 +2333,49 @@ export async function tickNightShift(reason = 'loop'): Promise<void> {
     }
     noteHold(after, null, '');
 
-    const { started, waiting } = fillLanes(after);
+    let { started, waiting } = fillLanes(after);
     lastWaiting = waiting;
 
-    const items = listNightItems(after.id);
-    const open = items.filter((i) => OPEN_STATUSES.has(i.status));
-    if (!open.length) { stopNightRun(after.id, 'complete', 'system'); return; }
+    let items = listNightItems(after.id);
+    let open = items.filter((i) => OPEN_STATUSES.has(i.status));
+
+    // SHIFTS v1 §3.3.2 — CONTINUOUS MODE. A drained list is not the end of a
+    // shift; it is a prompt to look again. Re-plan the tail and keep going, and
+    // only call it `complete` when the deterministic pass finds nothing at all
+    // for any included goal. `until_budget` re-plans too — it ends on the
+    // budget, not on a momentarily empty list.
+    if (!open.length) {
+      const appended = replanTail(after);
+      if (!appended) { stopNightRun(after.id, 'complete', 'system'); return; }
+      const refilled = fillLanes(getNightRun(after.id)!);
+      started += refilled.started;
+      waiting = refilled.waiting ?? waiting;
+      lastWaiting = waiting;
+      items = listNightItems(after.id);
+      open = items.filter((i) => OPEN_STATUSES.has(i.status));
+      driver.idleTicks = 0;
+      return;
+    }
+
     const running = open.filter((i) => i.status === 'running');
     if (!running.length && !started) {
-      driver.idleTicks += 1;
-      if (driver.idleTicks >= STUCK_TICKS) {
-        insertNightEvent(after.id, null, 'system', 'hold', `nothing runnable for ${driver.idleTicks} ticks — ${waiting ?? 'no reason recorded'}`);
-        stopNightRun(after.id, 'stuck', 'system');
+      // SHIFTS v1 §3.3.3 — STUCK MUST MEAN STUCK. Nothing runnable is only half
+      // the test; the other half is "and a re-plan produced nothing either".
+      // Run #1 stopped `stuck` at 02:14 with real work left, because a settled
+      // parent was blocking its siblings and nobody asked the planner again.
+      const appended = replanTail(after);
+      if (appended) {
+        const refilled = fillLanes(getNightRun(after.id)!);
+        started += refilled.started;
+        lastWaiting = refilled.waiting ?? waiting;
+        driver.idleTicks = 0;
+      } else {
+        driver.idleTicks += 1;
+        if (driver.idleTicks >= STUCK_TICKS) {
+          insertNightEvent(after.id, null, 'system', 'hold',
+            `nothing runnable for ${driver.idleTicks} ticks and a re-plan found no work — ${waiting ?? 'no reason recorded'}`);
+          stopNightRun(after.id, 'stuck', 'system');
+        }
       }
     } else {
       driver.idleTicks = 0;
@@ -2096,8 +2582,176 @@ export function buildNightBoard(): NightBoard {
     budget: budgetBars(),
     hold,
     heartbeat: getSetting(SETTING_HEARTBEAT),
-    thread_ext: NIGHT_THREAD_EXT,
+    thread_ext: run ? runThreadExt(run) : NIGHT_THREAD_EXT,
     eta_end: run ? nightEtaEnd(run.id) : null,
+  };
+}
+
+
+// ---------------------------------------------------------------------------
+// SHIFTS v1 §3.4 — SESSIONS: the list + the per-run summary
+//
+// "How long did you work on X overnight two days ago?" has to be ONE call, not
+// a scroll through a report. Two prepared statements, both aggregates grouped
+// server-side, so the list never fans out into a query per run.
+// ---------------------------------------------------------------------------
+
+const runsListStmt = sqliteDb.prepare(
+  `SELECT * FROM night_runs ORDER BY id DESC LIMIT ?`,
+);
+const runsListByStatusStmt = sqliteDb.prepare(
+  `SELECT * FROM night_runs WHERE status = ? ORDER BY id DESC LIMIT ?`,
+);
+/** ONE grouped aggregate for the whole page of runs — never a query per run. */
+const itemAggStmt = sqliteDb.prepare(
+  `SELECT run_id, goal_id,
+          COUNT(*)                                            AS total,
+          SUM(CASE WHEN status = 'done'    THEN 1 ELSE 0 END) AS done,
+          SUM(CASE WHEN status = 'failed'  THEN 1 ELSE 0 END) AS failed,
+          SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped,
+          SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
+          SUM(CASE WHEN started_at IS NOT NULL AND finished_at IS NOT NULL
+                   THEN MAX(0, CAST((julianday(finished_at) - julianday(started_at)) * 1440 AS INTEGER))
+                   ELSE 0 END)                                AS minutes
+     FROM night_items
+    GROUP BY run_id, goal_id`,
+);
+const goalTitlesStmt = sqliteDb.prepare(`SELECT id, title FROM goals`);
+
+interface ItemAgg {
+  run_id: number; goal_id: number; total: number; done: number; failed: number;
+  skipped: number; running: number; minutes: number;
+}
+
+function runDurationMin(run: NightRunRow): number | null {
+  const start = sqliteToMs(run.started_at);
+  if (start == null) return null;
+  const end = sqliteToMs(run.ended_at) ?? nowMs();
+  return Math.max(0, Math.round((end - start) / 60_000));
+}
+
+/** §3.4 — the Sessions table, newest first. */
+export function listNightRuns(opts: { limit?: number; status?: NightRunStatus | null } = {}): NightRunListRow[] {
+  const limit = Math.max(1, Math.min(500, Math.floor(opts.limit ?? 50)));
+  const raw = (opts.status
+    ? runsListByStatusStmt.all(opts.status, limit)
+    : runsListStmt.all(limit)) as Array<Record<string, unknown>>;
+  const runs = raw.map((r) => parseRun(r)).filter((r): r is NightRunRow => !!r);
+  if (!runs.length) return [];
+  const wanted = new Set(runs.map((r) => r.id));
+  const aggs = (itemAggStmt.all() as ItemAgg[]).filter((a) => wanted.has(a.run_id));
+  const titles = new Map((goalTitlesStmt.all() as Array<{ id: number; title: string }>).map((g) => [g.id, g.title]));
+  const byRun = new Map<number, ItemAgg[]>();
+  for (const a of aggs) {
+    if (!byRun.has(a.run_id)) byRun.set(a.run_id, []);
+    byRun.get(a.run_id)!.push(a);
+  }
+  return runs.map((run) => {
+    const rows = byRun.get(run.id) ?? [];
+    const items = rows.reduce(
+      (acc, r) => ({
+        total: acc.total + r.total, done: acc.done + r.done, failed: acc.failed + r.failed,
+        skipped: acc.skipped + r.skipped, running: acc.running + r.running,
+      }),
+      { total: 0, done: 0, failed: 0, skipped: 0, running: 0 },
+    );
+    // Every goal the run OWNS gets a row, even one that produced no item —
+    // "we worked on goal 6 and got nothing done" is a real answer.
+    const perGoal = new Map(rows.map((r) => [r.goal_id, r]));
+    const goals = run.goal_ids.map((gid) => {
+      const r = perGoal.get(gid);
+      return { goal_id: gid, title: titles.get(gid) ?? null, minutes: r?.minutes ?? 0, items_done: r?.done ?? 0 };
+    });
+    for (const r of rows) {
+      if (!run.goal_ids.includes(r.goal_id)) {
+        goals.push({ goal_id: r.goal_id, title: titles.get(r.goal_id) ?? null, minutes: r.minutes, items_done: r.done });
+      }
+    }
+    return {
+      id: run.id, label: run.label, brief: run.brief, status: run.status, mode: run.mode,
+      goal_ids: run.goal_ids, lanes: run.config.lanes, per_goal_parallel: run.config.per_goal_parallel,
+      planned_at: run.planned_at, started_at: run.started_at, ended_at: run.ended_at,
+      duration_min: runDurationMin(run), stop_reason: run.stop_reason,
+      thread_ext: run.thread_ext, report_path: run.report_path,
+      items, goals,
+    };
+  });
+}
+
+export interface NightEventRow {
+  id: number; run_id: number; item_id: number | null; actor: string; kind: string;
+  text: string | null; data: string | null; created_at: string;
+}
+
+const eventsStmt = sqliteDb.prepare(
+  `SELECT * FROM night_events WHERE run_id = ? ORDER BY id ASC LIMIT ?`,
+);
+
+/** §3.5 — the session drawer's event log. Capped so a long night cannot make
+ *  one GET return tens of thousands of rows. */
+export function listNightEvents(runId: number, limit = 500): NightEventRow[] {
+  return eventsStmt.all(runId, Math.max(1, Math.min(5000, Math.floor(limit)))) as NightEventRow[];
+}
+
+/** §3.4 — per-goal AND per-node minutes for one session. */
+export function nightRunSummary(runId: number): NightRunSummary | null {
+  const run = getNightRun(runId);
+  if (!run) return null;
+  const items = listNightItems(runId);
+  const titles = new Map((goalTitlesStmt.all() as Array<{ id: number; title: string }>).map((g) => [g.id, g.title]));
+  const minutesOf = (it: NightItemRow): number => {
+    const a = sqliteToMs(it.started_at);
+    const b = sqliteToMs(it.finished_at);
+    if (a == null || b == null) return 0;
+    return Math.max(0, Math.round((b - a) / 60_000));
+  };
+
+  const goals = new Map<number, NightRunSummary['goals'][number]>();
+  const nodes = new Map<string, NightRunSummary['nodes'][number]>();
+  const trees = new Set<string>();
+  let itemsFailed = 0;
+  for (const gid of run.goal_ids) {
+    goals.set(gid, { goal_id: gid, title: titles.get(gid) ?? null, minutes: 0, items: 0, items_done: 0, items_failed: 0 });
+  }
+  for (const it of items) {
+    if (!goals.has(it.goal_id)) {
+      goals.set(it.goal_id, { goal_id: it.goal_id, title: titles.get(it.goal_id) ?? null, minutes: 0, items: 0, items_done: 0, items_failed: 0 });
+    }
+    const g = goals.get(it.goal_id)!;
+    const m = minutesOf(it);
+    g.minutes += m; g.items += 1;
+    if (it.status === 'done') g.items_done += 1;
+    if (it.status === 'failed') { g.items_failed += 1; itemsFailed += 1; }
+    if (it.tree_id) trees.add(it.tree_id);
+    if (it.node_id == null) continue;
+    const key = `${it.goal_id}:${it.node_id}`;
+    if (!nodes.has(key)) {
+      nodes.set(key, { goal_id: it.goal_id, node_id: it.node_id, title: it.title, minutes: 0, items: 0, kinds: [], verified_done: false });
+    }
+    const n = nodes.get(key)!;
+    n.minutes += m; n.items += 1;
+    if (!n.kinds.includes(it.kind)) n.kinds.push(it.kind);
+  }
+
+  // Did the node actually land? Read the goal tree, not the item status — an
+  // item can be `done` ("tree landed, awaiting a verdict") while the node is not.
+  let verified = 0;
+  let parked = 0;
+  for (const n of nodes.values()) {
+    const node = getRawGoalNode(n.node_id);
+    if (!node) continue;
+    if (node.state === 'done') { n.verified_done = true; verified += 1; }
+    else if (node.state === 'parked') parked += 1;
+  }
+  return {
+    run_id: runId,
+    duration_min: runDurationMin(run),
+    goals: [...goals.values()].sort((a, b) => b.minutes - a.minutes || a.goal_id - b.goal_id),
+    nodes: [...nodes.values()].sort((a, b) => b.minutes - a.minutes || a.node_id - b.node_id),
+    trees_planted: [...trees],
+    nodes_verified_done: verified,
+    nodes_parked: parked,
+    items_failed: itemsFailed,
   };
 }
 
@@ -2246,11 +2900,13 @@ const NIGHT_CUE_HEADER = /^\[night item #(\d+) of (\d+) · lane (\d+)\]/;
 const AUTOPILOT_CUE_HEADER = /^\[autopilot goal #(\d+) — /m;
 
 /** Does this turn input look like one of our own cues? Returns the item id. */
-export function nightCueItem(turnInput: string | undefined): NightItemRow | null {
+export function nightCueItem(turnInput: string | undefined, forRun?: NightRunRow | null): NightItemRow | null {
   if (!turnInput) return null;
   const m = NIGHT_CUE_HEADER.exec(turnInput.trimStart());
   if (!m) return null;
-  const run = latestNightRun();
+  // SHIFTS v1 §3.1 — the run is the THREAD's run when we know it; only a call
+  // with no thread context falls back to "the latest".
+  const run = forRun ?? latestNightRun();
   if (!run) return null;
   const items = listNightItems(run.id);
   // REVIEW (node #682) — `position` is MUTABLE (an insert or a Kevin move
@@ -2266,30 +2922,56 @@ export function nightCueItem(turnInput: string | undefined): NightItemRow | null
   return items.find((i) => i.goal_id === goalId && i.status === 'running') ?? byPos;
 }
 
+/** SHIFTS v1 §3.1 — which run does this thread speak for?
+ *
+ *  A `cockpit:shift-<id>` thread ALWAYS answers about its own run, even months
+ *  later and even while a different shift is running — that is the whole point
+ *  of sessions. The lobby (`cockpit:night-shift`) speaks for the active run, or
+ *  the most recent one when nothing is live. Any other thread gets nothing. */
+export function runForThread(externalId: string): NightRunRow | null {
+  const id = runIdForThread(externalId);
+  if (id != null) return getNightRun(id);
+  if (externalId === NIGHT_THREAD_EXT) return latestNightRun();
+  return null;
+}
+
 export function nightShiftContextBlock(externalId: string, turnInput?: string): string {
-  if (externalId !== NIGHT_THREAD_EXT) return '';
   try {
-    const run = latestNightRun();
+    const run = runForThread(externalId);
     if (!run) return '';
     const items = listNightItems(run.id);
     const running = items.filter((i) => i.status === 'running');
     const elapsed = run.started_at ? fmtDuration(elapsedMinutes(run.started_at, nowMs())) : '—';
     const hold = driver.holdLog[driver.holdLog.length - 1];
     const holdAttr = run.status === 'running' && hold && hold.to == null ? `${hold.reason}` : '';
+    const active = activeNightRun();
+    const isActive = active?.id === run.id;
     const lines: string[] = [];
-    lines.push(`<night_shift run_id="${run.id}" status="${run.status}" mode="${run.mode}" lanes="${running.length}/${run.config.lanes}" elapsed="${elapsed}" eta_end="${ctTime(nightEtaEnd(run.id))}" hold="${holdAttr}">`);
+    lines.push(`<night_shift run_id="${run.id}" status="${run.status}" mode="${run.mode}" lanes="${running.length}/${run.config.lanes}" elapsed="${elapsed}" eta_end="${ctTime(nightEtaEnd(run.id))}" hold="${holdAttr}"${run.label ? ` label="${run.label.replace(/"/g, "'")}"` : ''}>`);
+    // §3.2 — Kevin's brief, verbatim, every single turn. It is the shift's
+    // standing instruction; a summary of it is not the same thing.
+    if (run.brief && run.brief.trim()) {
+      lines.push(`Kevin's brief for this shift: ${BRIEF_FENCE}${run.brief.trim()}${BRIEF_FENCE}`);
+    }
+    if (!isActive) {
+      lines.push(
+        `This shift ENDED${run.ended_at ? ` ${ctStamp(run.ended_at)} CT` : ''}${run.stop_reason ? ` (${run.stop_reason})` : ''}. It is the record of that session: answer questions about what it did, and do NOT start, pause, move or skip anything on it — those ops will be refused.`,
+      );
+    }
     const firstOpen = items.findIndex((i) => OPEN_STATUSES.has(i.status));
     const start = Math.max(0, Math.min(firstOpen === -1 ? 0 : firstOpen - 2, Math.max(0, items.length - 12)));
     for (const it of items.slice(start, start + 12)) {
       const glyph = it.status === 'running' && it.lane ? `▶L${it.lane}` : (GLYPH[it.status] ?? '·');
       lines.push(`#${it.position} ${glyph} G${it.goal_id}${it.node_id != null ? ` #${it.node_id}` : ''} · ${it.title} · ${it.kind} · ${it.est_minutes}m${it.eta_at ? ` · eta ${ctTime(it.eta_at)}` : ''}${it.locked ? ' 🔒' : ''}`);
     }
-    const laneTxt = laneViews(run, items).map((l) => l.item
-      ? `L${l.lane} #${l.item.position}${l.tree ? ` (${l.tree.id}, ${l.tree.done}/${l.tree.total} nodes)` : ''}`
-      : `L${l.lane} idle`).join(' · ');
-    lines.push(`lanes: ${laneTxt}${lastWaiting ? ` · next: ${lastWaiting}` : ''}`);
-    const budget = budgetBars().filter((b) => b.used_pct != null).map((b) => `${b.label} ${b.used_pct}%`).join(' · ');
-    if (budget) lines.push(`budget: ${budget}`);
+    if (isActive) {
+      const laneTxt = laneViews(run, items).map((l) => l.item
+        ? `L${l.lane} #${l.item.position}${l.tree ? ` (${l.tree.id}, ${l.tree.done}/${l.tree.total} nodes)` : ''}`
+        : `L${l.lane} idle`).join(' · ');
+      lines.push(`lanes: ${laneTxt}${lastWaiting ? ` · next: ${lastWaiting}` : ''}`);
+      const budget = budgetBars().filter((b) => b.used_pct != null).map((b) => `${b.label} ${b.used_pct}%`).join(' · ');
+      if (budget) lines.push(`budget: ${budget}`);
+    }
     lines.push('</night_shift>');
     let out = `${lines.join('\n')}\n`;
     // On a cue turn, hand the model the cued goal's tree with the SAME markers
@@ -2299,7 +2981,7 @@ export function nightShiftContextBlock(externalId: string, turnInput?: string): 
     const body = turnInput ? turnInput.split('\n').slice(1).join('\n') : undefined;
     const named = turnInput && NIGHT_CUE_HEADER.test(turnInput.trimStart())
       ? AUTOPILOT_CUE_HEADER.exec(turnInput) : null;
-    const cued = nightCueItem(turnInput);
+    const cued = nightCueItem(turnInput, run);
     const cuedGoalId = named ? Number(named[1]) : cued?.goal_id ?? null;
     if (cuedGoalId != null) {
       out += renderGoalTreeSnapshot(cuedGoalId, { turn_input: body, include_node_chats: false });
@@ -2315,8 +2997,12 @@ export function nightShiftContextBlock(externalId: string, turnInput?: string): 
 // Orchestrator log (§6 tool `log`) + the condensed status read
 // ---------------------------------------------------------------------------
 
-export function nightOrchestratorLog(text: string, kind: 'orchestrator_log' | 'plan_review' = 'orchestrator_log'): { run_id: number } {
-  const run = latestNightRun();
+export function nightOrchestratorLog(
+  text: string, kind: 'orchestrator_log' | 'plan_review' = 'orchestrator_log', runId?: number | null,
+): { run_id: number } {
+  // SHIFTS v1 §3.1 — a shift thread logs against ITS OWN run, always. Only a
+  // caller with no thread context falls back to the latest.
+  const run = runId != null ? getNightRun(runId) : latestNightRun();
   if (!run) throw new NightError(404, 'night_run_not_found', 'there is no night run to log against');
   insertNightEvent(run.id, null, 'jarvis', kind, text.slice(0, 2000));
   emitRun('updated', run);
@@ -2326,6 +3012,7 @@ export function nightOrchestratorLog(text: string, kind: 'orchestrator_log' | 'p
 export function nightStatusDigest(): {
   run: NightRunRow | null; items: NightItemRow[]; lanes: NightLaneView[];
   hold: NightBoard['hold']; budget: NightBudgetBar[]; eta_end: string | null; waiting: string | null; thread_ext: string;
+  brief: string | null; label: string | null; dials_at_start: NightDialsSnapshot | null;
 } {
   const board = buildNightBoard();
   const firstOpen = board.items.findIndex((i) => OPEN_STATUSES.has(i.status));
@@ -2333,6 +3020,11 @@ export function nightStatusDigest(): {
   return {
     run: board.run, items: board.items.slice(start, start + 12), lanes: board.lanes,
     hold: board.hold, budget: board.budget, eta_end: board.eta_end, waiting: lastWaiting,
-    thread_ext: NIGHT_THREAD_EXT,
+    thread_ext: board.thread_ext,
+    // SHIFTS v1 §3.4 — the session fields, so `night_shift status` answers
+    // "which shift am I, what did Kevin tell me, where do I live".
+    brief: board.run?.brief ?? null,
+    label: board.run?.label ?? null,
+    dials_at_start: board.run?.dials_at_start ?? null,
   };
 }

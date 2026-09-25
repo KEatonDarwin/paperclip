@@ -3046,9 +3046,9 @@ export function buildGoalThreadContext(externalId: string, turnInput?: string): 
 }
 
 /** NIGHT SHIFT (CONTRACT §6.1) — the `<goal_focus/>` + `<goal_tree>` snapshot
- *  itself, factored out of buildGoalThreadContext so the ONE orchestrator
- *  thread (`cockpit:night-shift`) can be handed the cued goal's tree with the
- *  SAME markers. Goal/node chats call it through buildGoalThreadContext with
+ *  itself, factored out of buildGoalThreadContext so a shift's orchestrator
+ *  thread (`cockpit:shift-<run_id>`, or the `cockpit:night-shift` lobby for a
+ *  pre-Shifts run) can be handed the cued goal's tree with the SAME markers. Goal/node chats call it through buildGoalThreadContext with
  *  the scope they resolved, so their output is byte-for-byte what it was. */
 export function renderGoalTreeSnapshot(
   goalId: number,

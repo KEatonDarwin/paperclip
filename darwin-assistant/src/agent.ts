@@ -31,6 +31,7 @@ import { buildGroupChatContext } from './group-chat-context.js';
 import { buildQuickChatContext } from './quick-chat-profiles.js';
 import { buildWorkbenchThreadContext } from './workbench.js';
 import { buildGoalThreadContext } from './goals.js';
+import { nightShiftContextBlock } from './night-shift.js';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getOrCreateInternalMcpKey } from './api-keys.js';
@@ -1524,6 +1525,13 @@ async function runConversationTurn(
   // v0.4 §15.10: the turn input is passed so an autopilot cue turn gets its
   // <autopilot_cue/> prefix line (matched on the fixed `[autopilot goal #g —` header).
   const goalContextBlock = buildGoalThreadContext(conv.external_id, input);
+  // SHIFTS v1 §3.1/§3.2 — a shift's orchestrator thread (`cockpit:shift-<id>`,
+  // or the `cockpit:night-shift` lobby) gets its run, its frozen list, its
+  // lanes and Kevin's VERBATIM brief every turn, plus the cued goal's tree on a
+  // cue turn. '' for every other thread. Without this the function existed and
+  // was never called: the orchestrator ran the whole night on transcript memory
+  // with no brief and no list.
+  const nightContextBlock = nightShiftContextBlock(conv.external_id, input);
 
   // DAR-744: hand the model an absolute file path per attached image, mirroring
   // the working vision-critique.ts pattern (local claude CLI reads an image when
@@ -1538,7 +1546,7 @@ async function runConversationTurn(
     ? `<attached_images>\nThe user attached ${images.length} image(s) to this message. Open and look at each one now before responding — absolute paths:\n${images.map((img) => `- ${img.absPath}`).join('\n')}\n</attached_images>\n\n`
     : '';
 
-  const perTurnContextPrefix = threadContextLine + autonomyDialLine + groupContextBlock + quickChatContextBlock + workbenchContextBlock + goalContextBlock + imageBlock;
+  const perTurnContextPrefix = threadContextLine + autonomyDialLine + groupContextBlock + quickChatContextBlock + workbenchContextBlock + goalContextBlock + nightContextBlock + imageBlock;
 
   // The resume path re-injects memory on EVERY turn that has a live sessionId
   // (the common case), so an uncapped loadMemoryBlock() here was the dominant

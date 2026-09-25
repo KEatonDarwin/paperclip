@@ -175,10 +175,12 @@ export function treeCueOnTreeStatus(treeId: string, status: 'done' | 'blocked' |
   // already suppresses foundry bells (isFoundryTree). Foundry reports through
   // /foundry; the module trees are its internal steps, not Kevin's review gate.
   if (tree.topic.startsWith('foundry:')) return;
-  // NIGHT SHIFT (review node #682): while a night run OWNS a goal, its trees are
-  // the night's items — the driver's P0 sync already settles them and kicks on
-  // the same tree-status event, and every cue for that goal must land in the ONE
-  // orchestrator thread (`cockpit:night-shift`), not the goal chat. Without this
+  // SHIFTS (review node #682, re-confirmed for Shifts v1): while a shift OWNS a
+  // goal, its trees are the shift's items — the driver's P0 sync already settles
+  // them and kicks on the same tree-status event, and the cue for that goal is
+  // posted by the driver into THAT SHIFT'S own orchestrator thread
+  // (`cockpit:shift-<run_id>`, or the `cockpit:night-shift` lobby for a run that
+  // predates per-shift threads), never the goal chat and never from here. Without this
   // a finished night tree ran a SECOND, un-briefed JARVIS turn in the goal chat
   // telling it to "review the deliverables and deploy per your standing rules" —
   // two drivers on one node, and a [needs Kevin] prompt at 3AM. Returns false
@@ -189,7 +191,7 @@ export function treeCueOnTreeStatus(treeId: string, status: 'done' | 'blocked' |
     ).get(treeId) as { goal_id: number } | undefined;
     if (owner && nightShiftOwnsGoal(owner.goal_id)) {
       setLastCueStmt.run(status, treeId);
-      console.log(`[tree-cue] ${treeId} ${status}: goal #${owner.goal_id} is owned by a night run — the orchestrator thread drives it`);
+      console.log(`[tree-cue] ${treeId} ${status}: goal #${owner.goal_id} is owned by a shift — that shift's orchestrator thread drives it`);
       return;
     }
   }

@@ -547,8 +547,29 @@ await checkAsync('sustained crossing -> one spike visible via GET /health/events
     'cue correlation key must be health:<event id> so turn-admission gates it');
   const notifs = sqliteDb.prepare(`SELECT COUNT(*) AS c FROM notifications WHERE source = 'health-monitor'`).get().c;
   assert.equal(Number(notifs), 1);
+  // While over threshold the spike must be OPEN — that is what drives the
+  // header status pill and /health/now.open_events (CONTRACT §2).
+  const duringSpike = await httpGet('/health/now', plainKey);
+  assert.equal(duringSpike.body.open_events.length, 1, 'an unresolved spike must show up in /health/now.open_events');
+  assert.equal(duringSpike.body.open_events[0].id, listAfterFirst.body.events[0].id);
 
   H.evaluateSpikes(at(T + 90_000, 20), T + 90_000); // release
+  await new Promise((r) => setTimeout(r, 150));
+  // AC-3's "...then a release": assert the release ROW exists over the wire and
+  // that it closed the spike. Section 2 proves the SSE frame; this proves the
+  // persisted surface the page and the `health` tool actually read.
+  const releases = await httpGet('/health/events?kind=release&metric=cpu', plainKey);
+  assert.equal(releases.body.events.length, 1, 'the release event was never recorded over the wire');
+  assert.equal(releases.body.events[0].metric, 'cpu');
+  const resolvedSpike = sqliteDb
+    .prepare(`SELECT resolved_at FROM health_events WHERE id = ?`)
+    .get(listAfterFirst.body.events[0].id);
+  assert.ok(resolvedSpike.resolved_at, 'the spike row was never stamped resolved_at on release');
+  const afterRelease = await httpGet('/health/now', plainKey);
+  assert.deepEqual(afterRelease.body.open_events, [], 'open_events must drain once the spike is released');
+  assert.equal(afterRelease.body.status.level, 'ok', 'status must fall back to ok after the release');
+  assert.equal(cues().length, 1, 'a release must NEVER cue (DESIGN §1.3: "release event (no cue)")');
+
   H.evaluateSpikes(at(T + 120_000, 95), T + 120_000);
   H.evaluateSpikes(at(T + 160_000, 96), T + 160_000); // second crossing, inside cooldown
   await new Promise((r) => setTimeout(r, 150));

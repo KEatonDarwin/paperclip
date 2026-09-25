@@ -18,6 +18,7 @@ import './tree-cue.js';
 import './night-shift.js';
 import { startFoundry } from './foundry.js';
 import { startMonitorScheduler } from './monitors.js';
+import { startHealthMonitor } from './health-monitor.js';
 
 const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT ?? '3200', 10);
 const SLACK_ENABLED = !!(process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN);
@@ -122,6 +123,11 @@ async function main() {
   // fire on node state writes); the 60s interval inside is only the safety net.
   startHopperEngine(processMessage);
   startFoundry();
+
+  // 🩺 Cockpit Health — the box sampler (cpu/mem/event-loop lag/disk/db/workload)
+  // plus the spike → suggestion loop. Plain code, zero model calls except one
+  // rate-limited cue per spike. HEALTH_MONITOR=0 disables.
+  if (process.env.HEALTH_MONITOR !== '0') startHealthMonitor();
 
   // Cockpit Monitors — cheap scheduled prompt-check agents. Runs through the
   // same processMessage/local-CLI adapter seam as normal cockpit threads.

@@ -256,6 +256,20 @@ import {
 // persona tool — a bare throttleStatus() with no inputs reports "dispatching"
 // regardless of the real governor state (review node #719).
 import { fullThrottleStatus } from '../throttle-status.js';
+// 🩺 COCKPIT HEALTH (docs/health/CONTRACT.md) — the box + workload monitor.
+import {
+  noteApiRequest,
+  healthNow,
+  seriesPoints,
+  listHealthEventsInWindow,
+  listHealthEvents,
+  ackHealthEvent,
+  workloadRows,
+  takeSample,
+  isHealthWindow,
+  HEALTH_WINDOWS,
+  type HealthWindow,
+} from '../health-monitor.js';
 import {
   buildSpawnMonitorSnapshot,
   buildSpawnMonitorTreeDetail,
@@ -1379,6 +1393,17 @@ export function createApiV1Router(): Router {
   const router: Router = Router();
 
   router.use(bearerAuth as (req: Request, res: Response, next: NextFunction) => void);
+
+  // 🩺 COCKPIT HEALTH — the "db reads" proxy. There is no cheap sqlite read
+  // counter, so the honest number we CAN count is requests served here; the UI
+  // labels it "API requests/min", never "sqlite reads" (CONTRACT §0). One
+  // integer increment per request, after auth so unauthorised probes don't
+  // inflate it.
+  router.use((_req: Request, _res: Response, next: NextFunction) => {
+    noteApiRequest();
+    next();
+  });
+
   installQueueDrain();
   installDispatchGate();
 
@@ -3592,6 +3617,110 @@ export function createApiV1Router(): Router {
     const raw: Record<string, string | null> = {};
     for (const key of GOVERNOR_SETTING_KEYS) raw[key] = getSetting(key);
     res.json({ ok: true, updated: Object.keys(updates), effective: governorStatus('claude').config, raw });
+  });
+
+  // == 🩺 COCKPIT HEALTH ========================================================
+  // The box monitor (docs/health/CONTRACT.md). Every route here is a READ of
+  // already-sampled state; the only write is POST /health/events/:id/ack, which
+  // stores JARVIS's suggestion. Nothing on this surface can change a dial — that
+  // is deliberate: the page exists to explain a spike and suggest, never to act.
+
+  router.get('/health/now', (_req: AuthedRequest, res) => {
+    try {
+      res.json({ ok: true, ...healthNow() });
+    } catch (err) {
+      sendError(res, 500, 'health_now_failed', (err as Error).message);
+    }
+  });
+
+  router.get('/health/series', (req: AuthedRequest, res) => {
+    const raw = typeof req.query.window === 'string' ? req.query.window.trim() : '1h';
+    const window: string = raw === '' ? '1h' : raw;
+    if (!isHealthWindow(window)) {
+      sendError(res, 400, 'invalid_window', `window must be one of: ${HEALTH_WINDOWS.join(', ')}`);
+      return;
+    }
+    // `metrics` is an advisory echo (CONTRACT §5): the points are small and the
+    // UI cross-plots them on one time axis, so trimming per metric would only
+    // cost the client the very series it wants to overlay.
+    const metrics = typeof req.query.metrics === 'string' && req.query.metrics.trim() !== ''
+      ? req.query.metrics.split(',').map((m) => m.trim()).filter(Boolean)
+      : ['cpu', 'mem', 'lag', 'disk', 'db', 'claude'];
+    try {
+      const series = seriesPoints(window as HealthWindow);
+      res.json({
+        ok: true,
+        window,
+        resolution: series.resolution,
+        from: series.from,
+        to: series.to,
+        metrics,
+        points: series.points,
+        events: listHealthEventsInWindow(series.from, series.to),
+      });
+    } catch (err) {
+      sendError(res, 500, 'health_series_failed', (err as Error).message);
+    }
+  });
+
+  router.get('/health/workloads', (_req: AuthedRequest, res) => {
+    try {
+      res.json({ ok: true, ...workloadRows() });
+    } catch (err) {
+      sendError(res, 500, 'health_workloads_failed', (err as Error).message);
+    }
+  });
+
+  router.get('/health/events', (req: AuthedRequest, res) => {
+    const limit = typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : 50;
+    const metric = typeof req.query.metric === 'string' && req.query.metric.trim() !== '' ? req.query.metric.trim() : undefined;
+    const kind = typeof req.query.kind === 'string' && req.query.kind.trim() !== '' ? req.query.kind.trim() : undefined;
+    try {
+      res.json({ ok: true, events: listHealthEvents({ limit: Number.isFinite(limit) ? limit : 50, metric, kind }) });
+    } catch (err) {
+      sendError(res, 500, 'health_events_failed', (err as Error).message);
+    }
+  });
+
+  // Storing a suggestion is a NOTE, not a dial — deliberately not admin-scoped,
+  // so the health thread's own JARVIS can write back with the normal key.
+  router.post('/health/events/:id/ack', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id)) {
+      sendError(res, 400, 'invalid_request', 'id must be a number');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const suggestion = typeof body.suggestion === 'string' ? body.suggestion : undefined;
+    try {
+      const event = ackHealthEvent(id, suggestion);
+      if (!event) {
+        sendError(res, 404, 'event_not_found', `No health event ${id}`);
+        return;
+      }
+      res.json({ ok: true, event });
+    } catch (err) {
+      sendError(res, 500, 'health_ack_failed', (err as Error).message);
+    }
+  });
+
+  // Force one sample now — the UI's "refresh" and the deploy-time check. Admin
+  // scoped only because it does real work on the box; it changes no setting.
+  router.post('/health/sample', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Forcing a health sample requires an admin-scoped key');
+      return;
+    }
+    try {
+      const sample = takeSample();
+      if (!sample) {
+        sendError(res, 500, 'health_sample_failed', 'The sampler could not collect a sample (see the service log)');
+        return;
+      }
+      res.json({ ok: true, sample });
+    } catch (err) {
+      sendError(res, 500, 'health_sample_failed', (err as Error).message);
+    }
   });
 
   // == ⚡ THROTTLE ==============================================================

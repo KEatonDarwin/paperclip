@@ -353,6 +353,16 @@ export function getNotepadLine(lineId: number): NotepadLineRow | undefined {
   return getLineByIdStmt.get(lineId);
 }
 
+const getLineDayStmt = sqliteDb.prepare<[number], { day: string }>(`
+  SELECT day FROM notepad_lines WHERE id = ?
+`);
+
+/** Which day a line belongs to. Used by the marker-dismiss route to hand
+ *  back the same day's full GET /notepad shape after a dismiss. */
+export function getNotepadLineDay(lineId: number): string | undefined {
+  return getLineDayStmt.get(lineId)?.day;
+}
+
 // line_id is the PRIMARY KEY, so this UPSERT can only ever hold one row per
 // line — an already-'acted' line that gets marked acted again UPDATES that
 // same row (the reconciliation-resolved path), it never inserts a sibling.

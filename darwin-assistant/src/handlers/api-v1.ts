@@ -65,6 +65,7 @@ import {
   isValidNotepadDate,
   todayNotepadDate,
   getNotepadLine,
+  getNotepadLineDay,
   getNotepadLineState,
   unscannedLines,
   markLineSeen,
@@ -72,6 +73,7 @@ import {
   markLineDismissed,
   type NotepadLineState,
 } from '../notepad.js';
+import { activeNotepadMarkers, dismissNotepadMarker, getNotepadMarker } from '../notepad-markers.js';
 import {
   listNotifications,
   unreadNotificationCount,
@@ -1644,6 +1646,22 @@ export function createApiV1Router(): Router {
 
   // == Notepad — one free-form note per day, line-identity-preserving =========
 
+  // Additive: markers ride the SAME GET /notepad payload the cockpit already
+  // polls -- no second fetch, no new SSE channel (goal #105 transport rule).
+  // Only ACTIVE markers are included (a dismissed one is simply absent), and
+  // the field is always an array, never null/omitted, so an empty/clean day
+  // still gets `markers: []`.
+  function notepadDayWithMarkers(day: string) {
+    const base = getNotepadDay(day);
+    const markers = activeNotepadMarkers(day).map((m) => ({
+      line_id: m.line_id,
+      kind: m.kind,
+      reason: m.reason,
+      action_ref: m.action_ref,
+    }));
+    return { ...base, markers };
+  }
+
   router.get('/notepad', (req: AuthedRequest, res) => {
     const dateParam = typeof req.query.date === 'string' ? req.query.date : undefined;
     const day = dateParam ?? todayNotepadDate();
@@ -1651,7 +1669,7 @@ export function createApiV1Router(): Router {
       sendError(res, 400, 'invalid_date', 'date must be YYYY-MM-DD');
       return;
     }
-    res.json(getNotepadDay(day));
+    res.json(notepadDayWithMarkers(day));
   });
 
   router.put('/notepad', (req: AuthedRequest, res) => {
@@ -1670,6 +1688,27 @@ export function createApiV1Router(): Router {
 
   router.get('/notepad/days', (_req: AuthedRequest, res) => {
     res.json(listNotepadDays());
+  });
+
+  // Dismiss the active marker on a line -- clears it for good (the
+  // day-independent text-hash memory in notepad-markers.ts is what makes it
+  // stick across days, not just this request). Returns the same shape
+  // GET /notepad returns for that line's day, so the caller can replace its
+  // state from one response.
+  router.post('/notepad/markers/:lineId/dismiss', (req: AuthedRequest, res) => {
+    const lineId = Number(req.params.lineId);
+    if (!Number.isInteger(lineId) || lineId <= 0) {
+      sendError(res, 400, 'invalid_line_id', 'lineId must be a positive integer');
+      return;
+    }
+    const marker = getNotepadMarker(lineId);
+    if (!marker) {
+      sendError(res, 404, 'marker_not_found', `no notepad marker on line '${lineId}'`);
+      return;
+    }
+    dismissNotepadMarker(lineId);
+    const day = getNotepadLineDay(lineId) ?? todayNotepadDate();
+    res.json(notepadDayWithMarkers(day));
   });
 
   const NOTEPAD_LINE_STATES: NotepadLineState[] = ['seen', 'acted', 'dismissed'];

@@ -7,9 +7,18 @@ import {
   workloadRows,
   listHealthEventsInWindow,
   isHealthWindow,
-  HEALTH_WINDOWS,
   type HealthWindow,
 } from '../health-monitor.js';
+
+// The window list is spelled out here rather than imported as HEALTH_WINDOWS.
+// tools/index.ts is reachable from health-monitor.ts's own import graph (via
+// agent.ts), so this module can initialise while health-monitor.js is still
+// evaluating — and a top-level read of one of its `const` exports then dies with
+// "Cannot access 'HEALTH_WINDOWS' before initialization", at import time, taking
+// the service down on boot. A literal has no such edge. isHealthWindow() remains
+// the single runtime authority (it is called lazily, inside the handler), and
+// health:check asserts these two lists stay in step.
+const WINDOW_ENUM = ['15m', '1h', '6h', '24h', '7d', '30d'] as const;
 
 // 🩺 COCKPIT HEALTH (docs/health/CONTRACT.md §8) — how JARVIS reads the box from
 // any thread, so "the cockpit feels laggy" stops being a guess.
@@ -33,7 +42,7 @@ export const health: ToolDef = {
       },
       window: {
         type: 'string',
-        enum: HEALTH_WINDOWS,
+        enum: WINDOW_ENUM,
         description: 'For series: 15m|1h|6h|24h|7d|30d (default 1h). Resolution is chosen server-side.',
       },
       metrics: {
@@ -58,7 +67,7 @@ export const health: ToolDef = {
 
     if (op === 'series') {
       const raw = typeof args.window === 'string' && args.window.trim() !== '' ? args.window.trim() : '1h';
-      if (!isHealthWindow(raw)) return { error: `window must be one of: ${HEALTH_WINDOWS.join(', ')}` };
+      if (!isHealthWindow(raw)) return { error: `window must be one of: ${WINDOW_ENUM.join(', ')}` };
       const series = seriesPoints(raw as HealthWindow);
       const metrics = typeof args.metrics === 'string' && args.metrics.trim() !== ''
         ? args.metrics.split(',').map((m) => m.trim()).filter(Boolean)

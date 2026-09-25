@@ -115,6 +115,19 @@ check('tick cost is recorded and under the 5 ms rail', () => {
   assert.ok(Number.isFinite(s1.tick_ms), 'tick_ms not recorded');
   assert.ok(s1.tick_ms < 25, `tick_ms ${s1.tick_ms} — wildly over budget`);
 });
+check('rates are not extrapolated from a sub-second interval', () => {
+  // Two samples back to back => interval ~1 ms. Before the floor this reported
+  // writes_per_min in the tens of thousands — a monitor inventing the very spike
+  // it exists to explain. Found by scripts/health-route-check.mjs on the box.
+  const a = H.collectSample();
+  const b = H.collectSample();
+  assert.ok(b.interval_ms < 1000, `expected a sub-second interval, got ${b.interval_ms}`);
+  assert.ok(b.db.writes_per_min <= b.db.writes * 60 + 0.1,
+    `writes_per_min ${b.db.writes_per_min} extrapolated from ${b.db.writes} writes in ${b.interval_ms}ms`);
+  assert.ok(b.db.api_requests_per_min <= b.db.api_requests * 60 + 0.1,
+    `api_requests_per_min ${b.db.api_requests_per_min} over-extrapolated`);
+  assert.ok(a);
+});
 check('toPoint projects a sample onto the chart row', () => {
   const p = H.toPoint(s1);
   assert.equal(p.ts, s1.ts);
@@ -124,6 +137,28 @@ check('toPoint projects a sample onto the chart row', () => {
   assert.equal(p.workers, s1.workload.workers.total);
 });
 console.log(`     tick_ms: first=${s0.tick_ms} second=${s1.tick_ms} avg=${H.samplerStats().avg_tick_ms}`);
+
+check('workload snapshot stamps as_of/age_seconds', () => {
+  const w = H.workloadSnapshot({ force: true });
+  assert.equal(typeof w.as_of, 'string');
+  assert.equal(w.age_seconds, 0, 'a forced compose is by definition zero-age');
+  assert.ok(Date.parse(w.as_of) > 0, 'as_of must parse');
+});
+check('the throttle composite is cached but the worker list is LIVE', () => {
+  setSetting('health_workload_ttl_seconds', '600');
+  H.__resetWorkloadCache();
+  const first = H.workloadSnapshot();
+  assert.equal(first.age_seconds, 0, 'the first compose should be fresh');
+  const second = H.workloadSnapshot();
+  assert.ok(second.age_seconds >= 0, 'the second read should come off the cache');
+  assert.equal(second.workers.total, second.workers.nodes.length,
+    'workers.total must be the LIVE node count, never the cached one');
+  setSetting('health_workload_ttl_seconds', '0');
+  const uncached = H.workloadSnapshot();
+  assert.equal(uncached.age_seconds, 0, 'ttl 0 must disable the cache entirely');
+  sqliteDb.prepare(`DELETE FROM settings WHERE key = 'health_workload_ttl_seconds'`).run();
+  H.__resetWorkloadCache();
+});
 
 // ── 2) AGGREGATE MATH: mean for rates, max in *_max, LAST for levels ────────
 console.log('\n2) aggregate math');
@@ -391,6 +426,7 @@ check('settings defaults match DESIGN.md on a fresh box', () => {
   assert.equal(H.rollupMinutes(), 5);
   assert.equal(H.retainRawHours(), 24);
   assert.equal(H.retain1mDays(), 30);
+  assert.equal(H.workloadTtlSeconds(), 60);
   assert.equal(H.monitorModel(), 'claude-sonnet-5');
   assert.equal(H.healthEnabled(), true);
   assert.equal(H.cueEnabled(), true);
@@ -421,6 +457,35 @@ check('turn-admission gates the health: prefix', () => {
 check('the health tool is registered in ALL_TOOLS', () => {
   const src = fs.readFileSync(path.join(distDir, 'tools', 'index.js'), 'utf8');
   assert.match(src, /health/, 'health tool not registered');
+});
+
+await checkAsync('health-tool.js imports standalone (no circular-import TDZ)', async () => {
+  // REGRESSION: the tool read HEALTH_WINDOWS from health-monitor.js at module
+  // top level. tools/index.js is reachable from health-monitor's own graph via
+  // agent.js, so on the real boot path the tool initialised while health-monitor
+  // was still evaluating and threw "Cannot access 'HEALTH_WINDOWS' before
+  // initialization" — at import time, killing the service. Importing the tool
+  // FIRST, before health-monitor, reproduces that order.
+  const url = pathToFileURL(path.join(distDir, 'tools', 'health-tool.js')).href + `?tdz=${Date.now()}`;
+  const mod = await import(url);
+  assert.ok(mod.health, 'the health tool did not load');
+  assert.equal(mod.health.name, 'health');
+});
+check('the tool window enum matches isHealthWindow exactly', () => {
+  const enumList = H.HEALTH_WINDOWS;
+  const toolSrc = fs.readFileSync(path.join(distDir, 'tools', 'health-tool.js'), 'utf8');
+  for (const w of enumList) assert.ok(toolSrc.includes(`'${w}'`), `tool enum is missing window ${w}`);
+  const declared = (toolSrc.match(/WINDOW_ENUM = \[([^\]]+)\]/) ?? [])[1] ?? '';
+  const parsed = declared.split(',').map((x) => x.trim().replace(/['"]/g, '')).filter(Boolean);
+  assert.deepEqual(parsed, [...enumList], 'WINDOW_ENUM has drifted from HEALTH_WINDOWS');
+});
+check('the bucket upsert prepares against the PARTIAL index', () => {
+  // REGRESSION: `ON CONFLICT(kind, ts)` without the index predicate raises
+  // "does not match any PRIMARY KEY or UNIQUE constraint" at PREPARE time, and
+  // that prepare is module-level — every fresh DB would have failed to boot.
+  const src = fs.readFileSync(path.join(distDir, 'health-monitor.js'), 'utf8');
+  assert.match(src, /ON CONFLICT\(kind, ts\) WHERE kind != 'raw'/,
+    'the upsert conflict target must repeat the partial index predicate');
 });
 
 console.log(`\n[health-check] ${pass} passed, ${fails.length} failed`);

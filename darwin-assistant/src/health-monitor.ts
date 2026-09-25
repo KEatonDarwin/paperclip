@@ -90,6 +90,10 @@ export interface WorkloadSnapshot {
     hold: { dispatching: boolean; reason: string; detail: string };
   };
   summary: string;
+  /** When this snapshot was composed. It can lag the sample's own `ts` by up to
+   *  `health_workload_ttl_seconds` — see workloadSnapshot(). */
+  as_of: string;
+  age_seconds: number;
 }
 
 export interface HealthSample {
@@ -200,6 +204,7 @@ export function retain1mDays(): number { return num('health_retain_1m_days', 30,
 export function spikeSeconds(): number { return num('health_spike_seconds', 30, 1, 3600); }
 export function cooldownMinutes(): number { return num('health_spike_cooldown_min', 30, 0, 1440); }
 export function cueEnabled(): boolean { return flag('health_cue_enabled', true); }
+export function workloadTtlSeconds(): number { return num('health_workload_ttl_seconds', 60, 0, 3600); }
 export function monitorModel(): string { return (getSetting('health_monitor_model') ?? '').trim() || 'claude-sonnet-5'; }
 
 export interface HealthThresholds { cpu_pct: number; mem_pct: number; lag_ms: number; disk_pct: number; spike_seconds: number; cooldown_min: number }
@@ -460,14 +465,72 @@ function summarize(w: WorkloadSnapshot): string {
   return bits.join(' · ');
 }
 
-export function workloadSnapshot(): WorkloadSnapshot {
-  // fullThrottleStatus() already composes the governor verdicts, the account
-  // meters, the running-node breakdown and the honest hold reason — reuse it
-  // rather than growing a second, drifting copy of all four.
-  let t: ReturnType<typeof fullThrottleStatus> | null = null;
-  try { t = fullThrottleStatus(); } catch (err) {
+let cachedThrottle: ReturnType<typeof fullThrottleStatus> | null = null;
+let cachedThrottleAtMs = 0;
+
+/**
+ * WHAT IS CACHED HERE, AND WHY IT IS THE HONEST SPLIT.
+ *
+ * Measured on a copy of the real 1.5 GB jarvis.db (14,301 turns / 866 hopper
+ * nodes / 173 trees), per call:
+ *
+ *     fullThrottleStatus()        17.9 ms     <- the entire cost
+ *     running hopper_nodes         0.009 ms
+ *     activeNightRun()             0.015 ms
+ *     activeAutomatedTurns()       0.001 ms
+ *     every pragma + MAX(id)      <0.01 ms
+ *     os.cpus() + statfs + memory  0.2 ms
+ *
+ * So one composite is ~95 % of the tick, and this module exists to MEASURE
+ * synchronous blocking — sampling it every 5 s would write a self-inflicted
+ * ~0.4 % duty cycle of stall straight into the lag histogram it reports, over
+ * DESIGN.md §2's < 5 ms rail.
+ *
+ * What does NOT work: deferring it with setImmediate the way refreshClaudeProcs()
+ * does. pgrep is a CHILD PROCESS, genuinely off-loop; fullThrottleStatus() is
+ * synchronous sqlite + file reads, so deferring it would only stop tick_ms being
+ * CHARGED for a stall that still happens — a monitor lying about its own cost.
+ * The fix has to be doing it less often.
+ *
+ * So the split follows how fast each half can actually change:
+ *   - LIVE every tick: the running workers, turns in flight, the shift, autopilot
+ *     goals. All microseconds, and all things Kevin watches move.
+ *   - CACHED `health_workload_ttl_seconds` (60): the throttle dials, governor
+ *     verdicts and account meters. A shorter TTL buys nothing real — the usage
+ *     files underneath are themselves polled once a minute, so those numbers
+ *     cannot be fresher than 60 s no matter how often we recompose them.
+ *
+ * Every snapshot carries `as_of`/`age_seconds` for the cached half so the UI can
+ * never imply it is more current than it is, and evaluateSpikes() forces a full
+ * recompose when it freezes evidence onto a spike row. TTL 0 disables the cache.
+ */
+function throttleStatusCached(force = false): ReturnType<typeof fullThrottleStatus> | null {
+  const ttlMs = workloadTtlSeconds() * 1000;
+  const nowMs = Date.now();
+  if (!force && cachedThrottle && ttlMs > 0 && nowMs - cachedThrottleAtMs < ttlMs) return cachedThrottle;
+  try {
+    cachedThrottle = fullThrottleStatus();
+    cachedThrottleAtMs = nowMs;
+  } catch (err) {
     console.warn('[health] throttle status unavailable for the workload snapshot', err);
+    if (!cachedThrottle) return null;
   }
+  return cachedThrottle;
+}
+
+export function workloadSnapshot(opts: { force?: boolean } = {}): WorkloadSnapshot {
+  return composeWorkloadSnapshot(throttleStatusCached(opts.force === true), opts.force === true);
+}
+
+/** Test seam only — drop the cached throttle composite. */
+export function __resetWorkloadCache(): void { cachedThrottle = null; cachedThrottleAtMs = 0; }
+
+function composeWorkloadSnapshot(
+  t: ReturnType<typeof fullThrottleStatus> | null,
+  forced: boolean,
+): WorkloadSnapshot {
+  // `t` carries the governor verdicts, account meters and dials — reused rather
+  // than re-derived (one source of truth), and cached per throttleStatusCached().
 
   const treeTopics = new Map<string, string | null>();
   for (const r of safeQuery<{ tree_id: string; topic: string | null }>(
@@ -481,7 +544,20 @@ export function workloadSnapshot(): WorkloadSnapshot {
   )) { leases.set(r.id, r.lease_expires_at); workerExts.set(r.id, r.worker_thread_ext); }
 
   const leaseMinutes = Math.max(5, parseInt(process.env.HOPPER_ENGINE_LEASE_MIN ?? '30', 10) || 30);
-  const nodes: WorkloadWorkerNode[] = (t?.running.nodes ?? []).map((n) => {
+  // Live every tick (0.009 ms): the cached throttle composite may be up to a
+  // minute old, and "which workers are running right now" is the one thing on
+  // this page that must not be.
+  const liveRunning = safeQuery<{
+    id: number; tree_id: string; title: string; adapter: string | null; model: string | null;
+  }>(`SELECT id, tree_id, title, adapter, model FROM hopper_nodes WHERE status = 'running'`, []);
+  const throttleById = new Map((t?.running.nodes ?? []).map((n) => [n.node_id, n]));
+
+  const nodes: WorkloadWorkerNode[] = liveRunning.map((live) => {
+    const n = throttleById.get(live.id) ?? {
+      node_id: live.id, tree_id: live.tree_id, goal_id: null as number | null,
+      title: live.title, adapter: live.adapter, model: live.model,
+      lease_expires_at: null as string | null,
+    };
     // A node has no started_at column; the lease is issued at claim time for a
     // fixed window, so elapsed = leaseMinutes - remaining. Honest and free.
     const leftMin = minutesSince(leases.get(n.node_id) ?? n.lease_expires_at);
@@ -511,9 +587,9 @@ export function workloadSnapshot(): WorkloadSnapshot {
 
   const snap: WorkloadSnapshot = {
     workers: {
-      total: t?.running.total ?? nodes.length,
+      total: nodes.length,                      // live count, not the cached one
       slots: t?.running.slots ?? 0,
-      free: t?.running.free ?? 0,
+      free: Math.max(0, (t?.running.slots ?? 0) - nodes.length),
       nodes,
       by_goal: t?.running.by_goal ?? [],
       by_tree: t?.running.by_tree ?? [],
@@ -542,6 +618,10 @@ export function workloadSnapshot(): WorkloadSnapshot {
       },
     },
     summary: '',
+    // as_of describes the CACHED half (dials/accounts/governor); workers, turns,
+    // the shift and autopilot above are always from this tick.
+    as_of: new Date(cachedThrottleAtMs || Date.now()).toISOString(),
+    age_seconds: forced || !cachedThrottleAtMs ? 0 : round((Date.now() - cachedThrottleAtMs) / 1000, 1),
   };
   snap.summary = summarize(snap);
   return snap;
@@ -591,7 +671,13 @@ export function collectSample(): HealthSample | null {
   try {
     const nowMs = Date.now();
     const intervalMs = lastSampleAtMs ? Math.max(1, nowMs - lastSampleAtMs) : sampleSeconds() * 1000;
-    const perMin = 60000 / intervalMs;
+    // Rates are extrapolated from the interval, so a sample taken moments after
+    // another one (POST /health/sample landing right behind a scheduled tick)
+    // would divide by ~1 ms and report a number like 60,000 writes/min. Floor the
+    // extrapolation window at one second: the tile may under-state a burst on a
+    // forced sample, which is the harmless direction — a monitor that invents a
+    // 60k spike is worse than useless, it is the thing you would then chase.
+    const perMin = 60000 / Math.max(intervalMs, 1000);
 
     const load = os.loadavg();
     const totalMem = os.totalmem();
@@ -1117,9 +1203,14 @@ export function evaluateSpikes(sample: HealthSample, nowMs = Date.parse(sample.t
       if (state.event_id != null) continue;                     // already reported
       if (nowMs - state.over_since < sustainMs) continue;        // not sustained yet
 
+      // The evidence frozen onto a spike row is the one place staleness would
+      // actually mislead, so pay the full compose here — once per spike.
+      let evidence = sample.workload;
+      try { evidence = workloadSnapshot({ force: true }); }
+      catch (err) { console.warn('[health] could not refresh the spike snapshot, using the sampled one', err); }
       const event = insertEvent({
         kind: 'spike', metric, value, threshold,
-        snapshot: sample.workload, ts: sample.ts,
+        snapshot: evidence, ts: sample.ts,
         cued: false,
       });
       if (!event) continue;

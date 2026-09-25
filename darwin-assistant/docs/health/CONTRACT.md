@@ -46,6 +46,7 @@ All are read **uncached** on every use, so a change lands on the next tick.
 | `health_spike_cooldown_min` | `30` | at most one **cue** per metric per this window (events still fire) |
 | `health_monitor_model` | `claude-sonnet-5` | model override applied ONCE when `cockpit:health-monitor` is created |
 | `health_cue_enabled` | `1` | `0` = spike events + notifications still fire, no cue (kill switch) |
+| `health_workload_ttl_seconds` | `60` | how long the **cached half** of the workload snapshot (throttle dials, governor verdicts, account meters) is reused before recomposing; `0` disables the cache. See §3. |
 
 Thresholds are also echoed on `GET /health/now` as `thresholds`, so the UI never
 has to read settings itself.
@@ -126,9 +127,41 @@ interface WorkloadSnapshot {
               claude_mode: string; claude_order: string;
               hold: { dispatching: boolean; reason: string; detail: string } };
   summary: string;                  // one line, e.g. "4 workers · 2 turns · shift #4 · A 5h 62%"
+  as_of: string;                    // when the CACHED half was composed (ISO-8601)
+  age_seconds: number;              // how stale that half is; 0 = composed this tick
 }
 ```
 `summary` is what the chart-marker hover shows.
+
+### Two halves, two freshnesses — the UI must not blur them
+
+Measured on a copy of the real 1.5 GB `jarvis.db` (14,301 turns / 866 hopper
+nodes): `fullThrottleStatus()` costs **~18–30 ms** while every other input to a
+sample costs **< 0.25 ms combined**. This page exists to measure synchronous
+event-loop blocking, so paying that on every 5 s tick would write a self-inflicted
+stall into the very histogram it reports — over DESIGN.md §2's `< 5 ms` rail. It
+cannot be fixed by deferring the call: unlike the `pgrep` child process, it is
+synchronous work, so deferring only stops `tick_ms` being *charged* for a stall
+that still happens.
+
+So the snapshot has two halves:
+
+| half | fields | freshness |
+|---|---|---|
+| **live** | `workers` (incl. `total` + `nodes`), `turns`, `night`, `autopilot` | recomposed **every tick** |
+| **cached** | `providers`, `accounts`, `throttle` (dials + `hold`) | recomposed every `health_workload_ttl_seconds` (60) |
+
+`as_of` / `age_seconds` describe the **cached** half only. A 60 s TTL costs
+nothing real there: the provider usage files underneath are themselves polled once
+a minute, so those meters cannot be fresher than 60 s however often we recompose.
+
+**UI rule:** render the account/governor/throttle tiles with the `age_seconds`
+stamp (e.g. "dials as of 34 s ago") and the worker/turn/shift rows without one.
+Never present a cached number as live.
+
+`evaluateSpikes()` forces a full recompose when it freezes evidence onto a spike
+row, so `HealthEvent.snapshot` is always `age_seconds: 0` — exact at the instant
+that mattered.
 
 ## 4. `HealthPoint` — the uniform series point
 
@@ -316,5 +349,12 @@ duplicates a minute or an hour).
 ## 10. npm script
 
 `npm run health:check` — deterministic, scratch-DB, `JARVIS_SIM=1`, no claude
-processes: sampler math, point conversion, rollup idempotency, retention trim,
-and the full spike/cooldown/release state machine. Under 60 s.
+processes: sampler math, point conversion, rate-extrapolation floor, the workload
+cache split, rollup idempotency, retention trim, the full spike/cooldown/release
+state machine, settings defaults + clamping, and two boot-crash regressions (the
+partial-index upsert and the circular-import TDZ in the tool). 45 checks, ~10 s.
+
+`npm run health:route-check` — mounts the REAL `createApiV1Router()` on a scratch
+DB on a temp port and prints every field of `GET /health/now` plus the resolution
+each window resolves to. This is the deploy-time proof for AC-1/AC-2; it never
+touches the live database or the live server.

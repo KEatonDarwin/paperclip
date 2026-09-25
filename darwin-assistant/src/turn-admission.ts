@@ -28,6 +28,12 @@ const AUTOMATED_KEY_PREFIXES = [
   // OUTSIDE the ceiling all night, which is exactly the surface this file exists
   // to cap. Gated turns WAIT for a slot, so nothing is lost.
   'night:',
+  // SHIFTS v1 REVIEW (node #833): the per-shift orchestrator thread's SEED cue
+  // mints `shift:<run>:seed` — a NEW prefix that `night:` does not match. That
+  // seed is an ~8KB first turn on a claude-opus-5 thread, fired from planNight
+  // while up to `hopper_slots` workers are already live, so it was doing
+  // exactly what the `night:` line above was added to stop. Same bug, new key.
+  'shift:',
 ];
 
 export function isAutomatedTurn(externalId: string, correlationKey?: string): boolean {

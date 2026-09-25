@@ -34,7 +34,7 @@ for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) fs.rmSync(p, { fo
 console.log(`[notepad-markers-check] DB: ${DB_PATH}`);
 
 const distDir = path.join(__dirname, '..', 'dist');
-const { putNotepadDay, lineTextHash } = await import(path.join(distDir, 'notepad.js'));
+const { putNotepadDay, lineTextHash, getNotepadLineState, unscannedLines } = await import(path.join(distDir, 'notepad.js'));
 const {
   reconcileNotepadMarker,
   dismissNotepadMarker,
@@ -151,7 +151,11 @@ let dismissLineId;
   check('a dismissed marker still shows up in listNotepadMarkers', listNotepadMarkers(DAY2).some((m) => m.line_id === dismissLineId));
 }
 
-// -- "remembered across days": put the SAME text back after an edit away ----
+// -- SAME-DAY revert: edit away, then edit back to exactly the dismissed
+//    text. This is a same-day, same-line_id cycle -- it proves the per-row
+//    dismissed_hash memory (signal 1 in reconcileNotepadMarker), NOT
+//    cross-day memory (that's the dedicated DAY5 block below, which uses a
+//    genuinely different day and a genuinely different line_id). ----------
 {
   // Edit the line away from the dismissed text (a genuinely different
   // judgment is allowed to fire)...
@@ -164,9 +168,9 @@ let dismissLineId;
   check('revived marker hash matches the NEW text', revived.hash === lineTextHash('grab milk and eggs on the way home'));
 
   // ...then edit it BACK to exactly the text that was dismissed. This is
-  // the literal "dismiss on Monday, stay quiet [later]" case: the same
-  // wording that was already ruled out must not resurrect a marker just
-  // because time (or another edit) passed in between.
+  // the literal "dismiss earlier, stay quiet after an unrelated detour"
+  // case: the same wording that was already ruled out must not resurrect a
+  // marker just because something else happened to the line in between.
   const reverted = putNotepadDay(DAY2, ['grab milk on the way home'].join('\n'));
   const revertedId = lineIdByText(reverted, 'grab milk on the way home');
   check('revert kept the same line id', revertedId === dismissLineId);
@@ -174,6 +178,41 @@ let dismissLineId;
   const afterRevert = reconcileNotepadMarker(dismissLineId, { kind: 'take_it', reason: 'errand JARVIS could remind about' });
   check('reverting to the exact dismissed text stays dismissed (never fires twice)', afterRevert.dismissed === true);
   check('exactly one row for this line_id through revive-then-revert', markerRowCount(dismissLineId) === 1);
+}
+
+// -- GENUINE CROSS-DAY dismissal memory: the SAME text dismissed on DAY2,
+//    then typed again on a DIFFERENT day (DAY5) where it gets a BRAND NEW
+//    line_id (lines are per-day, per LINE-IDENTITY.md). The per-row
+//    dismissed_hash above cannot see across that boundary -- this is what
+//    `notepad_marker_dismissals` (keyed on the text hash alone, no
+//    line_id) exists to cover, and it's what closes node #851 gap 1. -------
+const DAY5 = '2026-09-30';
+{
+  const DISMISSED_TEXT = 'grab milk on the way home';
+
+  const saved5 = putNotepadDay(DAY5, [DISMISSED_TEXT].join('\n'));
+  const lineId5 = lineIdByText(saved5, DISMISSED_TEXT);
+  check('DAY5 mints a FRESH line_id for identical text (proves ids really are per-day)', lineId5 !== dismissLineId);
+
+  check('no marker yet on the DAY5 line', getNotepadMarker(lineId5) === undefined);
+  const reconciled5 = reconcileNotepadMarker(lineId5, { kind: 'take_it', reason: 'a brand new judgment on a brand new day' });
+  check(
+    'THE CROSS-DAY GUARANTEE: reconciling the same dismissed text under a NEW line_id/day comes back dismissed',
+    reconciled5.dismissed === true,
+  );
+  check('the DAY5 marker is a real row for lineId5 (dismissed in place, not skipped)', getNotepadMarker(lineId5) !== undefined);
+  check(
+    'reconciling on DAY5 never touches the original DAY2 marker row',
+    markerRowCount(dismissLineId) === 1 && getNotepadMarker(dismissLineId).dismissed === true,
+  );
+  check('excluded from activeNotepadMarkers on DAY5', !activeNotepadMarkers(DAY5).some((m) => m.line_id === lineId5));
+
+  // The ledger side of the same integration (node #851 gap 4): dismissing
+  // a marker must route through markLineDismissed so notepad_line_state
+  // agrees, and a dismissed line must stop being offered by unscannedLines.
+  const ledgerRow = getNotepadLineState(dismissLineId);
+  check("the DAY2 line's ledger state is 'dismissed' at the marker's dismissed hash", ledgerRow?.state === 'dismissed' && ledgerRow?.hash === lineTextHash(DISMISSED_TEXT));
+  check('a dismissed line no longer shows up in unscannedLines(day)', !unscannedLines(DAY2).some((l) => l.line_id === dismissLineId));
 }
 
 // -- setNotepadMarkerActionRef: attach without disturbing the rest ----------

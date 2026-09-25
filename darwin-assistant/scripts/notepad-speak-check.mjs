@@ -10,12 +10,14 @@
 //       review, a real decided move) drives it, not just a direct call into
 //       reconcileNotepadMarker the way notepad-markers-check.mjs already
 //       proves at the unit level.
-//   (2) dismissing a marker on one settle cycle ("Monday") keeps it quiet on
-//       a LATER settle cycle over the same unchanged text ("Tuesday") --
-//       even when the model is genuinely asked again and proposes a
-//       DIFFERENT judgement than before -- because reconcileNotepadMarker's
-//       dismissed_hash check runs on every call this pipeline makes to it,
-//       not just on hand-crafted direct calls.
+//   (2) dismissing a marker on one day ("Monday") keeps it quiet on a
+//       GENUINELY DIFFERENT LATER DAY ("Tuesday") over the identical
+//       wording -- even though that later day mints a brand-new line_id
+//       (lines belong to a day, per LINE-IDENTITY.md) and the model is
+//       genuinely asked again and proposes a DIFFERENT judgement than
+//       before -- because reconcileNotepadMarker's day-independent
+//       text-hash dismissal memory (node #851) runs on every call this
+//       pipeline makes to it, not just on hand-crafted direct calls.
 //
 // The gate and the moves stage share the SAME opts.runOneShot injection
 // seam (runNotepadSpeak threads it to both); the stub below discriminates by
@@ -209,22 +211,25 @@ check('(1b) ledger now shows L1 acted, pinned to the CURRENT text', true); // sa
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// (2) DISMISS ON "MONDAY", STAY QUIET ON "TUESDAY" — a later settle cycle
-//     over the SAME unchanged text, where the model is genuinely re-asked
-//     and proposes a DIFFERENT move than before, must not resurrect it.
+// (2) DISMISS ON "MONDAY", STAY QUIET ON "TUESDAY" — a REAL second day (not
+//     a same-day re-save), where the identical text mints a BRAND NEW
+//     line_id (lines belong to a day per LINE-IDENTITY.md), the model is
+//     genuinely re-asked and proposes a DIFFERENT move than before, and the
+//     result must still not persist as an active marker.
 // ═══════════════════════════════════════════════════════════════════════════
-const DAY2 = '2026-10-06';
+const DAY2_MONDAY = '2026-10-06';
+const DAY2_TUESDAY = '2026-10-20';
 const L3 = 'Grab stamps at the post office before it closes for the day';
 let l3Id;
 let originalReason;
 
 // -- "Monday": the pipeline decides a real move and creates the marker. -----
 {
-  const saved = saveAtTick(DAY2, [L3].join('\n'), 5000);
+  const saved = saveAtTick(DAY2_MONDAY, [L3].join('\n'), 5000);
   l3Id = lineIdByText(saved, L3);
 
   const stub = combinedStub((id) => (id === l3Id ? { kind: 'take_it', reason: 'JARVIS could remind you on the way out' } : undefined));
-  const result = await runNotepadSpeak(DAY2, { now: tickDate(5000 + 20 + 1), runOneShot: stub });
+  const result = await runNotepadSpeak(DAY2_MONDAY, { now: tickDate(5000 + 20 + 1), runOneShot: stub });
 
   check('(2a) Monday: settled and decided a move', result.pass.settle !== null && result.moves?.moves.length === 1);
   check('(2a) Monday: the marker was created', result.markers.length === 1 && result.markers[0].line_id === l3Id);
@@ -238,32 +243,51 @@ let originalReason;
 {
   const dismissed = dismissNotepadMarker(l3Id);
   check('(2b) dismiss took effect', dismissed.dismissed === true);
-  check('(2b) hidden from the active set immediately', !activeNotepadMarkers(DAY2).some((m) => m.line_id === l3Id));
+  check('(2b) hidden from the active set immediately', !activeNotepadMarkers(DAY2_MONDAY).some((m) => m.line_id === l3Id));
 }
 
-// -- "Tuesday": a genuinely NEW settle over the SAME unchanged text (re-saved
-//    byte-identical, which still bumps notepad_days.updated_at and lets a
-//    fresh settle fire) — with the model asked again and proposing a
-//    DIFFERENT judgement than Monday's. -------------------------------------
+// -- "Tuesday": a GENUINELY DIFFERENT notepad day, not the same day re-saved.
+//    The identical text (after normalization) gets a BRAND NEW line_id here
+//    — this is the actual cross-day proof (node #851), not a same-day
+//    settle repeat. The pipeline surfaces it as an ordinary first_look (a
+//    fresh line_id has no ledger row of its own to compare against), the
+//    model is genuinely re-asked over the same wording and proposes
+//    something DIFFERENT than Monday's judgment — but the PERSISTED marker
+//    must still come back dismissed, because reconcileNotepadMarker's
+//    day-independent text-hash memory recognizes this exact wording
+//    regardless of which line_id or day it shows up under. -----------------
 {
   const movesCallsBefore = totalMovesCalls;
-  saveAtTick(DAY2, [L3].join('\n'), 6000); // identical text, new write timestamp
+  const savedTuesday = saveAtTick(DAY2_TUESDAY, [L3].join('\n'), 6000);
+  const l3IdTuesday = lineIdByText(savedTuesday, L3);
+  check('(2c) Tuesday mints a FRESH line_id for the identical text (a real second day, not a re-save)', l3IdTuesday !== l3Id);
 
-  const stub = combinedStub((id) => (id === l3Id ? { kind: 'question', reason: 'did you already grab these on Monday?' } : undefined));
-  const result = await runNotepadSpeak(DAY2, { now: tickDate(6000 + 20 + 1), runOneShot: stub });
+  const stub = combinedStub((id) => (id === l3IdTuesday ? { kind: 'question', reason: 'did you already grab these on Monday?' } : undefined));
+  const result = await runNotepadSpeak(DAY2_TUESDAY, { now: tickDate(6000 + 20 + 1), runOneShot: stub });
 
-  check('(2c) Tuesday: a new settle fired (a new write, not a repeat poll)', result.pass.settle !== null);
-  check('(2c) Tuesday: L3 was surfaced again (no ledger row to skip it)', result.pass.review?.lines.some((l) => l.line_id === l3Id && l.surfaced));
-  check('(2c) Tuesday: the model was genuinely re-asked and proposed something DIFFERENT', totalMovesCalls === movesCallsBefore + 1 && result.moves?.moves.length === 1 && result.moves?.moves[0].kind === 'question');
-  check('(2c) Tuesday: the pipeline still reconciled it (called the same one row)', result.markers.length === 1 && result.markers[0].line_id === l3Id);
+  check('(2c) Tuesday: a new settle fired for the new day', result.pass.settle !== null);
+  check(
+    "(2c) Tuesday: L3 surfaced as an ordinary first_look (its OWN line_id is unseen -- the dismissal lives in the day-independent text memory, not this line's ledger row)",
+    result.pass.review?.lines.some((l) => l.line_id === l3IdTuesday && l.surfaced && l.surfaced_kind === 'first_look'),
+  );
+  check(
+    '(2c) Tuesday: the model was genuinely re-asked and proposed something DIFFERENT',
+    totalMovesCalls === movesCallsBefore + 1 && result.moves?.moves.length === 1 && result.moves?.moves[0].kind === 'question',
+  );
+  check('(2c) Tuesday: the pipeline reconciled the NEW line_id', result.markers.length === 1 && result.markers[0].line_id === l3IdTuesday);
 
-  const stillQuiet = getNotepadMarker(l3Id);
-  check('(2c) THE GUARANTEE: still dismissed — the fresh "question" proposal never revived it', stillQuiet.dismissed === true);
-  check('(2c) THE GUARANTEE: kind was NOT overwritten by the new proposal', stillQuiet.kind === 'take_it');
-  check('(2c) THE GUARANTEE: reason was NOT overwritten by the new proposal', stillQuiet.reason === originalReason);
-  check('(2c) never a second row', markerRowCount(l3Id) === 1);
-  check('(2c) still invisible to activeNotepadMarkers on Tuesday', !activeNotepadMarkers(DAY2).some((m) => m.line_id === l3Id));
-  check('(2c) still present (dismissed) in listNotepadMarkers — remembered, not erased', listNotepadMarkers(DAY2).some((m) => m.line_id === l3Id));
+  const tuesdayMarker = getNotepadMarker(l3IdTuesday);
+  check(
+    "(2c) THE GUARANTEE: Tuesday's marker still comes back dismissed -- cross-day text memory, not a resurrected active proposal",
+    tuesdayMarker.dismissed === true,
+  );
+  check('(2c) THE GUARANTEE: the fresh "question" proposal never went active', !activeNotepadMarkers(DAY2_TUESDAY).some((m) => m.line_id === l3IdTuesday));
+  check('(2c) never a second row for Tuesday\'s own line_id', markerRowCount(l3IdTuesday) === 1);
+  check(
+    "(2c) Monday's own marker row is untouched by Tuesday's cycle (they are two different rows on two different days)",
+    getNotepadMarker(l3Id).reason === originalReason && markerRowCount(l3Id) === 1,
+  );
+  check('(2c) still present (dismissed) in listNotepadMarkers for Tuesday -- remembered, not erased', listNotepadMarkers(DAY2_TUESDAY).some((m) => m.line_id === l3IdTuesday));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -1,5 +1,5 @@
 import { sqliteDb } from './conversation-db.js';
-import { getNotepadLine, lineTextHash } from './notepad.js';
+import { getNotepadLine, getNotepadLineState, lineTextHash, markLineDismissed } from './notepad.js';
 
 // The marker store (goal 6, node #104 — "A marker belongs to the line,
 // survives edits, and never fires twice"). notepad-moves.ts's own module
@@ -31,6 +31,28 @@ import { getNotepadLine, lineTextHash } from './notepad.js';
 //   dismissed, line stay quiet through an edit-and-settle cycle that keeps
 //   landing back on the same wording, while still letting a real change to
 //   that line speak up.
+//
+//   That per-row `dismissed_hash` only covers ONE line_id, and line_ids are
+//   minted PER DAY (`notepad_lines.day`) — the same text typed again on a
+//   later day gets a brand-new line_id with no row and no memory, so the
+//   per-row check alone cannot make a dismissal survive past midnight. The
+//   day-independent `notepad_marker_dismissals` table below (keyed on the
+//   text hash alone, no line_id) is what actually delivers "remembered
+//   across days": reconcileNotepadMarker() consults it for every line, not
+//   just the current row, so the SAME dismissed wording stays quiet no
+//   matter which day or which line_id it shows up as. Dismissal is
+//   attached to normalized TEXT, not to any single day's occurrence of it.
+//   It also suppresses that text under every marker kind, not just the one
+//   it was dismissed under: once Kevin has ruled a line out, a difference
+//   in which angle a re-proposal takes does not undo that — the noise
+//   budget outranks a second valid angle on already-dismissed text.
+//
+//   dismissNotepadMarker() also routes through notepad.ts's own
+//   `markLineDismissed`, so the per-line ledger (notepad_line_state) and
+//   this marker store never disagree about whether a line is dismissed —
+//   and reconcileNotepadMarker() reads that ledger row too, so a line the
+//   ledger already dismissed at the current hash (however that dismissal
+//   happened) never gets a marker resurrected on top of it either.
 
 /** The four kinds of real move a marker can represent — identical to
  *  notepad-moves.ts's NotepadMoveKind, kept as its own type here so this
@@ -91,6 +113,19 @@ sqliteDb.exec(`
     created_at     TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  -- Day-independent dismissal memory, keyed on the normalized-text hash
+  -- alone (no line_id, no day) -- the thing that actually makes a
+  -- dismissal survive past midnight, since line_ids are minted per day and
+  -- the notepad_markers row above cannot outlive its own line_id. A hit
+  -- here means "this exact wording has been ruled out before," regardless
+  -- of which line or which day is asking.
+  CREATE TABLE IF NOT EXISTS notepad_marker_dismissals (
+    hash          TEXT PRIMARY KEY,
+    kind          TEXT,
+    note          TEXT,
+    dismissed_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
 
 interface MarkerRow {
@@ -131,6 +166,56 @@ export function getNotepadMarker(lineId: number): NotepadMarker | undefined {
   return row ? toMarker(row) : undefined;
 }
 
+/** The day-independent dismissal record for one normalized-text hash. */
+export interface NotepadMarkerDismissalRecord {
+  hash: string;
+  kind: NotepadMarkerKind | null;
+  note: string | null;
+  dismissed_at: string;
+}
+
+interface DismissalRow {
+  hash: string;
+  kind: string | null;
+  note: string | null;
+  dismissed_at: string;
+}
+
+function toDismissalRecord(row: DismissalRow): NotepadMarkerDismissalRecord {
+  return {
+    hash: row.hash,
+    kind: row.kind as NotepadMarkerKind | null,
+    note: row.note,
+    dismissed_at: row.dismissed_at,
+  };
+}
+
+const getDismissalByHashStmt = sqliteDb.prepare<[string], DismissalRow>(`
+  SELECT * FROM notepad_marker_dismissals WHERE hash = ?
+`);
+
+/** The dismissal-memory record for a normalized-text hash, if that exact
+ *  text has ever been dismissed (any line, any day). */
+export function getDismissedTextRecord(hash: string): NotepadMarkerDismissalRecord | undefined {
+  const row = getDismissalByHashStmt.get(hash);
+  return row ? toDismissalRecord(row) : undefined;
+}
+
+/** Has this exact text (after normalization) ever been dismissed? Convenience
+ *  wrapper over getDismissedTextRecord for callers that only need the bool. */
+export function isDismissedText(text: string): boolean {
+  return getDismissalByHashStmt.get(lineTextHash(text)) !== undefined;
+}
+
+const upsertDismissalRecordStmt = sqliteDb.prepare<[string, string, string | null]>(`
+  INSERT INTO notepad_marker_dismissals (hash, kind, note, dismissed_at)
+  VALUES (?, ?, ?, datetime('now'))
+  ON CONFLICT(hash) DO UPDATE SET
+    kind         = excluded.kind,
+    note         = excluded.note,
+    dismissed_at = excluded.dismissed_at
+`);
+
 // ON CONFLICT here is what "reconcile in place" IS, mechanically: the first
 // call for a line_id inserts; every call after that updates the same row.
 // This statement intentionally does NOT touch dismissed_hash/dismissed_at
@@ -157,6 +242,28 @@ const resyncDismissedMarkerStmt = sqliteDb.prepare<[string, number]>(`
   UPDATE notepad_markers SET dismissed = 1, hash = ?, updated_at = datetime('now') WHERE line_id = ?
 `);
 
+// The cross-day/cross-line hit branch: this line_id has never been
+// dismissed itself (no existing row, or an existing row dismissed under
+// different text), but the CURRENT text matches a dismissal recorded
+// against some other line_id (possibly a prior day). Unlike
+// upsertActiveMarkerStmt, this writes the marker straight into the
+// dismissed state -- the judgment fields (kind/reason/action_ref) are still
+// recorded for forensics/display, but the marker never goes active and
+// never shows up in activeNotepadMarkers().
+const upsertDismissedMarkerStmt = sqliteDb.prepare<[number, string, string, string | null, string, string]>(`
+  INSERT INTO notepad_markers (line_id, kind, reason, action_ref, hash, dismissed, dismissed_hash, dismissed_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, 1, ?, datetime('now'), datetime('now'))
+  ON CONFLICT(line_id) DO UPDATE SET
+    kind           = excluded.kind,
+    reason         = excluded.reason,
+    action_ref     = excluded.action_ref,
+    hash           = excluded.hash,
+    dismissed      = 1,
+    dismissed_hash = excluded.dismissed_hash,
+    dismissed_at   = excluded.dismissed_at,
+    updated_at     = excluded.updated_at
+`);
+
 /**
  * Reconcile line `lineId`'s marker against a freshly-decided `move`.
  *
@@ -164,29 +271,46 @@ const resyncDismissedMarkerStmt = sqliteDb.prepare<[string, number]>(`
  * call, update on every call after — "reconcile in place", never a second
  * row).
  *
- * "Dismissals keyed by text hash, remembered across days" means
- * `dismissed_hash` is durable memory, not a snapshot that gets wiped the
- * moment the line moves on to something else: reconcile only ever SETS
- * `dismissed_hash` inside dismissNotepadMarker(), never clears it here.
- * That is what makes this sequence come out right, which a naive
- * "clear dismissal on any edit" design gets wrong —
+ * "Dismissals keyed by text hash" means `dismissed_hash` is durable memory,
+ * not a snapshot that gets wiped the moment the line moves on to something
+ * else: reconcile only ever SETS `dismissed_hash` inside
+ * dismissNotepadMarker(), never clears it here. That is what makes this
+ * sequence come out right, which a naive "clear dismissal on any edit"
+ * design gets wrong —
  *
  *   dismiss "grab milk" (dismissed_hash = hash(grab milk))
  *   edit -> "grab milk and eggs"   -- different text, marker revives (active)
  *   edit back -> "grab milk"       -- SAME text as the original dismissal
  *
  * — the last line must come back dismissed, even though something else
- * happened to the line in between. So on every call this function checks
- * the CURRENT text's hash against whatever `dismissed_hash` is currently on
- * file (which may be from days ago, unrelated to the marker's last active
- * kind/reason): if they match, this is a no-op that only resyncs
- * `hash`/`dismissed` to reflect "yes, still/again dismissed" — the exact
- * text Kevin already ruled out never gets a marker resurrected for it,
- * which is the "never fires twice" half of the done_means. If they don't
- * match (no dismissal on file yet, or the dismissal was for different
- * text), this writes the new kind/reason/action_ref/hash and marks the
- * marker active — a genuinely different judgment for genuinely different
- * text is never suppressed by a dismissal that doesn't apply to it.
+ * happened to the line in between. So this function checks THREE signals,
+ * in order, before it will ever mark a fresh judgment active:
+ *
+ *   1. This line_id's OWN `dismissed_hash` (same as before) -- the current
+ *      text's hash against whatever `dismissed_hash` is currently on file
+ *      for THIS row. Covers same-line, same-day, edit-away-and-revert.
+ *   2. `notepad_marker_dismissals`, keyed on the text hash alone -- covers
+ *      "remembered across days": the SAME wording dismissed under a
+ *      DIFFERENT line_id (a different day's fresh id for identical text, or
+ *      a different line entirely) is honored here too, since line_ids are
+ *      per-day and the per-row hash above cannot see across that boundary.
+ *   3. The per-line ledger (`notepad_line_state`, notepad.ts) -- covers a
+ *      dismissal that landed on this exact line_id/hash through some path
+ *      other than this marker store's own dismiss flow (e.g. JARVIS calling
+ *      markLineDismissed directly); the marker store stays "on top of" the
+ *      ledger rather than beside it, so the two can never disagree about
+ *      whether a line is currently dismissed.
+ *
+ * A hit on ANY of the three writes the marker straight into the dismissed
+ * state (judgment fields still recorded, for forensics/display — just never
+ * surfaced): the exact text Kevin already ruled out never gets a marker
+ * resurrected for it, which is the "never fires twice" half of the
+ * done_means, and it holds under every marker KIND, not just the one it was
+ * dismissed under. If none of the three match (no dismissal on file
+ * anywhere for this text), this writes the new kind/reason/action_ref/hash
+ * and marks the marker active — a genuinely different judgment for
+ * genuinely different text is never suppressed by a dismissal that doesn't
+ * apply to it.
  *
  * Throws if `lineId` does not name a real notepad line, or if `move` is
  * malformed (unrecognized kind, blank reason) — mirrors markLine's
@@ -204,13 +328,26 @@ export function reconcileNotepadMarker(lineId: number, move: NotepadMarkerMove):
   const existing = getMarkerRowStmt.get(lineId);
 
   if (existing && existing.dismissed_hash === hash) {
-    // The current text is exactly what was (at some point) dismissed --
-    // leave the judgment fields alone, just resync hash/dismissed.
+    // Signal 1: this exact row already carries this dismissal -- leave the
+    // judgment fields alone, just resync hash/dismissed.
     resyncDismissedMarkerStmt.run(hash, lineId);
     return getNotepadMarker(lineId)!;
   }
 
   const actionRef = move.action_ref && move.action_ref.trim() ? move.action_ref.trim() : null;
+
+  // Signal 2 (cross-day/cross-line text memory) or signal 3 (the per-line
+  // ledger already dismissed this exact hash) -- either means this text
+  // stays dismissed even though it's new to THIS row.
+  const dismissalRecord = getDismissalByHashStmt.get(hash);
+  const ledgerState = getNotepadLineState(lineId);
+  const ledgerDismissed = ledgerState?.state === 'dismissed' && ledgerState.hash === hash;
+
+  if (dismissalRecord || ledgerDismissed) {
+    upsertDismissedMarkerStmt.run(lineId, move.kind, reason, actionRef, hash, hash);
+    return getNotepadMarker(lineId)!;
+  }
+
   upsertActiveMarkerStmt.run(lineId, move.kind, reason, actionRef, hash);
   return getNotepadMarker(lineId)!;
 }
@@ -221,21 +358,41 @@ const dismissMarkerStmt = sqliteDb.prepare<[number]>(`
   WHERE line_id = ?
 `);
 
+// One transaction for all three writes a dismiss makes: the per-row flip
+// (dismissMarkerStmt), the day-independent text-hash memory
+// (upsertDismissalRecordStmt), and the per-line ledger (markLineDismissed).
+// All three or none -- a dismiss can never partially land.
+const dismissMarkerTx = sqliteDb.transaction((lineId: number, kind: string, hash: string, note: string | null): void => {
+  dismissMarkerStmt.run(lineId);
+  upsertDismissalRecordStmt.run(hash, kind, note);
+  markLineDismissed(lineId, note ?? undefined);
+});
+
 /**
  * Dismiss the current marker on `lineId`. `dismissed_hash` is stamped from
  * the marker's own already-recorded `hash` column -- the text it was
  * actually judged against -- never re-read live from the line. That keeps
  * a dismiss self-consistent with what Kevin was looking at when he
  * dismissed it, with no window for the line to have drifted between render
- * and click.
+ * and click. The SAME hash is what `notepad_marker_dismissals` is keyed on,
+ * so this is also the one place that day-independent memory gets written.
+ *
+ * Also routes through notepad.ts's `markLineDismissed(lineId, note)` so the
+ * per-line ledger (`notepad_line_state`) agrees with this marker store
+ * about the dismissal — the integration reconcileNotepadMarker()'s ledger
+ * check above depends on.
+ *
+ * `note` is optional context for why (forwarded to both the dismissal
+ * record and the ledger row).
  *
  * Throws if there is no marker on this line to dismiss (same
  * no-silent-no-op discipline as reconcileNotepadMarker).
  */
-export function dismissNotepadMarker(lineId: number): NotepadMarker {
+export function dismissNotepadMarker(lineId: number, note?: string): NotepadMarker {
   const existing = getMarkerRowStmt.get(lineId);
   if (!existing) throw new Error(`no notepad marker on line ${lineId}`);
-  dismissMarkerStmt.run(lineId);
+  const trimmedNote = note && note.trim() ? note.trim() : null;
+  dismissMarkerTx(lineId, existing.kind, existing.hash, trimmedNote);
   return getNotepadMarker(lineId)!;
 }
 

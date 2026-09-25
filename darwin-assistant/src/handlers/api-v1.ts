@@ -58,7 +58,20 @@ import { listMcpServers, refreshMcpServers } from '../mcp-registry.js';
 import { resolveNativeServer, nativeListTools } from '../tools/mcp-native.js';
 import { listNotes, createNote } from '../notes-db.js';
 import { triageNote } from '../notes.js';
-import { getNotepadDay, putNotepadDay, listNotepadDays, isValidNotepadDate, todayNotepadDate } from '../notepad.js';
+import {
+  getNotepadDay,
+  putNotepadDay,
+  listNotepadDays,
+  isValidNotepadDate,
+  todayNotepadDate,
+  getNotepadLine,
+  getNotepadLineState,
+  unscannedLines,
+  markLineSeen,
+  markLineActed,
+  markLineDismissed,
+  type NotepadLineState,
+} from '../notepad.js';
 import {
   listNotifications,
   unreadNotificationCount,
@@ -1657,6 +1670,53 @@ export function createApiV1Router(): Router {
 
   router.get('/notepad/days', (_req: AuthedRequest, res) => {
     res.json(listNotepadDays());
+  });
+
+  const NOTEPAD_LINE_STATES: NotepadLineState[] = ['seen', 'acted', 'dismissed'];
+
+  // Per-line state ledger (docs/notepad/LINE-IDENTITY.md). GET returns every
+  // line for `day` that a re-scan should look at right now (unseen, plus
+  // anything whose text changed since it was last seen/acted/dismissed).
+  router.get('/notepad/line-state', (req: AuthedRequest, res) => {
+    const dateParam = typeof req.query.date === 'string' ? req.query.date : undefined;
+    const day = dateParam ?? todayNotepadDate();
+    if (!isValidNotepadDate(day)) {
+      sendError(res, 400, 'invalid_date', 'date must be YYYY-MM-DD');
+      return;
+    }
+    res.json({ day, lines: unscannedLines(day) });
+  });
+
+  router.post('/notepad/line-state', (req: AuthedRequest, res) => {
+    const lineId = Number(req.body?.line_id);
+    if (!Number.isInteger(lineId) || lineId <= 0) {
+      sendError(res, 400, 'line_id_required', 'line_id (a positive integer) is required');
+      return;
+    }
+    const state = req.body?.state;
+    if (typeof state !== 'string' || !NOTEPAD_LINE_STATES.includes(state as NotepadLineState)) {
+      sendError(res, 400, 'invalid_state', `state must be one of: ${NOTEPAD_LINE_STATES.join(', ')}`);
+      return;
+    }
+    const line = getNotepadLine(lineId);
+    if (!line) {
+      sendError(res, 404, 'line_not_found', `no notepad line with id '${lineId}'`);
+      return;
+    }
+    if (state === 'acted') {
+      const actionRef = typeof req.body?.action_ref === 'string' ? req.body.action_ref.trim() : '';
+      if (!actionRef) {
+        sendError(res, 400, 'action_ref_required', 'action_ref is required when state is "acted"');
+        return;
+      }
+      markLineActed(lineId, actionRef);
+    } else if (state === 'dismissed') {
+      const note = typeof req.body?.note === 'string' ? req.body.note : undefined;
+      markLineDismissed(lineId, note);
+    } else {
+      markLineSeen(lineId);
+    }
+    res.json({ line_id: lineId, state: getNotepadLineState(lineId) });
   });
 
   // == Quick-capture todo widget (DAR-737) =====================================

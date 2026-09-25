@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { sqliteDb } from './conversation-db.js';
 
 // Cockpit Notepad — one free-form note per calendar day (US/Central), backed
@@ -51,6 +52,24 @@ sqliteDb.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_notepad_lines_day ON notepad_lines(day, idx);
+
+  -- Per-line state ledger (docs/notepad/LINE-IDENTITY.md). line_id is BOTH the
+  -- primary key AND the foreign key: a line can hold at most one ledger row,
+  -- which is what structurally guarantees a line can never carry two
+  -- independent actions (an UPSERT on an already-'acted' line updates that
+  -- same row rather than ever inserting a second one). ON DELETE CASCADE
+  -- relies on 'PRAGMA foreign_keys = ON', which conversation-db.ts already
+  -- sets on this exact connection (sqliteDb re-exports that same 'db') — so a
+  -- deleted line's ledger row is removed automatically, never left orphaned.
+  CREATE TABLE IF NOT EXISTS notepad_line_state (
+    line_id    INTEGER PRIMARY KEY REFERENCES notepad_lines(id) ON DELETE CASCADE,
+    state      TEXT NOT NULL,
+    hash       TEXT NOT NULL,
+    scanned_at TEXT,
+    action_ref TEXT,
+    note       TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
 
 const upsertDayStmt = sqliteDb.prepare<[string]>(`
@@ -261,4 +280,174 @@ export function putNotepadDay(day: string, text: string): NotepadDay {
   const newTexts = text === '' ? [] : text.split('\n');
   putTx(day, newTexts);
   return getNotepadDay(day);
+}
+
+// == Per-line state ledger (docs/notepad/LINE-IDENTITY.md) ===================
+//
+// This section implements the contract's §2 (normalized hash), §3 (the four
+// states), and §4 (the decision table) on top of the line identity that
+// applyLineDiff() above already guarantees. It does not change anything
+// about diffing/identity — it only tracks, per line id, whether JARVIS has
+// looked at that line's CURRENT text yet.
+
+export type NotepadLineState = 'seen' | 'acted' | 'dismissed';
+
+export interface NotepadLineStateRow {
+  line_id: number;
+  state: NotepadLineState;
+  hash: string;
+  scanned_at: string | null;
+  action_ref: string | null;
+  note: string | null;
+  updated_at: string;
+}
+
+/**
+ * A line that a re-scan should look at, per the decision table (§4):
+ *   - 'first_look'  : unseen (no row), OR seen/dismissed whose text changed.
+ *                     There is no prior action to reconcile against.
+ *   - 'reconcile'    : acted, and the text changed since the action was
+ *                      taken. Always carries the original action_ref — the
+ *                      consumer re-examines whether that action still
+ *                      matches, it never files a second, independent one.
+ */
+export interface UnscannedNotepadLine {
+  line_id: number;
+  idx: number;
+  text: string;
+  kind: 'first_look' | 'reconcile';
+  action_ref: string | null;
+}
+
+const BULLET_MARKER_RE = /^[-*•]\s*/;
+
+/**
+ * Normalization per LINE-IDENTITY.md §2.1, in the exact order specified:
+ * trim -> strip a leading bullet marker (+ its trailing whitespace) ->
+ * collapse internal whitespace runs to a single space -> casefold.
+ *
+ * This is the ONE place normalization happens. Every marker (markLineSeen/
+ * markLineActed/markLineDismissed) and the reader (unscannedLines) call
+ * THIS function for their hash — never a re-implementation of these steps —
+ * because two copies that drift by even a trimmed space would make every
+ * line look changed forever (§4's "load-bearing reasoning").
+ */
+export function normalizeLineText(text: string): string {
+  const trimmed = text.trim();
+  const withoutBullet = trimmed.replace(BULLET_MARKER_RE, '');
+  const collapsed = withoutBullet.replace(/\s+/g, ' ');
+  return collapsed.toLowerCase();
+}
+
+/** sha256 of the normalized text, hex-encoded (§2.2). */
+export function lineTextHash(text: string): string {
+  return crypto.createHash('sha256').update(normalizeLineText(text), 'utf8').digest('hex');
+}
+
+const getLineByIdStmt = sqliteDb.prepare<[number], NotepadLineRow>(`
+  SELECT id, idx, text FROM notepad_lines WHERE id = ?
+`);
+
+/** Fetch a single line by id (any day). Used by routes to 404 on an unknown id. */
+export function getNotepadLine(lineId: number): NotepadLineRow | undefined {
+  return getLineByIdStmt.get(lineId);
+}
+
+// line_id is the PRIMARY KEY, so this UPSERT can only ever hold one row per
+// line — an already-'acted' line that gets marked acted again UPDATES that
+// same row (the reconciliation-resolved path), it never inserts a sibling.
+const upsertLineStateStmt = sqliteDb.prepare<[number, NotepadLineState, string, string | null, string | null]>(`
+  INSERT INTO notepad_line_state (line_id, state, hash, scanned_at, action_ref, note, updated_at)
+  VALUES (?, ?, ?, datetime('now'), ?, ?, datetime('now'))
+  ON CONFLICT(line_id) DO UPDATE SET
+    state      = excluded.state,
+    hash       = excluded.hash,
+    scanned_at = excluded.scanned_at,
+    action_ref = excluded.action_ref,
+    note       = excluded.note,
+    updated_at = excluded.updated_at
+`);
+
+function markLine(lineId: number, state: NotepadLineState, actionRef: string | null, note: string | null): void {
+  const line = getNotepadLine(lineId);
+  if (!line) throw new Error(`notepad line ${lineId} not found`);
+  // Stamp the hash of the text that was ACTUALLY examined right now — never
+  // a hash computed later — per §3's closing paragraph.
+  const hash = lineTextHash(line.text);
+  upsertLineStateStmt.run(lineId, state, hash, actionRef, note);
+}
+
+/** JARVIS examined the line's current text and judged it not actionable right now. */
+export function markLineSeen(lineId: number): void {
+  markLine(lineId, 'seen', null, null);
+}
+
+/**
+ * JARVIS took a real action because of this line. actionRef points into
+ * whatever system received the work (thread external_id, hopper tree id,
+ * goal node id, hopper item id, workstream id, commitment id, ...).
+ */
+export function markLineActed(lineId: number, actionRef: string): void {
+  if (!actionRef || !actionRef.trim()) {
+    throw new Error('actionRef is required for markLineActed');
+  }
+  markLine(lineId, 'acted', actionRef, null);
+}
+
+/** The line was explicitly ruled out as not needing further tracking. */
+export function markLineDismissed(lineId: number, note?: string): void {
+  markLine(lineId, 'dismissed', null, note && note.trim() ? note : null);
+}
+
+const listLineStatesForDayStmt = sqliteDb.prepare<
+  [string],
+  { id: number; idx: number; text: string; state: NotepadLineState | null; hash: string | null; action_ref: string | null }
+>(`
+  SELECT l.id AS id, l.idx AS idx, l.text AS text,
+         s.state AS state, s.hash AS hash, s.action_ref AS action_ref
+  FROM notepad_lines l
+  LEFT JOIN notepad_line_state s ON s.line_id = l.id
+  WHERE l.day = ?
+  ORDER BY l.idx ASC, l.id ASC
+`);
+
+/**
+ * Every line a scanner should look at for `day`, per the decision table
+ * (§4): every line with no state row ('unseen' is the absence of a row, not
+ * a value), plus every seen/acted/dismissed line whose CURRENT normalized
+ * hash no longer matches the hash recorded when that state was last set.
+ * Unchanged lines (hash still matches) are skipped entirely.
+ */
+export function unscannedLines(day: string): UnscannedNotepadLine[] {
+  const rows = listLineStatesForDayStmt.all(day);
+  const out: UnscannedNotepadLine[] = [];
+  for (const row of rows) {
+    if (row.state === null || row.hash === null) {
+      // No ledger row at all -> 'unseen'. No recorded hash to compare
+      // against, so it always surfaces as a first look.
+      out.push({ line_id: row.id, idx: row.idx, text: row.text, kind: 'first_look', action_ref: null });
+      continue;
+    }
+    const currentHash = lineTextHash(row.text);
+    if (currentHash === row.hash) continue; // unchanged since last recorded -> skip
+    if (row.state === 'acted') {
+      // Hash changed on an acted line -> reconciliation, carrying the
+      // existing action_ref. Never a bare first-look for this state.
+      out.push({ line_id: row.id, idx: row.idx, text: row.text, kind: 'reconcile', action_ref: row.action_ref });
+    } else {
+      // seen/dismissed judged specific prior text; different text has never
+      // been judged -> first look, not "already seen/dismissed".
+      out.push({ line_id: row.id, idx: row.idx, text: row.text, kind: 'first_look', action_ref: null });
+    }
+  }
+  return out;
+}
+
+const getLineStateStmt = sqliteDb.prepare<[number], NotepadLineStateRow>(`
+  SELECT * FROM notepad_line_state WHERE line_id = ?
+`);
+
+/** Read the raw ledger row for one line, if any (route reads). */
+export function getNotepadLineState(lineId: number): NotepadLineStateRow | undefined {
+  return getLineStateStmt.get(lineId);
 }

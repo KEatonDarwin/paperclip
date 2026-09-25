@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdirSync, writeFileSync, unlinkSync, readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildSystemPrompt, loadMemoryBlock } from './prompt.js';
+import { buildSystemPrompt, loadMemoryBlock, memoryProfileForThread, type MemoryProfile } from './prompt.js';
 import { getAuggieModels } from './auggie-catalog.js';
 import { getDevinModels } from './devin-catalog.js';
 import { getCodexModels } from './codex-catalog.js';
@@ -607,8 +607,8 @@ export function buildToolsBlock(): string {
   ].join('\n');
 }
 
-export function buildInitialPrompt(userMessage: string): string {
-  return [buildSystemPrompt(), buildToolsBlock(), '---', `Human: ${userMessage}`, 'Assistant:'].join('\n\n');
+export function buildInitialPrompt(userMessage: string, memoryProfile: MemoryProfile = 'full'): string {
+  return [buildSystemPrompt(memoryProfile), buildToolsBlock(), '---', `Human: ${userMessage}`, 'Assistant:'].join('\n\n');
 }
 
 export function adapterFromModel(model: string | null | undefined): string | null {
@@ -777,13 +777,16 @@ export function buildContinuationPrompt(
   userMessage: string,
   adapterId: string = 'claude',
   model: string | null = null,
-  opts?: { aggressive?: boolean },
+  opts?: { aggressive?: boolean; memoryProfile?: MemoryProfile },
 ): string {
   const priorTurns = turns.length && turns[turns.length - 1]?.role === 'user'
     ? turns.slice(0, -1)
     : turns;
 
-  const systemPrompt = buildSystemPrompt();
+  const memoryProfile = opts?.memoryProfile ?? 'full';
+  // Memory rides in the `## Current Memory` refresh block below, not in the
+  // system prompt — passing omitMemory kills the historical double injection.
+  const systemPrompt = buildSystemPrompt(memoryProfile, { omitMemory: true });
   const toolsBlock = buildToolsBlock();
 
   const windowTokens = contextWindowTokensFor(adapterId, model);
@@ -799,7 +802,7 @@ export function buildContinuationPrompt(
     : windowTokens <= 128_000
       ? 12_000
       : undefined;
-  const memoryBlock = loadMemoryBlock(memoryMaxChars);
+  const memoryBlock = loadMemoryBlock(memoryMaxChars, memoryProfile);
 
   const staticTokens =
     estimateTokens(systemPrompt) +
@@ -1557,9 +1560,12 @@ async function runConversationTurn(
   // read_memory for anything trimmed.
   const resumeMemoryMaxChars =
     contextWindowTokensFor(adapter.id, runtime.model) <= 128_000 ? 12_000 : undefined;
+  // Memory diet (2026-09-25): ephemeral workers get worker-core.md (~5KB rules)
+  // instead of the full memory on every prompt path.
+  const memoryProfile = memoryProfileForThread(conv.external_id);
   let stdinContent = perTurnContextPrefix + (sessionId
-    ? `<memory_refresh>\n${loadMemoryBlock(resumeMemoryMaxChars)}\n</memory_refresh>\n\n${modelInput}`
-    : (turns.length > 1 ? buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model) : buildInitialPrompt(modelInput)));
+    ? `<memory_refresh>\n${loadMemoryBlock(resumeMemoryMaxChars, memoryProfile)}\n</memory_refresh>\n\n${modelInput}`
+    : (turns.length > 1 ? buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { memoryProfile }) : buildInitialPrompt(modelInput, memoryProfile)));
 
   // DAR-756: only one aggressive-compaction retry per turn — if the destination
   // model still overflows after that, stop retrying and degrade to a friendly

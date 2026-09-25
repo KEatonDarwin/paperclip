@@ -2,12 +2,52 @@ import { readFileSync } from 'node:fs';
 
 const MEMORY_FILE = '/home/kevin/obsidian/paperclip-wiki/agent-memory/jarvis/memory.md';
 
+// Memory diet (Kevin, 2026-09-25): ephemeral workers get a ~5KB rules-only core
+// instead of the full chief-of-staff memory — their node spec carries the task,
+// and the full file at its worst (446KB ≈ 110K tokens) was injected into every
+// worker turn for nothing.
+const WORKER_CORE_FILE = '/home/kevin/obsidian/paperclip-wiki/agent-memory/jarvis/worker-core.md';
+
+export type MemoryProfile = 'full' | 'worker';
+
+/** Ephemeral single-task worker threads that get worker-core.md instead of the
+ *  full memory. Deliberately NARROW: goal/shift/checkin/quick threads are
+ *  JARVIS-persona surfaces Kevin talks to and keep the full (post-diet) memory. */
+export function memoryProfileForThread(externalId: string | null | undefined): MemoryProfile {
+  if (!externalId) return 'full';
+  return externalId.startsWith('cockpit:hopper-node-') || externalId.startsWith('cockpit:unblocker-')
+    ? 'worker'
+    : 'full';
+}
+
 // DAR-756: `maxChars` lets small-context-window adapters (mid-thread switch to
 // a model with a smaller window than the source) request a head-truncated copy
 // of the memory block instead of the full ~44.5k-token file every message —
 // that block was the single biggest fixed cost in a replayed continuation
 // prompt. Full block (no arg) is unchanged for the common case.
-export function loadMemoryBlock(maxChars?: number): string {
+export function loadMemoryBlock(maxChars?: number, profile: MemoryProfile = 'full'): string {
+  if (profile === 'worker') {
+    let core: string;
+    try {
+      core = readFileSync(WORKER_CORE_FILE, 'utf-8').trim();
+    } catch {
+      // Fail safe: a missing core file must never strip a worker of the rules.
+      core = [
+        '# Worker Core (fallback — worker-core.md unavailable)',
+        'You are a spawned worker for ONE task. NO API KEYS (subscription CLI binaries only).',
+        'Never touch production DBs/migrations or live Hub 2.0 kuojrvfdjjqhqyvkuiam. Never touch the live /home/kevin/paperclip checkout, never restart jarvis.service, never merge to main.',
+        'Finish contract: POST /api/v1/hopper-nodes/<id>/finish {outcome: done|split|blocked_question|blocked, result}. Reviews: first line VERDICT: PASS|FAIL.',
+        'Run commands with timeouts one at a time; missing toolchain → finish blocked, never shim.',
+      ].join('\n');
+    }
+    return [
+      '## Worker Rules (ephemeral worker — full JARVIS memory deliberately not loaded)',
+      '',
+      core,
+      '',
+      '---',
+    ].join('\n');
+  }
   let body: string;
   try {
     body = readFileSync(MEMORY_FILE, 'utf-8').trim();
@@ -28,14 +68,20 @@ export function loadMemoryBlock(maxChars?: number): string {
   ].join('\n');
 }
 
-export function buildSystemPrompt(): string {
+export function buildSystemPrompt(
+  profile: MemoryProfile = 'full',
+  opts?: { omitMemory?: boolean },
+): string {
   const now = new Date().toLocaleString('en-US', {
     timeZone: 'America/Chicago',
     dateStyle: 'full',
     timeStyle: 'short',
   });
 
-  const memoryBlock = loadMemoryBlock();
+  // omitMemory: the continuation path re-injects memory itself as a
+  // `## Current Memory` refresh block right below the system prompt — before
+  // 2026-09-25 both copies rode along (double injection, the fatter one uncapped).
+  const memoryBlock = opts?.omitMemory ? '' : loadMemoryBlock(undefined, profile);
 
   return `You are JARVIS — Kevin's personal AI life coach and chief of staff.
 

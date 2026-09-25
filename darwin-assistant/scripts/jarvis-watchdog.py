@@ -429,6 +429,44 @@ def sentinel_hopper_stall(c, now):
                        f"Tree {tree_id} resumed dispatching.")
 
 
+
+def sentinel_memory_bloat(c, now):
+    """Memory diet guard (Kevin, 2026-09-25): memory.md is injected into EVERY
+    turn — it was 446KB (~110K tokens/turn) before the diet cut it to ~25KB.
+    Bell when it creeps past budget so it never silently regrows. Same check on
+    worker-core.md (the ephemeral-worker injection, budget ~15KB)."""
+    import os
+    files = [
+        ("/home/kevin/obsidian/paperclip-wiki/agent-memory/jarvis/memory.md", 100_000, "memory.md"),
+        ("/home/kevin/obsidian/paperclip-wiki/agent-memory/jarvis/worker-core.md", 15_000, "worker-core.md"),
+    ]
+    for path, budget, label in files:
+        key = f"size:{label}"
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = -1
+        if size < 0:
+            state = "missing"
+        elif size > budget:
+            state = "bloated"
+        else:
+            state = "ok"
+        prev, _ = seen_state(c, "memory_bloat", key)
+        if state == prev:
+            continue
+        if state == "bloated":
+            notify("warning", f"Memory diet breach: {label} is {size//1024}KB (budget {budget//1024}KB)",
+                   f"{label} is injected into every JARVIS turn — trim it back (supersede in place, "
+                   f"archive sagas to agent-memory/jarvis/archive/). See the MEMORY DIET section in memory.md.")
+        elif state == "missing":
+            notify("error", f"Memory file MISSING: {label}",
+                   f"{path} unreadable — every JARVIS turn is now running without it.")
+        elif prev in ("bloated", "missing"):
+            notify("success", f"Memory diet restored: {label} back within budget ({size//1024}KB)", "")
+        record_state(c, "memory_bloat", key, state, "warning", f"{size} bytes")
+
+
 def main():
     now = datetime.datetime.utcnow()
     c = sqlite3.connect(DB, timeout=20)
@@ -436,7 +474,8 @@ def main():
     errors = []
     sentinels = [("dead_turn", sentinel_dead_turn),
                  ("commitments", sentinel_commitments), ("services", sentinel_services),
-                 ("hopper_stall", sentinel_hopper_stall)]
+                 ("hopper_stall", sentinel_hopper_stall),
+                 ("memory_bloat", sentinel_memory_bloat)]
     if PAPERCLIP_WATCH:  # mothballed 2026-09-24 — see PAPERCLIP_WATCH above
         sentinels.insert(0, ("foreman", sentinel_foreman))
     for name, fn in sentinels:
@@ -449,7 +488,7 @@ def main():
     try:
         with open(HEARTBEAT, "w") as f:
             json.dump({"ran_at": now.isoformat() + "Z", "errors": errors,
-                       "sentinels": ["foreman", "dead_turn", "commitments", "services", "hopper_stall"]}, f)
+                       "sentinels": ["foreman", "dead_turn", "commitments", "services", "hopper_stall", "memory_bloat"]}, f)
     except Exception:
         pass
     if errors:

@@ -697,3 +697,64 @@ integration-tree-specific.** Every check above runs on plain legacy trees (no
 unconditionally, with no `isIntegrationTree` branch anywhere in it, so a
 resource lease works identically whether or not the tree also happens to use
 per-node worktrees.
+
+### node #951 — AS BUILT: every section of this contract is LIVE and proven together
+
+This is the last node of the tree. Nothing in §1–§9 changed; this section is
+the closing status, not a revision.
+
+**What shipped, section by section:**
+
+| § | What | Landed by | Proof |
+|---|---|---|---|
+| §1–§2 | Recon + additive schema | #945, #948 | `hopper-git:check` |
+| §3.1–§3.4 | Per-node worktrees/branches, materialized at claim | #948 | `hopper-git:check` (125/125) |
+| §3.5–§3.6 | Merge-back, build gate resolution | #949 | `hopper-merge:check` (117/117) |
+| §4 | Dependency-driven dispatch, same-branch/per-goal-cap retired for integration trees | #948–#949 | `hopper-merge:check` MB-5 (§4.1 acceptance scenario) |
+| §5 | Resource leases | #950 | `hopper-leases:check` (25/25) |
+| §6 | Unpark conditions | #946 | `unpark:check` (41/41) |
+| §7 | Never-idle (serial fallback + honest stuck) | #946/#947 | `night:never-idle:check` (19/19) |
+| §8 | Safety invariants | #948–#950 | asserted inline in every check above (HG/MB/LC series) |
+| §9 | `src/hopper-git.ts` | #948–#950 | no stub bodies remain |
+| **all of the above, together, one timeline** | — | **#951** | `parallel:sim` (33/33) |
+
+**`npm run parallel:sim`** is the one thing no prior node's check proved: that
+§4/§5/§6/§7 don't just each work in isolation, but compose in a single run
+without fighting each other. One integration tree, Kevin's 4-node shape (B, C
+depend on A; D depends on nothing), a resource pair (E, F sharing a lease
+name), and a night-shift goal node parked on `node_done(A)` — all ticked
+together against one scratch DB and one throwaway git repo:
+
+- A, D, and the resource-pair winner claim in the SAME tick; the resource
+  loser is a clean SKIP (pending, zero attempts, no lease) — never a park.
+- The moment A reaches `status='done'`, the parked night item unparks — on
+  A's STATUS ALONE, before the merge has even started. This is deliberate and
+  distinct from B/C, which stay pending straight through A's integration: an
+  unpark condition asks "did the work happen", a dependent's dispatch asks
+  "is the work ON THE BRANCH I'd be cut from" — §3.5's whole reason for
+  existing. The sim asserts both halves of that distinction in the same tick
+  window, not just each one separately.
+- B and C claim only after A's merge lands, cut from a head that contains
+  A's file and A's line of the shared file.
+- The resource loser claims the instant the winner's lease releases —
+  serialization without a park, exactly like `hopper-leases:check`'s LC-1,
+  but happening interleaved with the dependency dispatch above instead of on
+  its own plain tree.
+- All six nodes land with zero conflicts and zero repair nodes; the
+  integration branch ends up holding every file, `shared.txt` still exactly
+  A's line.
+- The night run reaches `complete`; across the whole scenario no `stuck`
+  hold is ever recorded — proving §7 wasn't merely reachable in
+  `night-never-idle-check`'s own fixtures, but stays quiet under this
+  combined load too.
+
+**Full battery run for this node (counts, this checkout):** `npm run build`
+green · `parallel:sim` 33/33 · `hopper-git:check` 125/125 ·
+`hopper-merge:check` 117/117 · `hopper-leases:check` 25/25 · `unpark:check`
+41/41 · `night:never-idle:check` 19/19 · `night:check` 6/6 ·
+`night:shifts-check` 19/19 · `night:sim` 28/28 · `throttle:check` 41/41 ·
+`throttle:route-check` 9/9 · `big-board:check` PASSED · `work-switch:check`
+48/48. No regressions anywhere in that list.
+
+§11's open item stands exactly as node #945 left it: nothing here lands an
+integration branch on `main` — that merge is Kevin's, always.

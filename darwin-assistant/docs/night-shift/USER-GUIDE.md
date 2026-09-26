@@ -55,6 +55,35 @@ done as you can, use Claude A for most of it."*
    their trees keep running under the goal; prior per-goal autopilot flags restore; the report
    writes and posts into the shift's thread).
 
+## Never locks up
+
+A shift used to die with hours of budget left when a single parked item never re-queued, or
+when per-goal work was capped to one node at a time because every node shared the same
+checkout. `docs/hopper/PARALLEL-CONTRACT.md` (tree-383bb55b) closed both:
+
+- **Parks self-clear.** A park can now carry a condition (`node_done`, `tree_done`,
+  `branch_pushed`, `file_exists`, or plain `manual`) instead of being one-way. The driver
+  re-checks every live condition on this run's items and goal nodes at the top of every tick —
+  the moment the thing it was waiting on actually happens, the item re-queues on the very next
+  tick, no idle wait.
+- **Per-node branches on integration trees.** A tree opted into per-node worktrees (it has a
+  `repo_path` + `integration_branch`) is no longer limited to one node in flight at a time: each
+  node gets its own worktree and branch, cut from the integration branch's current head at the
+  moment it's claimed. A finished node merges back (`--no-ff`, then the tree's build gate) before
+  its dependents are released — so a node cut *after* that merge always contains the work it
+  depends on, and a node cut *before* it never does. A conflicting or red-gate merge becomes a
+  visible `integrate nX` repair node instead of silently corrupting the branch; the original
+  dependents stay blocked until the repair lands, then release automatically.
+- **Serial fallback, not a stop.** If a re-plan and a full unpark re-check both find nothing to
+  run, the driver looks for the oldest item that's blocked ONLY by a throttle-shaped reason (dep
+  ordering, same-branch, or a parallel cap) and force-runs it alone, one worker, no parallelism —
+  Kevin's own "even if it's much slower, wouldn't that keep us moving?" A `serial_fallback` event
+  names the item it picked.
+- **Honest stop reasons.** The driver may only call a run `stuck` once a re-plan, an unpark
+  re-check, AND the serial fallback have all found nothing. The stop event and the morning report
+  then name every remaining item, one line each, with why it's stuck (human-gated, parked on a
+  named condition, waiting on another item) — never a bare "nothing runnable."
+
 ## Reading Sessions
 
 Click **Sessions** in the header (top right, clock-with-arrow icon) to open the full history —

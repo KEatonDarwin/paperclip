@@ -358,6 +358,16 @@ domain, a settings row, a port, the integration worktree itself.
 - A resource conflict is a **SKIP, never a park** (⚡ Throttle §3.5 rule): status
   stays `pending`, no attempt consumed, no lease, no notification.
 
+The first two real resources this contract names, both genuinely un-worktree-able
+because they are not files in a repo: **`perclickity-sandbox-rules`**, the shared
+special-email rule list on the PerClickity sandbox domain (two nodes editing it
+concurrently corrupt each other's write, not each other's code, so a worktree
+can't fix it) and **`sandbox-intake-deploy`**, the sandbox intake's single
+deploy slot (a second deploy started mid-deploy races the first over the same
+running process, not over source). Any planner naming either in a node's
+`resources` gets automatic, deadlock-free serialization against every other node
+naming the same string — nothing else has to know these two are special.
+
 ---
 
 ## 6. UNPARK CONDITIONS — park stops being one-way
@@ -637,3 +647,53 @@ pipeline and it is TREE CONFIGURATION (planner/Kevin-authored, like a CI config)
 never worker text. §8.7's "never a shell string" governs the git surface, where a
 node title or branch would otherwise be interpolated; nothing worker-authored
 reaches the gate. Everything git still goes through `runGit`/`assertGitArgsSafe`.
+
+### node #950 — §5 RESOURCE LEASES are LIVE
+
+Landed in `src/hopper-engine.ts` only — no new table, per §5's own binding rule
+("the node row IS the lease"). `NewNodeInput.resources?: string[] | null`
+persisted into `hopper_nodes.resources` (JSON array) by `createHopperTree`'s
+insert (the column itself already existed, added by node #949 for repair
+nodes). Claimability is enforced in TWO layers, matching ⚡ Throttle's own
+`caps` pattern for the identical same-tick hazard:
+
+1. `readyLeavesStmt` gained a `NOT EXISTS` clause using `json_each` over both
+   the candidate's and every running node's `resources` arrays — a candidate
+   naming a resource any currently-`running` node holds never even reaches the
+   dispatch loop.
+2. `dispatchTick` builds a `heldResources` Set once per tick from
+   `runningResourcesStmt` (the same running-node snapshot the query above just
+   used), then records into it in-loop as nodes are actually claimed — closing
+   the gap `readyLeavesStmt`'s own snapshot can't: several nodes are claimed
+   off ONE query result per tick, so two ready leaves sharing a resource could
+   otherwise both pass the SQL filter before either is claimed. A hold is
+   `continue` — status stays `pending`, zero attempt cost, zero lease, zero
+   notification (§5's SKIP-never-park rule). If a claimed node's workspace prep
+   later fails (`releaseClaimAfterWorkspaceFailure`, integration trees only),
+   its names are removed from `heldResources` too — that revert already puts
+   the node back to `pending`, so holding the name for the rest of the tick
+   would starve a sibling over a resource nobody actually holds.
+
+Release needed no new code at all: every `finishHopperNode` outcome
+(`done`/`split`/`blocked`/`blocked_question`) and the existing lease-expiry
+sweep already move a node OFF `status='running'` before `dispatchTick`'s next
+pass rebuilds `heldResources` from scratch — that rebuild, every tick, from
+current `running` rows, is the entire release mechanism.
+
+Proof: `npm run hopper-leases:check` (25 checks, LC-1…LC-5): two nodes sharing
+one name run strictly serially while an unrelated third runs alongside them;
+release on `done`, release on `blocked` (any outcome, not just success);
+release on lease expiry with no finish call at all (proven via a
+higher-priority waiter that can only win the freed name if the sweep actually
+ran before the claim loop); multi-resource all-or-nothing (a two-name node
+blocked by either half never partially holds the other); and the SKIP-not-park
+invariant (zero unexpected `blocked` nodes across every fixture). No
+regressions: `hopper-git:check` 125/125, `hopper-merge:check` 117/117,
+`unpark:check` 41/41, `night:never-idle:check` 19/19, `npm run build` green.
+
+One fact later nodes need: **resources are engine-general, not
+integration-tree-specific.** Every check above runs on plain legacy trees (no
+`repo_path`/`integration_branch`) — §5's claim gate reads `n.resources`
+unconditionally, with no `isIntegrationTree` branch anywhere in it, so a
+resource lease works identically whether or not the tree also happens to use
+per-node worktrees.

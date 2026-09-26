@@ -47,7 +47,8 @@
     "unpark:check": "npm run build && JARVIS_DB_PATH=/tmp/unpark-check.db JARVIS_SIM=1 node scripts/unpark-check.mjs",
     "night:never-idle:check": "npm run build && JARVIS_DB_PATH=/tmp/night-never-idle-check.db JARVIS_SIM=1 node scripts/night-never-idle-check.mjs",
     "hopper-git:check": "npm run build && JARVIS_DB_PATH=/tmp/hopper-git-check.db JARVIS_SIM=1 node scripts/hopper-git-check.mjs",
-    "hopper-merge:check": "npm run build && JARVIS_DB_PATH=/tmp/hopper-merge-check.db JARVIS_SIM=1 node scripts/hopper-merge-check.mjs"
+    "hopper-merge:check": "npm run build && JARVIS_DB_PATH=/tmp/hopper-merge-check.db JARVIS_SIM=1 node scripts/hopper-merge-check.mjs",
+    "hopper-leases:check": "npm run build && JARVIS_DB_PATH=/tmp/hopper-leases-check.db JARVIS_SIM=1 node scripts/hopper-leases-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

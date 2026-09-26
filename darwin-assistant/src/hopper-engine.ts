@@ -334,11 +334,27 @@ const historyRecentStmt = sqliteDb.prepare<[], {
 
 // A node is DISPATCHABLE only if it's a pending LEAF (no children) in an active
 // tree — parents are containers that auto-complete off their children.
+// PARALLEL-CONTRACT §5 — resource leases: a candidate naming a resource held by
+// any currently-running node is filtered out here already (json_each over both
+// sides' JSON arrays). This is a same-tick SNAPSHOT — dispatchTick's in-loop
+// `heldResources` set (built from this same query's running-node view and
+// updated as nodes are claimed THIS tick) is what closes the gap where two
+// candidates sharing a resource both pass this query before either is claimed.
 const readyLeavesStmt = sqliteDb.prepare<[], HopperNodeRow>(`
   SELECT n.* FROM hopper_nodes n
   JOIN hopper_trees t ON t.id = n.tree_id AND t.status = 'active'
   WHERE n.status = 'pending'
     AND NOT EXISTS (SELECT 1 FROM hopper_nodes c WHERE c.parent_id = n.id)
+    AND (
+      n.resources IS NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM json_each(n.resources) nr
+        WHERE EXISTS (
+          SELECT 1 FROM hopper_nodes r, json_each(r.resources) rr
+          WHERE r.status = 'running' AND r.resources IS NOT NULL AND rr.value = nr.value
+        )
+      )
+    )
   ORDER BY n.priority DESC, n.id ASC
 `);
 
@@ -352,6 +368,26 @@ const claimStmt = sqliteDb.prepare<[string, string, number]>(`
 const expiredLeasesStmt = sqliteDb.prepare<[], HopperNodeRow>(`
   SELECT * FROM hopper_nodes WHERE status = 'running' AND lease_expires_at < datetime('now')
 `);
+
+// PARALLEL-CONTRACT §5 — "the node row IS the lease": no separate lease table,
+// no separate expiry clock. A resource is held for exactly as long as its
+// holder's row reads `status = 'running'`, so this query — re-run fresh every
+// tick, after the expired-lease sweep above has already released anything past
+// its 30-minute lease — is the entire release mechanism.
+const runningResourcesStmt = sqliteDb.prepare<[], { resources: string | null }>(
+  `SELECT resources FROM hopper_nodes WHERE status = 'running' AND resources IS NOT NULL`,
+);
+
+/** Parses a `resources` column value defensively; malformed JSON holds nothing. */
+function parseResourceList(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr.filter((r): r is string => typeof r === 'string') : [];
+  } catch {
+    return [];
+  }
+}
 
 function emitNode(action: HopperNodeEvent['action'], node: HopperNodeRow): void {
   sseBus.emit('sse', { type: 'hopper_node', action, node } satisfies HopperNodeEvent);
@@ -528,6 +564,13 @@ export interface NewNodeInput {
   priority?: number;
   adapter?: string | null;           // router: planner-assigned worker loadout
   model?: string | null;             // null → hopper_worker_model setting/env default
+  /**
+   * PARALLEL-CONTRACT §5: named shared-resource locks (e.g.
+   * 'perclickity-sandbox-rules'). A node holding any of these is skipped by
+   * every other node naming one of the same names until it stops running —
+   * see `heldResources` in dispatchTick. Free-form, lower-kebab, no default.
+   */
+  resources?: string[] | null;
 }
 
 /**
@@ -575,7 +618,7 @@ export function createHopperTree(
     );
   const ids: number[] = [];
   const insert = sqliteDb.prepare(
-    `INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, priority, adapter, model) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, priority, adapter, model, resources) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   for (const n of nodes) {
     if (n.parent_index != null) {
@@ -583,8 +626,9 @@ export function createHopperTree(
         `[hopper-engine] createHopperTree ignored parent_index=${n.parent_index} for "${n.title.slice(0, 80)}"; use depends_on_indexes for planner DAG ordering`,
       );
     }
+    const resources = Array.isArray(n.resources) && n.resources.length ? JSON.stringify(n.resources) : null;
     const info = insert.run(
-      treeId, null, n.title.slice(0, 300), n.spec ?? null, n.priority ?? 0, n.adapter ?? null, n.model ?? null,
+      treeId, null, n.title.slice(0, 300), n.spec ?? null, n.priority ?? 0, n.adapter ?? null, n.model ?? null, resources,
     );
     ids.push(Number(info.lastInsertRowid));
   }
@@ -1351,10 +1395,34 @@ export async function dispatchTick(reason: string): Promise<void> {
     // `caps.check()` is never consulted and dispatch is identical to before.
     const caps = throttleCapsForTick();
     let capHoldLogged = false;
+    // PARALLEL-CONTRACT §5 — resource leases. Built ONCE from currently-running
+    // nodes, then recorded IN-LOOP as nodes are claimed this tick (exactly the
+    // `caps` pattern above): readyLeavesStmt's own NOT EXISTS clause already
+    // excludes anything held as of the query, but dispatchTick claims several
+    // nodes per tick off ONE snapshot, so two ready leaves naming the same
+    // resource must not both slip through before either is claimed.
+    const heldResources = new Set<string>();
+    for (const row of runningResourcesStmt.all()) {
+      for (const r of parseResourceList(row.resources)) heldResources.add(r);
+    }
+    let resourceHoldLogged = false;
     for (const node of readyLeavesStmt.all()) {
       if (free <= 0) break;
       if (nightPaused.size && nightPaused.has(node.tree_id)) continue;
       if (!depsSatisfied(node)) continue;
+      // §5.3.5 — a resource conflict is a SKIP, never a park: status stays
+      // `pending`, no attempt consumed, no lease, no notification. A sibling
+      // finishing (or its lease expiring) releases the name and this node is
+      // simply retried, unmodified, on a later tick.
+      const nodeResources = parseResourceList(node.resources);
+      const waitingOn = nodeResources.filter((r) => heldResources.has(r));
+      if (waitingOn.length) {
+        if (!resourceHoldLogged) {
+          console.log(`[hopper-engine] resource_hold: node ${node.id} waits on [${waitingOn.join(', ')}] — holding`);
+          resourceHoldLogged = true;
+        }
+        continue;
+      }
       let adapter = node.adapter ?? WORKER_ADAPTER;
       let verdict = verdicts.get(adapter);
       if (verdict === undefined) {
@@ -1430,6 +1498,9 @@ export async function dispatchTick(reason: string): Promise<void> {
       const ext = `cockpit:hopper-node-${node.id}-${randomUUID().slice(0, 8)}`;
       const claimed = claimStmt.run(ext, `+${LEASE_MINUTES} minutes`, node.id);
       if (claimed.changes !== 1) continue; // raced — someone else claimed it
+      // §5 — record all-or-nothing: this claim just started holding every name
+      // in nodeResources, so the next candidate in this same loop sees it held.
+      for (const r of nodeResources) heldResources.add(r);
       const fresh = getNodeStmt.get(node.id)!;
       emitNode('updated', fresh);
       const tree = getHopperTree(node.tree_id)!;
@@ -1443,6 +1514,11 @@ export async function dispatchTick(reason: string): Promise<void> {
           `[hopper-engine] worktree prep failed for node ${fresh.id} (${prep.reason}): ${(prep.output ?? '').slice(0, 600)}`,
         );
         releaseClaimAfterWorkspaceFailure(fresh);
+        // §5 — the claim above was reverted to `pending`, so this node no
+        // longer holds anything; undo the in-tick record or a sibling wanting
+        // the same name would be starved for the rest of this tick over a
+        // resource nobody actually holds.
+        for (const r of nodeResources) heldResources.delete(r);
         continue;
       }
       const dispatched = prep.skipped ? fresh : getNodeStmt.get(node.id) ?? fresh;

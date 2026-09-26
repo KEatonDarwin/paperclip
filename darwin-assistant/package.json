@@ -43,7 +43,31 @@
     "work-switch:check": "node scripts/work-switch-check.mjs",
     "health:check": "npm run build && JARVIS_DB_PATH=/tmp/health-check.db JARVIS_SIM=1 node --import ./scripts/health-check.hooks.mjs scripts/health-check.mjs",
     "health:route-check": "npm run build && node scripts/health-route-check.mjs",
-    "health:sim": "npm run build && JARVIS_DB_PATH=/tmp/health-sim.db JARVIS_SIM=1 npx tsx scripts/health-sim.ts"
+    "health:sim": "npm run build && JARVIS_DB_PATH=/tmp/health-sim.db JARVIS_SIM=1 npx tsx scripts/health-sim.ts",
+    "notepad:state-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-state-check.db node scripts/notepad-state-check.mjs",
+    "notepad:replay-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-replay-check.db node scripts/notepad-replay-check.mjs",
+    "notepad:settle-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-settle-check.db node scripts/notepad-settle-check.mjs",
+    "notepad:gate-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-gate-check.db node scripts/notepad-gate-check.mjs",
+    "notepad:review-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-review-check.db node scripts/notepad-review-check.mjs",
+    "notepad:pass-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-pass-check.db node scripts/notepad-pass-check.mjs",
+    "notepad:moves-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-moves-check.db node scripts/notepad-moves-check.mjs",
+    "notepad:moves-budget-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-moves-budget-check.db node scripts/notepad-moves-budget-check.mjs",
+    "notepad:ledger-key-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-ledger-key-check.db node scripts/notepad-ledger-key-check.mjs",
+    "notepad:markers-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-markers-check.db node scripts/notepad-markers-check.mjs",
+    "notepad:speak-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-speak-check.db node scripts/notepad-speak-check.mjs",
+    "notepad:marker-route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-marker-route-check.db node scripts/notepad-marker-route-check.mjs",
+    "notepad:dossier-sources-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-dossier-sources-check.db node scripts/notepad-dossier-sources-check.mjs",
+    "notepad:dry-run": "npm run build && node scripts/notepad-dry-run.mjs",
+    "notepad:dossier-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-dossier-check.db node scripts/notepad-dossier-check.mjs",
+    "notepad:handoff-route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-handoff-route-check.db node scripts/notepad-handoff-route-check.mjs",
+    "notepad:route-rule-check": "npm run build && node scripts/notepad-route-rule-check.mjs",
+    "notepad:blocks-check": "npm run build && node scripts/notepad-blocks-check.mjs",
+    "notepad:dispatch-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-dispatch-check.db node scripts/notepad-dispatch-check.mjs",
+    "notepad:route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-route-check.db node scripts/notepad-route-check.mjs",
+    "notepad:actions-route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-actions-route-check.db node scripts/notepad-actions-route-check.mjs",
+    "notepad:rollover-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-rollover-check.db node scripts/notepad-rollover-check.mjs",
+    "notepad:rollover-wire-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-rollover-wire-check.db node scripts/notepad-rollover-wire-check.mjs",
+    "notepad:rollover-replay-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-rollover-replay-check.db node scripts/notepad-rollover-replay-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
@@ -61,5 +85,8 @@
     "@types/pg": "^8.20.0",
     "tsx": "^4.7.0",
     "typescript": "^5.4.0"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.9.0": true
   }
 }

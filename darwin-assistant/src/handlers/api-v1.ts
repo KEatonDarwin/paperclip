@@ -58,7 +58,26 @@ import { listMcpServers, refreshMcpServers } from '../mcp-registry.js';
 import { resolveNativeServer, nativeListTools } from '../tools/mcp-native.js';
 import { listNotes, createNote } from '../notes-db.js';
 import { triageNote } from '../notes.js';
-import { getNotepadDay, putNotepadDay, listNotepadDays, isValidNotepadDate, todayNotepadDate } from '../notepad.js';
+import {
+  putNotepadDay,
+  listNotepadDays,
+  isValidNotepadDate,
+  todayNotepadDate,
+  getNotepadLine,
+  getNotepadLineDay,
+  getNotepadDay,
+  getNotepadLineState,
+  unscannedLines,
+  markLineSeen,
+  markLineActed,
+  markLineDismissed,
+  type NotepadLineState,
+} from '../notepad.js';
+import { openNotepadDay } from '../notepad-rollover.js';
+import { activeNotepadMarkers, dismissNotepadMarker, getNotepadMarker } from '../notepad-markers.js';
+import { openNotepadHandoff } from '../notepad-handoff.js';
+import { parseNotepadBlocks, notepadBlockId } from '../notepad-blocks.js';
+import { listNotepadActedActions } from '../notepad-action-resolver.js';
 import {
   listNotifications,
   unreadNotificationCount,
@@ -1738,6 +1757,22 @@ export function createApiV1Router(): Router {
 
   // == Notepad — one free-form note per day, line-identity-preserving =========
 
+  // Additive: markers ride the SAME GET /notepad payload the cockpit already
+  // polls -- no second fetch, no new SSE channel (goal #105 transport rule).
+  // Only ACTIVE markers are included (a dismissed one is simply absent), and
+  // the field is always an array, never null/omitted, so an empty/clean day
+  // still gets `markers: []`.
+  function notepadDayWithMarkers(day: string) {
+    const base = openNotepadDay(day);
+    const markers = activeNotepadMarkers(day).map((m) => ({
+      line_id: m.line_id,
+      kind: m.kind,
+      reason: m.reason,
+      action_ref: m.action_ref,
+    }));
+    return { ...base, markers };
+  }
+
   router.get('/notepad', (req: AuthedRequest, res) => {
     const dateParam = typeof req.query.date === 'string' ? req.query.date : undefined;
     const day = dateParam ?? todayNotepadDate();
@@ -1745,7 +1780,7 @@ export function createApiV1Router(): Router {
       sendError(res, 400, 'invalid_date', 'date must be YYYY-MM-DD');
       return;
     }
-    res.json(getNotepadDay(day));
+    res.json(notepadDayWithMarkers(day));
   });
 
   router.put('/notepad', (req: AuthedRequest, res) => {
@@ -1764,6 +1799,137 @@ export function createApiV1Router(): Router {
 
   router.get('/notepad/days', (_req: AuthedRequest, res) => {
     res.json(listNotepadDays());
+  });
+
+  // Dismiss the active marker on a line -- clears it for good (the
+  // day-independent text-hash memory in notepad-markers.ts is what makes it
+  // stick across days, not just this request). Returns the same shape
+  // GET /notepad returns for that line's day, so the caller can replace its
+  // state from one response.
+  router.post('/notepad/markers/:lineId/dismiss', (req: AuthedRequest, res) => {
+    const lineId = Number(req.params.lineId);
+    if (!Number.isInteger(lineId) || lineId <= 0) {
+      sendError(res, 400, 'invalid_line_id', 'lineId must be a positive integer');
+      return;
+    }
+    const marker = getNotepadMarker(lineId);
+    if (!marker) {
+      sendError(res, 404, 'marker_not_found', `no notepad marker on line '${lineId}'`);
+      return;
+    }
+    dismissNotepadMarker(lineId);
+    const day = getNotepadLineDay(lineId) ?? todayNotepadDate();
+    res.json(notepadDayWithMarkers(day));
+  });
+
+  /**
+   * The topic BLOCK `lineId` belongs to (node #943, docs/notepad/BLOCKS.md),
+   * shaped for openNotepadHandoff/buildTopicDossier — so clicking a marker
+   * opens a thread seeded with the WHOLE topic Kevin wrote, not the one line
+   * the marker happens to sit on. Returns null when the line's day or block
+   * can't be resolved, in which case the handoff falls back to its original
+   * per-line behaviour rather than failing.
+   */
+  function notepadBlockForLine(lineId: number) {
+    const day = getNotepadLineDay(lineId);
+    if (!day) return null;
+    const { lines } = getNotepadDay(day);
+    const block = parseNotepadBlocks(lines).find((b) => b.member_line_ids.includes(lineId));
+    if (!block) return null;
+    const textById = new Map(lines.map((l) => [l.id, l.text]));
+    return {
+      block_id: notepadBlockId(block),
+      headline_line_id: block.headline_line_id,
+      headline: block.headline,
+      lines: block.member_line_ids.map((id) => ({ line_id: id, text: textById.get(id) ?? '' })),
+    };
+  }
+
+  // Open (or re-open) the handoff thread for a marker — "clicking a marker
+  // opens a thread that is already working" (node #869), now seeded with the
+  // whole topic block that marker belongs to (node #943). Find-or-create,
+  // deterministic per line_id; on first open the thread is seeded with a
+  // dossier-composed prompt and the turn dispatches. A second call is a pure
+  // read: same thread_ext, created:false, no second seed message.
+  router.post('/notepad/markers/:lineId/open', (req: AuthedRequest, res) => {
+    const lineId = Number(req.params.lineId);
+    if (!Number.isInteger(lineId) || lineId <= 0) {
+      sendError(res, 400, 'invalid_line_id', 'lineId must be a positive integer');
+      return;
+    }
+    const marker = getNotepadMarker(lineId);
+    if (!marker) {
+      sendError(res, 404, 'marker_not_found', `no notepad marker on line '${lineId}'`);
+      return;
+    }
+    openNotepadHandoff(lineId, { block: notepadBlockForLine(lineId) })
+      .then((result) => {
+        res.status(result.created ? 201 : 200).json(result);
+      })
+      .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        sendError(res, 500, 'notepad_handoff_failed', message);
+      });
+  });
+
+  const NOTEPAD_LINE_STATES: NotepadLineState[] = ['seen', 'acted', 'dismissed'];
+
+  // Per-line state ledger (docs/notepad/LINE-IDENTITY.md). GET returns every
+  // line for `day` that a re-scan should look at right now (unseen, plus
+  // anything whose text changed since it was last seen/acted/dismissed).
+  router.get('/notepad/line-state', (req: AuthedRequest, res) => {
+    const dateParam = typeof req.query.date === 'string' ? req.query.date : undefined;
+    const day = dateParam ?? todayNotepadDate();
+    if (!isValidNotepadDate(day)) {
+      sendError(res, 400, 'invalid_date', 'date must be YYYY-MM-DD');
+      return;
+    }
+    res.json({ day, lines: unscannedLines(day) });
+  });
+
+  router.post('/notepad/line-state', (req: AuthedRequest, res) => {
+    const lineId = Number(req.body?.line_id);
+    if (!Number.isInteger(lineId) || lineId <= 0) {
+      sendError(res, 400, 'line_id_required', 'line_id (a positive integer) is required');
+      return;
+    }
+    const state = req.body?.state;
+    if (typeof state !== 'string' || !NOTEPAD_LINE_STATES.includes(state as NotepadLineState)) {
+      sendError(res, 400, 'invalid_state', `state must be one of: ${NOTEPAD_LINE_STATES.join(', ')}`);
+      return;
+    }
+    const line = getNotepadLine(lineId);
+    if (!line) {
+      sendError(res, 404, 'line_not_found', `no notepad line with id '${lineId}'`);
+      return;
+    }
+    if (state === 'acted') {
+      const actionRef = typeof req.body?.action_ref === 'string' ? req.body.action_ref.trim() : '';
+      if (!actionRef) {
+        sendError(res, 400, 'action_ref_required', 'action_ref is required when state is "acted"');
+        return;
+      }
+      markLineActed(lineId, actionRef);
+    } else if (state === 'dismissed') {
+      const note = typeof req.body?.note === 'string' ? req.body.note : undefined;
+      markLineDismissed(lineId, note);
+    } else {
+      markLineSeen(lineId);
+    }
+    res.json({ line_id: lineId, state: getNotepadLineState(lineId) });
+  });
+
+  // Read side of the routing chain (node #877): every ACTED line for `day`,
+  // resolved back to its live target. Same 400 shape as GET /notepad on a
+  // malformed date. Always a bare array — empty on a day with no acted
+  // lines, never null.
+  router.get('/notepad/:date/actions', (req: AuthedRequest, res) => {
+    const day = typeof req.params.date === 'string' ? req.params.date : '';
+    if (!isValidNotepadDate(day)) {
+      sendError(res, 400, 'invalid_date', 'date must be YYYY-MM-DD');
+      return;
+    }
+    res.json(listNotepadActedActions(day));
   });
 
   // == Quick-capture todo widget (DAR-737) =====================================

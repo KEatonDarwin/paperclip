@@ -4,6 +4,7 @@ import { createSlackApp, sendDailyBriefing } from './handlers/slack.js';
 import { createWebhookRouter } from './handlers/webhook.js';
 import { startCheckinWorker } from './checkin-worker.js';
 import { startThreadReminderWorker } from './thread-reminders.js';
+import { startRelayPoller } from './relay.js';
 import { enqueueCalendarCheckins } from './briefing.js';
 import { startUiServer } from './ui-server.js';
 import { reconcileInterruptedRuns, autoHideStaleThreads } from './conversation-db.js';
@@ -117,6 +118,10 @@ async function main() {
   // bumping a cockpit thread is local + SQLite-only and must not depend on
   // Slack creds the way the Postgres-backed check-in worker does.
   startThreadReminderWorker();
+
+  // Relay poller — zero-model-call mirror of the JARVIS<->Mike's-AI message
+  // board (see src/relay.ts). No-ops until relay_enabled=1 is set.
+  startRelayPoller();
 
   // Hopper Engine — the autonomous work-tree dispatcher. Event-driven (ticks
   // fire on node state writes); the 60s interval inside is only the safety net.

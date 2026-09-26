@@ -416,6 +416,13 @@ import {
   INTERNAL_MCP_KEY_SETTING,
   type ApiKeyRow,
 } from '../api-keys.js';
+import {
+  listRelayThreads,
+  getRelayThreadDetail,
+  postKevinMessage,
+  setGlobalPause,
+  setThreadPause,
+} from '../relay-rest.js';
 
 const MAX_TEXT_LENGTH = 50_000;
 const UI_PORT = parseInt(process.env.JARVIS_UI_PORT ?? '3201', 10);
@@ -2673,6 +2680,76 @@ export function createApiV1Router(): Router {
       const r = buildNightShiftReport(parseInt(String(req.params.id), 10));
       res.json({ markdown: r.markdown, path: r.path, written: r.written });
     } catch (err) { sendNightError(res, err); }
+  });
+
+  // -- AI-to-AI relay REST surface (tree-3b42c6e2, node #920) -----------------
+  // Reads jarvis.db's relay mirror only (relay.ts/relay-rest.ts); the one
+  // write path that reaches outside jarvis.db is the messages POST below,
+  // which posts live as `kevin` — see relay-rest.ts for the gating.
+
+  router.get('/relay/threads', (_req: AuthedRequest, res) => {
+    res.json({ threads: listRelayThreads() });
+  });
+
+  router.get('/relay/threads/:id', (req: AuthedRequest, res) => {
+    const detail = getRelayThreadDetail(paramString(req.params.id));
+    if (!detail) {
+      sendError(res, 404, 'relay_thread_not_found', 'relay thread not found');
+      return;
+    }
+    res.json(detail);
+  });
+
+  // The principal for this route is ALWAYS kevin, stamped server-side — never
+  // taken from the request. Any attempt to set it from the body is rejected
+  // outright (400) before any other validation runs.
+  const RELAY_IDENTITY_KEYS = ['author', 'from', 'principal', 'as'];
+
+  router.post('/relay/threads/:id/messages', async (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const spoofed = RELAY_IDENTITY_KEYS.filter((k) => Object.prototype.hasOwnProperty.call(body, k));
+    if (spoofed.length > 0) {
+      sendError(res, 400, 'identity_not_client_settable',
+        `principal is always kevin on this route and cannot be set from the request body (rejected: ${spoofed.join(', ')})`);
+      return;
+    }
+    const kind = typeof body.kind === 'string' ? body.kind : '';
+    const messageBody = typeof body.body === 'string' ? body.body : '';
+    if (!kind || !messageBody) {
+      sendError(res, 400, 'invalid_request', 'kind and body are required strings');
+      return;
+    }
+    const result = await postKevinMessage(paramString(req.params.id), {
+      kind,
+      subject: typeof body.subject === 'string' ? body.subject : null,
+      body: messageBody,
+      refs: Array.isArray(body.refs) ? body.refs : undefined,
+    });
+    if (!result.ok) {
+      sendError(res, result.status, result.code, result.message);
+      return;
+    }
+    res.status(201).json({ message: result.message, thread: result.thread });
+  });
+
+  router.post('/relay/pause', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (typeof body.paused !== 'boolean') {
+      sendError(res, 400, 'invalid_request', 'paused (boolean) is required');
+      return;
+    }
+    const reason = typeof body.reason === 'string' ? body.reason : null;
+    const threadId = typeof body.thread_id === 'string' ? body.thread_id : undefined;
+    if (threadId) {
+      const result = setThreadPause(threadId, body.paused, 'kevin', reason);
+      if (!result.ok) {
+        sendError(res, 404, 'relay_thread_not_found', 'relay thread not found');
+        return;
+      }
+      res.json({ paused: body.paused, thread: result.thread });
+      return;
+    }
+    res.json(setGlobalPause(body.paused, 'kevin', reason));
   });
 
   router.get('/goals', (req: AuthedRequest, res) => {

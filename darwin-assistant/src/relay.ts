@@ -60,7 +60,7 @@ export interface RelayMessageRow {
   is_draft: number;
 }
 
-interface RawRelayMessage {
+export interface RawRelayMessage {
   id?: string;
   thread_id?: string;
   from?: string;
@@ -71,7 +71,7 @@ interface RawRelayMessage {
   created_at?: string;
 }
 
-interface RawRelayThread {
+export interface RawRelayThread {
   id?: string;
   title?: string | null;
   opened_by?: string | null;
@@ -127,6 +127,13 @@ export function getRelayPollSeconds(): number {
 
 export function isRelayAutoReplyEnabled(): boolean {
   return getSetting(RELAY_AUTO_REPLY_KEY) === '1';
+}
+
+/** Flip the relay kill switch. Exported for the REST surface's `/relay/pause`
+ *  (node #920): a global pause IS relay_enabled=0 — same switch that already
+ *  gates the poller/cue/outbound (item 4), not a second flag. */
+export function setRelayEnabled(enabled: boolean): void {
+  setSetting(RELAY_ENABLED_KEY, enabled ? '1' : '0');
 }
 
 /** Observable kill-switch state for a future `/relay` surface (item 4): when
@@ -257,7 +264,11 @@ function emitRelayEvent(
   sseBus.emit('sse', { type: 'relay_message', action, thread_id: threadId, ...extra } satisfies RelayMessageEvent);
 }
 
-function upsertThread(raw: RawRelayThread): void {
+/** Exported for the REST surface (node #920): after `postKevinMessage` posts
+ *  live via relay-tool `reply`, it mirrors the call's own `{thread, message}`
+ *  response through these same two functions the poller uses — same insert
+ *  path, same dedupe, same SSE emit, no second round-trip poll needed. */
+export function upsertThread(raw: RawRelayThread): void {
   if (!raw.id) return;
   upsertThreadStmt.run(
     raw.id,
@@ -276,7 +287,7 @@ function upsertThread(raw: RawRelayThread): void {
 /** Insert one message idempotently. Returns the row iff this call actually
  *  inserted it (a re-run over an already-mirrored message returns null via
  *  the ON CONFLICT(message_id) DO NOTHING no-op). */
-function upsertMessage(threadId: string, raw: RawRelayMessage): RelayMessageRow | null {
+export function upsertMessage(threadId: string, raw: RawRelayMessage): RelayMessageRow | null {
   if (!raw.id || !raw.body) return null;
   const info = insertMessageStmt.run(
     raw.id,

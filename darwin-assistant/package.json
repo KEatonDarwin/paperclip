@@ -19,6 +19,7 @@
     "claude-account-pin:test": "npm run build && JARVIS_DB_PATH=/tmp/claude-account-pin-test.db node scripts/claude-account-pin-test.mjs",
     "claude-account-pin:sim": "npm run build && JARVIS_DB_PATH=/tmp/claude-account-pin-sim.db node scripts/claude-account-pin-sim.mjs",
     "claude-accounts-route:test": "JARVIS_DB_PATH=/tmp/claude-accounts-route-test.db node scripts/claude-accounts-route-test.mjs",
+    "relay-rest-route:test": "JARVIS_DB_PATH=/tmp/relay-rest-route-test.db node scripts/relay-rest-route-test.mjs",
     "multi-claude:e2e-sim": "JARVIS_DB_PATH=/tmp/multi-claude-e2e-sim.db node scripts/multi-claude-e2e-sim.mjs",
     "claude-session-account:test": "JARVIS_DB_PATH=/tmp/claude-session-account-test.db node scripts/claude-session-account-test.mjs",
     "sse-event-types:check": "npm run build && JARVIS_DB_PATH=/tmp/sse-event-types-check.db node scripts/sse-event-types-check.mjs",

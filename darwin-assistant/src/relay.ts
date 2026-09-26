@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { sqliteDb, getSetting, setSetting } from './conversation-db.js';
 import { nativeCall } from './tools/mcp-native.js';
+import { sseBus, type RelayMessageEvent } from './sse-bus.js';
 
 /**
  * RELAY-CLIENT-ASSUMPTIONS — docs/relay/CONTRACT.md (DarwinIntakeSystem side)
@@ -104,8 +105,9 @@ const MIN_POLL_SECONDS = 5;
 const MAX_POLL_SECONDS = 3600;
 
 /** Seed a setting to its default iff it has never been set, without clobbering
- *  a value someone (Kevin, the cockpit) already wrote. */
-function ensureSettingDefault(key: string, defaultValue: string): void {
+ *  a value someone (Kevin, the cockpit) already wrote. Exported so relay-cue.ts
+ *  (the caps/dedupe/kill-switch layer) seeds its own settings the same way. */
+export function ensureSettingDefault(key: string, defaultValue: string): void {
   if (getSetting(key) === null) setSetting(key, defaultValue);
 }
 
@@ -125,6 +127,26 @@ export function getRelayPollSeconds(): number {
 
 export function isRelayAutoReplyEnabled(): boolean {
   return getSetting(RELAY_AUTO_REPLY_KEY) === '1';
+}
+
+/** Observable kill-switch state for a future `/relay` surface (item 4): when
+ *  relay_enabled is off this is the one place to read WHY polling/cues/outbound
+ *  are all dark, instead of inferring it from silence. */
+export interface RelayStatus {
+  enabled: boolean;
+  pollSeconds: number;
+  autoReply: boolean;
+  reason: string;
+}
+
+export function getRelayStatus(): RelayStatus {
+  const enabled = isRelayEnabled();
+  return {
+    enabled,
+    pollSeconds: getRelayPollSeconds(),
+    autoReply: isRelayAutoReplyEnabled(),
+    reason: enabled ? 'relay_enabled=1' : 'relay_enabled=0 (kill switch) — no polling, no cues, no outbound',
+  };
 }
 
 // -- schema (inline create-if-not-exists, same pattern as intel-desk.ts / notepad.ts) --
@@ -179,7 +201,11 @@ const upsertThreadStmt = sqliteDb.prepare<[
   ON CONFLICT(id) DO UPDATE SET
     title = excluded.title,
     opened_by = excluded.opened_by,
-    status = excluded.status,
+    -- A local cap-breach pause (relay-cue.ts) is JARVIS-side rate limiting the
+    -- remote server has no concept of. Without this guard, the very next poll
+    -- re-mirrors the server's own status and silently un-pauses the thread,
+    -- defeating the cap the moment it fires.
+    status = CASE WHEN relay_threads.status = 'paused' THEN 'paused' ELSE excluded.status END,
     exchange_count = excluded.exchange_count,
     read_by = excluded.read_by,
     updated_at = excluded.updated_at,
@@ -200,6 +226,10 @@ const getMessageStmt = sqliteDb.prepare<[number], RelayMessageRow>(
   `SELECT * FROM relay_messages WHERE id = ?`,
 );
 
+const getThreadStmt = sqliteDb.prepare<[string], RelayThreadRow>(
+  `SELECT * FROM relay_threads WHERE id = ?`,
+);
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -216,6 +246,17 @@ function safeJsonParse<T>(raw: string): T | null {
   }
 }
 
+/** Fired on the shared bus (payload carries its own `type`, per sse-bus.ts
+ *  convention) whenever a thread or message is mirrored, so a future `/relay`
+ *  page can render live instead of polling (item 6). */
+function emitRelayEvent(
+  action: RelayMessageEvent['action'],
+  threadId: string,
+  extra: { thread?: RelayThreadRow; message?: RelayMessageRow },
+): void {
+  sseBus.emit('sse', { type: 'relay_message', action, thread_id: threadId, ...extra } satisfies RelayMessageEvent);
+}
+
 function upsertThread(raw: RawRelayThread): void {
   if (!raw.id) return;
   upsertThreadStmt.run(
@@ -228,6 +269,8 @@ function upsertThread(raw: RawRelayThread): void {
     raw.created_at ?? nowIso(),
     raw.updated_at ?? null,
   );
+  const thread = getThreadStmt.get(raw.id) ?? undefined;
+  emitRelayEvent('thread_mirrored', raw.id, { thread });
 }
 
 /** Insert one message idempotently. Returns the row iff this call actually
@@ -247,16 +290,55 @@ function upsertMessage(threadId: string, raw: RawRelayMessage): RelayMessageRow 
     raw.created_at ?? nowIso(),
   );
   if (info.changes === 0) return null;
-  return getMessageStmt.get(Number(info.lastInsertRowid)) ?? null;
+  const message = getMessageStmt.get(Number(info.lastInsertRowid)) ?? null;
+  if (message) emitRelayEvent('message_mirrored', threadId, { message });
+  return message;
+}
+
+// -- draft-only outbound (item 5) -------------------------------------------
+// While relay_auto_reply=0 (the DEFAULT), any reply JARVIS composes is stored
+// here as a local draft (is_draft=1, message_id=NULL — the nullable UNIQUE
+// index on message_id was reserved for exactly this by the previous node) and
+// is NEVER sent to the relay. There is no code path anywhere in this file that
+// calls relay-tool to post a message. Whether an approval surface is ever
+// built to let a draft become a real outbound post — and whether the
+// relay_auto_reply default itself is ever flipped to 1 — is Kevin's call, not
+// this code's; isRelayOutboundAllowed() below exists so that future surface
+// has one place to check both gates, but nothing in this codebase calls it yet.
+const insertDraftStmt = sqliteDb.prepare<[string, string, string | null, string, string]>(`
+  INSERT INTO relay_messages (
+    message_id, thread_id, author, kind, subject, body, refs, content_hash, created_at, mirrored_at, cue_fired_at, is_draft
+  )
+  VALUES (NULL, ?, 'jarvis', ?, ?, ?, NULL, ?, datetime('now'), NULL, NULL, 1)
+`);
+
+/** Store a JARVIS-composed reply as a draft. Never posts it anywhere. */
+export function composeDraftReply(
+  threadId: string,
+  body: string,
+  kind: RelayMessageKind = 'answer',
+  subject: string | null = null,
+): RelayMessageRow {
+  const info = insertDraftStmt.run(threadId, kind, subject, body, contentHash(body));
+  const row = getMessageStmt.get(Number(info.lastInsertRowid));
+  if (!row) throw new Error('composeDraftReply: insert did not produce a row');
+  emitRelayEvent('message_mirrored', threadId, { message: row });
+  return row;
+}
+
+/** True only when BOTH the kill switch is on and Kevin has explicitly flipped
+ *  auto-reply on. Nothing in this codebase currently acts on this — it is the
+ *  single check a future approval/auto-post path must gate on. */
+export function isRelayOutboundAllowed(): boolean {
+  return isRelayEnabled() && isRelayAutoReplyEnabled();
 }
 
 // -- cue seam --------------------------------------------------------------
 // Cue firing (turning a new inbound message into a governed JARVIS turn),
-// exchange/rate caps, and content-hash dedupe are a LATER node's job (DESIGN
-// §4 items 3-4). This poller only mirrors and hands off. Register a listener
-// here to wire that up later — same shape as hopper-engine's
-// registerTreeStatusListener. Listener errors are caught so one bad handler
-// can never break the poll loop.
+// exchange/rate caps, and content-hash dedupe live in src/relay-cue.ts, which
+// registers itself below via registerRelayInboundListener — same shape as
+// hopper-engine's registerTreeStatusListener. Listener errors are caught so
+// one bad handler can never break the poll loop.
 
 type RelayInboundListener = (message: RelayMessageRow) => void;
 

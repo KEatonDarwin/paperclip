@@ -20,6 +20,7 @@ import type { IntelItem, IntelRun } from './intel-desk.js';
 import type { GoalSummary, GoalNodeRow, FocusRow } from './goals.js';
 import type { GoalGuardRow } from './goals-guards.js';
 import type { NightRunRow, NightItemRow } from './night-shift.js';
+import type { RelayThreadRow, RelayMessageRow } from './relay.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -349,6 +350,19 @@ export interface NightItemEvent {
   item: NightItemRow;
 }
 
+// AI-TO-AI RELAY (tree-3b42c6e2) — global like HopperItemEvent (no
+// conversationId). Fired whenever a relay thread or message is mirrored/
+// updated locally so a future `/relay` page can render live instead of
+// polling. `thread_id` is always present so a client can key off it even
+// when only one of thread/message is attached.
+export interface RelayMessageEvent {
+  type: 'relay_message';
+  action: 'thread_mirrored' | 'message_mirrored' | 'message_updated';
+  thread_id: string;
+  thread?: RelayThreadRow;
+  message?: RelayMessageRow;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
@@ -362,7 +376,7 @@ export type SSEEvent =
   | WorkstreamEvent | MonitorEvent | MonitorRunEvent | FoundryProjectEvent | FoundryModuleEvent
   | IntelRunEvent | IntelItemEvent | WorkbenchProposalEvent
   | GoalEvent | GoalNodeEvent | GoalFocusEvent | GoalGuardEvent
-  | NightRunEvent | NightItemEvent;
+  | NightRunEvent | NightItemEvent | RelayMessageEvent;
 
 // ---------------------------------------------------------------------------
 // THE GLOBAL-STREAM EVENT CONTRACT — one list, server-owned.
@@ -400,6 +414,7 @@ export const GLOBAL_STREAM_EVENT_TYPES = [
   'intel_run', 'intel_item',
   'goal', 'goal_node', 'goal_focus', 'goal_guard',
   'night_run', 'night_item',   // Night Shift (node #679/#680): board + /night live updates
+  'relay_message',   // AI-to-AI relay (tree-3b42c6e2, node #919): /relay live updates
 ] as const satisfies readonly SSEEvent['type'][];
 
 export type GlobalStreamEventType = (typeof GLOBAL_STREAM_EVENT_TYPES)[number];

@@ -5,6 +5,10 @@ import { createWebhookRouter } from './handlers/webhook.js';
 import { startCheckinWorker } from './checkin-worker.js';
 import { startThreadReminderWorker } from './thread-reminders.js';
 import { startRelayPoller } from './relay.js';
+// Side-effect import: registers the relay inbound listener that cues JARVIS in
+// cockpit:relay-mike on a new inbound message from mike, with dedupe/caps/
+// kill-switch gating (see src/relay-cue.ts).
+import './relay-cue.js';
 import { enqueueCalendarCheckins } from './briefing.js';
 import { startUiServer } from './ui-server.js';
 import { reconcileInterruptedRuns, autoHideStaleThreads } from './conversation-db.js';

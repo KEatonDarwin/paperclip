@@ -1,9 +1,16 @@
 #!/usr/bin/env node
 // NOTEPAD MOVES CHECK — exercises decideNotepadMoves (src/notepad-moves.ts),
 // the speaking bar (goal 6 node #103 / #62 "JARVIS speaks only when it has
-// something worth saying"). No HTTP. Every case drives the injection seam
-// (opts.runOneShot), so this file spawns ZERO real claude processes —
-// proven, not assumed, by the before/after pgrep snapshot at the end.
+// something worth saying"), now judging Kevin's topic BLOCKS rather than
+// isolated lines (node #943, docs/notepad/BLOCKS.md). No HTTP. Every case
+// drives the injection seam (opts.runOneShot), so this file spawns ZERO real
+// claude processes — proven, not assumed, by the before/after pgrep snapshot
+// at the end.
+//
+// Every fixture below whose lines are all zero-indent produces one
+// single-line block per line, so block_id == line_id there — which is what
+// lets the original per-line cases carry over unchanged in meaning. Case (M)
+// is the real block fixture: a headline with irregularly-indented children.
 //
 // Covers:
 //   (A) zero candidates -> outcome 'no_candidates', no model call at all:
@@ -11,14 +18,14 @@
 //       'seen' with an UNCHANGED hash (never surfaces at all).
 //   (B) a well-formed response covering some-but-not-all candidates: the
 //       named ones get their moves, the OMITTED one gets no entry at all
-//       (silence by omission, not a "none" kind) — and a line that never
+//       (silence by omission, not a "none" kind) — and a block that never
 //       even surfaced (already seen, unchanged) never reaches the model:
 //       proven by asserting on the CAPTURED PROMPT's judge-list.
-//   (C) at most one move per line: a response listing the SAME line_id
+//   (C) at most one move per block: a response listing the SAME block_id
 //       twice with different kinds keeps only the first, drops the second.
 //   (D) an unrecognized `kind` string is dropped (not coerced, not trusted).
 //   (E) a blank/missing `reason` is dropped.
-//   (F) a move for a line_id that was never a candidate (phantom) is
+//   (F) a move for a block_id that was never a candidate (phantom) is
 //       dropped and never appears in the output.
 //   (G) a non-JSON garbage response: outcome 'model' (the call itself
 //       succeeded), moves comes back EMPTY — garbage degrades to silence,
@@ -32,6 +39,11 @@
 //   (K) opts.review is honoured as an injection seam: a stale, pre-built
 //       review context is used as-is rather than the function silently
 //       re-querying the DB for a fresher one.
+//   (M) THE BLOCK CASE (node #943): a real headline+indented-children topic
+//       is ONE candidate, keyed on its headline line; a move on it carries
+//       every member line id; a child line is never a candidate of its own;
+//       and a candidate is offered whenever ANY member surfaces, even when
+//       the surfaced member is a junk child.
 //   (L) ZERO CLAUDE PROCESSES spawned across the whole run.
 //
 //   npm run build && JARVIS_DB_PATH=/tmp/notepad-moves-check.db node scripts/notepad-moves-check.mjs
@@ -141,12 +153,13 @@ let idTakeIt, idSilent, idNeverSurfaced;
 
   const review = buildNotepadReviewContext(DAY);
   check('(B) exactly 2 surfaced lines (the never-surfaced one is excluded)', review.lines.filter((l) => l.surfaced).length === 2);
+  check('(B) each zero-indent line is its own single-line block', review.blocks.length === 3 && review.blocks.every((b) => b.member_line_ids.length === 1));
 
   let capturedPrompt = null;
   const stub = countedStub(async (prompt) => {
     capturedPrompt = prompt;
     return JSON.stringify({
-      moves: [{ line_id: idTakeIt, kind: 'take_it', reason: 'Reply to the vendor about the invoice' }],
+      moves: [{ block_id: idTakeIt, kind: 'take_it', reason: 'Reply to the vendor about the invoice' }],
       // idSilent is deliberately OMITTED — that omission IS the "no move" answer.
     });
   });
@@ -158,17 +171,17 @@ let idTakeIt, idSilent, idNeverSurfaced;
   const move = result.moves[0];
   check(
     '(B) the named line gets kind take_it with a real reason',
-    move?.line_id === idTakeIt && move?.kind === 'take_it' && typeof move?.reason === 'string' && move.reason.length > 0,
+    move?.block_id === idTakeIt && move?.kind === 'take_it' && typeof move?.reason === 'string' && move.reason.length > 0,
   );
-  check('(B) the omitted candidate produces no entry at all (silence, not a "none" kind)', !result.moves.some((m) => m.line_id === idSilent));
+  check('(B) the omitted candidate produces no entry at all (silence, not a "none" kind)', !result.moves.some((m) => m.block_id === idSilent));
   check('(B) captured prompt is non-empty (the stub was invoked)', typeof capturedPrompt === 'string' && capturedPrompt.length > 0);
   check(
-    '(B) captured prompt lists BOTH surfaced candidates in the judge list',
-    capturedPrompt.includes(`- line_id ${idTakeIt}`) && capturedPrompt.includes(`- line_id ${idSilent}`),
+    '(B) captured prompt lists BOTH surfaced candidate blocks in the judge list',
+    capturedPrompt.includes(`- block ${idTakeIt}:`) && capturedPrompt.includes(`- block ${idSilent}:`),
   );
   check(
-    '(B) captured prompt does NOT list the never-surfaced line in the judge list',
-    !capturedPrompt.includes(`- line_id ${idNeverSurfaced}`),
+    '(B) captured prompt does NOT list the never-surfaced block in the judge list',
+    !capturedPrompt.includes(`- block ${idNeverSurfaced}:`),
   );
   check('(B) captured prompt carries the whole rendered note (all three lines) for context', capturedPrompt.includes(review.rendered));
 }
@@ -184,8 +197,8 @@ let idTakeIt, idSilent, idNeverSurfaced;
   const stub = countedStub(async () =>
     JSON.stringify({
       moves: [
-        { line_id: id, kind: 'take_it', reason: 'First verdict — reply to Sarah' },
-        { line_id: id, kind: 'question', reason: 'Second, conflicting verdict — should be dropped' },
+        { block_id: id, kind: 'take_it', reason: 'First verdict — reply to Sarah' },
+        { block_id: id, kind: 'question', reason: 'Second, conflicting verdict — should be dropped' },
       ],
     }),
   );
@@ -202,7 +215,7 @@ let idTakeIt, idSilent, idNeverSurfaced;
   putNotepadDay(DAY, text);
   const id = lineIdFor(DAY, text);
 
-  const stub = countedStub(async () => JSON.stringify({ moves: [{ line_id: id, kind: 'urgent_flag', reason: 'not a real kind' }] }));
+  const stub = countedStub(async () => JSON.stringify({ moves: [{ block_id: id, kind: 'urgent_flag', reason: 'not a real kind' }] }));
   const result = await decideNotepadMoves(DAY, { runOneShot: stub });
   check('(D) an unrecognized kind produces zero moves', result.moves.length === 0);
   check('(D) outcome is still model (the call succeeded, the entry was just invalid)', result.outcome === 'model');
@@ -220,14 +233,14 @@ let idTakeIt, idSilent, idNeverSurfaced;
   const stub = countedStub(async () =>
     JSON.stringify({
       moves: [
-        { line_id: idBlank, kind: 'take_it', reason: '   ' },
-        { line_id: idMissing, kind: 'take_it' }, // reason entirely absent
+        { block_id: idBlank, kind: 'take_it', reason: '   ' },
+        { block_id: idMissing, kind: 'take_it' }, // reason entirely absent
       ],
     }),
   );
   const result = await decideNotepadMoves(DAY, { runOneShot: stub });
-  check('(E) a whitespace-only reason is dropped', !result.moves.some((m) => m.line_id === idBlank));
-  check('(E) a missing reason is dropped', !result.moves.some((m) => m.line_id === idMissing));
+  check('(E) a whitespace-only reason is dropped', !result.moves.some((m) => m.block_id === idBlank));
+  check('(E) a missing reason is dropped', !result.moves.some((m) => m.block_id === idMissing));
   check('(E) zero moves survive', result.moves.length === 0);
 }
 
@@ -243,15 +256,15 @@ let idTakeIt, idSilent, idNeverSurfaced;
   const stub = countedStub(async () =>
     JSON.stringify({
       moves: [
-        { line_id: realId, kind: 'take_it', reason: 'Arrange overnight shipping' },
-        { line_id: phantomId, kind: 'take_it', reason: 'Should never appear' },
+        { block_id: realId, kind: 'take_it', reason: 'Arrange overnight shipping' },
+        { block_id: phantomId, kind: 'take_it', reason: 'Should never appear' },
       ],
     }),
   );
   const result = await decideNotepadMoves(DAY, { runOneShot: stub });
-  check('(F) the real candidate keeps its move', result.moves.some((m) => m.line_id === realId));
+  check('(F) the real candidate keeps its move', result.moves.some((m) => m.block_id === realId));
   check('(F) exactly one move came back (the phantom was not added as a second one)', result.moves.length === 1);
-  check('(F) the phantom line_id never appears anywhere in the output', !result.moves.some((m) => m.line_id === phantomId));
+  check('(F) the phantom block_id never appears anywhere in the output', !result.moves.some((m) => m.block_id === phantomId));
 }
 
 // == (G) a non-JSON garbage response: outcome 'model' (the call succeeded),
@@ -343,10 +356,99 @@ let idTakeIt, idSilent, idNeverSurfaced;
   const freshReview = buildNotepadReviewContext(DAY);
   check('(K) precondition: a FRESH rebuild now reports 0 surfaced candidates', freshReview.lines.filter((l) => l.surfaced).length === 0);
 
-  const stub = countedStub(async () => JSON.stringify({ moves: [{ line_id: id, kind: 'take_it', reason: 'Send the renewal terms' }] }));
+  const stub = countedStub(async () => JSON.stringify({ moves: [{ block_id: id, kind: 'take_it', reason: 'Send the renewal terms' }] }));
   const result = await decideNotepadMoves(DAY, { review: staleReview, runOneShot: stub });
   check('(K) decideNotepadMoves used the INJECTED stale review, not a fresh rebuild', result.candidate_count === 1 && result.outcome === 'model');
-  check('(K) the stale candidate still gets judged and its move returned', result.moves.some((m) => m.line_id === id));
+  check('(K) the stale candidate still gets judged and its move returned', result.moves.some((m) => m.block_id === id));
+}
+
+// == (M) THE BLOCK CASE (node #943) — a real headline + irregularly-indented
+// children topic, the way Kevin actually writes. ONE candidate for the whole
+// topic, keyed on the headline line; a move on it carries every member id; a
+// child is never a candidate of its own; and a block still enters play when
+// only a JUNK child surfaced, because a line is never judged alone. =========
+{
+  const DAY = '2026-10-06';
+  const HEADLINE = 'Universal KPI Goal';
+  const CHILD_A = '  - needs a row cap on the prod SELECTs before we schedule it';
+  const CHILD_B = '     - Ian flagged the 3am run last week';
+  const CHILD_JUNK = '  - ok'; // too short to pass the gate prefilter on its own
+  const OTHER = 'Dry cleaning';
+  putNotepadDay(DAY, [HEADLINE, CHILD_A, CHILD_B, '', CHILD_JUNK, OTHER].join('\n'));
+
+  const review = buildNotepadReviewContext(DAY);
+  const idOf = (text) => review.lines.find((l) => l.text === text).line_id;
+  const headlineId = idOf(HEADLINE);
+  const otherId = idOf(OTHER);
+  const childIds = [idOf(CHILD_A), idOf(CHILD_B), idOf(CHILD_JUNK)];
+
+  check('(M) the review groups the day into exactly 2 blocks', review.blocks.length === 2);
+
+  let capturedPrompt = null;
+  const stub = countedStub(async (prompt) => {
+    capturedPrompt = prompt;
+    return JSON.stringify({
+      moves: [{ block_id: headlineId, kind: 'take_it', reason: 'JARVIS can add the row cap before this gets scheduled' }],
+    });
+  });
+  const result = await decideNotepadMoves(DAY, { runOneShot: stub });
+
+  check('(M) candidate_count counts BLOCKS, not lines (2, not 6)', result.candidate_count === 2, { got: result.candidate_count });
+  check('(M) the topic is offered as ONE candidate, keyed on its headline line', capturedPrompt.includes(`- block ${headlineId}: ${HEADLINE}`));
+  check('(M) the candidate carries every member line verbatim, with its id', childIds.every((id) => capturedPrompt.includes(`[line_id ${id}]`)));
+  check('(M) the raw indentation Kevin typed is preserved in the candidate', capturedPrompt.includes(`[line_id ${childIds[1]}] ${CHILD_B}`));
+  check('(M) no child line is ever offered as a candidate block of its own', childIds.every((id) => !capturedPrompt.includes(`- block ${id}:`)));
+  check('(M) the second zero-indent line is its own separate candidate block', capturedPrompt.includes(`- block ${otherId}: ${OTHER}`));
+
+  check('(M) exactly one move came back, for the block', result.moves.length === 1 && result.moves[0].block_id === headlineId);
+  check('(M) the move names the headline line as the block id', result.moves[0].headline_line_id === headlineId);
+  check(
+    '(M) the move carries EVERY member line id (headline, 3 children, the interior blank) and nothing outside the block',
+    result.moves[0].member_line_ids.length === 5 &&
+      result.moves[0].member_line_ids.includes(headlineId) &&
+      childIds.every((id) => result.moves[0].member_line_ids.includes(id)) &&
+      !result.moves[0].member_line_ids.includes(otherId),
+  );
+
+  // A model answering with a CHILD's line id must be dropped: a child is not
+  // a block, so it was never a candidate — the same phantom-id rule as (F).
+  const childStub = countedStub(async () =>
+    JSON.stringify({ moves: [{ block_id: childIds[0], kind: 'take_it', reason: 'a child line is not a block' }] }),
+  );
+  const childResult = await decideNotepadMoves(DAY, { runOneShot: childStub });
+  check('(M) a move keyed on a CHILD line id is dropped — only a block_id is a candidate', childResult.moves.length === 0);
+}
+
+// == (M2) a block whose ONLY surfaced member is a junk child still enters
+// play as a whole topic — "never look at the line on its own" cuts both ways:
+// a child cannot be judged alone, and it cannot be dismissed alone either. ==
+{
+  const DAY = '2026-10-07';
+  const HEADLINE = 'Suppression files';
+  const CHILD = '  - Mike said the per-brand MD5 build is done';
+  putNotepadDay(DAY, [HEADLINE, CHILD].join('\n'));
+
+  const before = buildNotepadReviewContext(DAY);
+  const headlineId = before.lines.find((l) => l.text === HEADLINE).line_id;
+  const childId = before.lines.find((l) => l.text === CHILD).line_id;
+
+  // The headline alone is marked seen (unchanged) -> it stops surfacing; only
+  // the child still surfaces.
+  markLineSeen(headlineId);
+  const review = buildNotepadReviewContext(DAY);
+  check('(M2) precondition: only the CHILD line still surfaces', review.lines.filter((l) => l.surfaced).map((l) => l.line_id).join() === String(childId));
+
+  let capturedPrompt = null;
+  const stub = countedStub(async (prompt) => {
+    capturedPrompt = prompt;
+    return '{"moves":[]}';
+  });
+  const result = await decideNotepadMoves(DAY, { review, runOneShot: stub });
+
+  check('(M2) the block is still a candidate, on the strength of its one surfaced child', result.candidate_count === 1);
+  check('(M2) the candidate is keyed on the HEADLINE, not the surfaced child', capturedPrompt.includes(`- block ${headlineId}: ${HEADLINE}`) && !capturedPrompt.includes(`- block ${childId}:`));
+  check('(M2) the already-seen headline is still shown inside the candidate block', capturedPrompt.includes(`[line_id ${headlineId}] ${HEADLINE}`));
+  check('(M2) an empty answer is still silence, not an error', result.outcome === 'model' && result.moves.length === 0);
 }
 
 // == (L) zero claude processes spawned across the entire run =================

@@ -19,6 +19,13 @@
 // Every fixture is asserted TWICE (same input, same output) to prove
 // determinism, not just correctness.
 //
+// Node #943 adds the BLOCK form (routeNotepadBlock): the same table, the same
+// detectors, run over a whole topic — a zero-indent headline plus everything
+// indented under it (docs/notepad/BLOCKS.md). The 14 per-line fixtures below
+// are kept EXACTLY as they were, because the line form is unchanged and must
+// stay so: they are the proof that node #943 loosened nothing. The B-series
+// fixtures underneath them are the block form.
+//
 //   npm run build && node scripts/notepad-route-rule-check.mjs
 
 import path from 'node:path';
@@ -26,7 +33,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.join(__dirname, '..', 'dist');
-const { routeNotepadLine } = await import(path.join(distDir, 'notepad-route-rule.js'));
+const { routeNotepadLine, routeNotepadBlock } = await import(path.join(distDir, 'notepad-route-rule.js'));
 
 let pass = 0;
 let fail = 0;
@@ -155,6 +162,187 @@ function check(name, input, expectedSink) {
   } else {
     fail++;
     console.log(`FAIL  confidence: ambiguous fixture 9a expected medium, got ${decision.confidence}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE BLOCK FORM (node #943) — routeNotepadBlock over Kevin's real
+// headline + irregularly-indented-dash topics.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Build a RouteBlockInput from a headline (or null) and its raw child lines,
+ *  numbering ids from `startId`, exactly as parseNotepadBlocks would. */
+function block(startId, headline, children) {
+  const lines = [];
+  let id = startId;
+  let idx = 0;
+  if (headline !== null) lines.push({ line_id: id++, idx: idx++, text: headline });
+  for (const text of children) lines.push({ line_id: id++, idx: idx++, text });
+  return {
+    block_id: headline !== null ? startId : lines[0].line_id,
+    headline_line_id: headline !== null ? startId : null,
+    headline,
+    lines,
+  };
+}
+
+function checkBlock(name, input, expectedSink, expectedConfidence) {
+  const first = routeNotepadBlock(input);
+  const second = routeNotepadBlock(input); // determinism: same input, same output
+  const ok =
+    first.sink === expectedSink &&
+    second.sink === expectedSink &&
+    first.why === second.why &&
+    first.confidence === second.confidence &&
+    (expectedConfidence === undefined || first.confidence === expectedConfidence);
+  if (ok) {
+    pass++;
+    console.log(`PASS  ${name} -> ${first.sink} (${first.confidence}) — ${first.why}`);
+  } else {
+    fail++;
+    console.log(
+      `FAIL  ${name}: expected ${expectedSink}${expectedConfidence ? `/${expectedConfidence}` : ''}, got ${first.sink}/${first.confidence} (why: ${first.why})`,
+    );
+  }
+}
+
+// ── B1: the `Potential Goals:` block — the heading IS the headline. No
+// backward walk, no section-boundary guessing: the block IS the section. ────
+checkBlock(
+  'B1. a "Potential Goals:" headline block routes the WHOLE topic to goal_proposal',
+  {
+    block: block(100, 'Potential Goals:', [
+      '  - A universal KPI tracker across every brand',
+      '     - one base class, one append-only value store',
+      '',
+      ' - a shared retro board for the team',
+    ]),
+    move: { kind: 'take_it' },
+  },
+  'goal_proposal',
+  'high',
+);
+
+// ── B2: an explicit `goal:` cue on a CHILD line, not the headline ──────────
+checkBlock(
+  'B2. an explicit goal: cue on an indented child still routes the block to goal_proposal',
+  {
+    block: block(200, 'Ideas from the drive home', ['  - goal: build a universal KPI tracker', '  - also need to call the bank']),
+    move: { kind: 'take_it' },
+  },
+  'goal_proposal',
+  'high',
+);
+
+// ── B3: a build-shaped CHILD — the case the per-line form kept missing,
+// because "Fix the composer auto-grow bug in notepad.ts" only makes sense
+// under its headline. ─────────────────────────────────────────────────────
+checkBlock(
+  'B3. an imperative build child routes the block to hopper',
+  {
+    block: block(300, 'Smart notepad', ['\t- Fix the composer auto-grow bug in notepad.ts', '  - it jumps when you paste']),
+    move: { kind: 'take_it' },
+  },
+  'hopper',
+  'high',
+);
+
+// ── B4: a ball-in-the-air CHILD ────────────────────────────────────────────
+checkBlock(
+  'B4. a waiting-on child routes the block to workstream',
+  {
+    block: block(400, 'Suppression files', ['  - Waiting on Mike to approve the FC gate', '  - six sources still not suppressing']),
+    move: { kind: 'take_it' },
+  },
+  'workstream',
+  'high',
+);
+
+// ── B5: an annotation ANYWHERE in the block closes the whole topic out.
+// Deliberately the cautious direction — a topic with a child already handled
+// is exactly the thing that must not be re-fanned into a duplicate sink row.
+checkBlock(
+  'B5. a "(Created a goal)" annotation on one child sends the WHOLE block to thread',
+  {
+    block: block(500, 'Potential Goals:', [
+      '  - A universal KPI tracker across every brand (Created a goal)',
+      '  - a shared retro board for the team',
+    ]),
+    move: { kind: 'take_it' },
+  },
+  'thread',
+);
+
+// ── B6: the three non-take_it kinds are conversation for a block too ───────
+for (const kind of ['question', 'already_done', 'context']) {
+  checkBlock(
+    `B6. a ${kind}-kind block is always thread`,
+    { block: block(600, 'Pricing', ['  - should we raise the sequenced offer for Q4?']), move: { kind } },
+    'thread',
+  );
+}
+
+// ── B7: nothing rule-shaped anywhere in the block -> the safe default ──────
+checkBlock(
+  'B7. a block no rule matches falls to thread with low confidence',
+  {
+    block: block(700, 'Groceries', ['  - milk, eggs, bread', '  - dog food']),
+    move: { kind: 'take_it' },
+  },
+  'thread',
+  'low',
+);
+
+// ── B8: a headline:null lead-in block (the day opened mid-thought) ─────────
+checkBlock(
+  'B8. a headline:null lead-in block still routes on its children',
+  {
+    block: block(800, null, ['  - Ship the /api/notepad/route endpoint to sandbox-intake']),
+    move: { kind: 'take_it' },
+  },
+  'hopper',
+  'high',
+);
+
+// ── B9: NOTHING WAS LOOSENED. buildShapeReason still demands the imperative
+// verb and the concrete artifact on the SAME line. A block with the verb on
+// one child and an artifact noun on another must NOT become a hopper card —
+// if the detectors had been relaxed into "match anywhere in the glued-up
+// block text", this fixture would route to hopper. ────────────────────────
+checkBlock(
+  'B9. a verb on one child and an artifact on ANOTHER does not fabricate a build cue',
+  {
+    block: block(900, 'Random thoughts', ['  - build something nice for mom', '  - the dashboard looked off today']),
+    move: { kind: 'take_it' },
+  },
+  'thread',
+  'low',
+);
+
+// ── B10: an ambiguous block (build child AND a goals headline) resolves by
+// the SAME priority order the per-line table uses — goal before build. ─────
+checkBlock(
+  'B10. ambiguous: a build-shaped child under a goals headline -> goal_proposal, medium',
+  {
+    block: block(1000, 'Potential Goals:', ['  - Build a goal tracker page for hopper visibility']),
+    move: { kind: 'take_it' },
+  },
+  'goal_proposal',
+  'medium',
+);
+
+// ── B11: a block's `why` names the exact child line that fired, so a block
+// decision stays as auditable as a line decision was. ─────────────────────
+{
+  const b = block(1100, 'Smart notepad', ['  - nothing here', '  - Fix the composer auto-grow bug in notepad.ts']);
+  const decision = routeNotepadBlock({ block: b, move: { kind: 'take_it' } });
+  const firedLineId = b.lines[2].line_id;
+  if (decision.sink === 'hopper' && decision.why.includes(`[line ${firedLineId}]`)) {
+    pass++;
+    console.log(`PASS  B11. the block's why names the child line that fired — ${decision.why}`);
+  } else {
+    fail++;
+    console.log(`FAIL  B11. expected hopper naming line ${firedLineId}, got ${decision.sink} (why: ${decision.why})`);
   }
 }
 

@@ -44,6 +44,13 @@ export type DossierConfidence = 'none' | 'weak' | 'strong';
 
 export interface TopicDossier {
   line_id: number | null;
+  /** Node #943 -- when the dossier was built for a topic BLOCK rather than a
+   *  bare line, the block's id (its headline line's id, or the first member's
+   *  id for a headline:null lead-in block). Null for a line/text dossier. */
+  block_id: number | null;
+  /** Every line of the block the dossier covers, document order. `[line_id]`
+   *  for a single-line dossier; empty when built from raw text alone. */
+  member_line_ids: number[];
   text: string;
   topic: string | null;
   confidence: DossierConfidence;
@@ -58,9 +65,27 @@ export interface TopicDossier {
   unresolved_reason: string | null;
 }
 
+/**
+ * One topic BLOCK, as the judgment layer sees it (docs/notepad/BLOCKS.md):
+ * the headline plus every indented child, with their real line ids. The
+ * dossier's topic is the BLOCK, not one line inside it -- which is the whole
+ * point of node #943: `- rate limit` on its own resolves to nothing, but the
+ * same line under a `Universal KPI Goal` headline resolves to the goal.
+ */
+export interface DossierBlockInput {
+  block_id: number;
+  headline_line_id: number | null;
+  headline: string | null;
+  /** Every member line, document order, text EXACTLY as Kevin typed it. */
+  lines: Array<{ line_id: number; text: string }>;
+}
+
 export interface BuildDossierInput {
   line_id?: number;
   text?: string;
+  /** Takes precedence over line_id/text when given -- the topic becomes the
+   *  whole block, and repo/branch/goal resolution runs against all of it. */
+  block?: DossierBlockInput;
 }
 
 export interface BuildDossierOptions {
@@ -135,6 +160,20 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+/** The block rendered for the model: one "[line_id N] <raw text>" row per
+ *  member, raw indentation preserved -- the same shape notepad-blocks.ts's
+ *  own `text` uses, so the model sees one consistent view everywhere. */
+function renderDossierBlock(block: DossierBlockInput): string {
+  return block.lines.map((l) => `[line_id ${l.line_id}] ${l.text}`).join('\n');
+}
+
+/** The block as Kevin typed it, no id prefixes -- what topic resolution and
+ *  evidence gathering run against, so a render detail can never leak into a
+ *  search term. */
+function blockPlainText(block: DossierBlockInput): string {
+  return block.lines.map((l) => l.text).join('\n');
+}
+
 interface KnownFacts {
   topic: string;
   goal: { goal_id: number; node_id: number | null; title: string } | null;
@@ -142,7 +181,12 @@ interface KnownFacts {
   branch: string | null;
 }
 
-function buildDossierPrompt(text: string, facts: KnownFacts, evidence: DossierEvidence[]): string {
+function buildDossierPrompt(
+  text: string,
+  facts: KnownFacts,
+  evidence: DossierEvidence[],
+  block: DossierBlockInput | null,
+): string {
   const evidenceLines = evidence
     .map((e, i) => {
       const tags = [e.repo ? `repo: ${e.repo}` : null, e.branch ? `branch: ${e.branch}` : null].filter(Boolean).join(', ');
@@ -159,12 +203,29 @@ function buildDossierPrompt(text: string, facts: KnownFacts, evidence: DossierEv
     facts.branch ? `Branch: ${facts.branch}` : 'Branch: none found in evidence',
   ].join('\n');
 
+  // Node #943: when this dossier covers a BLOCK, show the model Kevin's real
+  // formatting -- the headline and every indented child, each row carrying its
+  // own line_id -- rather than one flattened string. The topic IS the block.
+  const subject = block
+    ? [
+        'You are drafting a short internal briefing for JARVIS about ONE topic BLOCK from',
+        "Kevin's notepad -- a headline he wrote with no indentation, plus everything he",
+        'indented underneath it -- so a fresh conversation opens already oriented instead',
+        'of having to ask "what is this about?"',
+        '',
+        `The block's headline: ${block.headline !== null ? JSON.stringify(block.headline) : '(none -- a leading fragment, no headline yet)'}`,
+        'The block, verbatim (one row per line, each with its line_id):',
+        renderDossierBlock(block),
+      ]
+    : [
+        'You are drafting a short internal briefing for JARVIS about ONE notepad line Kevin',
+        'wrote, so a fresh conversation opens already oriented instead of having to ask',
+        '"what is this about?"',
+        '',
+        `The notepad line: ${JSON.stringify(text)}`,
+      ];
   return [
-    'You are drafting a short internal briefing for JARVIS about ONE notepad line Kevin',
-    'wrote, so a fresh conversation opens already oriented instead of having to ask',
-    '"what is this about?"',
-    '',
-    `The notepad line: ${JSON.stringify(text)}`,
+    ...subject,
     '',
     'Everything already known about this, gathered deterministically -- this, plus the',
     'evidence rows below, is the ONLY information you may draw on. Do not use outside',
@@ -180,7 +241,7 @@ function buildDossierPrompt(text: string, facts: KnownFacts, evidence: DossierEv
     '   evidence above. NEVER name a repo, branch, file, or "#<number>" reference that is',
     '   not literally present in the text above -- if you are not sure of something, say',
     '   so in the narrative instead of guessing or inventing one.',
-    '2. "open_question" -- the single most useful question this line raises given the',
+    '2. "open_question" -- the single most useful question this raises given the',
     '   evidence, or null if the evidence does not clearly imply one. Do not force one.',
     '',
     'Return ONLY a JSON object, no markdown fences, no prose before or after it, with',
@@ -333,7 +394,11 @@ function priorWorkLines(evidence: DossierEvidence[]): string[] {
 // == never fall below) ========================================================
 
 function renderNoneConfidence(text: string): string {
-  return `JARVIS has no context on this line yet -- "${text}" doesn't match anything in goals, trees, or recent threads. Starting cold; nothing prior to draw on.`;
+  // Collapsed to one line: a BLOCK subject (node #943) is multi-line, and a
+  // raw newline inside this sentence would break the one-paragraph shape every
+  // consumer of `rendered` assumes. A single-line subject is unchanged by this.
+  const subject = text.replace(/\s+/g, ' ').trim();
+  return `JARVIS has no context on this line yet -- "${subject}" doesn't match anything in goals, trees, or recent threads. Starting cold; nothing prior to draw on.`;
 }
 
 function renderDeterministic(params: {
@@ -393,17 +458,28 @@ function renderDeterministic(params: {
 export async function buildTopicDossier(input: BuildDossierInput, opts: BuildDossierOptions = {}): Promise<TopicDossier> {
   const db = opts.db ?? sqliteDb;
 
+  // Node #943 -- a block, when given, IS the subject: its id becomes the
+  // dossier's line_id (the headline line, which is where the ledger row and
+  // the marker live), and its whole text -- headline plus every child -- is
+  // what topic resolution and evidence gathering run against.
+  const block = input.block ?? null;
   let lineId: number | null = input.line_id ?? null;
   let text: string;
-  if (typeof input.text === 'string' && input.text.trim()) {
+  if (block) {
+    if (block.lines.length === 0) throw new Error('buildTopicDossier was given a block with no lines');
+    lineId = block.headline_line_id ?? block.lines[0].line_id;
+    text = blockPlainText(block);
+  } else if (typeof input.text === 'string' && input.text.trim()) {
     text = input.text;
   } else if (lineId != null) {
     const line = getNotepadLine(lineId);
     if (!line) throw new Error(`notepad line ${lineId} not found`);
     text = line.text;
   } else {
-    throw new Error('buildTopicDossier requires line_id or text');
+    throw new Error('buildTopicDossier requires line_id, text, or block');
   }
+  const blockId = block ? block.block_id : null;
+  const memberLineIds = block ? block.lines.map((l) => l.line_id) : lineId != null ? [lineId] : [];
 
   const resolved = resolveTopic(text, db);
   const gatherOpts: GatherEvidenceOptions = { cacheDir: opts.cacheDir, orientationCacheTtlMs: opts.orientationCacheTtlMs };
@@ -415,6 +491,8 @@ export async function buildTopicDossier(input: BuildDossierInput, opts: BuildDos
     const { evidence, availability } = await gatherEvidence(resolved.topic, resolved.terms, db, gatherOpts);
     return {
       line_id: lineId,
+      block_id: blockId,
+      member_line_ids: memberLineIds,
       text,
       topic: null,
       confidence: 'none',
@@ -458,7 +536,7 @@ export async function buildTopicDossier(input: BuildDossierInput, opts: BuildDos
   }
   const runOneShot = opts.runOneShot ?? defaultRunOneShot;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_DOSSIER_TIMEOUT_MS;
-  const prompt = buildDossierPrompt(text, facts, evidence);
+  const prompt = buildDossierPrompt(text, facts, evidence, block);
 
   try {
     const raw = await withTimeout(runOneShot(prompt), timeoutMs);
@@ -491,6 +569,8 @@ export async function buildTopicDossier(input: BuildDossierInput, opts: BuildDos
 
   return {
     line_id: lineId,
+    block_id: blockId,
+    member_line_ids: memberLineIds,
     text,
     topic: resolved.topic,
     confidence,

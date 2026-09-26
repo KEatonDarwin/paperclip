@@ -31,7 +31,12 @@
 //       proves it does not throw and does not block the route response
 //       (fire-and-forget), relying on sim-guard (src/sim-guard.ts) to no-op
 //       the actual spawn under this scratch JARVIS_DB_PATH.
-//   (6) ZERO CLAUDE PROCESSES spawned across the whole run (before/after
+//   (6b) NODE #943 — THE BLOCK FORM: clicking a marker that sits on a topic
+//       BLOCK's headline opens a thread seeded with the WHOLE topic (every
+//       indented child, verbatim, with its line_id), and the dossier it was
+//       composed from was built over the whole block too. The route resolves
+//       the block from the line the same way src/handlers/api-v1.ts does.
+//   (7) ZERO CLAUDE PROCESSES spawned across the whole run (before/after
 //       pgrep snapshot) -- this node makes no model calls of its own; the one
 //       real model seam it drives (buildTopicDossier's narrative call) is
 //       always stubbed here, exactly like notepad-dossier-check.mjs does.
@@ -81,7 +86,8 @@ process.env.JARVIS_SMARTY_PANTS_URL = 'http://127.0.0.1:1';
 process.env.JARVIS_MCP_NATIVE_TIMEOUT_MS = '5000';
 
 const distDir = path.join(__dirname, '..', 'dist');
-const { putNotepadDay, getNotepadLineState } = await import(path.join(distDir, 'notepad.js'));
+const { putNotepadDay, getNotepadLineState, getNotepadDay, getNotepadLineDay } = await import(path.join(distDir, 'notepad.js'));
+const { parseNotepadBlocks, notepadBlockId } = await import(path.join(distDir, 'notepad-blocks.js'));
 const { reconcileNotepadMarker, getNotepadMarker } = await import(path.join(distDir, 'notepad-markers.js'));
 const { openNotepadHandoff, buildNotepadHandoffPrompt, notepadHandoffThreadExt } = await import(
   path.join(distDir, 'notepad-handoff.js')
@@ -114,6 +120,23 @@ const stubRunOneShot = async () => '{}';
 // Mirrors the route's own two inline guards exactly, then defers everything
 // else to the real exported openNotepadHandoff -- the same shape
 // notepad-marker-route-check.mjs's dismissRoute() uses for the dismiss route.
+/** Mirrors the block resolution the real route (src/handlers/api-v1.ts,
+ *  notepadBlockForLine) performs before calling openNotepadHandoff. */
+function blockForLine(lineId) {
+  const day = getNotepadLineDay(lineId);
+  if (!day) return null;
+  const { lines } = getNotepadDay(day);
+  const block = parseNotepadBlocks(lines).find((b) => b.member_line_ids.includes(lineId));
+  if (!block) return null;
+  const textById = new Map(lines.map((l) => [l.id, l.text]));
+  return {
+    block_id: notepadBlockId(block),
+    headline_line_id: block.headline_line_id,
+    headline: block.headline,
+    lines: block.member_line_ids.map((id) => ({ line_id: id, text: textById.get(id) ?? '' })),
+  };
+}
+
 async function openRoute(lineId, opts = {}) {
   if (!Number.isInteger(lineId) || lineId <= 0) {
     return { status: 400, body: { error: 'invalid_line_id', message: 'lineId must be a positive integer' } };
@@ -269,6 +292,47 @@ let threadExt = null;
   check('buildNotepadHandoffPrompt embeds the exact dossier.rendered text (reused, not rebuilt)', prompt.includes(dossier.rendered));
   check('buildNotepadHandoffPrompt names the already_done kind', prompt.includes('JARVIS believes this is already done'));
   check('buildNotepadHandoffPrompt carries the reason', prompt.includes('this shipped last week'));
+}
+
+// -- (6b) THE BLOCK FORM: a marker on a topic headline seeds the WHOLE topic
+{
+  const BLOCK_DAY = '2026-09-26';
+  const savedBlock = putNotepadDay(
+    BLOCK_DAY,
+    ['Universal KPI Goal', '  - needs a row cap on the prod SELECTs', '     - Ian flagged the 3am run', '  - who owns the value store?'].join('\n'),
+  );
+  const headlineId = lineIdByText(savedBlock, 'Universal KPI Goal');
+  const childIds = savedBlock.lines.filter((l) => l.id !== headlineId).map((l) => l.id);
+  reconcileNotepadMarker(headlineId, { kind: 'take_it', reason: 'JARVIS can add the row cap' });
+
+  const resolvedBlock = blockForLine(headlineId);
+  check('(6b) the route resolves the headline line to its own topic block', resolvedBlock?.block_id === headlineId && resolvedBlock.lines.length === 4);
+
+  let dossierPrompt = null;
+  const result = await openRoute(headlineId, {
+    block: resolvedBlock,
+    dossierOpts: {
+      runOneShot: async (prompt) => {
+        dossierPrompt = prompt;
+        return stubRunOneShot(prompt);
+      },
+    },
+    postMessage: async () => '[stub] posted',
+  });
+
+  check('(6b) first open of the block returns 201', result.status === 201);
+  const prompt = result.body.seeded_prompt;
+  check('(6b) THE SEED: the prompt names the topic by its headline', prompt.includes('The topic — "Universal KPI Goal"'));
+  check(
+    '(6b) THE SEED: every child line rides along verbatim, with its line_id and real indentation',
+    childIds.every((id) => prompt.includes(`[line_id ${id}] ${savedBlock.lines.find((l) => l.id === id).text}`)),
+  );
+  check('(6b) THE SEED: it still ends with a start-working instruction', prompt.includes('Start working on this now'));
+  check(
+    '(6b) THE DOSSIER: the one model call it makes was asked about the BLOCK, not the headline alone',
+    dossierPrompt === null || (dossierPrompt.includes('ONE topic BLOCK') && dossierPrompt.includes('Ian flagged the 3am run')),
+  );
+  check("(6b) the per-line ledger still records 'acted' on the HEADLINE line", getNotepadLineState(headlineId)?.state === 'acted');
 }
 
 // -- (7) zero claude processes spawned across the whole run -----------------

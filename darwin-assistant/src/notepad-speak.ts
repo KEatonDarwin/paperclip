@@ -25,6 +25,15 @@ import type { NotepadMarker } from './notepad-markers.js';
 // see resolveActionRef() below. Getting that mapping right is what makes
 // "edit an acted line and get ONE marker" true at the pipeline level and
 // not just at the unit level notepad-markers-check.mjs already proves.
+//
+// NODE #943 -- ONE MARKER PER BLOCK. decideNotepadMoves now decides about
+// topic BLOCKS (docs/notepad/BLOCKS.md), so a move carries a `block_id` --
+// the headline line's id, or the first member's id for a headline:null
+// lead-in block. That is the line the marker is persisted against: ONE
+// marker per topic, on its headline, never one per dash underneath it. The
+// marker store itself is unchanged and still per-line, because a block_id IS
+// one of the block's own line ids -- exactly what makes the block layer a
+// judgement layer and not a second identity scheme.
 
 /** The outcome of one call to runNotepadSpeak -- see the module doc above. */
 export interface NotepadSpeakResult {
@@ -42,16 +51,21 @@ export interface NotepadSpeakResult {
 }
 
 /**
- * A decided move's action_ref: carried forward from the line's EXISTING
- * action_ref when (and only when) the candidate it was decided about
- * surfaced as a 'reconcile' (an acted line whose text changed) --
- * never invented, never left to whatever the model happened to say (the
- * model isn't even asked for one; NotepadMove has no action_ref field).
- * A first_look candidate has no prior action to carry, so its move's
- * action_ref is null -- a genuinely new marker, not a continuation of one.
+ * A decided move's action_ref: carried forward from the HEADLINE line's
+ * EXISTING action_ref when (and only when) that line surfaced as a
+ * 'reconcile' (an acted line whose text changed) -- never invented, never
+ * left to whatever the model happened to say (the model isn't even asked for
+ * one; NotepadMove has no action_ref field). A first_look headline has no
+ * prior action to carry, so its move's action_ref is null -- a genuinely new
+ * marker, not a continuation of one.
+ *
+ * The headline line is the right one to ask, and the only one: it is where
+ * the marker and the `acted` ledger row for this block live (see
+ * notepad-dispatch.ts), so it is the only member whose action_ref could be
+ * this block's prior action.
  */
-function resolveActionRef(pass: NotepadPassResult, lineId: number): string | null {
-  const line = pass.review?.lines.find((l) => l.line_id === lineId);
+function resolveActionRef(pass: NotepadPassResult, blockId: number): string | null {
+  const line = pass.review?.lines.find((l) => l.line_id === blockId);
   if (!line) return null;
   return line.surfaced && line.surfaced_kind === 'reconcile' ? line.action_ref : null;
 }
@@ -97,9 +111,10 @@ export async function runNotepadSpeak(
 
   const markers: NotepadMarker[] = [];
   for (const move of moves.moves) {
-    const actionRef = resolveActionRef(pass, move.line_id);
+    // One marker per BLOCK, on its headline line (move.block_id).
+    const actionRef = resolveActionRef(pass, move.block_id);
     markers.push(
-      reconcileNotepadMarker(move.line_id, { kind: move.kind, reason: move.reason, action_ref: actionRef }),
+      reconcileNotepadMarker(move.block_id, { kind: move.kind, reason: move.reason, action_ref: actionRef }),
     );
   }
 

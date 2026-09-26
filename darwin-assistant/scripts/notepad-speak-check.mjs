@@ -115,12 +115,13 @@ let totalMovesCalls = 0;
  * silence — mirroring how an actual model both can and usually does stay
  * silent on most candidates.
  *
- * The two stages speak different id vocabularies (node #942 moved the GATE
- * to block_id; the MOVES stage, out of this node's scope, still speaks
- * line_id) -- extract each with its own regex, deduped, since the moves
- * prompt now mentions each line_id TWICE (once in review.rendered's
- * "[line_id N]" prefix, once in its own candidate-list bullet) and a naive
- * extraction would double-propose every move.
+ * Since node #943 BOTH stages speak block_id (the gate lists "block_id N",
+ * the moves prompt lists its candidates as "block N: <headline>"), so each is
+ * extracted with its own regex -- deduped, because both prompts also carry
+ * the whole-note render in which every row is prefixed "[line_id N]", and a
+ * naive extraction would double-propose every move. `block (\d+)` cannot
+ * collide with `block_id N` (no space after "block" there), which is exactly
+ * why the two prompts use different spellings.
  */
 function combinedStub(moveFor) {
   return async (prompt) => {
@@ -130,11 +131,11 @@ function combinedStub(moveFor) {
       return JSON.stringify({ verdicts: blockIds.map((block_id) => ({ block_id, complete_thought: true })) });
     }
     totalMovesCalls += 1;
-    const lineIds = [...new Set([...prompt.matchAll(/line_id (\d+)/g)].map((m) => Number(m[1])))];
+    const blockIds = [...new Set([...prompt.matchAll(/^- block (\d+):/gm)].map((m) => Number(m[1])))];
     const moves = [];
-    for (const line_id of lineIds) {
-      const m = moveFor(line_id);
-      if (m) moves.push({ line_id, kind: m.kind, reason: m.reason });
+    for (const block_id of blockIds) {
+      const m = moveFor(block_id);
+      if (m) moves.push({ block_id, kind: m.kind, reason: m.reason });
     }
     return JSON.stringify({ moves });
   };
@@ -163,7 +164,8 @@ let l1Id;
   check('(1a) the pass settled', result.pass.settle !== null);
   check('(1a) worth_reviewing is true', result.pass.worth_reviewing === true);
   check('(1a) moves were decided (not skipped)', result.moves !== null);
-  check('(1a) exactly one real move was decided, for L1', result.moves?.moves.length === 1 && result.moves?.moves[0].line_id === l1Id);
+  check('(1a) exactly one real move was decided, for L1\'s block', result.moves?.moves.length === 1 && result.moves?.moves[0].block_id === l1Id);
+  check('(1a) the move names the block it belongs to (headline line = the block id)', result.moves?.moves[0].headline_line_id === l1Id && result.moves?.moves[0].member_line_ids.length === 1);
   check('(1a) exactly one marker was reconciled', result.markers.length === 1 && result.markers[0].line_id === l1Id);
   check('(1a) marker kind matches the decided move', result.markers[0].kind === 'take_it');
   check('(1a) a first_look move carries no action_ref (nothing to carry yet)', result.markers[0].action_ref === null);
@@ -313,6 +315,66 @@ const DAY3 = '2026-10-07';
   check('(3) moves was never decided — null, not an empty result', result.moves === null);
   check('(3) markers is empty', result.markers.length === 0);
   check('(3) decideNotepadMoves was never actually called', totalMovesCalls === movesCallsBefore);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// (4) NODE #943 — A REAL TOPIC BLOCK. Kevin's own formatting: a zero-indent
+//     headline with irregularly-indented, dash-prefixed children under it.
+//     The whole pipeline must treat that as ONE thing: one candidate offered
+//     to the moves model, one move decided, and exactly ONE marker persisted
+//     — on the HEADLINE line — with nothing on the children.
+// ═══════════════════════════════════════════════════════════════════════════
+const DAY4 = '2026-10-08';
+{
+  const NOTE = [
+    'Universal KPI Goal',
+    '  - needs a row cap on the prod SELECTs before we schedule it',
+    '     - Ian flagged the 3am run last week',
+    '',
+    '  - decide whether the base class owns the append-only value store',
+    'Dry cleaning',
+  ].join('\n');
+  const saved = saveAtTick(DAY4, NOTE, 8000);
+  const headlineId = lineIdByText(saved, 'Universal KPI Goal');
+  const childIds = saved.lines.filter((l) => l.text.startsWith(' ')).map((l) => l.id);
+  const otherHeadlineId = lineIdByText(saved, 'Dry cleaning');
+  check('(4) fixture: the block has a headline plus 3 indented children and an interior blank line', childIds.length === 3 && saved.lines.length === 6);
+
+  let capturedMovesPrompt = null;
+  const stub = async (prompt) => {
+    if (prompt.includes('complete_thought')) {
+      totalGateCalls += 1;
+      const blockIds = [...new Set([...prompt.matchAll(/block_id (\d+)/g)].map((m) => Number(m[1])))];
+      return JSON.stringify({ verdicts: blockIds.map((block_id) => ({ block_id, complete_thought: true })) });
+    }
+    totalMovesCalls += 1;
+    capturedMovesPrompt = prompt;
+    return JSON.stringify({
+      moves: [{ block_id: headlineId, kind: 'take_it', reason: 'JARVIS can add the row cap before this gets scheduled' }],
+    });
+  };
+
+  const result = await runNotepadSpeak(DAY4, { now: tickDate(8000 + 20 + 1), runOneShot: stub });
+
+  check('(4) the moves prompt offered the BLOCK as one candidate, keyed on its headline line', capturedMovesPrompt?.includes(`- block ${headlineId}: Universal KPI Goal`));
+  check(
+    "(4) the candidate carried every child line verbatim, with its id — not the headline alone",
+    childIds.every((id) => capturedMovesPrompt?.includes(`[line_id ${id}]`)),
+  );
+  check('(4) no child line was ever offered as a candidate block of its own', childIds.every((id) => !capturedMovesPrompt?.includes(`- block ${id}:`)));
+  check('(4) the OTHER zero-indent line is its own separate candidate block', capturedMovesPrompt?.includes(`- block ${otherHeadlineId}: Dry cleaning`));
+
+  check('(4) exactly one move was decided, for the block', result.moves?.moves.length === 1 && result.moves?.moves[0].block_id === headlineId);
+  check(
+    '(4) the move carries the whole block\'s member line ids (headline + children)',
+    result.moves?.moves[0].member_line_ids.length === 1 + childIds.length + 1 &&
+      result.moves?.moves[0].member_line_ids.includes(headlineId) &&
+      childIds.every((id) => result.moves?.moves[0].member_line_ids.includes(id)) &&
+      !result.moves?.moves[0].member_line_ids.includes(otherHeadlineId),
+  );
+  check('(4) THE GUARANTEE: exactly ONE marker was reconciled for the whole topic', result.markers.length === 1);
+  check('(4) THE GUARANTEE: the marker lives on the HEADLINE line', result.markers[0].line_id === headlineId && markerRowCount(headlineId) === 1);
+  check('(4) THE GUARANTEE: not one child line carries a marker of its own', childIds.every((id) => getNotepadMarker(id) === undefined));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

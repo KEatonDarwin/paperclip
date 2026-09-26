@@ -65,6 +65,7 @@ import {
   todayNotepadDate,
   getNotepadLine,
   getNotepadLineDay,
+  getNotepadDay,
   getNotepadLineState,
   unscannedLines,
   markLineSeen,
@@ -75,6 +76,7 @@ import {
 import { openNotepadDay } from '../notepad-rollover.js';
 import { activeNotepadMarkers, dismissNotepadMarker, getNotepadMarker } from '../notepad-markers.js';
 import { openNotepadHandoff } from '../notepad-handoff.js';
+import { parseNotepadBlocks, notepadBlockId } from '../notepad-blocks.js';
 import { listNotepadActedActions } from '../notepad-action-resolver.js';
 import {
   listNotifications,
@@ -1713,8 +1715,32 @@ export function createApiV1Router(): Router {
     res.json(notepadDayWithMarkers(day));
   });
 
+  /**
+   * The topic BLOCK `lineId` belongs to (node #943, docs/notepad/BLOCKS.md),
+   * shaped for openNotepadHandoff/buildTopicDossier — so clicking a marker
+   * opens a thread seeded with the WHOLE topic Kevin wrote, not the one line
+   * the marker happens to sit on. Returns null when the line's day or block
+   * can't be resolved, in which case the handoff falls back to its original
+   * per-line behaviour rather than failing.
+   */
+  function notepadBlockForLine(lineId: number) {
+    const day = getNotepadLineDay(lineId);
+    if (!day) return null;
+    const { lines } = getNotepadDay(day);
+    const block = parseNotepadBlocks(lines).find((b) => b.member_line_ids.includes(lineId));
+    if (!block) return null;
+    const textById = new Map(lines.map((l) => [l.id, l.text]));
+    return {
+      block_id: notepadBlockId(block),
+      headline_line_id: block.headline_line_id,
+      headline: block.headline,
+      lines: block.member_line_ids.map((id) => ({ line_id: id, text: textById.get(id) ?? '' })),
+    };
+  }
+
   // Open (or re-open) the handoff thread for a marker — "clicking a marker
-  // opens a thread that is already working" (node #869). Find-or-create,
+  // opens a thread that is already working" (node #869), now seeded with the
+  // whole topic block that marker belongs to (node #943). Find-or-create,
   // deterministic per line_id; on first open the thread is seeded with a
   // dossier-composed prompt and the turn dispatches. A second call is a pure
   // read: same thread_ext, created:false, no second seed message.
@@ -1729,7 +1755,7 @@ export function createApiV1Router(): Router {
       sendError(res, 404, 'marker_not_found', `no notepad marker on line '${lineId}'`);
       return;
     }
-    openNotepadHandoff(lineId)
+    openNotepadHandoff(lineId, { block: notepadBlockForLine(lineId) })
       .then((result) => {
         res.status(result.created ? 201 : 200).json(result);
       })

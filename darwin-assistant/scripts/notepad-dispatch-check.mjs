@@ -17,7 +17,14 @@
 //       (state:'ghost', authored_by:'jarvis'), never a set node.
 //   (6) a goal-shaped line whose dossier names NO goal falls back to the
 //       thread sink rather than inventing a goal to attach to.
-//   (7) ZERO claude processes spawned across the whole run.
+//   (7) NODE #943 — THE BLOCK FORM (dispatchNotepadBlock): a real
+//       headline+indented-children topic dispatches as ONE thing; the
+//       HEADLINE line gets the 'acted' ledger row + the action_ref + the one
+//       marker, every OTHER member is marked 'seen' (never acted, never its
+//       own sink row); the sink row carries the whole topic (hopper
+//       raw_message, goal-proposal notes); a thread handoff seeds the WHOLE
+//       block; and re-dispatching the block is a no-op.
+//   (8) ZERO claude processes spawned across the whole run.
 //
 //   npm run build && JARVIS_DB_PATH=/tmp/notepad-dispatch-check.db node scripts/notepad-dispatch-check.mjs
 
@@ -66,9 +73,10 @@ const { getConversation } = await import(path.join(distDir, 'conversation-db.js'
 const { createGoal, createGoalNode, getGoalTree } = await import(path.join(distDir, 'goals.js'));
 const { listHopperItems, getHopperItem } = await import(path.join(distDir, 'hopper.js'));
 const { listWorkstreams, getWorkstream } = await import(path.join(distDir, 'workstreams.js'));
-const { dispatchNotepadLine, buildActionRef, parseActionRef } = await import(
+const { dispatchNotepadLine, dispatchNotepadBlock, buildActionRef, parseActionRef } = await import(
   path.join(distDir, 'notepad-dispatch.js')
 );
+const { parseNotepadBlocks, notepadBlockId } = await import(path.join(distDir, 'notepad-blocks.js'));
 
 let failed = false;
 function check(label, ok) {
@@ -303,6 +311,156 @@ for (const id of [goalLine, hopperLine, workstreamLine, threadLine, noHomeGoalLi
   check('with no dossier.goal, dispatch actually lands on thread (never invents a goal)', result.sink === 'thread');
   const parsed = parseActionRef(result.action_ref);
   check('the fallback action_ref is a real thread ref', parsed?.sink === 'thread' && !!getConversation(parsed.thread_ext));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// (7) THE BLOCK FORM — node #943. Kevin's real format: a zero-indent headline
+// with irregularly-indented, dash-prefixed children underneath it. The whole
+// topic dispatches as ONE thing.
+// ═══════════════════════════════════════════════════════════════════════════
+const BLOCK_DAY = '2026-09-26';
+{
+  const NOTE = [
+    'Universal KPI Goal',
+    '  - build a universal KPI tracker page for every brand',
+    '     - one base class, one append-only value store',
+    '',
+    '  - needs a row cap before we schedule it',
+    'Suppression files',
+    '  - Waiting on Mike to finish the per-brand MD5 build',
+    '   - six sources still not suppressing',
+    'Lunch',
+    '  - probably tacos',
+  ].join('\n');
+  const savedBlocks = putNotepadDay(BLOCK_DAY, NOTE);
+  const blocks = parseNotepadBlocks(savedBlocks.lines.map((l) => ({ id: l.id, idx: l.idx, text: l.text })));
+  check('(7) the day parses into exactly 3 topic blocks', blocks.length === 3);
+
+  const byId = new Map(savedBlocks.lines.map((l) => [l.id, l]));
+  const toRouteBlock = (b) => ({
+    block_id: notepadBlockId(b),
+    headline_line_id: b.headline_line_id,
+    headline: b.headline,
+    lines: b.member_line_ids.map((id) => ({ line_id: id, idx: byId.get(id).idx, text: byId.get(id).text })),
+  });
+  const [kpiBlock, suppressionBlock, lunchBlock] = blocks.map(toRouteBlock);
+
+  // -- hopper sink: the build cue lives on a CHILD line ---------------------
+  {
+    const beforeCount = listHopperItems('all', 500).length;
+    for (const id of kpiBlock.lines.map((l) => l.line_id)) {
+      check(`(7) precondition: line ${id} has no ledger row yet`, getNotepadLineState(id) === undefined);
+    }
+    reconcileNotepadMarker(kpiBlock.block_id, { kind: 'take_it', reason: 'block dispatch fixture' });
+
+    const result = await dispatchNotepadBlock({
+      block: kpiBlock,
+      move: { kind: 'take_it', reason: 'a concrete build ask, written under its topic' },
+      handoffOpts: stubHandoffOpts,
+    });
+
+    check('(7) the block routed to hopper off a CHILD line\'s build cue', result.decision.sink === 'hopper' && result.sink === 'hopper');
+    check('(7) exactly one hopper candidate appeared for the whole topic', listHopperItems('all', 500).length === beforeCount + 1);
+
+    const parsed = parseActionRef(result.action_ref);
+    const item = getHopperItem(parsed.candidate_id);
+    check('(7) the hopper card is titled with the block HEADLINE, not a dash', item?.title === 'Universal KPI Goal');
+    check('(7) the hopper card carries the WHOLE block verbatim as raw_message', item?.raw_message.includes('row cap') && item.raw_message.includes('append-only value store'));
+    check('(7) the hopper card is provenanced to the block', item?.source_ref === `notepad-block-${kpiBlock.block_id}`);
+
+    // THE LEDGER: headline acted, every other member seen -------------------
+    check('(7) the result names the headline as the acted line', result.acted_line_id === kpiBlock.headline_line_id);
+    const headState = getNotepadLineState(kpiBlock.block_id);
+    check("(7) THE LEDGER: the HEADLINE line is 'acted' and carries the action_ref", headState?.state === 'acted' && headState.action_ref === result.action_ref);
+    const childIds = kpiBlock.lines.map((l) => l.line_id).filter((id) => id !== kpiBlock.block_id);
+    check(
+      "(7) THE LEDGER: every OTHER member line is 'seen' — never acted, never carrying an action_ref of its own",
+      childIds.every((id) => {
+        const st = getNotepadLineState(id);
+        return st?.state === 'seen' && st.action_ref === null;
+      }),
+    );
+    check('(7) the result reports exactly those lines as newly seen', result.seen_line_ids.slice().sort().join() === childIds.slice().sort().join());
+
+    // THE MARKER: one, on the headline -------------------------------------
+    check('(7) THE MARKER: the headline carries the block\'s one marker, stamped with the action_ref', getNotepadMarker(kpiBlock.block_id)?.action_ref === result.action_ref);
+    check('(7) THE MARKER: not one child line has a marker of its own', childIds.every((id) => getNotepadMarker(id) === undefined));
+
+    // IDEMPOTENCE ----------------------------------------------------------
+    const beforeSecond = listHopperItems('all', 500).length;
+    const second = await dispatchNotepadBlock({
+      block: kpiBlock,
+      move: { kind: 'take_it', reason: 'a concrete build ask, written under its topic' },
+      handoffOpts: stubHandoffOpts,
+    });
+    check('(7) re-dispatching the block reports created:false', second.created === false);
+    check('(7) re-dispatching the block returns the SAME action_ref', second.action_ref === result.action_ref);
+    check('(7) re-dispatching the block created NO second candidate', listHopperItems('all', 500).length === beforeSecond);
+  }
+
+  // -- workstream sink off a child's ball-in-the-air phrase ------------------
+  {
+    const beforeCount = listWorkstreams(true).length;
+    const result = await dispatchNotepadBlock({
+      block: suppressionBlock,
+      move: { kind: 'take_it', reason: 'a ball in the air under its own topic' },
+      handoffOpts: stubHandoffOpts,
+    });
+    check('(7) a waiting-on CHILD routes the whole block to workstream', result.sink === 'workstream');
+    const ws = getWorkstream(parseActionRef(result.action_ref).workstream_id);
+    check('(7) the workstream row exists and is live', !!ws && ws.turn === 'jarvis' && typeof ws.next_action === 'string' && ws.next_action.length > 0);
+    // jotWorkstream is find-or-CREATE: this block's headline overlaps the
+    // earlier per-line fixture ("waiting on Mike to finish the suppression
+    // file"), so attaching to that existing row is the correct outcome. What
+    // must hold either way is that the whole topic produced AT MOST one row.
+    const wsDelta = listWorkstreams(true).length - beforeCount;
+    check('(7) the whole topic produced at most ONE workstream row (attached or created)', wsDelta === (result.detail?.matched ? 0 : 1), { wsDelta, matched: result.detail?.matched });
+    check(
+      "(7) the workstream block's children are 'seen', its headline 'acted'",
+      getNotepadLineState(suppressionBlock.block_id)?.state === 'acted' &&
+        suppressionBlock.lines
+          .map((l) => l.line_id)
+          .filter((id) => id !== suppressionBlock.block_id)
+          .every((id) => getNotepadLineState(id)?.state === 'seen'),
+    );
+  }
+
+  // -- thread sink: the handoff is seeded with the WHOLE block ---------------
+  {
+    // The handoff contract (node #869) is that a marker already exists on the
+    // line being opened — for a block, that is its headline, which is exactly
+    // where runNotepadSpeak persists it.
+    reconcileNotepadMarker(lunchBlock.block_id, { kind: 'take_it', reason: 'block thread fixture' });
+    let seededPrompt = null;
+    const result = await dispatchNotepadBlock({
+      block: lunchBlock,
+      move: { kind: 'take_it', reason: 'nothing rule-shaped here' },
+      handoffOpts: {
+        dossierOpts: { runOneShot: async () => '{}' },
+        postMessage: async (text) => {
+          seededPrompt = text;
+          return '[stub] posted';
+        },
+      },
+    });
+    check('(7) an unshaped block falls to the thread sink', result.sink === 'thread');
+    const parsed = parseActionRef(result.action_ref);
+    check('(7) the thread conversation exists', !!getConversation(parsed.thread_ext));
+    check('(7) the thread is keyed on the block\'s headline line', parsed.thread_ext === `cockpit:notepad-line-${lunchBlock.block_id}`);
+    check('(7) THE HANDOFF: the seed prompt carries the block HEADLINE', seededPrompt?.includes('Lunch'));
+    check(
+      '(7) THE HANDOFF: the seed prompt carries every CHILD line verbatim, with its line_id',
+      lunchBlock.lines.every((l) => seededPrompt?.includes(`[line_id ${l.line_id}] ${l.text}`)),
+    );
+    check(
+      "(7) the thread block's child is 'seen' and its headline 'acted'",
+      getNotepadLineState(lunchBlock.block_id)?.state === 'acted' &&
+        lunchBlock.lines
+          .map((l) => l.line_id)
+          .filter((id) => id !== lunchBlock.block_id)
+          .every((id) => getNotepadLineState(id)?.state === 'seen'),
+    );
+  }
 }
 
 // -- zero claude processes spawned across the whole run -----------------------

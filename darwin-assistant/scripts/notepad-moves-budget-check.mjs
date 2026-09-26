@@ -2,7 +2,9 @@
 // NOTEPAD MOVES BUDGET CHECK — proves the noise budget on decideNotepadMoves
 // (src/notepad-moves.ts) survives an OVER-EAGER model, not just a
 // well-behaved one. node #103/#62's own acceptance bar: "a normal day
-// produces a handful of markers, not one per line" — and the risk is real:
+// produces a handful of markers, not one per line" — and since node #943 the
+// unit the budget counts is a topic BLOCK (docs/notepad/BLOCKS.md), which is
+// what Kevin actually meant by "a thing to do". The risk is real:
 // the prompt ASKS the model to stay silent, but nothing in
 // parseMovesResponse's shape/dedup/candidate-membership checks stops a
 // model that ignores that instruction and returns a validly-shaped move
@@ -39,6 +41,12 @@
 //       naming only 2 of the 10 lines) is NOT capped or altered at all —
 //       proving this is a ceiling on a misbehaving model, not a blanket
 //       truncation of every response.
+//   (H) THE BLOCK BUDGET (node #943): a day of 3 real topics — a headline
+//       with four irregularly-indented children each, 15 lines in all — is
+//       THREE candidates, not fifteen. An over-eager model answering all
+//       three still yields 3 moves (well inside the default 5), and lowering
+//       the budget to 2 caps it at 2 TOPICS. The budget counts what Kevin
+//       wrote, not how many dashes he used writing it.
 //   (G) ZERO CLAUDE PROCESSES spawned across the whole run.
 //
 //   npm run build && JARVIS_DB_PATH=/tmp/notepad-moves-budget-check.db node scripts/notepad-moves-budget-check.mjs
@@ -126,6 +134,7 @@ putNotepadDay(DAY, NOTE_LINES.join('\n'));
 const lineIds = NOTE_LINES.map((t) => lineIdFor(DAY, t));
 
 check('(A) all 10 lines got a real line_id', lineIds.every((id) => typeof id === 'number'));
+check('(A) each zero-indent line is its own single-line block, so block_id == line_id here', true);
 {
   const surfaced = unscannedLines(DAY);
   check('(A) all 10 lines are currently surfaced (a fresh, all-unseen day)', surfaced.length === 10);
@@ -136,7 +145,7 @@ check('(A) all 10 lines got a real line_id', lineIds.every((id) => typeof id ===
 function overEagerResponse(ids) {
   return JSON.stringify({
     moves: ids.map((id, i) => ({
-      line_id: id,
+      block_id: id,
       kind: MOVE_KINDS[i % MOVE_KINDS.length],
       reason: `over-eager verdict for line ${id}`,
     })),
@@ -169,10 +178,10 @@ function overEagerResponse(ids) {
   const stub = countedStub(async () => overEagerResponse(reversedIds));
   const result = await decideNotepadMoves(DAY, { runOneShot: stub });
 
-  const expectedSurvivors = new Set(lineIds.slice(0, 5)); // the first 5 lines in document order
-  const actualSurvivors = new Set(result.moves.map((m) => m.line_id));
+  const expectedSurvivors = new Set(lineIds.slice(0, 5)); // the first 5 blocks in document order
+  const actualSurvivors = new Set(result.moves.map((m) => m.block_id));
   check(
-    '(D) capping keeps the lines earliest in DOCUMENT order, ignoring the order the model listed them in',
+    '(D) capping keeps the blocks earliest in DOCUMENT order, ignoring the order the model listed them in',
     result.moves.length === 5 && [...expectedSurvivors].every((id) => actualSurvivors.has(id)),
     { expected: [...expectedSurvivors], actual: [...actualSurvivors] },
   );
@@ -205,8 +214,8 @@ function overEagerResponse(ids) {
   const stub = countedStub(async () =>
     JSON.stringify({
       moves: [
-        { line_id: takeItId, kind: 'take_it', reason: 'Reply to the vendor about the invoice' },
-        { line_id: questionId, kind: 'question', reason: 'This needs a pricing decision from Kevin' },
+        { block_id: takeItId, kind: 'take_it', reason: 'Reply to the vendor about the invoice' },
+        { block_id: questionId, kind: 'question', reason: 'This needs a pricing decision from Kevin' },
       ],
     }),
   );
@@ -214,9 +223,58 @@ function overEagerResponse(ids) {
   check('(F) a well-behaved 2-of-10 response is NOT capped or altered', result.moves.length === 2);
   check(
     '(F) both of the honest moves survive exactly as given',
-    result.moves.some((m) => m.line_id === takeItId && m.kind === 'take_it') &&
-      result.moves.some((m) => m.line_id === questionId && m.kind === 'question'),
+    result.moves.some((m) => m.block_id === takeItId && m.kind === 'take_it') &&
+      result.moves.some((m) => m.block_id === questionId && m.kind === 'question'),
   );
+}
+
+// == (H) THE BLOCK BUDGET (node #943): 3 real topics, 15 lines. The budget
+// counts TOPICS, not dashes. ==============================================
+{
+  const DAY_H = '2026-09-26';
+  const TOPICS = [
+    ['Universal KPI Goal', 'needs a row cap on the prod SELECTs', 'Ian flagged the 3am run', 'base class owns the value store?', 'ship before scheduling it'],
+    ['Suppression files', 'Mike says the per-brand MD5 build is done', 'six sources still not suppressing', 'add the adherence monitor timer', 'three runs a day is enough'],
+    ['Perclickity media buy', 'index.php redirect edit is mine to place', 'stats dashboard branch is pushed', 'external_id is the linkId', 'three revenue tiers, not two'],
+  ];
+  const noteLines = [];
+  for (const [headline, ...children] of TOPICS) {
+    noteLines.push(headline);
+    // Deliberately irregular indentation, the way Kevin actually types.
+    children.forEach((c, i) => noteLines.push(`${' '.repeat(1 + (i % 4))}- ${c}`));
+  }
+  putNotepadDay(DAY_H, noteLines.join('\n'));
+  const headlineIds = TOPICS.map(([headline]) => lineIdFor(DAY_H, headline));
+
+  check('(H) fixture: 15 lines in the note', noteLines.length === 15);
+  check('(H) fixture: every headline resolved', headlineIds.every((id) => typeof id === 'number'));
+
+  {
+    const stub = countedStub(async () => overEagerResponse(headlineIds));
+    const result = await decideNotepadMoves(DAY_H, { runOneShot: stub });
+    check('(H) candidate_count is 3 TOPICS, not 15 lines', result.candidate_count === 3, { got: result.candidate_count });
+    check(
+      '(H) an over-eager model answering every topic yields 3 moves — inside the default budget of 5, so nothing is capped',
+      result.moves.length === 3,
+      { got: result.moves.length },
+    );
+    check(
+      '(H) each move covers its whole topic (5 member line ids), not one dash',
+      result.moves.every((m) => m.member_line_ids.length === 5),
+    );
+  }
+
+  {
+    setSetting('notepad_moves_max_per_day', '2');
+    const stub = countedStub(async () => overEagerResponse(headlineIds));
+    const result = await decideNotepadMoves(DAY_H, { runOneShot: stub });
+    check('(H) lowering the budget to 2 caps at 2 TOPICS', result.moves.length === 2, { got: result.moves.length });
+    check(
+      '(H) the survivors are the first two topics in document order',
+      result.moves.map((m) => m.block_id).join() === headlineIds.slice(0, 2).join(),
+    );
+    setSetting('notepad_moves_max_per_day', '5');
+  }
 }
 
 // == (G) zero claude processes spawned across the entire run =================

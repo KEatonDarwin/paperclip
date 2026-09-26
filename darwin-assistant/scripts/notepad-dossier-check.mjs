@@ -347,6 +347,48 @@ function freshCacheDir(tag) {
   check('line_id path: resolves the same as the raw-text path', dossier.confidence === 'strong');
 }
 
+// == BLOCK path (node #943) — the topic is the whole block, not one dash ====
+// The child line on its own resolves to nothing; under its headline, the same
+// child resolves exactly as the headline does. That is the whole reason the
+// dossier moved to blocks.
+{
+  const BLOCK_DAY = '2026-09-26';
+  const CHILD = '  - worth a look before Friday';
+  const savedBlock = putNotepadDay(BLOCK_DAY, [PERCLICKITY_LINE, CHILD].join('\n'));
+  const headlineId = savedBlock.lines[0].id;
+  const childId = savedBlock.lines[1].id;
+
+  const bare = await buildTopicDossier({ text: CHILD }, { runOneShot: async () => '{}', cacheDir: freshCacheDir('bare-child') });
+  check('(block) the child line ALONE resolves to no topic at all', bare.topic === null && bare.confidence === 'none');
+
+  let capturedPrompt = null;
+  const stub = async (prompt) => {
+    capturedPrompt = prompt;
+    return JSON.stringify({ narrative: 'Block lookup path.', open_question: null });
+  };
+  const dossier = await buildTopicDossier(
+    {
+      block: {
+        block_id: headlineId,
+        headline_line_id: headlineId,
+        headline: PERCLICKITY_LINE,
+        lines: [
+          { line_id: headlineId, text: PERCLICKITY_LINE },
+          { line_id: childId, text: CHILD },
+        ],
+      },
+    },
+    { runOneShot: stub, cacheDir: freshCacheDir('block') },
+  );
+
+  check('(block) the same child, read inside its block, resolves the topic', dossier.confidence === 'strong');
+  check('(block) block_id is carried through', dossier.block_id === headlineId);
+  check('(block) member_line_ids covers the whole block', dossier.member_line_ids.join() === `${headlineId},${childId}`);
+  check('(block) line_id resolves to the HEADLINE line (where the ledger row lives)', dossier.line_id === headlineId);
+  check('(block) text is the block as Kevin typed it — no [line_id] render prefixes', dossier.text === `${PERCLICKITY_LINE}\n${CHILD}` && !dossier.text.includes('[line_id'));
+  check('(block) the model was shown the block with its ids and real indentation', capturedPrompt.includes('ONE topic BLOCK') && capturedPrompt.includes(`[line_id ${childId}] ${CHILD}`));
+}
+
 // == an unresolvable line_id throws, not a silent wrong answer ==============
 {
   let threw = false;

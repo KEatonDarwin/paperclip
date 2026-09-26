@@ -2,7 +2,13 @@
 // NOTEPAD MARKER STORE CHECK — exercises src/notepad-markers.ts
 // (reconcileNotepadMarker / dismissNotepadMarker / setNotepadMarkerActionRef
 // / getNotepadMarker / listNotepadMarkers / activeNotepadMarkers) against
-// goal 6 node #104's done_means: "Markers persist against line_id with
+// goal 6 node #104's done_means, plus node #943's BLOCK wiring (the last
+// section): a marker belongs to a TOPIC, and it lives on that topic's
+// headline line. The store itself is unchanged and still keyed by line_id --
+// which is exactly why blocks needed no new identity: a block_id IS one of
+// the block's own line ids (docs/notepad/BLOCKS.md §3).
+//
+// Original done_means: "Markers persist against line_id with
 // their move kind, reason and action_ref; editing an acted line reconciles
 // its existing marker instead of creating a second one; dismissing a
 // marker is remembered across days; and a check proves an already-acted
@@ -44,6 +50,7 @@ const {
   activeNotepadMarkers,
 } = await import(path.join(distDir, 'notepad-markers.js'));
 const { sqliteDb } = await import(path.join(distDir, 'conversation-db.js'));
+const { parseNotepadBlocks, notepadBlockId } = await import(path.join(distDir, 'notepad-blocks.js'));
 
 let failed = false;
 function check(label, ok) {
@@ -298,6 +305,47 @@ const DAY4 = '2026-09-28';
     threw = true;
   }
   check('setNotepadMarkerActionRef on a line with no marker throws', threw);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NODE #943 — THE BLOCK WIRING: one marker per TOPIC, on its headline line.
+// ═══════════════════════════════════════════════════════════════════════════
+const DAY_BLOCK = '2026-09-30';
+{
+  const NOTE = [
+    'Universal KPI Goal',
+    '  - needs a row cap on the prod SELECTs',
+    '     - Ian flagged the 3am run',
+    '',
+    '  - base class owns the value store',
+    'Dry cleaning',
+  ].join('\n');
+  const saved = putNotepadDay(DAY_BLOCK, NOTE);
+  const blocks = parseNotepadBlocks(saved.lines.map((l) => ({ id: l.id, idx: l.idx, text: l.text })));
+  check('block wiring: the day is 2 topics', blocks.length === 2);
+
+  const topic = blocks[0];
+  const headlineId = notepadBlockId(topic);
+  const childIds = topic.member_line_ids.filter((id) => id !== headlineId);
+  check('block wiring: the block id IS the headline line id — no second identity scheme', headlineId === topic.headline_line_id);
+
+  // The pipeline persists exactly one marker per decided move, keyed on the
+  // move's block_id -- i.e. this call, with this id.
+  const marker = reconcileNotepadMarker(headlineId, { kind: 'take_it', reason: 'JARVIS can add the row cap' });
+  check('block wiring: the marker landed on the headline line', marker.line_id === headlineId);
+  check('block wiring: exactly one row for the topic', markerRowCount(headlineId) === 1);
+  check('block wiring: not one child line carries a marker of its own', childIds.every((id) => getNotepadMarker(id) === undefined));
+  check('block wiring: the day lists ONE marker for this topic, not one per dash', listNotepadMarkers(DAY_BLOCK).filter((m) => topic.member_line_ids.includes(m.line_id)).length === 1);
+
+  // Kevin edits a CHILD of the topic. The headline's text is untouched, so
+  // its marker reconciles in place against the topic's new judgement --
+  // still exactly one row, never a second one for the edited child.
+  const EDITED = NOTE.replace('  - needs a row cap on the prod SELECTs', '  - needs a row cap AND a statement timeout on the prod SELECTs');
+  putNotepadDay(DAY_BLOCK, EDITED);
+  const reconciled = reconcileNotepadMarker(headlineId, { kind: 'take_it', reason: 'row cap plus a statement timeout' });
+  check('block wiring: editing a CHILD reconciles the topic\'s existing marker in place', markerRowCount(headlineId) === 1 && reconciled.reason === 'row cap plus a statement timeout');
+  check('block wiring: the edited child still has no marker of its own', getNotepadMarker(childIds[0]) === undefined);
+  check('block wiring: the headline line id survived the child edit', getNotepadMarker(headlineId)?.line_id === headlineId);
 }
 
 console.log(failed ? '\nFAILED' : '\nALL PASS');

@@ -2,10 +2,12 @@
 // NOTEPAD DRY RUN — run the whole notepad brain over a real day of notes and
 // report what it WOULD do, creating nothing.
 //
-// The chain is the production one: the gate (does a complete thought live on
-// this line?) -> the whole-note review -> the move decision under its real
-// noise budget -> the topic dossier -> the deterministic routing rule. It
-// stops one step short of dispatchNotepadLine(), which is the only function
+// The chain is the production one, and since node #943 every judging stage in
+// it reads Kevin's topic BLOCKS rather than isolated lines (docs/notepad/
+// BLOCKS.md): the gate (did a complete topic land in this block?) -> the
+// whole-note review -> the move decision under its real per-BLOCK noise
+// budget -> the topic dossier for the whole block -> the deterministic block
+// routing rule. It stops one step short of dispatchNotepadBlock(), the only function
 // that creates hopper cards / ghost goal nodes / workstreams / threads and the
 // only one that writes the line-state ledger. Nothing here writes anything but
 // the report.
@@ -62,7 +64,8 @@ const { buildNotepadReviewContext } = await import(path.join(distDir, 'notepad-r
 const { runNotepadGate } = await import(path.join(distDir, 'notepad-gate.js'));
 const { decideNotepadMoves } = await import(path.join(distDir, 'notepad-moves.js'));
 const { buildTopicDossier } = await import(path.join(distDir, 'notepad-dossier.js'));
-const { routeNotepadLine } = await import(path.join(distDir, 'notepad-route-rule.js'));
+const { routeNotepadBlock } = await import(path.join(distDir, 'notepad-route-rule.js'));
+const { parseNotepadBlocks, notepadBlockId } = await import(path.join(distDir, 'notepad-blocks.js'));
 const { sqliteDb } = await import(path.join(distDir, 'conversation-db.js'));
 
 // ── which day ───────────────────────────────────────────────────────────────
@@ -164,26 +167,47 @@ if (movesResult.outcome === 'fallback' && !hasFlag('allow-fallback')) {
 const allLines = day.lines.map((l) => ({ line_id: l.id, idx: l.idx, text: l.text }));
 const byId = new Map(allLines.map((l) => [l.line_id, l]));
 
+// Kevin's topic blocks over the same lines -- the unit every judgement below
+// is made about. Keyed by block_id (the headline's line id) so a move can be
+// resolved straight back to the block it was decided about.
+const blocksById = new Map(
+  parseNotepadBlocks(day.lines.map((l) => ({ id: l.id, idx: l.idx, text: l.text }))).map((b) => {
+    const block_id = notepadBlockId(b);
+    return [
+      block_id,
+      {
+        block_id,
+        headline_line_id: b.headline_line_id,
+        headline: b.headline,
+        lines: b.member_line_ids.map((id) => byId.get(id)).filter(Boolean),
+      },
+    ];
+  }),
+);
+console.error(`[notepad-dry-run] ${blocksById.size} topic block(s) across ${day.lines.length} lines`);
+
 const plans = [];
 for (const move of movesResult.moves) {
-  const line = byId.get(move.line_id);
-  if (!line) continue;
+  const block = blocksById.get(move.block_id);
+  if (!block) continue;
   let dossier = null;
   if (!hasFlag('no-dossier') && move.kind === 'take_it') {
-    console.error(`[notepad-dry-run] dossier for line ${move.line_id}…`);
+    console.error(`[notepad-dry-run] dossier for block ${move.block_id}…`);
     try {
-      dossier = await buildTopicDossier({ line_id: move.line_id }, { runOneShot: judgeOneShot, timeoutMs: 1_140_000 });
+      dossier = await buildTopicDossier(
+        { block: { block_id: block.block_id, headline_line_id: block.headline_line_id, headline: block.headline, lines: block.lines.map((l) => ({ line_id: l.line_id, text: l.text })) } },
+        { runOneShot: judgeOneShot, timeoutMs: 1_140_000 },
+      );
     } catch (e) {
       dossier = { error: String(e?.message ?? e) };
     }
   }
-  const decision = routeNotepadLine({
-    line,
+  const decision = routeNotepadBlock({
+    block,
     move: { kind: move.kind, reason: move.reason },
     dossier: dossier && !dossier.error ? { confidence: dossier.confidence } : null,
-    allLines,
   });
-  plans.push({ move, line, decision, dossier });
+  plans.push({ move, block, decision, dossier });
 }
 
 // ── the report ──────────────────────────────────────────────────────────────
@@ -206,39 +230,50 @@ out.push('');
 out.push(`| | |`);
 out.push(`|---|---|`);
 out.push(`| lines in the notepad | ${day.lines.length} (${day.lines.filter((l) => l.text.trim()).length} with text) |`);
-out.push(`| surfaced to the scanner | ${surfaced.length} |`);
-out.push(`| gate says a complete thought landed | ${completeIds.size} |`);
-out.push(`| moves proposed | ${movesResult.moves.length} (budget ${budget ?? 5}, outcome \`${movesResult.outcome}\`) |`);
+out.push(`| topic blocks | ${blocksById.size} |`);
+out.push(`| surfaced to the scanner | ${surfaced.length} line(s) |`);
+out.push(`| gate says a complete topic landed | ${gate.filter((v) => v.complete_thought).length} block(s) / ${completeIds.size} line(s) |`);
+out.push(`| moves proposed | ${movesResult.moves.length} of ${movesResult.candidate_count} candidate block(s) (budget ${budget ?? 5} blocks/day, outcome \`${movesResult.outcome}\`) |`);
 out.push(`| model calls spent | ${spawnCount} |`);
 out.push('');
 
 out.push('## What it would do');
 out.push('');
+function blockTitleOf(p) {
+  if (p.block.headline !== null && p.block.headline.trim()) return p.block.headline.trim();
+  const first = p.block.lines.find((l) => l.text.trim());
+  return (first?.text ?? '').trim();
+}
+
 if (plans.length === 0) {
-  out.push('_Nothing. Every line was judged either incomplete, already handled, or not worth a move._');
+  out.push('_Nothing. Every topic was judged either incomplete, already handled, or not worth a move._');
 } else {
-  out.push('| line | the thought | move | sink | what that creates | why |');
+  out.push('| topic | lines | move | sink | what that creates | why |');
   out.push('|---|---|---|---|---|---|');
   for (const p of plans) {
-    const text = p.line.text.trim().replace(/\|/g, '\\|');
+    const title = blockTitleOf(p).replace(/\|/g, '\\|');
     out.push(
-      `| ${p.line.idx + 1} | ${text} | \`${p.move.kind}\` | **${p.decision.sink}** (${p.decision.confidence}) | ${
+      `| ${title} | ${p.block.lines.length} | \`${p.move.kind}\` | **${p.decision.sink}** (${p.decision.confidence}) | ${
         WOULD_CREATE[p.decision.sink]
       } | ${p.decision.why.replace(/\|/g, '\\|')} |`,
     );
   }
   out.push('');
-  out.push('### Its reasoning, line by line');
+  out.push('### Its reasoning, topic by topic');
   out.push('');
   for (const p of plans) {
-    out.push(`**Line ${p.line.idx + 1} — ${p.line.text.trim()}**`);
+    out.push(`**${blockTitleOf(p)}**`);
+    out.push('');
+    out.push('```');
+    for (const l of p.block.lines) out.push(l.text);
+    out.push('```');
     out.push('');
     out.push(`- move: \`${p.move.kind}\` — ${p.move.reason}`);
     out.push(`- sink: \`${p.decision.sink}\` (${p.decision.confidence} confidence) — ${p.decision.why}`);
     if (p.dossier?.error) out.push(`- dossier: FAILED — ${p.dossier.error}`);
     else if (p.dossier) {
-      out.push(`- dossier confidence: \`${p.dossier.confidence}\`${p.dossier.goal ? ` · goal: ${p.dossier.goal}` : ''}`);
-      if (p.dossier.summary) out.push(`- dossier: ${p.dossier.summary}`);
+      out.push(`- dossier confidence: \`${p.dossier.confidence}\`${p.dossier.goal ? ` · goal: #${p.dossier.goal.goal_id} ${p.dossier.goal.title}` : ''}`);
+      if (p.dossier.unresolved_reason) out.push(`- dossier note: ${p.dossier.unresolved_reason}`);
     }
     out.push('');
   }
@@ -247,15 +282,15 @@ out.push('');
 
 out.push('## What it would stay silent about');
 out.push('');
-const moved = new Set(plans.map((p) => p.line.line_id));
-const silentComplete = [...completeIds].filter((id) => !moved.has(id));
+const movedLineIds = new Set(plans.flatMap((p) => p.block.lines.map((l) => l.line_id)));
+const silentComplete = [...completeIds].filter((id) => !movedLineIds.has(id));
 out.push(
-  `${silentComplete.length} line(s) the gate judged a complete thought, that the move decision still left alone:`,
+  `${silentComplete.length} line(s), inside topics the gate judged complete, that the move decision still left alone:`,
 );
 out.push('');
 for (const id of silentComplete) {
   const l = byId.get(id);
-  if (l) out.push(`- ${l.idx + 1}. ${l.text.trim()}`);
+  if (l && l.text.trim()) out.push(`- ${l.idx + 1}. ${l.text.trim()}`);
 }
 out.push('');
 const rejected = gate.filter((v) => !v.complete_thought);
@@ -264,7 +299,7 @@ for (const v of rejected) (byReason[v.reason] ??= []).push(...v.member_line_ids)
 out.push('## What the gate filtered out before any judgement');
 out.push('');
 for (const [reason, ids] of Object.entries(byReason)) {
-  out.push(`- \`${reason}\` — ${ids.length} line(s)`);
+  out.push(`- \`${reason}\` — ${ids.length} line(s) across ${rejected.filter((v) => v.reason === reason).length} block(s)`);
 }
 out.push('');
 out.push(`_Wall time ${(Date.now() - started) / 1000}s._`);

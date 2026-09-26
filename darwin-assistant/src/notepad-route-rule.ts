@@ -271,3 +271,154 @@ export async function tieBreakRouteWithModel(
     return fallbackSink;
   }
 }
+
+// == The BLOCK form (node #943) ==============================================
+// Kevin's own rule, made operational: "never look at the line on its own,
+// look at the entire block" (docs/notepad/BLOCKS.md). routeNotepadBlock runs
+// THE SAME rule table, with THE SAME detectors, against the whole topic block
+// — headline plus every indented child — instead of one stripped line.
+//
+// NOTHING is loosened. Every detector below is the exact function the
+// per-line table above uses; the only change is how much of Kevin's note it
+// is offered. A detector is applied to each member line INDIVIDUALLY (first
+// match wins, in document order) rather than to the block's lines glued into
+// one string, precisely so a line-anchored rule keeps its line-anchored
+// meaning: `buildShapeReason` still demands the imperative verb and the
+// concrete artifact on the SAME line, never a verb on one child and an
+// artifact three children down.
+//
+// Two rules read the block's structure directly, which is where the block
+// form actually earns its keep:
+//
+//  - GOAL HEADING. The per-line form had to walk backward through the day
+//    hunting for a `Potential Goals:` heading and guess where its section
+//    ended (goalsHeadingReason). For a block there is nothing to hunt: the
+//    heading IS the block's own headline, and the section IS the block. The
+//    fragile walk is gone, not weakened.
+//  - ALREADY ANNOTATED. An annotation Kevin (or JARVIS) appended — `(Created
+//    a goal)`, `(done)` — anywhere in the block sends the WHOLE block to
+//    `thread`. This is deliberately the cautious direction: a topic where
+//    some children are already handled is exactly the thing that must not be
+//    silently re-fanned into a second goal proposal or a duplicate hopper
+//    card. Per this file's standing rule, a chat is always safe; inventing a
+//    sink is not.
+
+export interface RouteBlockInput {
+  /** The block's identity — its headline's line_id, or its first member's
+   *  line_id for a headline:null lead-in block (notepadBlockId). */
+  block_id: number;
+  headline_line_id: number | null;
+  headline: string | null;
+  /** Every member line of the block, document order, with the text EXACTLY as
+   *  Kevin typed it — raw indentation, no "[line_id N] " render prefixes. The
+   *  detectors below match against real note text, never a rendered view. */
+  lines: RouteLineInput[];
+}
+
+export interface RouteNotepadBlockInput {
+  block: RouteBlockInput;
+  move: RouteMoveInput;
+  /** Same forward-compatibility seam as the per-line form — accepted, never
+   *  consulted, never able to change the deterministic answer. */
+  dossier?: Pick<TopicDossier, 'confidence'> | null;
+}
+
+/**
+ * The ONE normalization the block form applies before running a detector on a
+ * member line: strip the leading indentation and Kevin's list marker.
+ *
+ * This is not a relaxed rule, it is the same rule reaching the text it was
+ * always meant to read. Every start-anchored detector above (`goal:`, the
+ * imperative build verb) was written against a line's actual first WORD;
+ * Kevin's own format puts a dash and some eyeballed indentation in front of
+ * every child ("almost always denoted with a dash"), so without this the
+ * detectors could only ever fire on a headline and never on the child lines
+ * where he actually writes the ask. notepad.ts's normalizeLineText() strips
+ * exactly one leading bullet for exactly this reason; this mirrors it, minus
+ * the lowercasing/collapsing (a detector's `why` quotes the text back).
+ */
+const LEADING_INDENT_AND_BULLET_RE = /^\s*[-*•]\s*/;
+
+function memberProbeText(text: string): string {
+  const stripped = text.replace(LEADING_INDENT_AND_BULLET_RE, '');
+  return stripped === text ? text.replace(/^\s+/, '') : stripped;
+}
+
+/** Apply a line-level detector to every member of the block in document
+ *  order; the first match wins and names the line it fired on, so a block's
+ *  `why` stays as specific as a line's was. */
+function firstMemberReason(block: RouteBlockInput, detect: (text: string) => string | null): string | null {
+  for (const line of block.lines) {
+    const reason = detect(memberProbeText(line.text));
+    if (reason) return `${reason} [line ${line.line_id}]`;
+  }
+  return null;
+}
+
+/** The block's own headline is the heading — no backward walk, no section
+ *  boundary guessing. Falls back to the explicit `goal:` / `new goal` cue on
+ *  any member line, exactly as the per-line form does. */
+function blockGoalShapeReason(block: RouteBlockInput): string | null {
+  if (block.headline !== null && isGoalHeadingLine(block.headline)) {
+    return `the block's own headline is a "${block.headline.trim()}" heading`;
+  }
+  return firstMemberReason(block, goalCueReason);
+}
+
+interface BlockRouteRule {
+  sink: NotepadRouteSink;
+  match: (block: RouteBlockInput, move: RouteMoveInput) => string | null;
+}
+
+// Same sinks, same priority order, same tie-break semantics as ROUTE_RULES.
+const BLOCK_ROUTE_RULES: BlockRouteRule[] = [
+  {
+    sink: 'thread',
+    match: (_block, move) =>
+      move.kind === 'take_it' ? null : `move kind '${move.kind}' is conversation, not machinery`,
+  },
+  {
+    sink: 'thread',
+    match: (block) => firstMemberReason(block, alreadyAnnotatedReason),
+  },
+  {
+    sink: 'goal_proposal',
+    match: (block) => blockGoalShapeReason(block),
+  },
+  {
+    sink: 'hopper',
+    match: (block) => firstMemberReason(block, buildShapeReason),
+  },
+  {
+    sink: 'workstream',
+    match: (block) => firstMemberReason(block, ballInAirReason),
+  },
+];
+
+/**
+ * Route one notepad BLOCK to exactly one sink. Deterministic and pure: same
+ * input always produces the same output, no DB, no model call, no clock —
+ * identical contract to routeNotepadLine, one topic wider.
+ */
+export function routeNotepadBlock(input: RouteNotepadBlockInput): NotepadRouteDecision {
+  const matches: Array<{ rule: BlockRouteRule; reason: string }> = [];
+  for (const rule of BLOCK_ROUTE_RULES) {
+    const reason = rule.match(input.block, input.move);
+    if (reason) matches.push({ rule, reason });
+  }
+
+  if (matches.length === 0) {
+    return {
+      sink: 'thread',
+      why: 'no rule matched anywhere in the block — defaulting to conversation; a chat is always safe, inventing a sink is not',
+      confidence: 'low',
+    };
+  }
+
+  const winner = matches[0];
+  return {
+    sink: winner.rule.sink,
+    why: winner.reason,
+    confidence: matches.length === 1 ? 'high' : 'medium',
+  };
+}

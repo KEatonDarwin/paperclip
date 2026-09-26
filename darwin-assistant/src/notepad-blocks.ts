@@ -85,3 +85,18 @@ export function parseNotepadBlocks(lines: NotepadBlockLineInput[]): NotepadBlock
 
   return blocks;
 }
+
+/**
+ * A block's stable identity for the JUDGMENT layer: the headline's line_id,
+ * or — for a `headline: null` lead-in block, which by construction still has
+ * at least one member — its first member's line_id. Defined here once so the
+ * gate, the moves decision, the dossier, the router and dispatch all agree on
+ * what "this block" means without re-deriving it four times.
+ *
+ * It is NOT a new kind of identity: it is always one of the block's own
+ * per-line ids, which is exactly what lets a block-level judgement resolve
+ * back down to the per-line ledger (docs/notepad/BLOCKS.md §3).
+ */
+export function notepadBlockId(block: Pick<NotepadBlock, 'headline_line_id' | 'member_line_ids'>): number {
+  return block.headline_line_id ?? block.member_line_ids[0];
+}

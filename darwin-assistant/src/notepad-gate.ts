@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { getSetting } from './conversation-db.js';
 import { getNotepadDay, normalizeLineText, unscannedLines } from './notepad.js';
-import { parseNotepadBlocks } from './notepad-blocks.js';
+import { parseNotepadBlocks, notepadBlockId } from './notepad-blocks.js';
 import { isScratchEnv, scratchReason } from './sim-guard.js';
 import { extractJsonObject } from './tools/ux-reviewer/vision-critique.js';
 
@@ -143,7 +143,7 @@ export function prefilterGateCandidates(day: string): PrefilterResult {
   for (const block of blocks) {
     if (!block.member_line_ids.some((id) => surfacedLineIds.has(id))) continue; // not a candidate block
 
-    const blockId = block.headline_line_id ?? block.member_line_ids[0];
+    const blockId = notepadBlockId(block);
     const memberReasons = block.member_line_ids.map((id) => classifyGateSkip(textById.get(id) ?? '', minChars));
 
     if (memberReasons.every((r): r is GateSkipReason => r !== null)) {

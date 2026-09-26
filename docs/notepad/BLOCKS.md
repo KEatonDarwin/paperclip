@@ -151,9 +151,81 @@ The first two consumers are wired:
   refuses to publish a report containing any `fallback` verdict, which is
   what keeps a failed model call loud instead of a confident-looking zero.
 
-Still per-line by design, and out of node #942's scope: `notepad-moves.ts`
-(it judges surfaced lines, now against an id-prefixed render), the marker/
-route/dispatch layers, and everything in `notepad.ts` / `notepad-rollover.ts`.
+## 3c. The action chain moves to blocks (node #943)
+
+The rest of the judgment layer follows, and the chain is now block-shaped end
+to end. `notepad.ts` and `notepad-rollover.ts` are still untouched — the
+per-line ledger and carry-forward were never this node's to change, and
+`notepad:ledger-key-check` stays green without edits.
+
+**`notepad-moves.ts` — the speaking bar decides about BLOCKS.**
+`NotepadMove` is `{ block_id, headline_line_id, member_line_ids, kind,
+reason }`. Candidates are the review's blocks with at least one surfaced
+member line (`moveBlockCandidates`) — `unscannedLines()` is still the only
+source of "surfaced", one line at a time; this only groups its answer. The
+prompt shows the whole rendered note and then lists each candidate as
+`- block <id>: <headline>` followed by the block's id-prefixed rows. A
+`block_id` the model invents, or a *child's* line id, is dropped exactly the
+way a phantom line id always was. The noise budget
+(`notepad_moves_max_per_day`, default 5) now caps **blocks per day** — which
+is what "a handful of markers, not one per line" always meant.
+
+**`notepad-dossier.ts` — the topic is the block.** `buildTopicDossier` takes
+a `block` (`DossierBlockInput`: block_id, headline, and every member line with
+its id). Topic resolution and evidence gathering run over the block's whole
+plain text, and the one permitted model call is shown the block with its real
+indentation. The dossier carries `block_id` and `member_line_ids` back out.
+Every structural guarantee from node #107 is unchanged: repo/branch/goal/
+prior_work are still evidence-only, and a narrative citing anything the
+evidence didn't prove is still discarded wholesale.
+
+**`notepad-route-rule.ts` — `routeNotepadBlock`.** Same sinks, same rule
+table, same priority order, and *the same detector functions*, applied to each
+member line of the block (first match wins, and the `why` names the line that
+fired). Two rules read the block's structure instead of guessing at it:
+
+* the `Potential Goals:` rule no longer walks backward hunting for a heading
+  and guessing where its section ends — **the heading IS the block's headline
+  and the section IS the block**;
+* an annotation (`(Created a goal)`, `(done)`) anywhere in the block sends the
+  whole block to `thread`. That is deliberately the cautious direction: a
+  topic with some children already handled is exactly the thing that must not
+  be re-fanned into a duplicate sink row.
+
+One normalization is applied before a detector reads a member line: the
+leading indentation and Kevin's list marker are stripped, mirroring
+`normalizeLineText()`'s own single-bullet strip. Without it a start-anchored
+detector (`goal:`, an imperative build verb) could only ever fire on a
+headline and never on the dashed child where he actually writes the ask.
+Nothing is relaxed — `notepad-route-rule-check.mjs` keeps all 14 original
+per-line fixtures unchanged as the proof, and adds fixture B9, which shows a
+verb on one child plus an artifact on another still does **not** fabricate a
+build cue.
+
+**`notepad-dispatch.ts` — `dispatchNotepadBlock`.** Routes the block, acts on
+the sink with the whole topic (the ghost goal node is titled with the
+headline and carries the block text in its notes; the hopper card's
+`raw_message` is the whole block; the thread handoff seeds the whole block),
+and then writes the EXISTING per-line ledger:
+
+* the **headline** line → `acted`, carrying the `action_ref`;
+* every **other member** → `seen` — unless it already carries a real
+  `action_ref` of its own, in which case it is left alone rather than
+  downgraded.
+
+Idempotence is keyed on the headline: a block whose headline already carries
+an `action_ref` performs no sink call and no write. `dispatchNotepadLine` is
+kept for the genuinely single-line caller and shares every sink actor and the
+ledger write with the block form.
+
+**`notepad-speak.ts` / `notepad-markers.ts` — one marker per topic.**
+`runNotepadSpeak` persists each decided move against `move.block_id`, i.e. the
+block's headline line. The marker store itself needed no change at all, which
+is the clearest statement of §3's decision: a `block_id` **is** one of the
+block's own line ids, so blocks are a judgment layer and never a second
+identity scheme. `POST /notepad/markers/:lineId/open` resolves the line's
+block and hands it to the handoff, so clicking a marker opens a thread already
+holding the whole topic.
 
 ## 4. Verification
 
@@ -172,6 +244,31 @@ function test — no DB, no `JARVIS_DB_PATH`, no model call:
 7. Every input line lands in exactly one block, and document order is
    preserved (the concatenation of every block's member ids equals the
    full input id sequence).
+
+Node #943's checks (all hermetic, stubbed model, zero claude spawns):
+
+* `notepad:route-rule-check` — the 14 original per-line fixtures, unchanged,
+  plus 12 block fixtures (B1–B11): the headline-as-heading rule, a cue on a
+  child, a headline:null lead-in block, the annotation rule, the non-take_it
+  kinds, the low-confidence default, the ambiguity tie-break, the `why`
+  naming the child line that fired, and B9's proof that nothing was loosened.
+* `notepad:moves-check` — (M) a real topic is ONE candidate keyed on its
+  headline, carrying every member id and Kevin's raw indentation; a move keyed
+  on a child is dropped; (M2) a block whose only surfaced member is a junk
+  child still enters play as a whole topic.
+* `notepad:moves-budget-check` — (H) three topics across fifteen lines are
+  three candidates, and lowering the budget to 2 caps at two TOPICS.
+* `notepad:dispatch-check` (7) and `notepad:route-check` — the ledger proof:
+  headline `acted` + `action_ref` + the one marker, every child `seen` with a
+  null `action_ref` and no marker of its own; the sink row carries the whole
+  topic; re-dispatch is a no-op with zero row deltas anywhere.
+* `notepad:speak-check` (4) and `notepad:markers-check` — one marker per
+  topic, on its headline, and editing a child reconciles that same single row.
+* `notepad:handoff-route-check` (6b) — clicking the marker opens a thread
+  seeded with the whole block, from a dossier built over the whole block.
+* `notepad:pass-check` (I) — a topic burst settles once, reaches the gate as
+  one block verdict covering every member, and the review still carries both
+  the per-line ledger view and the block grouping.
 
 `scripts/notepad-gate-check.mjs` (`npm run notepad:gate-check`) and
 `scripts/notepad-review-check.mjs` (`npm run notepad:review-check`) cover the

@@ -376,6 +376,66 @@ const DAY_H = '2026-10-01';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// (I) — NODE #943: the pass hands off BLOCKS. Kevin types a whole topic (a
+// headline plus irregularly-indented dashed children) in one burst. It must
+// settle once, reach the gate as ONE block candidate covering every member
+// line, and come back in a review that carries both the per-line ledger view
+// AND the block grouping — because the ledger remembers by line and the
+// models judge by block (docs/notepad/BLOCKS.md §3).
+// ═══════════════════════════════════════════════════════════════════════════
+const DAY_I = '2026-10-02';
+{
+  const NOTE = [
+    'Universal KPI Goal',
+    '  - needs a row cap on the prod SELECTs before we schedule it',
+    '     - Ian flagged the 3am run last week',
+    '',
+    '  - decide whether the base class owns the value store',
+    'Dry cleaning',
+  ].join('\n');
+  saveAtTick(DAY_I, NOTE, 5000);
+  const { lines: linesI } = getNotepadDay(DAY_I);
+  const headline = linesI.find((l) => l.text === 'Universal KPI Goal');
+  const other = linesI.find((l) => l.text === 'Dry cleaning');
+  const topicMemberIds = linesI.filter((l) => l.id !== other.id).map((l) => l.id);
+
+  const gateCallsBeforeI = totalGateCalls;
+  let capturedGatePrompt = null;
+  const stubI = async (prompt) => {
+    totalGateCalls += 1;
+    capturedGatePrompt = prompt;
+    const ids = [...new Set([...prompt.matchAll(/block_id (\d+)/g)].map((m) => Number(m[1])))];
+    return JSON.stringify({ verdicts: ids.map((block_id) => ({ block_id, complete_thought: true })) });
+  };
+
+  const result = await runNotepadPass(DAY_I, { now: tickDate(5000 + 20 + 1), runOneShot: stubI });
+
+  check('(I) the topic burst settled exactly once', result.settle !== null);
+  if (result.settle) totalSettles += 1;
+  check('(I) exactly one gate call for the whole day', totalGateCalls === gateCallsBeforeI + 1, `got ${totalGateCalls - gateCallsBeforeI}`);
+  check('(I) the gate judged 2 BLOCKS, not 6 lines', result.gate?.length === 2, `got ${result.gate?.length}`);
+
+  const topicVerdict = result.gate?.find((v) => v.block_id === headline.id);
+  check('(I) the topic verdict is keyed on its headline line', topicVerdict !== undefined);
+  check(
+    '(I) the topic verdict covers EVERY member line of the block (headline, children, the interior blank)',
+    topicVerdict?.member_line_ids.slice().sort((a, b) => a - b).join() === topicMemberIds.slice().sort((a, b) => a - b).join(),
+  );
+  check('(I) no child line was judged as a block of its own', !result.gate?.some((v) => topicMemberIds.includes(v.block_id) && v.block_id !== headline.id));
+  check('(I) the gate prompt showed the block with its real indentation preserved', capturedGatePrompt?.includes('     - Ian flagged the 3am run last week'));
+
+  check('(I) worth_reviewing is true and a review was assembled', result.worth_reviewing === true && result.review !== null);
+  if (result.review) {
+    check('(I) the review still carries the WHOLE note per line (the ledger is per-line)', result.review.lines.length === linesI.length);
+    check('(I) the review also carries the block grouping, in document order', result.review.blocks.length === 2 && result.review.blocks[0].headline === 'Universal KPI Goal');
+    check(
+      '(I) every rendered row carries its line_id prefix',
+      result.review.rendered.split('\n').every((row) => /^\[line_id \d+\] /.test(row)),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // (F) — zero real claude processes were ever spawned by this whole run.
 // ═══════════════════════════════════════════════════════════════════════════
 const spawnsAfter = claudeProcessCount();

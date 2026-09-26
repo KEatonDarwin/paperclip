@@ -1,6 +1,6 @@
 import { getNotepadLine, markLineActed, type NotepadLine } from './notepad.js';
 import { getNotepadMarker, setNotepadMarkerActionRef, type NotepadMarker, type NotepadMarkerKind } from './notepad-markers.js';
-import { buildTopicDossier, type TopicDossier, type BuildDossierOptions } from './notepad-dossier.js';
+import { buildTopicDossier, type TopicDossier, type BuildDossierOptions, type DossierBlockInput } from './notepad-dossier.js';
 import { getConversation, getOrCreateConversation, renameConversation } from './conversation-db.js';
 import { processMessage } from './agent.js';
 
@@ -41,11 +41,22 @@ export function buildNotepadHandoffPrompt(
   line: Pick<NotepadLine, 'text'>,
   marker: Pick<NotepadMarker, 'kind' | 'reason'>,
   dossier: TopicDossier,
+  block?: DossierBlockInput | null,
 ): string {
+  // Node #943 — when the marker belongs to a topic BLOCK, the thread is
+  // seeded with the WHOLE block (headline + every indented child, verbatim,
+  // with their line ids), not just the headline. Kevin's rule: never look at
+  // the line on its own. A single-line handoff is unchanged.
+  const subject = block
+    ? [
+        `The topic — ${block.headline !== null ? JSON.stringify(block.headline) : '(no headline; a leading fragment)'} — as he wrote it:`,
+        block.lines.map((l) => `[line_id ${l.line_id}] ${l.text}`).join('\n'),
+      ]
+    : [`The line: ${JSON.stringify(line.text)}`];
   return [
     "Kevin clicked a marker on this notepad line — this chat exists to act on it, not to ask him what he meant.",
     '',
-    `The line: ${JSON.stringify(line.text)}`,
+    ...subject,
     `${MARKER_KIND_LABEL[marker.kind] ?? marker.kind} — ${marker.reason}`,
     '',
     dossier.rendered,
@@ -76,6 +87,11 @@ export interface OpenNotepadHandoffOptions {
   /** Forwarded to buildTopicDossier — the injection seam a sim/check uses to
    *  stub its one model call, exactly as notepad-dossier-check.mjs already does. */
   dossierOpts?: BuildDossierOptions;
+  /** Node #943 — the topic BLOCK this line's marker belongs to. When given,
+   *  the dossier is built for the whole block and the seed prompt carries
+   *  every member line verbatim, instead of the headline alone. Omitted, this
+   *  behaves exactly as node #869's per-line handoff always did. */
+  block?: DossierBlockInput | null;
   /** Injection seam for a sim/check to stub the actual turn dispatch instead
    *  of touching agent.js's real processMessage. Defaults to processMessage
    *  itself, which is already sim-guarded (src/sim-guard.ts) — under a
@@ -123,8 +139,9 @@ export async function openNotepadHandoff(
 
   renameConversation(conv.id, line.text.slice(0, 120));
 
-  const dossier = await buildTopicDossier({ line_id: lineId }, opts.dossierOpts);
-  const prompt = buildNotepadHandoffPrompt(line, marker, dossier);
+  const block = opts.block ?? null;
+  const dossier = await buildTopicDossier(block ? { block } : { line_id: lineId }, opts.dossierOpts);
+  const prompt = buildNotepadHandoffPrompt(line, marker, dossier, block);
 
   setNotepadMarkerActionRef(lineId, externalId);
   markLineActed(lineId, externalId);

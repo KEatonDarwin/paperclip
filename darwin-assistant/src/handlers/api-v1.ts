@@ -78,6 +78,7 @@ import { openNotepadDay } from '../notepad-rollover.js';
 import { activeNotepadMarkers, dismissNotepadMarker, getNotepadMarker } from '../notepad-markers.js';
 import { openNotepadHandoff } from '../notepad-handoff.js';
 import { parseNotepadBlocks, notepadBlockId } from '../notepad-blocks.js';
+import { notepadBlockStates } from '../notepad-block-state.js';
 import { listNotepadActedActions } from '../notepad-action-resolver.js';
 import {
   listNotifications,
@@ -1771,7 +1772,12 @@ export function createApiV1Router(): Router {
       reason: m.reason,
       action_ref: m.action_ref,
     }));
-    return { ...base, markers };
+    // node #187 — the per-block gutter state (docs/notepad/BLOCKS.md "Gutter
+    // state"), so a block JARVIS read and stayed silent on renders
+    // differently than one it never looked at. Additive: every other field
+    // above is byte-identical to before this node.
+    const blocks = notepadBlockStates(day);
+    return { ...base, markers, blocks };
   }
 
   router.get('/notepad', (req: AuthedRequest, res) => {

@@ -5,8 +5,9 @@
 // in this codebase may shell out to git; if you need a git operation, add it
 // here so the safety invariants (§8) hold in exactly one place.
 //
-// THIS MODULE IS A TYPED STUB. Nodes 2-6 of the tree fill the bodies. It exists
-// now so those nodes build against one agreed surface instead of inventing four.
+// Authored as a typed stub by node #945 so nodes 2-6 built against one agreed
+// surface; node #948 filled §3.1-§3.4/§8 and node #949 the §3.5-§3.6 merge-back,
+// so every body below is now real. Nothing here is a placeholder.
 //
 // Safety invariants this surface exists to enforce (§8 — do not weaken):
 //   1. No force-push, ever (no --force / --force-with-lease / +refs).
@@ -20,14 +21,10 @@
 //   8. Every call is timeout-bounded and returns a RESULT, never throws a
 //      failure that could strand a node's claim.
 
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { getHopperNode, getHopperTree, type HopperNodeRow, type HopperTreeRow } from './hopper-engine.js';
-
-const NOT_IMPLEMENTED = (fn: string): never => {
-  throw new Error(`[hopper-git] ${fn} is not implemented yet (docs/hopper/PARALLEL-CONTRACT.md §9)`);
-};
 
 /** Every git call is timeout-bounded (§8.8). Worktree adds copy a checkout, so 5m. */
 const GIT_TIMEOUT_MS = 300_000;
@@ -158,6 +155,14 @@ export interface BuildGateOutcome {
   output: string;
   /** Process exit code, or null when skipped / timed out. */
   exit_code: number | null;
+  /**
+   * Machine-ish reason on failure. `'build_toolchain_missing'` (a failed
+   * `npm ci --include=dev`, or exit 127 = `tsc: not found`) is deliberately
+   * DISTINCT from `'build_failed'`: the first is the environment, the second is
+   * the code, and an `integrate nX` node must not blame a worker for the
+   * environment. Undefined when the gate passed or was skipped. §3.6
+   */
+  reason?: string;
 }
 
 /** §6 — machine-checkable unpark conditions. Stored as JSON. */
@@ -503,6 +508,63 @@ export function pruneNodeWorktree(
 // Merge-back (§3.5)
 // ---------------------------------------------------------------------------
 
+/** §3.5 step 3: the gate gets 20 minutes, the same number the contract names. */
+const BUILD_GATE_TIMEOUT_MS = 20 * 60 * 1000;
+/** A cold worktree's dependency install is slower than the build it enables. */
+const NPM_INSTALL_TIMEOUT_MS = 15 * 60 * 1000;
+/** §3.6 — `--include=dev` is the whole point; see runBuildGate. */
+const NPM_INSTALL_CMD = 'npm ci --include=dev';
+
+/** Does this gate run in a node package (i.e. is the npm-install step relevant)? */
+function isNodeGate(resolved: { command: string; cwd: string }): boolean {
+  return fs.existsSync(path.join(resolved.cwd, 'package.json'));
+}
+
+/**
+ * Run the BUILD GATE (never git — git goes through runGit). Timeout-bounded,
+ * output captured, failure returned as a value: a red gate is an expected
+ * outcome that becomes an `integrate nX` node, not an exception.
+ *
+ * `build_gate_cmd` is TREE CONFIGURATION (a planner/Kevin writes it, the same
+ * way a CI config is written), never worker-supplied text, and a gate has to be
+ * able to be a pipeline — so it runs through `sh -c`. §8.7's "never a shell
+ * string" governs the git surface, where a node TITLE or BRANCH would otherwise
+ * be interpolated; nothing worker-authored reaches this call.
+ */
+function runCommand(
+  cwd: string,
+  command: string,
+  timeoutMs: number,
+): Promise<{ code: number | null; output: string; timed_out: boolean }> {
+  return new Promise((resolve) => {
+    execFile(
+      '/bin/sh',
+      ['-c', command],
+      {
+        cwd,
+        timeout: timeoutMs,
+        encoding: 'utf8',
+        maxBuffer: 16 * 1024 * 1024,
+        // NODE_ENV is deliberately NOT forced: `npm ci --include=dev` is what
+        // makes a production env safe, and rewriting the worker's environment
+        // would make the gate test something other than the real build.
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      },
+      (err, stdout, stderr) => {
+        const output = `${stdout ?? ''}${stderr ?? ''}`.trim();
+        if (!err) return resolve({ code: 0, output, timed_out: false });
+        const e = err as { code?: number | string; killed?: boolean; signal?: string | null; message?: string };
+        const timedOut = e.killed === true || e.signal === 'SIGTERM';
+        resolve({
+          code: typeof e.code === 'number' ? e.code : null,
+          output: output || e.message || 'command failed',
+          timed_out: timedOut,
+        });
+      },
+    );
+  });
+}
+
 /** `git rev-parse HEAD` in a worktree. Read-only. */
 export function currentHead(worktreePath: string): GitResult<{ sha: string }> {
   const res = runGit(worktreePath, ['rev-parse', 'HEAD'], 30_000);
@@ -535,12 +597,88 @@ export function remoteBranchExists(repoPath: string, branch: string): boolean {
  * into the `integrate nX` node. §3.5 steps 1-2
  */
 export function mergeNodeBranch(
-  _integrationWorktreePath: string,
-  _integrationBranch: string,
-  _nodeBranch: string,
-  _message: string,
-): GitResult<{ merge_sha: string; pre_merge_sha: string }> {
-  return NOT_IMPLEMENTED('mergeNodeBranch');
+  integrationWorktreePath: string,
+  integrationBranch: string,
+  nodeBranch: string,
+  message: string,
+): GitResult<{ merge_sha: string; pre_merge_sha: string; already_up_to_date: boolean }> {
+  // Checked FIRST, before any git runs (§8.3). A tree whose integration_branch
+  // column somehow says master/main can never reach a merge.
+  assertMergeTargetSafe(integrationBranch);
+  if (!nodeBranch?.trim()) {
+    return { ok: false, reason: 'no_node_branch', output: 'mergeNodeBranch called with an empty node branch' };
+  }
+  if (!fs.existsSync(integrationWorktreePath)) {
+    return { ok: false, reason: 'integration_worktree_missing', output: `no integration worktree at ${integrationWorktreePath}` };
+  }
+  // The merge target is the branch CHECKED OUT here, so assert it matches the
+  // tree's column rather than trusting the path: a hand-moved worktree must not
+  // become a merge into something else entirely.
+  const on = runGit(integrationWorktreePath, ['rev-parse', '--abbrev-ref', 'HEAD'], 30_000);
+  if (!on.ok) return { ok: false, reason: 'integration_head_unreadable', output: on.output };
+  if (on.output.trim() !== integrationBranch) {
+    return {
+      ok: false,
+      reason: 'integration_worktree_branch_mismatch',
+      output: `${integrationWorktreePath} is on "${on.output.trim()}", expected "${integrationBranch}"`,
+    };
+  }
+  const pre = currentHead(integrationWorktreePath);
+  if (!pre.ok) return pre;
+
+  // --no-ff so every integration is one reviewable merge commit even when the
+  // node branch could fast-forward. `-m` is passed as its own argv element, so a
+  // node title can never break out of the message (§8.7).
+  const merged = runGit(integrationWorktreePath, ['merge', '--no-ff', '-m', message, nodeBranch]);
+  if (!merged.ok) {
+    // Leave the worktree clean whatever happened: a conflicted merge is aborted,
+    // and a failure with nothing to abort just reports that too. The caller
+    // additionally resets to pre_merge_sha, so the integration branch is
+    // unchanged by a failed merge-back either way (§3.5 step 2).
+    const abort = runGit(integrationWorktreePath, ['merge', '--abort'], 60_000);
+    const conflicted = /conflict/i.test(merged.output);
+    const files = conflictedFiles(integrationWorktreePath, merged.output);
+    return {
+      ok: false,
+      reason: conflicted ? 'merge_conflict' : 'merge_failed',
+      output: [
+        merged.output,
+        files.length ? `\nConflicted files:\n${files.map((f) => `  - ${f}`).join('\n')}` : '',
+        abort.ok ? '' : `\n[git merge --abort also reported: ${abort.output}]`,
+      ].join(''),
+    };
+  }
+  const post = currentHead(integrationWorktreePath);
+  if (!post.ok) return post;
+  return {
+    ok: true,
+    merge_sha: post.sha,
+    pre_merge_sha: pre.sha,
+    // `--no-ff` still reports "Already up to date." when the node branch is an
+    // ancestor (a worker that committed nothing). That is a SUCCESS: there is
+    // nothing to integrate, and the node must not be held as pending forever.
+    already_up_to_date: post.sha === pre.sha,
+  };
+}
+
+/**
+ * The conflicted paths, by name, for the `integrate nX` node's spec. Read from
+ * `git diff --name-only --diff-filter=U` while the merge is still conflicted;
+ * falls back to parsing git's own `CONFLICT (...): ... in <path>` lines, which is
+ * all that survives if the caller already aborted.
+ */
+function conflictedFiles(worktreePath: string, mergeOutput: string): string[] {
+  const listed = runGit(worktreePath, ['diff', '--name-only', '--diff-filter=U'], 30_000);
+  const fromIndex = listed.ok
+    ? listed.output.split('\n').map((l) => l.trim()).filter(Boolean)
+    : [];
+  if (fromIndex.length) return fromIndex;
+  const parsed = new Set<string>();
+  for (const line of mergeOutput.split('\n')) {
+    const m = /^CONFLICT \([^)]*\): (?:Merge conflict in|.* in) (.+)$/.exec(line.trim());
+    if (m) parsed.add(m[1].trim());
+  }
+  return [...parsed];
 }
 
 /**
@@ -551,10 +689,22 @@ export function mergeNodeBranch(
  *   - otherwise, or explicit ''         → null = SKIP the gate, merge alone decides
  */
 export function resolveBuildGateCmd(
-  _tree: HopperTreeRow,
-  _integrationWorktreePath: string,
+  tree: HopperTreeRow,
+  integrationWorktreePath: string,
 ): { command: string; cwd: string } | null {
-  return NOT_IMPLEMENTED('resolveBuildGateCmd');
+  const raw = tree.build_gate_cmd;
+  if (raw != null) {
+    const command = raw.trim();
+    // An EXPLICIT empty string is a deliberate "no gate" (§3.6) — merge alone
+    // decides. That is why null and '' resolve differently.
+    if (!command) return null;
+    return { command, cwd: integrationWorktreePath };
+  }
+  const repoPath = tree.repo_path?.trim();
+  if (repoPath && fs.existsSync(path.join(repoPath, 'darwin-assistant', 'package.json'))) {
+    return { command: 'npm run build', cwd: path.join(integrationWorktreePath, 'darwin-assistant') };
+  }
+  return null;
 }
 
 /**
@@ -568,11 +718,59 @@ export function resolveBuildGateCmd(
  * Exit 127 is surfaced as `reason:'build_toolchain_missing'`, never as a code
  * failure. §3.5 step 3, §3.6
  */
-export function runBuildGate(
-  _tree: HopperTreeRow,
-  _integrationWorktreePath: string,
+export async function runBuildGate(
+  tree: HopperTreeRow,
+  integrationWorktreePath: string,
 ): Promise<BuildGateOutcome> {
-  return NOT_IMPLEMENTED('runBuildGate');
+  const resolved = resolveBuildGateCmd(tree, integrationWorktreePath);
+  if (!resolved) return { passed: true, skipped: true, command: null, output: '', exit_code: null };
+  if (!fs.existsSync(resolved.cwd)) {
+    return {
+      passed: false,
+      skipped: false,
+      command: resolved.command,
+      output: `build gate cwd does not exist: ${resolved.cwd}`,
+      exit_code: null,
+      reason: 'build_cwd_missing',
+    };
+  }
+
+  // §3.6, proven the hard way: a fresh worktree has no node_modules, and hopper
+  // workers run with NODE_ENV=production, under which a plain `npm ci` OMITS
+  // devDependencies — so `npm run build` dies with `tsc: not found` and a
+  // perfectly good merge is reported as a red build.
+  const installOutput: string[] = [];
+  if (isNodeGate(resolved) && !fs.existsSync(path.join(resolved.cwd, 'node_modules', '.bin'))) {
+    const install = await runCommand(resolved.cwd, NPM_INSTALL_CMD, NPM_INSTALL_TIMEOUT_MS);
+    installOutput.push(`$ ${NPM_INSTALL_CMD}\n${install.output}`);
+    if (install.code !== 0) {
+      return {
+        passed: false,
+        skipped: false,
+        command: NPM_INSTALL_CMD,
+        output: installOutput.join('\n'),
+        exit_code: install.code,
+        // The ENVIRONMENT, not the code. An `integrate nX` node must never blame
+        // a worker for a toolchain that was never installed.
+        reason: 'build_toolchain_missing',
+      };
+    }
+  }
+
+  const run = await runCommand(resolved.cwd, resolved.command, BUILD_GATE_TIMEOUT_MS);
+  const output = [...installOutput, `$ ${resolved.command}  (cwd ${resolved.cwd})\n${run.output}`].join('\n');
+  if (run.code === 0) {
+    return { passed: true, skipped: false, command: resolved.command, output, exit_code: 0 };
+  }
+  return {
+    passed: false,
+    skipped: false,
+    command: resolved.command,
+    output,
+    exit_code: run.code,
+    // 127 = "command not found" = the toolchain, never the code (§3.6).
+    reason: run.code === 127 ? 'build_toolchain_missing' : run.timed_out ? 'build_timed_out' : 'build_failed',
+  };
 }
 
 /**
@@ -581,13 +779,35 @@ export function runBuildGate(
  * a red build gate. Asserts the path is under the tree root first. §3.5 step 4, §8.5
  */
 export function resetHardTo(
-  _repoPath: string,
-  _treeId: string,
-  _integrationWorktreePath: string,
-  _sha: string,
+  repoPath: string,
+  treeId: string,
+  integrationWorktreePath: string,
+  sha: string,
 ): GitResult<{ sha: string }> {
-  return NOT_IMPLEMENTED('resetHardTo');
+  assertPathInTreeRoot(repoPath, treeId, integrationWorktreePath);
+  // §8.5 is narrower than §8.4: not merely "inside the tree root" but THE
+  // integration worktree. A node worktree holds a worker's only copy of its
+  // work; reset --hard must be structurally unable to reach one.
+  const expected = integrationWorktreePath ? path.resolve(integrationWorktreePath) : '';
+  if (expected !== integrationWorktreePathFor(repoPath, treeId)) {
+    throw new Error(
+      `[hopper-git] §8.5 violation: reset --hard is permitted only in the engine's own integration worktree (${integrationWorktreePathFor(repoPath, treeId)}), not "${expected}"`,
+    );
+  }
+  const target = (sha ?? '').trim();
+  if (!/^[0-9a-f]{7,40}$/i.test(target)) {
+    return { ok: false, reason: 'invalid_reset_target', output: `refusing to reset to "${sha}" — a full sha is required` };
+  }
+  const res = runGit(integrationWorktreePath, ['reset', '--hard', target], 120_000);
+  if (!res.ok) return { ok: false, reason: 'reset_failed', output: res.output };
+  const head = currentHead(integrationWorktreePath);
+  if (!head.ok) return head;
+  return { ok: true, sha: head.sha };
 }
+
+/** Alias so resetHardTo's §8.5 assertion reads as the guard it is. */
+const integrationWorktreePathFor = (repoPath: string, treeId: string): string =>
+  path.resolve(integrationWorktreePath(repoPath, treeId));
 
 // ---------------------------------------------------------------------------
 // Unpark evaluation (§6) — pure-ish: sqlite + fs + read-only git. No model

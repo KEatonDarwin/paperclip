@@ -21,7 +21,18 @@ import { laneHoldReason } from './work-switch.js';
 // (hopper-git imports getHopperNode/getHopperTree from here for §6 unpark
 // evaluation; the cycle is safe because neither side calls the other at module
 // init — both export hoisted function declarations.)
-import { assertMergeTargetSafe, ensureIntegrationWorktree, isIntegrationTree, materializeNodeWorktree } from './hopper-git.js';
+import {
+  assertMergeTargetSafe,
+  ensureIntegrationWorktree,
+  integrationWorktreePath,
+  isIntegrationTree,
+  materializeNodeWorktree,
+  mergeNodeBranch,
+  pruneNodeWorktree,
+  resetHardTo,
+  resolveBuildGateCmd,
+  runBuildGate,
+} from './hopper-git.js';
 
 // HOPPER ENGINE — the autonomous work-tree executor (designed 2026-09-06 with
 // Kevin; worker-model details hashed out in cockpit:worker-engine-design-2026-09-06).
@@ -89,6 +100,19 @@ export interface HopperNodeRow {
   worktree_path: string | null;
   /** PARALLEL-CONTRACT §3.1: `<integration_branch>-n<id>`; null on legacy trees. */
   node_branch: string | null;
+  /**
+   * PARALLEL-CONTRACT §3.5. `null` = nothing to integrate (every legacy node);
+   * `'integration_pending'` = finished `done` but its work is NOT on the
+   * integration branch yet (merge running, or a merge/gate failure awaiting its
+   * `integrate nX` node); `'merged'` = its work is on the integration branch.
+   * **A dependent does not unblock while a dep is `integration_pending`** — that
+   * is the no-clobbering guarantee, enforced in depsSatisfied().
+   */
+  integration_state: string | null;
+  /** PARALLEL-CONTRACT §5: JSON array of lease names; null = holds nothing. */
+  resources: string | null;
+  /** The node whose failed merge-back this node exists to repair (§3.5); null normally. */
+  integrates_node_id: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -229,6 +253,19 @@ for (const col of [
   'throttle_reroute TEXT',
   'worktree_path TEXT',
   'node_branch TEXT',
+  // §3.5 merge-back: null | 'integration_pending' | 'merged'. Null on every
+  // legacy node, which is what keeps depsSatisfied() byte-identical for them.
+  'integration_state TEXT',
+  // §5 lease names, JSON array. Written here by the merge-back (an `integrate nX`
+  // node holds `integration:<tree_id>`) so the repair nodes this node creates are
+  // already correct when §5's claimability rule lands.
+  'resources TEXT',
+  // ADDITIVE beyond §2's table, and the reason is worth the column: a repair node
+  // has to know WHICH node's merge it is repairing, so that landing the repair
+  // also lands the original (and releases the original's dependents). The
+  // alternative was re-parsing the `integrate nX` title, i.e. engine state living
+  // in a display string.
+  'integrates_node_id INTEGER',
 ]) {
   try {
     sqliteDb.exec(`ALTER TABLE hopper_nodes ADD COLUMN ${col}`);
@@ -606,7 +643,15 @@ function depsSatisfied(node: HopperNodeRow): boolean {
       // 'split' is terminal for the parent but its children are still working;
       // settleAncestors flips the parent to 'done' once every child settles, so
       // only 'done' releases a dependent (foundry review #3/#4).
-      return !dep || dep.status === 'done';
+      if (!dep) return true;
+      if (dep.status !== 'done') return false;
+      // PARALLEL-CONTRACT §3.5 — THE no-clobbering rule. On an integration tree a
+      // dep is only really finished once its branch is ON the integration branch:
+      // a dependent claimed while the merge is still pending (or has failed and is
+      // waiting on its `integrate nX` node) would be cut from a head that does not
+      // contain the work it depends on. `null` here = a legacy node with nothing
+      // to integrate, so this clause is invisible to every existing tree.
+      return dep.integration_state !== 'integration_pending';
     });
   } catch {
     return true;
@@ -829,6 +874,287 @@ function maybeFinishTree(treeId: string): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// MERGE-BACK (PARALLEL-CONTRACT.md §3.5-§3.6)
+//
+// A node finishing `done` on an INTEGRATION TREE is not finished until its
+// branch is merged into the tree's integration branch and the build gate is
+// green. Until then it is `integration_pending`, and depsSatisfied() refuses to
+// release its dependents — that is what makes clobbering structurally
+// impossible rather than merely unlikely.
+//
+// A conflict or a red gate NEVER stops the tree: the integration branch is put
+// back exactly as it was, and a visible `integrate nX` node is created that a
+// worker can fix. The tree keeps moving; the failure is a task, not a wall.
+// ---------------------------------------------------------------------------
+
+/**
+ * §3.5 last line — merge-backs for ONE tree are serialized, so two nodes
+ * finishing in the same tick merge one at a time, in finish order, and can never
+ * race the integration worktree. Per-TREE, so unrelated trees still integrate
+ * concurrently. (§5's `integration:<tree_id>` resource lease is the same idea one
+ * level up, for the repair NODES a worker runs; this chain covers the engine's
+ * own merges, which hold no node.)
+ */
+const integrationChains = new Map<string, Promise<void>>();
+
+function enqueueIntegration(node: HopperNodeRow, tree: HopperTreeRow): void {
+  const prev = integrationChains.get(tree.id) ?? Promise.resolve();
+  const next: Promise<void> = prev
+    .then(() => integrateFinishedNode(node.id))
+    .catch((err) => {
+      // integrateFinishedNode already converts every expected failure into an
+      // `integrate nX` node; reaching here means something unexpected threw, and
+      // the chain must survive it or the tree's later merges never run.
+      console.error(`[hopper-engine] integration chain error on node ${node.id}:`, err);
+    })
+    .finally(() => {
+      if (integrationChains.get(tree.id) === next) integrationChains.delete(tree.id);
+    });
+  integrationChains.set(tree.id, next);
+}
+
+/**
+ * Await every in-flight merge-back for a tree (nothing pending → resolves
+ * immediately). Exported for the hermetic check, which has to observe the state
+ * AFTER a merge that `finishHopperNode` deliberately does not block on.
+ */
+export async function integrationIdle(treeId: string): Promise<void> {
+  // Loop: awaiting the current chain can itself let another finish enqueue one.
+  for (let i = 0; i < 200; i += 1) {
+    const cur = integrationChains.get(treeId);
+    if (!cur) return;
+    await cur.catch(() => {});
+  }
+}
+
+/** Is a merge-back for this tree still in flight? Used by the cockpit/API reads. */
+export function isIntegrating(treeId: string): boolean {
+  return integrationChains.has(treeId);
+}
+
+const repairNodeStmt = sqliteDb.prepare<[string, number], HopperNodeRow>(`
+  SELECT * FROM hopper_nodes
+  WHERE tree_id = ? AND integrates_node_id = ?
+    AND status IN ('draft','pending','running','blocked','blocked_question')
+  ORDER BY id DESC LIMIT 1
+`);
+
+/**
+ * §3.5 step 5 — the node's work is on the integration branch. Its worktree is
+ * pruned (the BRANCH survives, §8.2) and its dependents are released.
+ *
+ * When the node that landed is itself an `integrate nX` repair node, landing it
+ * lands the ORIGINAL too: the original's work is in this merge, so it stops being
+ * `integration_pending` and its own dependents unblock on the next tick.
+ */
+function markIntegrated(node: HopperNodeRow, tree: HopperTreeRow, note: string): void {
+  setNode(node.id, { integration_state: 'merged' });
+  pruneNodeWorktree(tree.repo_path!, tree.id, node.id);
+  console.log(`[hopper-engine] node ${node.id} integrated into ${tree.integration_branch} (${note})`);
+  if (node.integrates_node_id) {
+    const original = getNodeStmt.get(node.integrates_node_id);
+    if (original && original.integration_state === 'integration_pending') {
+      setNode(original.id, { integration_state: 'merged' });
+      pruneNodeWorktree(tree.repo_path!, tree.id, original.id);
+      console.log(`[hopper-engine] repair node ${node.id} also landed node ${original.id}`);
+      const fresh = getNodeStmt.get(original.id);
+      if (fresh) settleAncestors(fresh);
+    }
+  }
+}
+
+/**
+ * §3.5 FAIL — a conflict or a red gate becomes a VISIBLE task.
+ *
+ * The original node stays `status='done'` (the worker did its job; the merge is a
+ * separate problem) but `integration_state='integration_pending'`, which is what
+ * holds its dependents. The repair node:
+ *   - `depends_on = null`  → claimable on the very next tick
+ *   - `parent_id` = the original's, so it is a literal sibling and a split parent
+ *     cannot bubble to `done` while its child's work is still unmerged
+ *   - `resources = ["integration:<tree_id>"]` (§5)
+ *   - adapter/model inherited from the failed node
+ */
+function createIntegrationRepairNode(
+  node: HopperNodeRow,
+  tree: HopperTreeRow,
+  headline: string,
+  reason: string,
+  output: string,
+  extra: { worktree: string; gate: string | null },
+): void {
+  setNode(node.id, { integration_state: 'integration_pending' });
+
+  const spec = [
+    `AUTO-CREATED BY THE HOPPER ENGINE (PARALLEL-CONTRACT.md §3.5).`,
+    ``,
+    `Node #${node.id} "${node.title}" finished \`done\`, but merging its branch back`,
+    `into the integration branch FAILED: **${headline}** (\`${reason}\`).`,
+    ``,
+    `Your ONE job is to make that work land on the integration branch. Nothing else.`,
+    ``,
+    `- Repo:                 ${tree.repo_path}`,
+    `- Integration branch:   ${tree.integration_branch}   ← the merge target; never master/main`,
+    `- Integration worktree: ${extra.worktree}   ← the ENGINE owns this; do not work in it`,
+    `- Branch that failed:   ${node.node_branch}`,
+    `- Build gate:           ${extra.gate ?? '(none — the merge alone decides)'}`,
+    ``,
+    `HOW`,
+    `1. In YOUR OWN worktree/branch (named in the worktree block above — it is cut`,
+    `   from the integration branch, so it already has everything that HAS landed):`,
+    `   \`git merge ${node.node_branch}\` and resolve the conflicts by hand.`,
+    `2. Make the build gate pass in your worktree.`,
+    `3. Commit. Do NOT push, do NOT check out or merge into ${tree.integration_branch} —`,
+    `   the engine merges YOUR branch back when you finish \`done\`, and that is what`,
+    `   lands node #${node.id}'s work and releases its dependents.`,
+    ``,
+    `CAPTURED OUTPUT (${reason})`,
+    '```',
+    output.slice(0, 8000),
+    '```',
+  ].join('\n');
+
+  const existing = repairNodeStmt.get(tree.id, node.id);
+  if (existing) {
+    // A retry of the same node failed to integrate again: refresh the open repair
+    // node's spec with the latest evidence instead of stacking duplicates.
+    setNode(existing.id, { spec, status: existing.status === 'pending' ? 'pending' : existing.status });
+    console.warn(`[hopper-engine] node ${node.id} still fails to integrate (${reason}); refreshed repair node ${existing.id}`);
+    return;
+  }
+
+  const info = sqliteDb
+    .prepare(
+      `INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, status, depends_on, priority, adapter, model, resources, integrates_node_id)
+       VALUES (?, ?, ?, ?, 'pending', NULL, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      tree.id,
+      node.parent_id,
+      `integrate n${node.id}`,
+      spec,
+      // One rung above the failed node: an unmerged branch blocks its dependents,
+      // so repairing it is the most valuable thing the tree can do next.
+      node.priority + 1,
+      node.adapter,
+      node.model,
+      JSON.stringify([`integration:${tree.id}`]),
+      node.id,
+    );
+  const created = getNodeStmt.get(Number(info.lastInsertRowid));
+  if (created) emitNode('created', created);
+  console.warn(`[hopper-engine] node ${node.id} merge-back failed (${reason}) → repair node ${created?.id}`);
+  if (!isFoundryTree(tree)) {
+    createNotification({
+      severity: 'warning',
+      title: `🧩 Merge-back failed: ${node.title.slice(0, 90)}`,
+      body: `${headline} (${reason}) merging ${node.node_branch} → ${tree.integration_branch}.\nThe integration branch was left unchanged. Node #${created?.id} "integrate n${node.id}" was created to fix it and is claimable now.`,
+      source: 'hopper-engine',
+    });
+  }
+}
+
+/**
+ * §3.5 — merge one finished node's branch into the tree's integration branch,
+ * gate it, and either land it or turn the failure into a repair node. Always
+ * settles ancestors at the end, pass or fail, so the tree never deadlocks on a
+ * merge (§3.5), and always ticks the dispatcher so whatever just unblocked moves.
+ */
+async function integrateFinishedNode(nodeId: number): Promise<void> {
+  const node = getNodeStmt.get(nodeId);
+  if (!node) return;
+  const tree = getHopperTree(node.tree_id);
+  if (!tree || !isIntegrationTree(tree)) return;
+  const repoPath = tree.repo_path!;
+  const integrationBranch = tree.integration_branch!;
+  const wtPath = integrationWorktreePath(repoPath, tree.id);
+  try {
+    if (!node.node_branch) {
+      // The node never got a worktree — a tree opted into the parallel engine
+      // after this node was already running. There is nothing to merge, and
+      // holding it `integration_pending` forever would deadlock its dependents.
+      markIntegrated(node, tree, 'no node branch — nothing to merge');
+      return;
+    }
+    const integ = ensureIntegrationWorktree(repoPath, tree.id, integrationBranch);
+    if (!integ.ok) {
+      createIntegrationRepairNode(node, tree, 'the integration worktree is unavailable', integ.reason, integ.output, {
+        worktree: wtPath,
+        gate: resolveBuildGateCmd(tree, wtPath)?.command ?? null,
+      });
+      return;
+    }
+    const preMergeSha = integ.head_sha;
+    const gateCmd = resolveBuildGateCmd(tree, integ.worktree_path)?.command ?? null;
+
+    const merged = mergeNodeBranch(
+      integ.worktree_path,
+      integrationBranch,
+      node.node_branch,
+      `hopper: integrate n${node.id} ${node.title.slice(0, 120)}`,
+    );
+    if (!merged.ok) {
+      // The integration branch must be BYTE-IDENTICAL to what it was before a
+      // failed merge-back. `merge --abort` already did that in the normal case;
+      // this is the backstop for the case where the abort itself failed.
+      const undo = resetHardTo(repoPath, tree.id, integ.worktree_path, preMergeSha);
+      createIntegrationRepairNode(
+        node,
+        tree,
+        merged.reason === 'merge_conflict' ? 'merge conflict' : 'the merge could not run',
+        merged.reason,
+        `${merged.output}${undo.ok ? '' : `\n[restoring ${integrationBranch} to ${preMergeSha} also failed: ${undo.output}]`}`,
+        { worktree: integ.worktree_path, gate: gateCmd },
+      );
+      return;
+    }
+
+    const gate = await runBuildGate(tree, integ.worktree_path);
+    if (!gate.passed) {
+      // §3.5 step 4 — undo the engine's own merge inside the engine's own
+      // integration worktree. This is the ONLY reset --hard in the system (§8.5).
+      const undo = resetHardTo(repoPath, tree.id, integ.worktree_path, merged.pre_merge_sha);
+      createIntegrationRepairNode(
+        node,
+        tree,
+        gate.reason === 'build_toolchain_missing' ? 'the build gate could not run (toolchain)' : 'the build gate failed',
+        gate.reason ?? 'build_failed',
+        [
+          `exit ${gate.exit_code ?? '(none)'}`,
+          gate.output,
+          undo.ok
+            ? `\n[${integrationBranch} reset back to ${merged.pre_merge_sha.slice(0, 12)} — the integration branch is unchanged]`
+            : `\n[restoring ${integrationBranch} to ${merged.pre_merge_sha} FAILED: ${undo.output}]`,
+        ].join('\n'),
+        { worktree: integ.worktree_path, gate: gateCmd },
+      );
+      return;
+    }
+    markIntegrated(
+      node,
+      tree,
+      merged.already_up_to_date
+        ? 'nothing to merge (the branch had no new commits)'
+        : `${merged.merge_sha.slice(0, 12)}${gate.skipped ? ', gate skipped' : ', gate green'}`,
+    );
+  } catch (err) {
+    // A §8 guard threw, or something genuinely unexpected happened. It still has
+    // to become a visible task rather than a node stuck `integration_pending`.
+    createIntegrationRepairNode(node, tree, 'integration threw', 'integration_exception', String(err), {
+      worktree: wtPath,
+      gate: null,
+    });
+  } finally {
+    // §3.5 — settleAncestors runs AFTER integration, pass or fail: on a pass the
+    // dependents are now safe to cut; on a fail the repair node already exists, so
+    // neither the parent nor the tree can flip `done` behind it.
+    const fresh = getNodeStmt.get(nodeId);
+    if (fresh) settleAncestors(fresh);
+    queueMicrotask(() => void dispatchTick('node_integrated'));
+  }
+}
+
 /** Worker report-back — the ONE place execution writes tree state. */
 export function finishHopperNode(
   id: number,
@@ -840,8 +1166,21 @@ export function finishHopperNode(
   const tree = getHopperTree(node.tree_id);
 
   if (outcome === 'done') {
-    const updated = setNode(id, { status: 'done', result: payload.result ?? '(no result text)', lease_expires_at: null });
-    if (updated) settleAncestors(updated);
+    // PARALLEL-CONTRACT §3.5 — on an INTEGRATION tree, `done` is only half of it:
+    // the node's branch still has to land on the integration branch. It is marked
+    // `integration_pending` in the same write that marks it done, so there is no
+    // window in which a dependent could be claimed against a head that does not
+    // contain this node's work, and settleAncestors is deferred until the merge
+    // settles. For a legacy tree this is byte-for-byte the old two lines.
+    const integrating = isIntegrationTree(tree);
+    const updated = setNode(id, {
+      status: 'done',
+      result: payload.result ?? '(no result text)',
+      lease_expires_at: null,
+      ...(integrating ? { integration_state: 'integration_pending' } : {}),
+    });
+    if (updated && integrating && tree) enqueueIntegration(updated, tree);
+    else if (updated) settleAncestors(updated);
   } else if (outcome === 'split' && payload.children?.length) {
     const insert = sqliteDb.prepare(
       `INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, status, depends_on, adapter, model)

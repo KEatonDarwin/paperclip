@@ -590,3 +590,50 @@ Three facts found while building, that later nodes will otherwise rediscover:
 neither locally nor as `origin/<branch>`, cutting it from the repo's current
 `HEAD` (`created_branch: true`). §8 is intact — no force, no deletion, no push,
 and the live checkout's working tree is never written.
+
+### node #949 — §3.5-§3.6 MERGE-BACK is LIVE
+
+Landed: `mergeNodeBranch` / `resolveBuildGateCmd` / `runBuildGate` / `resetHardTo`
+in `src/hopper-git.ts` (no stub bodies remain in that module), and the merge-back
+orchestration in `src/hopper-engine.ts`: `finishHopperNode(done)` on an
+integration tree writes `status='done'` **and** `integration_state='integration_pending'`
+in one statement, enqueues the merge, and defers `settleAncestors` until the merge
+settles. Proof: `npm run hopper-merge:check` (117 checks, MB-1…MB-7, incl. §4.1
+end-to-end). `npm run hopper-git:check` still 125/125, `npm run unpark:check`
+41/41, `npm run build` green.
+
+Five facts later nodes need:
+
+1. **`integration_state='integration_pending'` is what holds dependents, and it is
+   written in the SAME statement as `status='done'`.** `depsSatisfied()` now
+   refuses a dep that is `done` but `integration_pending`, so there is no window
+   in which a dependent could be cut from a head that lacks its dependency's work.
+   `null` on every legacy node means the clause is invisible to existing trees.
+   §3.5's "it stays `status='done'` so the tree does not deadlock" is intact —
+   `settleAncestors` still runs on both the pass and the fail path.
+2. **Merge-back is ASYNC and serialized per tree.** `finishHopperNode` stays
+   synchronous (an API handler calls it) and returns immediately; the merge + gate
+   run on a per-tree promise chain, so two finishes in one tick merge one at a
+   time in finish order. `integrationIdle(treeId)` awaits it (that is how the
+   check observes post-merge state) and `isIntegrating(treeId)` reads it.
+3. **One additive column beyond §2: `hopper_nodes.integrates_node_id`.** A repair
+   node has to know which node's merge it repairs, because landing the repair is
+   what lands the original (and releases the original's dependents). The
+   alternative was re-parsing the `integrate nX` title — engine state living in a
+   display string. `resources` and `integration_state` also ship here (additive,
+   nullable), so §5's claimability rule finds repair nodes already correct.
+4. **A repair node inherits the failed node's `parent_id`**, i.e. it is a literal
+   sibling. On a split subtree that is load-bearing: a root-level repair node
+   would let the split parent bubble to `done` while its child's work was still
+   unmerged, and the parent's own dependents would unblock early.
+5. **`--no-ff` still says "Already up to date." when a worker committed nothing.**
+   That is a SUCCESS (`already_up_to_date: true`), not a failure — holding such a
+   node `integration_pending` forever would deadlock its dependents. Same for a
+   node with a null `node_branch` (a tree opted in mid-flight): nothing to merge,
+   so it is marked `merged` with a logged reason.
+
+`build_gate_cmd` runs through `sh -c` because a gate has to be able to be a
+pipeline and it is TREE CONFIGURATION (planner/Kevin-authored, like a CI config),
+never worker text. §8.7's "never a shell string" governs the git surface, where a
+node title or branch would otherwise be interpolated; nothing worker-authored
+reaches the gate. Everything git still goes through `runGit`/`assertGitArgsSafe`.

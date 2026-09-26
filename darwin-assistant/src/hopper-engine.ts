@@ -16,6 +16,12 @@ import {
   setThrottlePausedTreesProvider,
 } from './throttle.js';
 import { laneHoldReason } from './work-switch.js';
+// PARALLEL-CONTRACT.md §9 — the ONE git surface. This module never shells out to
+// git itself; every path, branch name and safety guard lives in hopper-git.ts.
+// (hopper-git imports getHopperNode/getHopperTree from here for §6 unpark
+// evaluation; the cycle is safe because neither side calls the other at module
+// init — both export hoisted function declarations.)
+import { assertMergeTargetSafe, ensureIntegrationWorktree, isIntegrationTree, materializeNodeWorktree } from './hopper-git.js';
 
 // HOPPER ENGINE — the autonomous work-tree executor (designed 2026-09-06 with
 // Kevin; worker-model details hashed out in cockpit:worker-engine-design-2026-09-06).
@@ -49,6 +55,12 @@ export interface HopperTreeRow {
   topic: string;
   origin_thread_ext: string | null;
   status: 'draft' | 'active' | 'done' | 'archived';
+  /** PARALLEL-CONTRACT §2: absolute repo the tree builds in; null = legacy tree. */
+  repo_path: string | null;
+  /** PARALLEL-CONTRACT §2: the branch node branches are cut from and merged back to. */
+  integration_branch: string | null;
+  /** PARALLEL-CONTRACT §3.6: the merge-back gate; null = resolve a default, '' = skip. */
+  build_gate_cmd: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -73,6 +85,10 @@ export interface HopperNodeRow {
   foundry_auto_retries: number;
   /** ⚡ THROTTLE §5.2: audit trail for a cross-provider reroute; null normally. */
   throttle_reroute: string | null;
+  /** PARALLEL-CONTRACT §3.2: worktree materialized AT CLAIM; null on legacy trees. */
+  worktree_path: string | null;
+  /** PARALLEL-CONTRACT §3.1: `<integration_branch>-n<id>`; null on legacy trees. */
+  node_branch: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -204,9 +220,32 @@ sqliteDb.exec(`
 // be invisible. jarvis.db is JARVIS's own local SQLite, not a Darwin production
 // database, so the eggshell rule does not apply; this is the same additive
 // ALTER TABLE pattern every trailing column in this schema used.
-for (const col of ['adapter TEXT', 'model TEXT', 'foundry_auto_retries INTEGER NOT NULL DEFAULT 0', 'throttle_reroute TEXT']) {
+// PARALLEL-CONTRACT.md §2 adds `worktree_path` / `node_branch` here: the two
+// facts a claimed node needs to remember about the checkout it was given.
+for (const col of [
+  'adapter TEXT',
+  'model TEXT',
+  'foundry_auto_retries INTEGER NOT NULL DEFAULT 0',
+  'throttle_reroute TEXT',
+  'worktree_path TEXT',
+  'node_branch TEXT',
+]) {
   try {
     sqliteDb.exec(`ALTER TABLE hopper_nodes ADD COLUMN ${col}`);
+  } catch {
+    /* column already exists */
+  }
+}
+
+// PARALLEL-CONTRACT.md §2 — the twin loop for hopper_trees. All three columns are
+// NULLABLE with no default, so every existing row reads back null, and
+// `isIntegrationTree()` is false for all of them: dispatch is byte-for-byte what
+// it is today until a planner opts a tree in. That IS the migration guarantee.
+// No CHECK constraint — sqlite cannot add one by ALTER TABLE; the engine
+// validates on write instead.
+for (const col of ['repo_path TEXT', 'integration_branch TEXT', 'build_gate_cmd TEXT']) {
+  try {
+    sqliteDb.exec(`ALTER TABLE hopper_trees ADD COLUMN ${col}`);
   } catch {
     /* column already exists */
   }
@@ -454,15 +493,49 @@ export interface NewNodeInput {
   model?: string | null;             // null → hopper_worker_model setting/env default
 }
 
+/**
+ * PARALLEL-CONTRACT.md §2 — how a planner OPTS A TREE IN to the parallel engine.
+ * Omit it (or either of the first two fields) and the tree is a legacy tree:
+ * one shared checkout, no per-node branches, today's dispatch byte-for-byte.
+ */
+export interface IntegrationTreeInput {
+  /** Absolute path to the repo the tree builds in. */
+  repo_path?: string | null;
+  /** The branch node branches are cut from and merged back to. Never master/main (§8.3). */
+  integration_branch?: string | null;
+  /** Merge-back gate; null = resolved default, '' = skip the gate (§3.6). */
+  build_gate_cmd?: string | null;
+}
+
 /** Create a tree + its draft nodes in one shot (the breakdown chat calls this). */
-export function createHopperTree(topic: string, originThreadExt: string | null, nodes: NewNodeInput[]): {
+export function createHopperTree(
+  topic: string,
+  originThreadExt: string | null,
+  nodes: NewNodeInput[],
+  integration?: IntegrationTreeInput | null,
+): {
   tree: HopperTreeRow;
   nodes: HopperNodeRow[];
 } {
   const treeId = `tree-${randomUUID().slice(0, 8)}`;
+  const repoPath = integration?.repo_path?.trim() || null;
+  const integrationBranch = integration?.integration_branch?.trim() || null;
+  // Validate on write — sqlite cannot ALTER TABLE ... ADD CHECK (§2), so this is
+  // where a bad integration branch is rejected, before any node can be claimed.
+  if (integrationBranch) assertMergeTargetSafe(integrationBranch);
   sqliteDb
-    .prepare(`INSERT INTO hopper_trees (id, topic, origin_thread_ext) VALUES (?, ?, ?)`)
-    .run(treeId, topic.slice(0, 300), originThreadExt);
+    .prepare(
+      `INSERT INTO hopper_trees (id, topic, origin_thread_ext, repo_path, integration_branch, build_gate_cmd)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      treeId,
+      topic.slice(0, 300),
+      originThreadExt,
+      repoPath,
+      integrationBranch,
+      integration?.build_gate_cmd ?? null,
+    );
   const ids: number[] = [];
   const insert = sqliteDb.prepare(
     `INSERT INTO hopper_nodes (tree_id, parent_id, title, spec, priority, adapter, model) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -553,8 +626,13 @@ function depResults(node: HopperNodeRow): Array<{ title: string; result: string 
   }
 }
 
-/** The one prompt a worker is born with: guardrails + the leaf + the finish contract. */
-function composeWorkerPrompt(node: HopperNodeRow, tree: HopperTreeRow): string {
+/**
+ * The one prompt a worker is born with: guardrails + the leaf + the finish
+ * contract. Exported so scripts/hopper-git-check.mjs can assert §3.4's worktree
+ * block (present for integration trees, absent for legacy ones) against the real
+ * builder instead of a copy of it.
+ */
+export function composeWorkerPrompt(node: HopperNodeRow, tree: HopperTreeRow): string {
   const deps = depResults(node);
   const lines: string[] = [
     `You are a SPAWNED HOPPER-ENGINE WORKER — an ephemeral JARVIS instance born to complete ONE task, report the result, and stop. You are not a conversation; nobody will reply to your messages. Kevin sees your work through the tree, not this thread.`,
@@ -562,6 +640,21 @@ function composeWorkerPrompt(node: HopperNodeRow, tree: HopperTreeRow): string {
     `**Project (tree ${tree.id}):** ${tree.topic}`,
     `**Your task (node #${node.id}):** ${node.title}`,
   ];
+  // PARALLEL-CONTRACT.md §3.4 — an integration-tree worker learns its checkout
+  // from the ENGINE, not from prose a planner happened to type into the spec.
+  // Prose-only worktrees are exactly how a shared checkout gets clobbered.
+  // Legacy trees get a byte-identical prompt to today's (no block at all).
+  if (isIntegrationTree(tree) && node.worktree_path && node.node_branch) {
+    lines.push(
+      '',
+      '**Your worktree (authoritative — overrides anything the spec says):**',
+      `- WORKTREE: ${node.worktree_path}`,
+      `- BRANCH: ${node.node_branch} (cut from ${tree.integration_branch})`,
+      `- Work in that worktree, on that branch. Commit there.`,
+      `- Do NOT switch branches, do NOT merge, do NOT push to ${tree.integration_branch} — the engine merges your branch into it after you finish \`done\`.`,
+      `- Never touch ${tree.repo_path} (the live checkout) or any other node's worktree.`,
+    );
+  }
   if (node.spec) lines.push('', '**Spec:**', node.spec);
   if (node.answer) lines.push('', `**Kevin answered a previous blocking question on this task:**`, `Q: ${node.question ?? '(see spec)'}`, `A: ${node.answer}`);
   if (deps.length) {
@@ -610,6 +703,70 @@ const spawnTaskInsert = sqliteDb.prepare(`
 const spawnTaskMarkRerouted = sqliteDb.prepare<[string, string]>(`
   UPDATE spawn_tasks SET status = 'failed', error = ?, updated_at = datetime('now') WHERE thread_ext = ?
 `);
+
+/** Outcome of §3.2's at-claim workspace materialization. */
+export interface WorkspacePrep {
+  /** true = the worker may spawn. */
+  ok: boolean;
+  /** true = legacy tree; NOTHING was done and dispatch is today's behavior exactly. */
+  skipped: boolean;
+  worktree_path?: string;
+  node_branch?: string;
+  base_sha?: string;
+  /** true when the node's branch already existed (a retry reusing its own work). */
+  reused?: boolean;
+  reason?: string;
+  output?: string;
+}
+
+/**
+ * PARALLEL-CONTRACT.md §3.2 — materialize this node's worktree AT CLAIM TIME,
+ * after `claimStmt` and before `spawnWorker`.
+ *
+ * For a LEGACY tree (no repo_path/integration_branch) this returns
+ * `{ok:true, skipped:true}` having run nothing at all — that is the migration
+ * guarantee, and the hermetic check asserts it.
+ *
+ * Exported so scripts/hopper-git-check.mjs can drive the real seam rather than
+ * re-implementing it.
+ */
+export function prepareIntegrationWorkspace(node: HopperNodeRow, tree: HopperTreeRow): WorkspacePrep {
+  if (!isIntegrationTree(tree)) return { ok: true, skipped: true };
+  try {
+    const integ = ensureIntegrationWorktree(tree.repo_path!, tree.id, tree.integration_branch!);
+    if (!integ.ok) return { ok: false, skipped: false, reason: integ.reason, output: integ.output };
+    const wt = materializeNodeWorktree(tree, node);
+    if (!wt.ok) return { ok: false, skipped: false, reason: wt.reason, output: wt.output };
+    setNode(node.id, { worktree_path: wt.worktree_path, node_branch: wt.node_branch });
+    return {
+      ok: true,
+      skipped: false,
+      worktree_path: wt.worktree_path,
+      node_branch: wt.node_branch,
+      base_sha: wt.base_sha,
+      reused: wt.reused,
+    };
+  } catch (err) {
+    // A §8 guard threw — that means a caller asked for something the contract
+    // forbids, which is a bug to surface, but it must still not strand a claim.
+    return { ok: false, skipped: false, reason: 'workspace_guard_threw', output: String(err) };
+  }
+}
+
+/**
+ * §3.2 step 5 — a git failure must never burn an attempt or strand a lease.
+ * `claimStmt` already incremented `attempts`, so releasing it also gives the
+ * attempt back: the node re-dispatches next tick exactly as if it had never
+ * been picked, instead of marching toward MAX_ATTEMPTS on environment trouble.
+ */
+function releaseClaimAfterWorkspaceFailure(claimed: HopperNodeRow): void {
+  setNode(claimed.id, {
+    status: 'pending',
+    worker_thread_ext: null,
+    lease_expires_at: null,
+    attempts: Math.max(0, claimed.attempts - 1),
+  });
+}
 
 async function spawnWorker(node: HopperNodeRow, tree: HopperTreeRow): Promise<void> {
   if (!processMessageRef) return;
@@ -937,11 +1094,29 @@ export async function dispatchTick(reason: string): Promise<void> {
       const fresh = getNodeStmt.get(node.id)!;
       emitNode('updated', fresh);
       const tree = getHopperTree(node.tree_id)!;
+      // PARALLEL-CONTRACT.md §3.2 — cut the branch and materialize the worktree
+      // between the claim and the spawn, so the branch is cut from the
+      // integration head AS OF NOW and the worker is TOLD where it lives (§3.4).
+      // No-op for legacy trees.
+      const prep = prepareIntegrationWorkspace(fresh, tree);
+      if (!prep.ok) {
+        console.error(
+          `[hopper-engine] worktree prep failed for node ${fresh.id} (${prep.reason}): ${(prep.output ?? '').slice(0, 600)}`,
+        );
+        releaseClaimAfterWorkspaceFailure(fresh);
+        continue;
+      }
+      const dispatched = prep.skipped ? fresh : getNodeStmt.get(node.id) ?? fresh;
+      if (!prep.skipped) {
+        console.log(
+          `[hopper-engine] node ${fresh.id} worktree ${prep.reused ? 'reused' : 'cut'} ${prep.worktree_path} @ ${prep.node_branch} (base ${(prep.base_sha ?? '').slice(0, 8)})`,
+        );
+      }
       free -= 1;
       if (nonClaude) daytimeRunning += 1;
       caps.record(node.tree_id);
       console.log(`[hopper-engine] dispatch node ${node.id} (${reason}) → ${ext}`);
-      void spawnWorker(fresh, tree);
+      void spawnWorker(dispatched, tree);
     }
   } finally {
     ticking = false;

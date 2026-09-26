@@ -539,3 +539,54 @@ that structurally impossible for the engine. When a tree finishes, its
 integration branch simply sits there, green, with the whole tree's work merged
 into it — and Kevin merges it (or doesn't). That is deliberate, and it is the
 last human gate in the loop.
+
+---
+
+## 12. IMPLEMENTATION LOG (append-only — one entry per node, facts later nodes need)
+
+### node #948 — §1-§2, §3.1-§3.4, §8 are LIVE
+
+Landed: `src/hopper-git.ts` real bodies for every §3.1 path/name helper, both §8
+guards, `ensureIntegrationWorktree` / `materializeNodeWorktree` /
+`pruneNodeWorktree` / `currentHead` / `branchExists`; the §2 additive migrations
+(`hopper_trees.repo_path|integration_branch|build_gate_cmd`,
+`hopper_nodes.worktree_path|node_branch`); §3.2 materialization wired into
+`dispatchTick` between `claimStmt` and `spawnWorker` via the exported
+`prepareIntegrationWorkspace()`; §3.4's worktree block in `composeWorkerPrompt`.
+Proof: `npm run hopper-git:check` (125 checks, HG-1…HG-10).
+
+Still stubbed for later nodes: `mergeNodeBranch`, `runBuildGate`,
+`resolveBuildGateCmd`, `resetHardTo` (§3.5-§3.6).
+
+Additions to the §9 surface (all additive, nothing renamed):
+
+- `ensureIntegrationWorktree(...)` also returns `reused` and `created_branch`.
+- `registeredWorktree(repo, path)` — read-only `worktree list --porcelain` lookup.
+- `pruneStaleWorktreeRegistrations(repo)` — `git worktree prune`; what lets a
+  crashed or hand-deleted node worktree be re-materialized instead of wedging.
+- `assertGitArgsSafe(args)` — §8.1/§8.2/§8.6 enforced at ONE chokepoint every
+  git call in the module passes through, and asserted directly by HG-3.
+- `prepareIntegrationWorkspace(node, tree)` / `composeWorkerPrompt(node, tree)`
+  exported from `hopper-engine.ts` so the check drives the real seam.
+
+Three facts found while building, that later nodes will otherwise rediscover:
+
+1. **One integration branch = one worktree.** Git allows a branch to be checked
+   out in only one worktree, so **two trees can never share an integration
+   branch** — the second gets `integration_branch_checked_out_elsewhere` as a
+   value. Same for a branch already checked out in the live checkout. Never
+   forced; the tree stops, it does not clobber.
+2. **A bad `repo_path` is checked before anything is created.** `repoUnavailable()`
+   runs ahead of the first `mkdir`, so a misconfigured tree leaves no empty
+   `<repo>-worktrees/<tree_id>/` behind and reports `repo_unavailable` instead of
+   a bare spawn `ENOENT`.
+3. **§3.2 step 5 refunds the attempt.** `claimStmt` increments `attempts`, so
+   releasing a claim after a git failure also decrements it — otherwise
+   environment trouble would march a healthy node to `MAX_ATTEMPTS` and park it.
+   HG-9 drives this through the real `dispatchTick` and asserts `attempts === 0`
+   and zero spawns.
+
+`ensureIntegrationWorktree` will CREATE the integration branch when it exists
+neither locally nor as `origin/<branch>`, cutting it from the repo's current
+`HEAD` (`created_branch: true`). §8 is intact — no force, no deletion, no push,
+and the live checkout's working tree is never written.

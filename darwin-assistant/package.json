@@ -45,7 +45,8 @@
     "health:route-check": "npm run build && node scripts/health-route-check.mjs",
     "health:sim": "npm run build && JARVIS_DB_PATH=/tmp/health-sim.db JARVIS_SIM=1 npx tsx scripts/health-sim.ts",
     "unpark:check": "npm run build && JARVIS_DB_PATH=/tmp/unpark-check.db JARVIS_SIM=1 node scripts/unpark-check.mjs",
-    "night:never-idle:check": "npm run build && JARVIS_DB_PATH=/tmp/night-never-idle-check.db JARVIS_SIM=1 node scripts/night-never-idle-check.mjs"
+    "night:never-idle:check": "npm run build && JARVIS_DB_PATH=/tmp/night-never-idle-check.db JARVIS_SIM=1 node scripts/night-never-idle-check.mjs",
+    "hopper-git:check": "npm run build && JARVIS_DB_PATH=/tmp/hopper-git-check.db JARVIS_SIM=1 node scripts/hopper-git-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

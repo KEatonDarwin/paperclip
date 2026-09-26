@@ -1,7 +1,7 @@
 {
   "name": "darwin-assistant",
   "version": "0.1.0",
-  "description": "External Darwin AI assistant \u2014 voice intake, Slack bot, full Paperclip access",
+  "description": "External Darwin AI assistant — voice intake, Slack bot, full Paperclip access",
   "private": true,
   "type": "module",
   "scripts": {
@@ -53,7 +53,8 @@
     "notepad:route-rule-check": "npm run build && node scripts/notepad-route-rule-check.mjs",
     "notepad:dispatch-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-dispatch-check.db node scripts/notepad-dispatch-check.mjs",
     "notepad:route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-route-check.db node scripts/notepad-route-check.mjs",
-    "notepad:actions-route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-actions-route-check.db node scripts/notepad-actions-route-check.mjs"
+    "notepad:actions-route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-actions-route-check.db node scripts/notepad-actions-route-check.mjs",
+    "notepad:rollover-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-rollover-check.db node scripts/notepad-rollover-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
@@ -71,5 +72,8 @@
     "@types/pg": "^8.20.0",
     "tsx": "^4.7.0",
     "typescript": "^5.4.0"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.9.0": true
   }
 }

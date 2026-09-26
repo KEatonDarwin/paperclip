@@ -110,6 +110,51 @@ group of line ids — it carries no state of its own.
 
 In short: **the ledger remembers by line. The models judge by block.**
 
+## 3b. What the judgment layer actually consumes (node #942)
+
+The first two consumers are wired:
+
+**`notepad-review.ts` — `buildNotepadReviewContext(day)`**
+
+* returns `blocks: NotepadBlock[]` alongside the existing per-line `lines[]`,
+  parsed with `parseNotepadBlocks()` over the same raw day lines (a pure
+  read — it adds no second source of truth);
+* `rendered` stays whole-day and in document order, but **every** row is now
+  prefixed `"[line_id N] "` *ahead of* its state tag
+  (`[line_id 41] [ACTED -> cockpit:…] …`). This is the root-cause fix for
+  yesterday's dry run: the moves model was handed bare text and a separate
+  list of ids to judge, so 4 of its 5 reasons landed on the wrong lines.
+  Raw indentation is preserved after the prefix, so the block shape is still
+  visible to a reader.
+
+**`notepad-gate.ts` — the gate judges BLOCKS**
+
+* `prefilterGateCandidates(day)` returns `GateBlockCandidate[]`. A block
+  *enters consideration* only if at least one member line surfaces via
+  `unscannedLines(day)` — that per-line ledger call is untouched and is
+  still the only source of "what's a candidate at all". Once a block
+  qualifies, **every** member line is classified with `classifyGateSkip`,
+  and the block is disposed only when *every* member is blank/marker-only/
+  url-only/too-short. One member with real content sends the whole block to
+  the model, junk members included, because Kevin's rule is never judge a
+  line alone.
+* Block identity is `block_id` = `headline_line_id`, falling back to the
+  first member line's id for a `headline: null` lead-in block. `GateVerdict`
+  carries `block_id`, `headline_line_id` and `member_line_ids`, so a caller
+  can always resolve a verdict back down to lines (`notepad-pass.ts` and
+  `scripts/notepad-dry-run.mjs` do exactly that).
+* The model is asked the same single question as before — is there a
+  complete topic here, or a fragment still being typed — once per block,
+  in one batched call. Every failure mode (spawn error, timeout, non-JSON,
+  wrong shape, an omitted or phantom `block_id`) still resolves that block
+  to `complete_thought: false, reason: 'fallback'`; `notepad-dry-run.mjs`
+  refuses to publish a report containing any `fallback` verdict, which is
+  what keeps a failed model call loud instead of a confident-looking zero.
+
+Still per-line by design, and out of node #942's scope: `notepad-moves.ts`
+(it judges surfaced lines, now against an id-prefixed render), the marker/
+route/dispatch layers, and everything in `notepad.ts` / `notepad-rollover.ts`.
+
 ## 4. Verification
 
 `scripts/notepad-blocks-check.mjs` (`npm run notepad:blocks-check`) is a pure
@@ -127,3 +172,12 @@ function test — no DB, no `JARVIS_DB_PATH`, no model call:
 7. Every input line lands in exactly one block, and document order is
    preserved (the concatenation of every block's member ids equals the
    full input id sequence).
+
+`scripts/notepad-gate-check.mjs` (`npm run notepad:gate-check`) and
+`scripts/notepad-review-check.mjs` (`npm run notepad:review-check`) cover the
+consumer wiring above at block granularity against a scratch DB with a
+stubbed model and zero claude spawns: wholesale disposal of an all-junk
+block, a mixed block reaching the model whole, block-keyed model/fallback/
+phantom-id verdicts, the `headline: null` block_id fallback, and the
+`[line_id N]` prefix on every rendered row (indented and blank rows
+included).

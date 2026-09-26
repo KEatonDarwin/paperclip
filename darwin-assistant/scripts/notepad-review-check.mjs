@@ -16,6 +16,21 @@
 //   (H) purity: two calls produce byte-identical `rendered`, and calling the
 //       function does not itself change any line's ledger state
 //   (I) zero claude spawns across the whole run
+//   (J) EVERY rendered line carries its own "[line_id N] " prefix, ahead of
+//       any state tag (node #942 — the moves model needs a way to map ids
+//       back onto rendered text)
+//   (K) `blocks` covers the same lines per docs/notepad/BLOCKS.md: this
+//       fixture's five surviving lines are all zero-indent (Kevin's "topic
+//       on its own line, nothing under it" case), so each is its own
+//       single-line block, in document order, headline === the line's own
+//       text and member_line_ids === [that line's id] -- the parser used
+//       here is the exact same parseNotepadBlocks() notepad-blocks-check.mjs
+//       exercises in depth; this only proves the wiring into review context
+//   (L) the same wiring against a day shaped like Kevin's REAL notes — an
+//       indented mid-thought lead-in (headline:null block) plus two topic
+//       headlines with unevenly indented (space/6-space/tab) children and an
+//       interior blank line; the [line_id N] prefix holds on indented and
+//       blank rows too, and raw indentation survives after the prefix
 //
 //   npm run build && JARVIS_DB_PATH=/tmp/notepad-review-check.db node scripts/notepad-review-check.mjs
 
@@ -57,6 +72,14 @@ const { putNotepadDay, markLineSeen, markLineActed, markLineDismissed } = await 
   path.join(distDir, 'notepad.js')
 );
 const { buildNotepadReviewContext } = await import(path.join(distDir, 'notepad-review.js'));
+
+// Every rendered row is now prefixed "[line_id N] " ahead of any state tag
+// (node #942) — strip it before applying the pre-existing state-tag
+// assertions below, so those checks keep testing the state-tag rendering
+// itself rather than the id prefix in front of it.
+function stripLineIdPrefix(row) {
+  return row.replace(/^\[line_id \d+\] /, '');
+}
 
 let failed = false;
 function check(label, ok, detail) {
@@ -192,8 +215,8 @@ check('(A) all five surviving lines appear, lines.length === 5', ctx1.lines.leng
   // row's marker text against what a genuine first_look (unseen) row looks
   // like — the two MUST render differently.
   const renderedRows = ctx1.rendered.split('\n');
-  const unseenRow = renderedRows[ctx1.lines.findIndex((l) => l.line_id === unseenId)];
-  const reconcileRow = renderedRows[ctx1.lines.findIndex((l) => l.line_id === reconcileId)];
+  const unseenRow = stripLineIdPrefix(renderedRows[ctx1.lines.findIndex((l) => l.line_id === unseenId)]);
+  const reconcileRow = stripLineIdPrefix(renderedRows[ctx1.lines.findIndex((l) => l.line_id === reconcileId)]);
   check(
     '(E) reconcile row is visually distinct from an unseen/first_look row',
     unseenRow !== undefined &&
@@ -207,8 +230,8 @@ check('(A) all five surviving lines appear, lines.length === 5', ctx1.lines.leng
 // (F) acted line's rendering is distinguishable from the unseen line's
 {
   const renderedRows = ctx1.rendered.split('\n');
-  const unseenRow = renderedRows[ctx1.lines.findIndex((l) => l.line_id === unseenId)];
-  const actedRow = renderedRows[ctx1.lines.findIndex((l) => l.line_id === actedId)];
+  const unseenRow = stripLineIdPrefix(renderedRows[ctx1.lines.findIndex((l) => l.line_id === unseenId)]);
+  const actedRow = stripLineIdPrefix(renderedRows[ctx1.lines.findIndex((l) => l.line_id === actedId)]);
   check(
     '(F) acted row marker text differs from unseen row marker text',
     unseenRow !== undefined && actedRow !== undefined && unseenRow.startsWith('  ') && !actedRow.startsWith('  ') && actedRow.includes('ACTED'),
@@ -245,6 +268,92 @@ check('(A) all five surviving lines appear, lines.length === 5', ctx1.lines.leng
 const claudeAfter = countClaudeProcs();
 console.log(`  claude processes before/after: ${claudeBefore}/${claudeAfter}`);
 check('(I) no increase in claude process count (zero spawns)', claudeAfter <= claudeBefore, { claudeBefore, claudeAfter });
+
+// (J) EVERY rendered line carries its own "[line_id N] " prefix, ahead of any
+// state tag. Without this, a model told to judge a set of line_ids has no
+// way to map its verdicts back onto the rendered text it read (node #942's
+// root-cause fix for yesterday's moves-model dry run).
+{
+  const renderedRows = ctx1.rendered.split('\n');
+  check('(J) rendered has exactly one row per surviving line', renderedRows.length === ctx1.lines.length, renderedRows.length);
+  const allPrefixed = ctx1.lines.every((l, i) => renderedRows[i]?.startsWith(`[line_id ${l.line_id}] `));
+  check(
+    '(J) every rendered row starts with its OWN "[line_id N] " prefix, in order',
+    allPrefixed,
+    { rows: renderedRows, ids: ctx1.lines.map((l) => l.line_id) }
+  );
+}
+
+// (K) `blocks` covers the same five surviving lines. This fixture's lines
+// are all zero-indent, so per THE BLOCK RULE each is its own single-line
+// block — proves buildNotepadReviewContext is actually wired to
+// parseNotepadBlocks() (notepad-blocks-check.mjs covers the parser's real
+// nesting/indent logic in depth; this is the integration point).
+{
+  check('(K) blocks.length === lines.length (all zero-indent -> one block per line)', ctx1.blocks.length === ctx1.lines.length, ctx1.blocks.length);
+  const idsInOrder = ctx1.lines.map((l) => l.line_id);
+  const blockMemberIds = ctx1.blocks.map((b) => b.member_line_ids[0]);
+  check('(K) blocks appear in the same document order as `lines`', JSON.stringify(blockMemberIds) === JSON.stringify(idsInOrder), { blockMemberIds, idsInOrder });
+  const everySingleMember = ctx1.blocks.every((b) => b.member_line_ids.length === 1);
+  check('(K) every block is single-line (member_line_ids.length === 1)', everySingleMember);
+  const headlinesMatch = ctx1.blocks.every((b, i) => b.headline === ctx1.lines[i].text && b.headline_line_id === ctx1.lines[i].line_id);
+  check('(K) each block\'s headline is exactly its line\'s own text/id', headlinesMatch);
+}
+
+// (L) the SAME wiring against a day shaped like Kevin's REAL notes — a
+// mid-thought indented lead-in before any headline, then two topic headlines
+// with unevenly indented children (spaces and a tab, dash-prefixed) and an
+// interior blank line. (K) above only proves the degenerate all-zero-indent
+// case; this proves buildNotepadReviewContext hands back the blocks Kevin's
+// actual format produces, with the id prefix intact on indented rows too.
+{
+  const DAY_L = '2026-09-26';
+  const leadIn = '  - finishing yesterday’s thought about the KPI substrate';
+  const h1 = 'Universal KPI Goal';
+  const h1a = '  - base class is built and verified live';
+  const h1b = '      - still no row cap on the prod SELECTs';
+  const blank = '';
+  const h1c = '\t- decide the timeout before scheduling anything';
+  const h2 = 'Suppression files';
+  const h2a = ' - six sources are not suppressing yet';
+  const fixture = [leadIn, h1, h1a, h1b, blank, h1c, h2, h2a];
+  putNotepadDay(DAY_L, fixture.join('\n'));
+  const ctxL = buildNotepadReviewContext(DAY_L);
+
+  check('(L) all eight fixture lines survive (blank line included)', ctxL.lines.length === 8, ctxL.lines.length);
+  check('(L) three blocks: the headline-less lead-in + two topics', ctxL.blocks.length === 3, ctxL.blocks.map((b) => b.headline));
+
+  const [b0, b1, b2] = ctxL.blocks;
+  check('(L) the lead-in block has headline === null', b0?.headline === null && b0?.headline_line_id === null, b0);
+  check('(L) the lead-in block holds exactly that one line', b0?.member_line_ids.length === 1);
+  check('(L) block 2 is the first topic, headline verbatim', b1?.headline === h1, b1?.headline);
+  check(
+    '(L) block 2 swallows all four indented children INCLUDING the interior blank line (space-, 6-space- and tab-indented)',
+    b1?.member_line_ids.length === 5,
+    b1?.member_line_ids.length
+  );
+  check('(L) block 3 is the second topic with its single child', b2?.headline === h2 && b2?.member_line_ids.length === 2, b2);
+  const allIds = ctxL.blocks.flatMap((b) => b.member_line_ids);
+  check(
+    '(L) every line lands in exactly one block, in document order',
+    JSON.stringify(allIds) === JSON.stringify(ctxL.lines.map((l) => l.line_id)),
+    { allIds, lineIds: ctxL.lines.map((l) => l.line_id) }
+  );
+
+  // The id prefix must hold on INDENTED rows too — that is precisely where
+  // the moves model lost track of which id it was judging.
+  const rowsL = ctxL.rendered.split('\n');
+  check(
+    '(L) every rendered row — indented and blank rows included — carries its own [line_id N] prefix',
+    ctxL.lines.every((l, i) => rowsL[i]?.startsWith(`[line_id ${l.line_id}] `)),
+    rowsL
+  );
+  check(
+    '(L) rendered preserves each line’s raw indentation after the prefix',
+    rowsL.some((r) => r.includes('\t- decide the timeout')) && rowsL.some((r) => r.includes('      - still no row cap')),
+    rowsL
+  );
+}
 
 // ── summary line ──────────────────────────────────────────────────────────────
 const counts = ctx1.counts;

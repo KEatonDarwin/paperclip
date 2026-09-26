@@ -123,8 +123,8 @@ const DAY_A = '2026-09-27';
 const SENTENCE = 'Email the vendor about overdue invoice'; // 39 chars — the full, complete thought
 const stubA = countedStub((prompt) => {
   // whichever line_ids are in the prompt, say every one is a complete thought
-  const ids = [...prompt.matchAll(/line_id (\d+)/g)].map((m) => Number(m[1]));
-  return ids.map((line_id) => ({ line_id, complete_thought: true }));
+  const ids = [...prompt.matchAll(/block_id (\d+)/g)].map((m) => Number(m[1]));
+  return ids.map((block_id) => ({ block_id, complete_thought: true }));
 });
 
 {
@@ -252,8 +252,8 @@ const DAY_G = '2026-09-30';
   const gateCallsBeforeG = totalGateCalls;
 
   const stubG = countedStub((prompt) => {
-    const ids = [...prompt.matchAll(/line_id (\d+)/g)].map((m) => Number(m[1]));
-    return ids.map((line_id) => ({ line_id, complete_thought: true }));
+    const ids = [...prompt.matchAll(/block_id (\d+)/g)].map((m) => Number(m[1]));
+    return ids.map((block_id) => ({ block_id, complete_thought: true }));
   });
 
   const results = await Promise.all([
@@ -307,8 +307,8 @@ const DAY_H = '2026-10-01';
 
   const gateCallsBeforeH = totalGateCalls;
   const stubH = countedStub((prompt) => {
-    const ids = [...prompt.matchAll(/line_id (\d+)/g)].map((m) => Number(m[1]));
-    return ids.map((line_id) => ({ line_id, complete_thought: true }));
+    const ids = [...prompt.matchAll(/block_id (\d+)/g)].map((m) => Number(m[1]));
+    return ids.map((block_id) => ({ block_id, complete_thought: true }));
   });
 
   const pastBoundary = tickDate(4010 + 20 + 1);

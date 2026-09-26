@@ -114,17 +114,25 @@ let totalMovesCalls = 0;
  * line_id this call should propose a real move for, or undefined for
  * silence — mirroring how an actual model both can and usually does stay
  * silent on most candidates.
+ *
+ * The two stages speak different id vocabularies (node #942 moved the GATE
+ * to block_id; the MOVES stage, out of this node's scope, still speaks
+ * line_id) -- extract each with its own regex, deduped, since the moves
+ * prompt now mentions each line_id TWICE (once in review.rendered's
+ * "[line_id N]" prefix, once in its own candidate-list bullet) and a naive
+ * extraction would double-propose every move.
  */
 function combinedStub(moveFor) {
   return async (prompt) => {
-    const ids = [...prompt.matchAll(/line_id (\d+)/g)].map((m) => Number(m[1]));
     if (prompt.includes('complete_thought')) {
       totalGateCalls += 1;
-      return JSON.stringify({ verdicts: ids.map((line_id) => ({ line_id, complete_thought: true })) });
+      const blockIds = [...new Set([...prompt.matchAll(/block_id (\d+)/g)].map((m) => Number(m[1])))];
+      return JSON.stringify({ verdicts: blockIds.map((block_id) => ({ block_id, complete_thought: true })) });
     }
     totalMovesCalls += 1;
+    const lineIds = [...new Set([...prompt.matchAll(/line_id (\d+)/g)].map((m) => Number(m[1])))];
     const moves = [];
-    for (const line_id of ids) {
+    for (const line_id of lineIds) {
       const m = moveFor(line_id);
       if (m) moves.push({ line_id, kind: m.kind, reason: m.reason });
     }

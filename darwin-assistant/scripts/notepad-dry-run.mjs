@@ -125,20 +125,27 @@ const surfaced = review.lines.filter((l) => l.surfaced);
 console.error(`[notepad-dry-run] ${day.lines.length} lines, ${surfaced.length} surfaced to the scanner`);
 
 console.error('[notepad-dry-run] gate…');
+// Node #942: the gate now judges Kevin's topic BLOCKS, not individual lines
+// (docs/notepad/BLOCKS.md) -- each GateVerdict covers a block's whole
+// member_line_ids, not one line_id. This report is still line-oriented, so
+// every block verdict is flattened back out over its members: every line in
+// a "complete" block counts as complete, every line in a rejected block
+// shares that block's rejection reason.
 const gate = await runNotepadGate(DAY, { runOneShot: gateOneShot, timeoutMs: 540_000 });
-const completeIds = new Set(gate.filter((v) => v.complete_thought).map((v) => v.line_id));
-console.error(`[notepad-dry-run] gate: ${completeIds.size}/${gate.length} complete thoughts`);
+const completeIds = new Set(gate.filter((v) => v.complete_thought).flatMap((v) => v.member_line_ids));
+console.error(`[notepad-dry-run] gate: ${gate.length} block(s) judged, ${completeIds.size} line(s) in a complete-thought block`);
 
 // A 'fallback' verdict means the model call FAILED (usually a timeout). The gate
-// then reports every line as not-a-complete-thought, which reads exactly like a
+// then reports every block as not-a-complete-thought, which reads exactly like a
 // confident "nothing here." Publishing that as a dry-run result would be worse
 // than publishing nothing, so refuse.
-const fellBack = gate.filter((v) => v.reason === 'fallback').length;
-if (fellBack > 0 && !hasFlag('allow-fallback')) {
+const fellBackBlocks = gate.filter((v) => v.reason === 'fallback');
+if (fellBackBlocks.length > 0 && !hasFlag('allow-fallback')) {
+  const fellBackLines = fellBackBlocks.reduce((n, v) => n + v.member_line_ids.length, 0);
   console.error(
-    `FATAL: ${fellBack} gate verdict(s) came back 'fallback' -- the model call failed, so those lines` +
-      ` are being reported as incomplete without ever having been judged. Raise the timeout, or pass` +
-      ` --allow-fallback to publish anyway.`,
+    `FATAL: ${fellBackBlocks.length} gate block verdict(s) (${fellBackLines} line(s)) came back 'fallback' --` +
+      ` the model call failed, so those blocks are being reported as incomplete without ever having been` +
+      ` judged. Raise the timeout, or pass --allow-fallback to publish anyway.`,
   );
   process.exit(1);
 }
@@ -253,7 +260,7 @@ for (const id of silentComplete) {
 out.push('');
 const rejected = gate.filter((v) => !v.complete_thought);
 const byReason = {};
-for (const v of rejected) (byReason[v.reason] ??= []).push(v.line_id);
+for (const v of rejected) (byReason[v.reason] ??= []).push(...v.member_line_ids);
 out.push('## What the gate filtered out before any judgement');
 out.push('');
 for (const [reason, ids] of Object.entries(byReason)) {

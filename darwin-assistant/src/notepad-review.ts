@@ -1,4 +1,6 @@
 import { getNotepadDay, getNotepadLineState, unscannedLines } from './notepad.js';
+import { parseNotepadBlocks } from './notepad-blocks.js';
+import type { NotepadBlock } from './notepad-blocks.js';
 
 // The settle-and-reread pass (node #61's consumer) needs more than "here are
 // the lines the gate flagged" — a reader judging whether something is worth
@@ -24,6 +26,7 @@ export interface ReviewLine {
 export interface NotepadReviewContext {
   day: string;
   lines: ReviewLine[]; // document order, no gaps, no deleted lines
+  blocks: NotepadBlock[]; // Kevin's topic blocks over the same lines, per docs/notepad/BLOCKS.md
   rendered: string; // the prose block a reader consumes top-to-bottom
   counts: {
     total: number;
@@ -69,7 +72,13 @@ export function buildNotepadReviewContext(day: string): NotepadReviewContext {
     return { line_id: line.id, idx: line.idx, text: line.text, state, action_ref, surfaced, surfaced_kind };
   });
 
-  return { day, lines, rendered: renderReviewLines(lines), counts };
+  // Kevin's own words: "never look at the line on its own, look at the
+  // entire block." parseNotepadBlocks groups the SAME raw lines (document
+  // order, exact text) into topic blocks per docs/notepad/BLOCKS.md — a pure
+  // read, no state of its own, so this adds no new source of truth.
+  const blocks = parseNotepadBlocks(rawLines);
+
+  return { day, lines, blocks, rendered: renderReviewLines(lines), counts };
 }
 
 function renderReviewLines(lines: ReviewLine[]): string {
@@ -80,6 +89,10 @@ function renderReviewLines(lines: ReviewLine[]): string {
 /**
  * Rendering rules (docs/notepad/LINE-IDENTITY.md §4 made visible):
  *  - Document order always; caller controls that by not re-sorting `lines`.
+ *  - Every line is prefixed "[line_id N] " AHEAD of any state tag — the
+ *    block-judgment layer (notepad-gate.ts's model prompt, notepad-moves.ts)
+ *    needs a way to map the ids it is asked to judge back onto rendered
+ *    text; a bare-text render gave it none (node #942's root-cause fix).
  *  - An acted line is UNMISTAKABLY marked acted and carries its action_ref
  *    on the same line, whether or not it's currently surfaced — this is
  *    what makes "never re-act on something already handled" legible to a
@@ -95,36 +108,37 @@ function renderReviewLines(lines: ReviewLine[]): string {
  *  - unseen lines render plain (the default state, no ledger row).
  */
 function renderReviewLine(line: ReviewLine): string {
-  const { state, action_ref, surfaced, surfaced_kind, text } = line;
+  const { line_id, state, action_ref, surfaced, surfaced_kind, text } = line;
+  const idPrefix = `[line_id ${line_id}] `;
 
   if (state === 'acted') {
     if (surfaced && surfaced_kind === 'reconcile') {
-      return `[RECONCILE — was ACTED -> ${action_ref}, text changed since] ${text}`;
+      return `${idPrefix}[RECONCILE — was ACTED -> ${action_ref}, text changed since] ${text}`;
     }
-    return `[ACTED -> ${action_ref}] ${text}`;
+    return `${idPrefix}[ACTED -> ${action_ref}] ${text}`;
   }
 
   if (state === 'dismissed') {
     if (surfaced && surfaced_kind === 'first_look') {
-      return `[NEW — previously dismissed, text changed] ${text}`;
+      return `${idPrefix}[NEW — previously dismissed, text changed] ${text}`;
     }
-    return `[dismissed] ${text}`;
+    return `${idPrefix}[dismissed] ${text}`;
   }
 
   if (state === 'done') {
     if (surfaced && surfaced_kind === 'first_look') {
-      return `[NEW — previously done, text changed] ${text}`;
+      return `${idPrefix}[NEW — previously done, text changed] ${text}`;
     }
-    return `[done] ${text}`;
+    return `${idPrefix}[done] ${text}`;
   }
 
   if (state === 'seen') {
     if (surfaced && surfaced_kind === 'first_look') {
-      return `[NEW — previously seen, text changed] ${text}`;
+      return `${idPrefix}[NEW — previously seen, text changed] ${text}`;
     }
-    return `[seen] ${text}`;
+    return `${idPrefix}[seen] ${text}`;
   }
 
   // unseen: default state, no ledger row, always a first look.
-  return `  ${text}`;
+  return `${idPrefix}  ${text}`;
 }

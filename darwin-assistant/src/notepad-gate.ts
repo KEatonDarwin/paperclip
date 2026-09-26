@@ -1,38 +1,57 @@
 import { execFile } from 'node:child_process';
 import { getSetting } from './conversation-db.js';
-import { normalizeLineText, unscannedLines } from './notepad.js';
+import { getNotepadDay, normalizeLineText, unscannedLines } from './notepad.js';
+import { parseNotepadBlocks } from './notepad-blocks.js';
 import { isScratchEnv, scratchReason } from './sim-guard.js';
 import { extractJsonObject } from './tools/ux-reviewer/vision-critique.js';
 
 // The cheap gate (docs/notepad/LINE-IDENTITY.md §5, node #61's "settle-and-
-// reread pass" / "the cheap gate: did a complete thought just land?"). This
-// module owns the DETERMINISTIC half only — disposing of lines that are
-// obviously not worth a model's attention (blank, a markdown marker with no
-// words, a bare URL, too short to be a thought) before anything gets near a
-// claude spawn, plus the guard the NEXT node (the model call itself) must
-// call before it dares spawn one.
+// reread pass" / "the cheap gate: did a complete thought just land?").
+// Node #942 moved this from a per-LINE judgement to a per-BLOCK one, per
+// Kevin's own note-taking format (docs/notepad/BLOCKS.md): "never look at
+// the line on its own, look at the entire block." This module owns the
+// DETERMINISTIC half only — disposing of BLOCKS that are obviously not
+// worth a model's attention (every member line blank, a markdown marker
+// with no words, a bare URL, too short to be a thought) before anything
+// gets near a claude spawn, plus the guard the NEXT node (the model call
+// itself) must call before it dares spawn one.
 //
-// This node spawns NO model. It answers only "which of unscannedLines(day)'s
-// candidates are even worth a second look" -- it makes no judgement about
-// importance, urgency, or what kind of line something is.
+// This node spawns NO model. It answers only "which blocks touching
+// unscannedLines(day)'s candidates are even worth a second look" -- it
+// makes no judgement about importance, urgency, or what kind of block
+// something is. Per BLOCKS.md's binding design decision, storage/line-
+// identity/the ledger/carry-forward all stay PER-LINE — unscannedLines()
+// itself is untouched; this module only groups its output by block.
 
 const DEFAULT_MIN_CHARS = 12;
 
-/** Why a candidate line was disposed of before ever reaching a model. */
+/** Why a member line was disposable before ever reaching a model. */
 export type GateSkipReason = 'blank' | 'marker_only' | 'url_only' | 'too_short' | 'not_a_candidate';
 
-/** A line that survived the deterministic prefilter -- worth a second look. */
-export interface GateCandidate {
-  line_id: number;
-  idx: number;
-  text: string;
-  kind: 'first_look' | 'reconcile';
-  action_ref: string | null;
+/**
+ * A block that survived the deterministic prefilter -- worth a second look.
+ * `block_id` is the block's identity for gate purposes: the headline's
+ * line_id, or (for a headline:null lead-in block) its first member's
+ * line_id -- there is always at least one member, so this is always defined.
+ */
+export interface GateBlockCandidate {
+  block_id: number;
+  headline_line_id: number | null;
+  headline: string | null;
+  member_line_ids: number[];
+  text: string; // the block rendered verbatim, one "[line_id N] " line per member
 }
 
 export interface PrefilterResult {
-  candidates: GateCandidate[];
-  disposed: Array<{ line_id: number | null; text: string; reason: GateSkipReason }>;
+  candidates: GateBlockCandidate[];
+  disposed: Array<{
+    block_id: number;
+    headline_line_id: number | null;
+    headline: string | null;
+    member_line_ids: number[];
+    /** classifyGateSkip's verdict for each member, same order as member_line_ids -- every entry is non-null, since a block only disposes when EVERY member is disposable. */
+    member_reasons: GateSkipReason[];
+  }>;
   passed_count: number;
   disposed_count: number;
 }
@@ -94,11 +113,18 @@ export function classifyCandidateOrigin(day: string, lineId: number): GateSkipRe
 }
 
 /**
- * Deterministic prefilter over unscannedLines(day) -- the ONLY source of
- * candidates (per LINE-IDENTITY.md, this is the ledger's contract). A line
- * the ledger did not return is not a candidate at all: 'not_a_candidate' is
- * reserved for that case so a caller that hands in arbitrary text is
- * disposed of rather than silently treated as real ledger output.
+ * Deterministic prefilter, now over BLOCKS rather than individual lines.
+ *
+ * unscannedLines(day) is still the ONLY source of "what's a candidate at
+ * all" (per LINE-IDENTITY.md, the ledger's contract is untouched) -- a block
+ * only enters consideration here if at least one of its member lines
+ * surfaces via unscannedLines(day). Once a block qualifies, EVERY member
+ * line of that block (not just the surfaced ones -- the model needs the
+ * whole topic, including lines it already judged) is classified with
+ * classifyGateSkip. The block is disposed only if every single member is
+ * disposable; if even one member carries real content, the WHOLE block goes
+ * to the model, junk members and all, because Kevin's own rule is "never
+ * look at the line on its own."
  *
  * Zero model calls, zero network, no randomness -- reads the DB and the
  * settings-KV min-chars threshold (re-read on every call, never cached, so a
@@ -106,23 +132,37 @@ export function classifyCandidateOrigin(day: string, lineId: number): GateSkipRe
  */
 export function prefilterGateCandidates(day: string): PrefilterResult {
   const minChars = minCharsSetting();
-  const lines = unscannedLines(day);
+  const { lines: allLines } = getNotepadDay(day);
+  const blocks = parseNotepadBlocks(allLines);
+  const textById = new Map(allLines.map((l) => [l.id, l.text]));
+  const surfacedLineIds = new Set(unscannedLines(day).map((l) => l.line_id));
 
-  const candidates: GateCandidate[] = [];
+  const candidates: GateBlockCandidate[] = [];
   const disposed: PrefilterResult['disposed'] = [];
 
-  for (const line of lines) {
-    const reason = classifyGateSkip(line.text, minChars);
-    if (reason) {
-      disposed.push({ line_id: line.line_id, text: line.text, reason });
+  for (const block of blocks) {
+    if (!block.member_line_ids.some((id) => surfacedLineIds.has(id))) continue; // not a candidate block
+
+    const blockId = block.headline_line_id ?? block.member_line_ids[0];
+    const memberReasons = block.member_line_ids.map((id) => classifyGateSkip(textById.get(id) ?? '', minChars));
+
+    if (memberReasons.every((r): r is GateSkipReason => r !== null)) {
+      disposed.push({
+        block_id: blockId,
+        headline_line_id: block.headline_line_id,
+        headline: block.headline,
+        member_line_ids: block.member_line_ids,
+        member_reasons: memberReasons as GateSkipReason[],
+      });
       continue;
     }
+
     candidates.push({
-      line_id: line.line_id,
-      idx: line.idx,
-      text: line.text,
-      kind: line.kind,
-      action_ref: line.action_ref,
+      block_id: blockId,
+      headline_line_id: block.headline_line_id,
+      headline: block.headline,
+      member_line_ids: block.member_line_ids,
+      text: block.text,
     });
   }
 
@@ -154,9 +194,9 @@ export function assertModelSpawnAllowed(): void {
 
 // ─────────────────────────────────────────────────────────────────────────
 // The model half of the gate (§5's node #61 "cheap gate" continued): for
-// each candidate that survived the deterministic prefilter above, answer
-// EXACTLY one question -- did a complete thought just land on this line?
-// Nothing about importance, urgency, or what kind of line it is -- that
+// each BLOCK that survived the deterministic prefilter above, answer
+// EXACTLY one question -- did a complete TOPIC just land in this block?
+// Nothing about importance, urgency, or what kind of block it is -- that
 // judgement belongs to node #62, not here.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -167,9 +207,11 @@ const DEFAULT_GATE_TIMEOUT_MS = 20 * 1000;
 /** Why a gate verdict has the value it does. */
 export type GateVerdictReason = 'model' | 'prefilter' | 'fallback';
 
-/** One line's gate verdict: did a complete thought just land here? */
+/** One block's gate verdict: did a complete topic just land here? */
 export interface GateVerdict {
-  line_id: number;
+  block_id: number;
+  headline_line_id: number | null;
+  member_line_ids: number[];
   complete_thought: boolean;
   reason: GateVerdictReason;
 }
@@ -231,52 +273,60 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-function buildGatePrompt(candidates: GateCandidate[]): string {
-  const lines = candidates.map((c) => `- line_id ${c.line_id}: ${JSON.stringify(c.text)}`).join('\n');
+function buildGatePrompt(candidates: GateBlockCandidate[]): string {
+  const blocks = candidates
+    .map((c) => {
+      const headlineLine = c.headline !== null ? JSON.stringify(c.headline) : '(none -- a leading fragment, no headline yet)';
+      return `- block_id ${c.block_id} -- headline: ${headlineLine}\n${c.text}`;
+    })
+    .join('\n\n');
   return [
-    'You are a fast, cheap filter for a notepad app. For each line below, answer',
-    'EXACTLY ONE question: did a COMPLETE THOUGHT just land on this line, as opposed',
-    'to a fragment that is still being typed or trails off mid-sentence?',
+    'You are a fast, cheap filter for a notepad app. Kevin writes in topic BLOCKS,',
+    'not isolated lines: a headline on its own line, with everything he wrote under',
+    'it indented beneath it. For each block below, answer EXACTLY ONE question: is',
+    'there a COMPLETE TOPIC here, as opposed to a fragment that is still being typed',
+    'or trails off mid-thought? Judge the WHOLE block, never a single line in it.',
     '',
-    'This is NOT a judgement of importance, urgency, or what kind of line it is --',
-    'a grocery item ("milk, eggs, bread") and a business-critical decision both',
-    'count as a complete thought if they read as a finished statement. A line like',
-    '"and then we should" or "call the" is NOT complete -- it trails off mid-thought.',
+    'This is NOT a judgement of importance, urgency, or what kind of block it is --',
+    'a grocery list block and a business-critical decision block both count as',
+    'complete if they read as a finished thought, even a short one. A block that',
+    'trails off ("and then we should" with nothing more, or a bare headline with',
+    'nothing useful under it yet) is NOT complete.',
     '',
-    '=== LINES ===',
-    lines,
-    '=== END LINES ===',
+    '=== BLOCKS ===',
+    blocks,
+    '=== END BLOCKS ===',
     '',
     'Return ONLY a JSON object -- no markdown fences, no prose before or after --',
-    'with EXACTLY this shape, one entry per line_id above, in any order:',
-    '{"verdicts": [{"line_id": 123, "complete_thought": true}, {"line_id": 456, "complete_thought": false}]}',
+    'with EXACTLY this shape, one entry per block_id above, in any order:',
+    '{"verdicts": [{"block_id": 123, "complete_thought": true}, {"block_id": 456, "complete_thought": false}]}',
   ].join('\n');
 }
 
 /**
- * Parse the model's raw response into a map of line_id -> complete_thought.
+ * Parse the model's raw response into a map of block_id -> complete_thought.
  * Defensive by construction: an unparseable response, a non-object/non-array
- * shape, a malformed entry, or an entry whose line_id was never one of the
+ * shape, a malformed entry, or an entry whose block_id was never one of the
  * candidates we actually asked about all get SKIPPED rather than trusted --
- * they simply leave that line_id absent from the returned map. The caller
+ * they simply leave that block_id absent from the returned map. The caller
  * (runNotepadGate) treats "absent from the map" as reason:'fallback' for
- * that one line, which is what makes both "the whole response was garbage"
- * and "the response omitted one line" fail the exact same safe way.
+ * that one block, which is what makes both "the whole response was garbage"
+ * and "the response omitted one block" fail the exact same safe way.
  */
-function parseGateResponse(raw: string, candidates: GateCandidate[]): Map<number, boolean> {
+function parseGateResponse(raw: string, candidates: GateBlockCandidate[]): Map<number, boolean> {
   const map = new Map<number, boolean>();
-  const validIds = new Set(candidates.map((c) => c.line_id));
+  const validIds = new Set(candidates.map((c) => c.block_id));
   const parsed = extractJsonObject(raw) as { verdicts?: unknown } | null;
   const verdicts = parsed && Array.isArray(parsed.verdicts) ? parsed.verdicts : null;
   if (!verdicts) return map;
   for (const entry of verdicts) {
     if (!entry || typeof entry !== 'object') continue;
     const e = entry as Record<string, unknown>;
-    const lineId = typeof e.line_id === 'number' ? e.line_id : NaN;
+    const blockId = typeof e.block_id === 'number' ? e.block_id : NaN;
     const completeThought = typeof e.complete_thought === 'boolean' ? e.complete_thought : null;
-    if (!Number.isFinite(lineId) || completeThought === null) continue; // malformed entry -- ignored
-    if (!validIds.has(lineId)) continue; // an id we never asked about -- ignored, never trusted
-    map.set(lineId, completeThought);
+    if (!Number.isFinite(blockId) || completeThought === null) continue; // malformed entry -- ignored
+    if (!validIds.has(blockId)) continue; // an id we never asked about -- ignored, never trusted
+    map.set(blockId, completeThought);
   }
   return map;
 }
@@ -289,9 +339,9 @@ function parseGateResponse(raw: string, candidates: GateCandidate[]): Map<number
  * ONE batched model call over every surviving candidate.
  *
  * Fails toward SILENCE, never noise: any failure mode on the model call --
- * spawn error, timeout, non-JSON, wrong shape, an omitted line_id -- resolves
- * that line to complete_thought:false, reason:'fallback'. It never throws
- * for a model-call failure. A missed thought costs Kevin one line he can
+ * spawn error, timeout, non-JSON, wrong shape, an omitted block_id -- resolves
+ * that block to complete_thought:false, reason:'fallback'. It never throws
+ * for a model-call failure. A missed thought costs Kevin one block he can
  * re-type; a false yes wakes the whole re-read-and-act chain on a fragment
  * and trains him to ignore it, which is the worse failure by far.
  *
@@ -310,9 +360,13 @@ export async function runNotepadGate(
   opts?: { runOneShot?: (prompt: string) => Promise<string>; timeoutMs?: number },
 ): Promise<GateVerdict[]> {
   const { candidates, disposed } = prefilterGateCandidates(day);
-  const verdicts: GateVerdict[] = disposed
-    .filter((d): d is typeof d & { line_id: number } => d.line_id !== null)
-    .map((d) => ({ line_id: d.line_id, complete_thought: false, reason: 'prefilter' as const }));
+  const verdicts: GateVerdict[] = disposed.map((d) => ({
+    block_id: d.block_id,
+    headline_line_id: d.headline_line_id,
+    member_line_ids: d.member_line_ids,
+    complete_thought: false,
+    reason: 'prefilter' as const,
+  }));
 
   if (candidates.length === 0) return verdicts;
 
@@ -336,11 +390,11 @@ export async function runNotepadGate(
   }
 
   for (const c of candidates) {
-    const verdict = modelVerdicts.get(c.line_id);
+    const verdict = modelVerdicts.get(c.block_id);
     verdicts.push(
       verdict === undefined
-        ? { line_id: c.line_id, complete_thought: false, reason: 'fallback' }
-        : { line_id: c.line_id, complete_thought: verdict, reason: 'model' },
+        ? { block_id: c.block_id, headline_line_id: c.headline_line_id, member_line_ids: c.member_line_ids, complete_thought: false, reason: 'fallback' }
+        : { block_id: c.block_id, headline_line_id: c.headline_line_id, member_line_ids: c.member_line_ids, complete_thought: verdict, reason: 'model' },
     );
   }
 

@@ -22,7 +22,7 @@
 
 import { sqliteDb, getSetting, setSetting } from './conversation-db.js';
 import { sseBus } from './sse-bus.js';
-import { nativeCall } from './tools/mcp-native.js';
+import { nativeCallAsPrincipal } from './tools/mcp-native.js';
 import {
   isRelayEnabled,
   setRelayEnabled,
@@ -304,11 +304,14 @@ export type PostKevinMessageResult =
   | { ok: true; message: RelayMessageDTO; thread: RelayThreadListItem }
   | { ok: false; status: number; code: string; message: string };
 
-/** Posts live to the relay as principal `kevin` via relay-tool `reply`
- *  (CONTRACT.md §1: the trusted kevin-connected route JARVIS's backend holds
- *  may post `as: kevin` when the cockpit composer says so — this endpoint IS
- *  that composer action). Every check below runs BEFORE the outbound call, so
- *  a disabled/paused relay never reaches the network. */
+/** Posts live to the relay as principal `kevin` via relay-tool `reply`.
+ *  CONTRACT.md §1/§35: the principal is whichever ROUTE a call lands on, not
+ *  anything sent in the call's arguments — an `as`/`from`/`author`/`principal`
+ *  argument is ignored and logged server-side, never trusted. So "posting as
+ *  kevin" means calling over the kevin-connected route, via
+ *  `nativeCallAsPrincipal('kevin', ...)` below — there is no argument that
+ *  could do it instead. Every check below runs BEFORE the outbound call, so a
+ *  disabled/paused relay never reaches the network. */
 export async function postKevinMessage(threadId: string, input: PostKevinMessageInput): Promise<PostKevinMessageResult> {
   const thread = getThreadStmt.get(threadId);
   if (!thread) {
@@ -332,9 +335,8 @@ export async function postKevinMessage(threadId: string, input: PostKevinMessage
     return { ok: false, status: 413, code: 'body_too_large', message: `body exceeds ${MAX_BODY_BYTES} bytes` };
   }
 
-  const call = await nativeCall('smarty-pants', 'relay-tool', {
-    operation: 'reply',
-    as: 'kevin',
+  const call = await nativeCallAsPrincipal('kevin', 'relay-tool', {
+    op: 'reply',
     thread_id: threadId,
     kind: input.kind,
     subject: input.subject ?? undefined,
@@ -372,16 +374,43 @@ export interface GlobalPauseStatus {
   paused_by: string | null;
   paused_at: string | null;
   reason: string | null;
+  // RELAY-DEVIATIONS (b), relay.ts: this pause is LOCAL to JARVIS only. See
+  // callDarwinIntakeGlobalPause below for where the real cross-host call
+  // belongs and why it isn't wired up yet.
+  scope: 'local_only';
+  note: string;
 }
+
+const LOCAL_ONLY_PAUSE_NOTE =
+  'LOCAL ONLY: stops JARVIS\'s own poller/cue/outbound (relay_enabled=0). ' +
+  'Does NOT reach DarwinIntakeSystem — Mike\'s AI can still post to the board ' +
+  'until CONTRACT.md §7\'s POST /api/relay/pause is wired up (see RELAY-DEVIATIONS in relay.ts).';
+
+/** SEAM for CONTRACT.md §7's global pause: a real implementation would POST
+ *  to DarwinIntakeSystem's `/api/relay/pause` (bearer `RELAY_PAUSE_TOKEN`) to
+ *  set `paused.flag` there, so Mike's AI is actually blocked too — not just
+ *  JARVIS's own poller. NOT implemented in this node: `RELAY_PAUSE_TOKEN`
+ *  isn't provisioned yet (CONTRACT.md §9 item 3, Kevin's call), and this
+ *  worker's guardrails forbid reaching out to a live host on its own anyway.
+ *  This function is intentionally unused — it is the one place that call
+ *  belongs once the token exists. Do not wire it up without Kevin's say-so. */
+async function callDarwinIntakeGlobalPause(_paused: boolean, _reason: string | null): Promise<void> {
+  throw new Error('not implemented — RELAY_PAUSE_TOKEN not provisioned (CONTRACT.md §9 item 3); see RELAY-DEVIATIONS (b) in relay.ts');
+}
+void callDarwinIntakeGlobalPause; // seam kept visible for the caller who wires it up later
 
 /** A global pause IS relay_enabled=0 — the same kill switch relay.ts already
  *  gates the poller/cue/outbound on (item 4), not a second flag. Settings-KV
- *  records who/when/why on top of the flip, since the raw flag alone can't. */
+ *  records who/when/why on top of the flip, since the raw flag alone can't.
+ *  This is LOCAL ONLY — see callDarwinIntakeGlobalPause above. */
 export function setGlobalPause(paused: boolean, actor: string, reason: string | null): GlobalPauseStatus {
   setRelayEnabled(!paused);
   setSetting(GLOBAL_PAUSE_BY_KEY, paused ? actor : '');
   setSetting(GLOBAL_PAUSE_AT_KEY, paused ? new Date().toISOString() : '');
   setSetting(GLOBAL_PAUSE_REASON_KEY, paused ? (reason ?? '') : '');
+  if (paused) {
+    console.warn(`[relay] ${LOCAL_ONLY_PAUSE_NOTE}`);
+  }
   return getGlobalPauseStatus();
 }
 
@@ -391,6 +420,8 @@ export function getGlobalPauseStatus(): GlobalPauseStatus {
     paused_by: getSetting(GLOBAL_PAUSE_BY_KEY) || null,
     paused_at: getSetting(GLOBAL_PAUSE_AT_KEY) || null,
     reason: getSetting(GLOBAL_PAUSE_REASON_KEY) || null,
+    scope: 'local_only',
+    note: LOCAL_ONLY_PAUSE_NOTE,
   };
 }
 

@@ -37,7 +37,8 @@
     "night:check": "npm run build && bash scripts/night-shift-check.sh",
     "notepad:check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-check.db node scripts/notepad-check.mjs",
     "notepad:sim": "npm run build && JARVIS_DB_PATH=/tmp/notepad-sim.db node scripts/notepad-sim.mjs",
-    "relay:sim": "npm run build && JARVIS_DB_PATH=/tmp/relay-sim.db npx tsx scripts/relay-sim.ts"
+    "relay:sim": "npm run build && JARVIS_DB_PATH=/tmp/relay-sim.db npx tsx scripts/relay-sim.ts",
+    "relay-contract-shape:check": "npm run build && JARVIS_DB_PATH=/tmp/relay-contract-shape-check.db node scripts/relay-contract-shape-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

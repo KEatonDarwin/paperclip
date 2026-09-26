@@ -1,31 +1,58 @@
 import { createHash } from 'node:crypto';
 import { sqliteDb, getSetting, setSetting } from './conversation-db.js';
-import { nativeCall } from './tools/mcp-native.js';
+import { nativeCallAsPrincipal } from './tools/mcp-native.js';
 import { sseBus, type RelayMessageEvent } from './sse-bus.js';
 
 /**
- * RELAY-CLIENT-ASSUMPTIONS — docs/relay/CONTRACT.md (DarwinIntakeSystem side)
- * did not exist yet when this was written, so the wire shapes below are read
- * straight off outbox/relay/DESIGN.md §1/§3. If CONTRACT.md lands with a
- * different shape, reconcile against this list, not against guesswork:
+ * RELAY-DEVIATIONS — carried forward from docs/relay/CONTRACT.md (the
+ * binding contract, DarwinIntakeSystem repo). Two gaps between what the
+ * contract envisions and what this code can actually do today, both rooted
+ * in JARVIS having exactly one trusted relay route:
  *
- *  - Tool name: `relay-tool`, reached the same way as smarty-pants (native
- *    Streamable-HTTP client, principal `jarvis` stamped server-side by the
- *    route — nothing about identity is sent in the call args).
- *  - `inbox` takes no args and returns `{ messages: [{ id, thread_id, from,
- *    kind, subject, body, refs, created_at, ... }] }` — unread-for-me
- *    messages, newest first, each carrying its `thread_id`.
- *  - `read_thread` takes `{ id: <thread ulid> }` and returns
- *    `{ thread: { id, title, opened_by, status, exchange_count, read_by,
- *    created_at, updated_at }, messages: [ <full Message[]> ] }`. Calling it
- *    marks every message read by `jarvis` (the read receipt), so `read_by` on
- *    the returned thread is assumed to be a `{ party: iso_timestamp }` map.
- *  - `Message.from` is the server-stamped principal string (`jarvis` |
- *    `mike` | `kevin`); `refs` is a JSON-serializable array; all timestamps
- *    are ISO 8601 strings and are stored verbatim as TEXT.
- *  - `list_threads` / `search` exist per DESIGN §3 but are not called here —
- *    `inbox` + `read_thread` are sufficient to mirror everything relevant to
- *    JARVIS; a later REST-surface node may want them for the `/relay` page.
+ *  (a) NO JARVIS PRINCIPAL EXISTS YET. CONTRACT.md §1 fixes exactly two
+ *      route-stamped principals — `kevin` (`/mcp/kevin-connected`) and `mike`
+ *      (`/mcp/mike-<slug>`). There is no `/mcp/jarvis-*` route, so nothing
+ *      ever server-stamps `jarvis`. Every call this file makes — `inbox` and
+ *      `read_thread` — travels over the trusted `kevin` route and is
+ *      therefore `kevin`-principaled, not `jarvis`. This is safe in practice
+ *      ONLY because `relay_auto_reply=0` is the default: every reply JARVIS
+ *      composes is held as a local draft (`composeDraftReply` below) and is
+ *      never actually posted, so nothing is mis-stamped on the live board.
+ *      Resolve by either adding a real jarvis route/principal (tracked as
+ *      #112, currently parked) or formally accepting kevin-only for JARVIS's
+ *      own posts — #115 must review whichever way this goes before
+ *      `relay_auto_reply` is ever flipped to 1.
+ *  (b) POST /relay/pause (relay-rest.ts) IS LOCAL-ONLY. It flips this host's
+ *      `relay_enabled` setting, which stops JARVIS's own poller/cue/outbound
+ *      — but CONTRACT.md §7 specifies a global pause should ALSO call
+ *      DarwinIntakeSystem's `POST /api/relay/pause` (bearer
+ *      `RELAY_PAUSE_TOKEN`) to set `paused.flag` there. That call is not
+ *      wired up (see the seam and the local-only note left in
+ *      relay-rest.ts's `setGlobalPause`/`GlobalPauseStatus`). Pausing from
+ *      JARVIS today does NOT stop Mike's AI from posting to the board.
+ *
+ * Wire shapes below are read off docs/relay/CONTRACT.md §3/§7 (the binding
+ * spec) — reconcile against that file, not this comment, if they ever drift:
+ *
+ *  - Tool name: `relay-tool`, reached over the `kevin`-connected native
+ *    Streamable-HTTP MCP route (see (a) above). Arguments carry `op`, never
+ *    an identity field — the server-stamped route principal is the only
+ *    identity that counts (CONTRACT.md §1/§35: any `from`/`author`/`as`/
+ *    `principal` in arguments is ignored and logged, never trusted).
+ *  - `inbox {op: 'inbox'}` returns `{ messages: [{ id, thread_id, from, kind,
+ *    subject, body, refs, created_at, ... }] }` — unread-for-me messages,
+ *    newest first, each carrying its `thread_id`.
+ *  - `read_thread {op: 'read_thread', id}` returns `{ thread: { id, title,
+ *    opened_by, status, exchange_count, read_by, created_at, updated_at },
+ *    messages: [ <full Message[]> ] }`. Calling it marks every message read
+ *    by `kevin` (see (a) — not `jarvis`), so `read_by` on the returned thread
+ *    is a `{ party: iso_timestamp }` map.
+ *  - `Message.from` is the server-stamped principal string (`kevin` | `mike`
+ *    in practice today — see (a)); `refs` is a JSON-serializable array; all
+ *    timestamps are ISO 8601 strings and are stored verbatim as TEXT.
+ *  - `list_threads` / `search` exist per CONTRACT.md §3 but are not called
+ *    here — `inbox` + `read_thread` are sufficient to mirror everything
+ *    relevant to JARVIS; relay-rest.ts's REST surface covers the rest.
  */
 
 export type RelayParty = 'jarvis' | 'mike' | 'kevin';
@@ -389,7 +416,7 @@ async function doPoll(): Promise<RelayPollSummary> {
     return { ok: true, skipped: 'disabled', threadsSeen: 0, messagesUpserted: 0, newMessages: [] };
   }
 
-  const inboxCall = await nativeCall('smarty-pants', 'relay-tool', { operation: 'inbox' });
+  const inboxCall = await nativeCallAsPrincipal('kevin', 'relay-tool', { op: 'inbox' });
   if (!inboxCall.ok) {
     return { ok: false, threadsSeen: 0, messagesUpserted: 0, newMessages: [], error: inboxCall.error };
   }
@@ -407,7 +434,7 @@ async function doPoll(): Promise<RelayPollSummary> {
   const errors: string[] = [];
 
   for (const threadId of threadIds) {
-    const threadCall = await nativeCall('smarty-pants', 'relay-tool', { operation: 'read_thread', id: threadId });
+    const threadCall = await nativeCallAsPrincipal('kevin', 'relay-tool', { op: 'read_thread', id: threadId });
     if (!threadCall.ok) {
       errors.push(`read_thread ${threadId}: ${threadCall.error}`);
       continue;

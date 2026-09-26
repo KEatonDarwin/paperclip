@@ -39,6 +39,29 @@ export function resolveNativeServer(server: string): { url: string; headers?: Re
   return NATIVE_SERVERS[key];
 }
 
+/**
+ * Per-principal URLs for `relay-tool` (docs/relay/CONTRACT.md §1/§7): the
+ * relay's identity model is enforced by WHICH ROUTE a call lands on, not by
+ * anything in the call's arguments — `RelayPrincipal` middleware stamps the
+ * principal from the route itself. So a relay call must name the principal
+ * whose route it wants, and gets that route's URL. There is deliberately NO
+ * implicit default here — naming no principal, or one not in this map,
+ * throws rather than silently borrowing whichever URL happens to be first.
+ * `mike`'s route is Mike's AI's own; JARVIS has no reason to ever call it, so
+ * it is intentionally absent.
+ */
+const RELAY_PRINCIPAL_URLS: Record<string, string> = {
+  kevin: process.env.JARVIS_SMARTY_PANTS_URL || 'https://mcp.thedarwinhub.com/mcp/kevin-connected',
+};
+
+export function resolveRelayPrincipalUrl(principal: string): string {
+  const url = RELAY_PRINCIPAL_URLS[principal];
+  if (!url) {
+    throw new Error(`relay: no MCP URL configured for principal '${principal}' — refusing to guess a default`);
+  }
+  return url;
+}
+
 export interface NativeCallResult {
   ok: boolean;
   tool: string;
@@ -217,20 +240,17 @@ function sessionFor(url: string, headers?: Record<string, string>): McpHttpSessi
  * (must resolve via {@link resolveNativeServer}); `tool` is the bare tool name
  * (no `mcp__…` prefix — that framing is a claude-CLI concept, irrelevant here).
  */
-export async function nativeCall(
-  server: string,
+async function callAtUrl(
+  url: string,
+  headers: Record<string, string> | undefined,
   tool: string,
   args: Record<string, unknown>,
 ): Promise<NativeCallResult> {
-  const target = resolveNativeServer(server);
-  if (!target) {
-    return { ok: false, tool, result: '', error: `no native transport for server '${server}'` };
-  }
   const started = Date.now();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
   try {
-    const session = sessionFor(target.url, target.headers);
+    const session = sessionFor(url, headers);
     const result = await session.callTool(tool, args ?? {}, controller.signal);
     return {
       ok: true,
@@ -244,6 +264,35 @@ export async function nativeCall(
   } finally {
     clearTimeout(timer);
   }
+}
+
+export async function nativeCall(
+  server: string,
+  tool: string,
+  args: Record<string, unknown>,
+): Promise<NativeCallResult> {
+  const target = resolveNativeServer(server);
+  if (!target) {
+    return { ok: false, tool, result: '', error: `no native transport for server '${server}'` };
+  }
+  return callAtUrl(target.url, target.headers, tool, args);
+}
+
+/**
+ * Call `relay-tool` over the MCP route for a named principal (see
+ * {@link resolveRelayPrincipalUrl}). This is the ONLY way relay.ts /
+ * relay-rest.ts should reach the relay — never the generic {@link nativeCall}
+ * with a friendly server name, which has no concept of "which principal".
+ * Throws synchronously (before any network call) if `principal` is missing or
+ * unconfigured.
+ */
+export async function nativeCallAsPrincipal(
+  principal: string,
+  tool: string,
+  args: Record<string, unknown>,
+): Promise<NativeCallResult> {
+  const url = resolveRelayPrincipalUrl(principal);
+  return callAtUrl(url, undefined, tool, args);
 }
 
 /**

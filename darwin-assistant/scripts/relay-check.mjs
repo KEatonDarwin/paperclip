@@ -95,8 +95,8 @@ globalThis.fetch = async (_url, init) => {
   }
   if (body.method === 'tools/call') {
     const { name, arguments: args } = body.params;
-    if (name === 'relay-tool' && args.operation === 'inbox') return jsonRpcResult(body.id, INBOX_FIXTURE);
-    if (name === 'relay-tool' && args.operation === 'read_thread') {
+    if (name === 'relay-tool' && args.op === 'inbox') return jsonRpcResult(body.id, INBOX_FIXTURE);
+    if (name === 'relay-tool' && args.op === 'read_thread') {
       const found = THREADS_BY_ID[args.id];
       if (!found) throw new Error(`fixture has no thread ${args.id}`);
       return jsonRpcResult(body.id, found);

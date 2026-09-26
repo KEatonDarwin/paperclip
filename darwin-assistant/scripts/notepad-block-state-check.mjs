@@ -31,11 +31,14 @@ for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) fs.rmSync(p, { fo
 console.log(`[notepad-block-state-check] DB: ${DB_PATH}`);
 
 const distDir = path.join(__dirname, '..', 'dist');
-const { putNotepadDay, getNotepadDay, markLineSeen, markLineActed } = await import(path.join(distDir, 'notepad.js'));
+const { putNotepadDay, getNotepadDay, markLineSeen, markLineActed, getNotepadLineState } = await import(
+  path.join(distDir, 'notepad.js')
+);
 const { reconcileNotepadMarker, dismissNotepadMarker } = await import(path.join(distDir, 'notepad-markers.js'));
 const { carryForwardInto } = await import(path.join(distDir, 'notepad-rollover.js'));
 const { sqliteDb } = await import(path.join(distDir, 'conversation-db.js'));
 const { notepadBlockStates } = await import(path.join(distDir, 'notepad-block-state.js'));
+const { runNotepadSpeak } = await import(path.join(distDir, 'notepad-speak.js'));
 
 let failed = false;
 function check(label, ok) {
@@ -202,6 +205,128 @@ const D9 = '2026-09-13';
   const rows = notepadBlockStates(D9);
   check('headline:null block: still returns a row for the lead-in block', rows.length === 2);
   check('headline:null block: lead-in block reports unseen (never examined)', rows[0]?.state === 'unseen');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NODE #1054 — THE REAL CHAIN, not a hand-seeded ledger. Every case above
+// proves notepadBlockStates() reads a hand-built ledger correctly; none of
+// them prove the autonomous pipeline (runNotepadSpeak) ever WRITES to that
+// ledger for a block it judged silent -- which is exactly the gap #1054
+// exists to close (verifier #1053: a real day judged 14 blocks and produced
+// zero 'seen' rows). Same deterministic tick scheme as notepad-speak-check.mjs.
+// ═══════════════════════════════════════════════════════════════════════════
+const EPOCH_MS = Date.parse('2026-01-01T00:00:00Z');
+function tickDate(n) {
+  return new Date(EPOCH_MS + n * 1000); // one tick = one second
+}
+function sqliteDatetimeString(date) {
+  return date.toISOString().slice(0, 19).replace('T', ' ');
+}
+const setUpdatedAtStmt = sqliteDb.prepare(`UPDATE notepad_days SET updated_at = ? WHERE day = ?`);
+function saveAtTick(day, text, tick) {
+  const saved = putNotepadDay(day, text);
+  setUpdatedAtStmt.run(sqliteDatetimeString(tickDate(tick)), day);
+  return saved;
+}
+
+// One stub serving both stages runNotepadSpeak drives through the same
+// opts.runOneShot seam, discriminated by prompt content exactly like
+// notepad-speak-check.mjs's combinedStub -- the gate prompt is the only one
+// that mentions "complete_thought". `moveFor(block_id)` returns {kind,
+// reason} for a block this call should propose a real move for, or
+// undefined for silence.
+function speakStub(moveFor) {
+  return async (prompt) => {
+    if (prompt.includes('complete_thought')) {
+      const blockIds = [...new Set([...prompt.matchAll(/block_id (\d+)/g)].map((m) => Number(m[1])))];
+      return JSON.stringify({ verdicts: blockIds.map((block_id) => ({ block_id, complete_thought: true })) });
+    }
+    const blockIds = [...new Set([...prompt.matchAll(/^- block (\d+):/gm)].map((m) => Number(m[1])))];
+    const moves = [];
+    for (const block_id of blockIds) {
+      const m = moveFor(block_id);
+      if (m) moves.push({ block_id, kind: m.kind, reason: m.reason });
+    }
+    return JSON.stringify({ moves });
+  };
+}
+
+// -- (A) THE REAL CHAIN: 3 candidate blocks in one settle pass -- ONE gets a
+//    real move, TWO are judged and come back silent, and a FOURTH block --
+//    added to the note only AFTER this pass already ran, so the gate never
+//    laid eyes on it at all -- must be completely untouched. -----------------
+const DAY_SPEAK = '2026-09-20';
+{
+  const NOTE = ['Topic Alpha', '  - alpha detail one', 'Topic Bravo', '  - bravo detail one', 'Topic Charlie', '  - charlie detail one'].join('\n');
+  const saved = saveAtTick(DAY_SPEAK, NOTE, 1);
+  const alphaId = lineIdByText(saved, 'Topic Alpha');
+  const bravoId = lineIdByText(saved, 'Topic Bravo');
+  const bravoChildId = lineIdByText(saved, '  - bravo detail one');
+  const charlieId = lineIdByText(saved, 'Topic Charlie');
+  const charlieChildId = lineIdByText(saved, '  - charlie detail one');
+
+  const stub = speakStub((id) => (id === alphaId ? { kind: 'take_it', reason: 'JARVIS can take Alpha' } : undefined));
+  const result = await runNotepadSpeak(DAY_SPEAK, { now: tickDate(1 + 20 + 1), runOneShot: stub });
+
+  check('(1054a) the pass settled and decided moves', result.pass.settle !== null && result.moves !== null);
+  check('(1054a) outcome is model (a real batched call, not a fallback)', result.moves?.outcome === 'model');
+  check(
+    '(1054a) GAP 1: candidate_block_ids names all 3 blocks the model was actually shown',
+    [alphaId, bravoId, charlieId].every((id) => result.moves?.candidate_block_ids.includes(id)) && result.moves?.candidate_block_ids.length === 3,
+  );
+  check('(1054a) exactly one real move was decided, for Alpha', result.moves?.moves.length === 1 && result.moves?.moves[0].block_id === alphaId);
+
+  // Add the 4th block ONLY NOW -- it did not exist when the pass above ran,
+  // so it was never a gate/moves candidate at all. Its headline never went
+  // through the pipeline; it must read exactly as untouched.
+  saveAtTick(DAY_SPEAK, NOTE + '\nTopic Delta\n  - delta detail one', 2);
+  const deltaSaved = getNotepadDay(DAY_SPEAK);
+  const deltaId = lineIdByText(deltaSaved, 'Topic Delta');
+
+  const alpha = stateFor(DAY_SPEAK, 'Topic Alpha');
+  const bravo = stateFor(DAY_SPEAK, 'Topic Bravo');
+  const charlie = stateFor(DAY_SPEAK, 'Topic Charlie');
+  const delta = stateFor(DAY_SPEAK, 'Topic Delta');
+
+  check('(1054a) THE FIX: the block with a real move reports move', alpha?.state === 'move');
+  check('(1054a) THE FIX: a judged-but-silent block reports seen, not unseen', bravo?.state === 'seen');
+  check('(1054a) THE FIX: the OTHER judged-but-silent block also reports seen', charlie?.state === 'seen');
+  // notepadBlockStates only reports the HEADLINE's derived gutter state;
+  // confirm the CHILD lines were individually written to the ledger too
+  // (not just the headline) by reading their raw ledger rows directly --
+  // marking only the headline would still pass every check above.
+  check("(1054a) bravo's own CHILD line was individually marked seen in the ledger", getNotepadLineState(bravoChildId)?.state === 'seen');
+  check("(1054a) charlie's own CHILD line was individually marked seen in the ledger", getNotepadLineState(charlieChildId)?.state === 'seen');
+  check(
+    "(1054a) THE GUARANTEE: a block the pass never saw at all (added after the fact) still reports unseen -- marking silence never spills onto the whole day",
+    delta?.state === 'unseen',
+  );
+}
+
+// -- (B) A FALLBACK OUTCOME WRITES NOTHING: the moves call itself fails, so
+//    every candidate block must come back exactly as it went in (unseen) --
+//    stamping seen there would launder a broken pass into "nothing to say".
+const DAY_FALLBACK = '2026-09-21';
+{
+  const NOTE = ['Topic Echo', '  - echo detail one', 'Topic Foxtrot', '  - foxtrot detail one'].join('\n');
+  const saved = saveAtTick(DAY_FALLBACK, NOTE, 3000);
+  const echoId = lineIdByText(saved, 'Topic Echo');
+
+  const stub = async (prompt) => {
+    if (prompt.includes('complete_thought')) {
+      const blockIds = [...new Set([...prompt.matchAll(/block_id (\d+)/g)].map((m) => Number(m[1])))];
+      return JSON.stringify({ verdicts: blockIds.map((block_id) => ({ block_id, complete_thought: true })) });
+    }
+    throw new Error('simulated moves-model failure');
+  };
+
+  const result = await runNotepadSpeak(DAY_FALLBACK, { now: tickDate(3000 + 20 + 1), runOneShot: stub });
+
+  check('(1054b) the moves call was attempted and failed', result.moves?.outcome === 'fallback');
+  check('(1054b) it still names which blocks it had tried to judge', result.moves?.candidate_block_ids.length === 2);
+  check('(1054b) THE GUARANTEE: a fallback writes nothing -- both blocks still report unseen', stateFor(DAY_FALLBACK, 'Topic Echo')?.state === 'unseen' && stateFor(DAY_FALLBACK, 'Topic Foxtrot')?.state === 'unseen');
+  check('(1054b) THE GUARANTEE: no ledger row was written for the headline at all', getNotepadLineState(echoId) === undefined);
+  check('(1054b) no marker was created either', notepadBlockStates(DAY_FALLBACK).every((r) => r.state === 'unseen'));
 }
 
 console.log(failed ? '\nFAILED' : '\nALL PASS');

@@ -104,6 +104,13 @@ export interface NotepadMovesResult {
   day: string;
   /** How many BLOCKS were in play (node #943 -- this used to count lines). */
   candidate_count: number;
+  /** Which blocks were actually put in front of the model, same order as
+   *  `candidates` -- i.e. exactly the block_ids a caller may treat as
+   *  "judged this pass" (node #1054). A block_id NOT in this list was never
+   *  shown to the model at all and must stay untouched, whatever `moves`
+   *  says -- this list is what lets a caller distinguish "judged, silent"
+   *  from "never surfaced". */
+  candidate_block_ids: number[];
   moves: NotepadMove[]; // sparse -- absence of an entry for a block_id IS silence
   outcome: NotepadMovesOutcome;
 }
@@ -372,7 +379,7 @@ export async function decideNotepadMoves(
   const candidates = moveBlockCandidates(review);
 
   if (candidates.length === 0) {
-    return { day, candidate_count: 0, moves: [], outcome: 'no_candidates' };
+    return { day, candidate_count: 0, candidate_block_ids: [], moves: [], outcome: 'no_candidates' };
   }
 
   const usingDefaultSpawn = !opts?.runOneShot;
@@ -387,15 +394,16 @@ export async function decideNotepadMoves(
   const timeoutMs = opts?.timeoutMs ?? movesTimeoutMs();
   const prompt = buildMovesPrompt(review, candidates);
   const candidatesById = new Map(candidates.map((c) => [c.block_id, c]));
+  const candidateBlockIds = candidates.map((c) => c.block_id);
 
   try {
     const raw = await withTimeout(runOneShot(prompt), timeoutMs);
     const moves = capMoves(parseMovesResponse(raw, candidatesById), candidates);
-    return { day, candidate_count: candidates.length, moves, outcome: 'model' };
+    return { day, candidate_count: candidates.length, candidate_block_ids: candidateBlockIds, moves, outcome: 'model' };
   } catch {
     // Spawn failure, non-zero exit, or a timeout -- forced total silence
     // for this batch. A missed move costs Kevin nothing he didn't already
     // have; a guessed one trains him to ignore markers.
-    return { day, candidate_count: candidates.length, moves: [], outcome: 'fallback' };
+    return { day, candidate_count: candidates.length, candidate_block_ids: candidateBlockIds, moves: [], outcome: 'fallback' };
   }
 }

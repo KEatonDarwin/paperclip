@@ -4,6 +4,10 @@ import { decideNotepadMoves } from './notepad-moves.js';
 import type { NotepadMovesResult } from './notepad-moves.js';
 import { reconcileNotepadMarker } from './notepad-markers.js';
 import type { NotepadMarker } from './notepad-markers.js';
+import { getNotepadLineState, markLineSeen } from './notepad.js';
+import { notepadBlockId } from './notepad-blocks.js';
+
+const BLANK_RE = /^\s*$/;
 
 // The pipeline wiring node #850's dependency chain has been building toward:
 // runNotepadPass (#61 — settle -> gate -> whole-note review) hands off a
@@ -116,6 +120,37 @@ export async function runNotepadSpeak(
     markers.push(
       reconcileNotepadMarker(move.block_id, { kind: move.kind, reason: move.reason, action_ref: actionRef }),
     );
+  }
+
+  // NODE #1054 -- silence leaves a trace. A block the model was actually
+  // shown (moves.candidate_block_ids) but returned no move for WAS judged --
+  // it just had nothing worth saying. Mark every text-bearing member line of
+  // that block `seen`, the same ledger write dispatch gives an unpicked
+  // sibling of an ACTED block (notepad-dispatch.ts's markLineSeen loop),
+  // reused here verbatim. A block that got a real move keeps today's
+  // behaviour (marker reconcile only, no separate seen pass) -- dispatch, if
+  // and when it runs, is what marks that block's other members.
+  //
+  // `outcome === 'fallback'` writes NOTHING: the model call itself failed or
+  // timed out, so nothing was actually read. Stamping `seen` there would
+  // launder a broken pass into "read it, nothing to say" -- the exact
+  // distinction this node exists to preserve.
+  if (moves.outcome !== 'fallback') {
+    const movedBlockIds = new Set(moves.moves.map((m) => m.block_id));
+    const blockById = new Map(pass.review.blocks.map((b) => [notepadBlockId(b), b]));
+    const textByLineId = new Map(pass.review.lines.map((l) => [l.line_id, l.text]));
+
+    for (const blockId of moves.candidate_block_ids) {
+      if (movedBlockIds.has(blockId)) continue;
+      const block = blockById.get(blockId);
+      if (!block) continue;
+      for (const lineId of block.member_line_ids) {
+        const text = textByLineId.get(lineId);
+        if (text === undefined || BLANK_RE.test(text)) continue;
+        if (getNotepadLineState(lineId)?.action_ref) continue;
+        markLineSeen(lineId);
+      }
+    }
   }
 
   return { day, pass, moves, markers };

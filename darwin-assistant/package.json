@@ -65,9 +65,13 @@
     "notepad:dispatch-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-dispatch-check.db node scripts/notepad-dispatch-check.mjs",
     "notepad:route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-route-check.db node scripts/notepad-route-check.mjs",
     "notepad:actions-route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-actions-route-check.db node scripts/notepad-actions-route-check.mjs",
+<<<<<<< HEAD
     "notepad:rollover-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-rollover-check.db node scripts/notepad-rollover-check.mjs",
     "notepad:rollover-wire-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-rollover-wire-check.db node scripts/notepad-rollover-wire-check.mjs",
     "notepad:rollover-replay-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-rollover-replay-check.db node scripts/notepad-rollover-replay-check.mjs"
+=======
+    "notepad:provenance-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-provenance-check.db node scripts/notepad-provenance-check.mjs"
+>>>>>>> hopper/notepad
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

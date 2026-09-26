@@ -20,7 +20,9 @@
 //   8. Every call is timeout-bounded and returns a RESULT, never throws a
 //      failure that could strand a node's claim.
 
-import type { HopperNodeRow, HopperTreeRow } from './hopper-engine.js';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import { getHopperNode, getHopperTree, type HopperNodeRow, type HopperTreeRow } from './hopper-engine.js';
 
 const NOT_IMPLEMENTED = (fn: string): never => {
   throw new Error(`[hopper-git] ${fn} is not implemented yet (docs/hopper/PARALLEL-CONTRACT.md §9)`);
@@ -219,9 +221,21 @@ export function branchExists(_repoPath: string, _branch: string): boolean {
 /**
  * `git rev-parse --verify refs/remotes/origin/<branch>` — read-only. Backs the
  * `branch_pushed` unpark condition. §6
+ *
+ * Reads local refs only (no `fetch`, no network) — a failure (unknown ref, not
+ * a git repo, timeout) is a value: `false`, never a throw, per §8.8.
  */
-export function remoteBranchExists(_repoPath: string, _branch: string): boolean {
-  return NOT_IMPLEMENTED('remoteBranchExists');
+export function remoteBranchExists(repoPath: string, branch: string): boolean {
+  try {
+    execFileSync('git', ['rev-parse', '--verify', `refs/remotes/origin/${branch}`], {
+      cwd: repoPath,
+      timeout: 10_000,
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -291,8 +305,17 @@ export function resetHardTo(
 // ---------------------------------------------------------------------------
 
 /** Parse a stored `unpark_when` JSON blob. Returns null for null/invalid input. */
-export function parseUnparkCondition(_json: string | null | undefined): UnparkCondition | null {
-  return NOT_IMPLEMENTED('parseUnparkCondition');
+export function parseUnparkCondition(json: string | null | undefined): UnparkCondition | null {
+  if (!json) return null;
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (!parsed || typeof parsed !== 'object' || typeof (parsed as { kind?: unknown }).kind !== 'string') return null;
+    const kind = (parsed as { kind: string }).kind;
+    if (!['node_done', 'tree_done', 'branch_pushed', 'file_exists', 'manual'].includes(kind)) return null;
+    return parsed as UnparkCondition;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -300,6 +323,20 @@ export function parseUnparkCondition(_json: string | null | undefined): UnparkCo
  * `{kind:'manual'}` (and a null condition) is NEVER met — that is today's
  * behavior: only Kevin unparks it. §6
  */
-export function evaluateUnpark(_cond: UnparkCondition | null): boolean {
-  return NOT_IMPLEMENTED('evaluateUnpark');
+export function evaluateUnpark(cond: UnparkCondition | null): boolean {
+  if (!cond) return false;
+  switch (cond.kind) {
+    case 'manual':
+      return false;
+    case 'node_done':
+      return getHopperNode(cond.node_id)?.status === 'done';
+    case 'tree_done':
+      return getHopperTree(cond.tree_id)?.status === 'done';
+    case 'branch_pushed':
+      return remoteBranchExists(cond.repo, cond.branch);
+    case 'file_exists':
+      return fs.existsSync(cond.path);
+    default:
+      return false;
+  }
 }

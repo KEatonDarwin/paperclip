@@ -272,62 +272,31 @@ Node #943's checks (all hermetic, stubbed model, zero claude spawns):
 
 ## Gutter state (node #187)
 
-Until this node, only a block with an active marker showed anything in the
-gutter — a block JARVIS read and stayed silent on looked identical to one it
-never read. `src/notepad-block-state.ts`'s `notepadBlockStates(day)` derives
-a fifth, always-present signal per block, riding on `GET /notepad` as
-`blocks: NotepadBlockStateRow[]`. It is a pure read over the existing
-per-line ledger (`notepad_line_state`) and marker store (`notepad_markers`)
-— neither changes, and nothing about `parseNotepadBlocks` changes either.
+Every block's headline carries a deterministic **gutter state** so JARVIS
+silence is visible. `notepadBlockStates(day)` on `GET /notepad` returns
+`blocks: NotepadBlockStateRow[]`, a pure read over the existing per-line
+ledger and marker store — neither changes.
 
-```ts
-type NotepadBlockState = 'unseen' | 'seen' | 'move' | 'acted' | 'changed';
-interface NotepadBlockStateRow {
-  headline_line_id: number; // the block's own id (notepadBlockId) — a
-                             // headline:null lead-in block's first member
-                             // stands in, exactly as everywhere else in this file
-  member_line_ids: number[];
-  state: NotepadBlockState;
-  state_reason: string;
-}
-```
+**The five states, in precedence order:**
 
-The five states, in the exact precedence order a re-derivation checks them:
+1. **`acted`** — headline has an active marker with non-null `action_ref`, or
+   ledger row is `acted` with a ref. `state_reason` names the action_ref
+   (e.g., `"marker action_ref: cockpit:thread-2"`).
+2. **`move`** — headline has an active marker with null `action_ref`. The only
+   state that renders as a dot. `state_reason`: `"marker, no action_ref yet"`.
+3. **`changed`** — headline or a member was edited after JARVIS examined it.
+   `state_reason` names the edited line id
+   (e.g., `"line 47 edited since ledger row 'seen'"`).
+4. **`seen`** — every text-bearing member has a ledger row (seen/acted/
+   dismissed/done) and none of 1–3 apply. Blank lines don't count.
+   `state_reason`: `"all members examined"`.
+5. **`unseen`** — at least one text-bearing line has no ledger row.
+   `state_reason`: `"line 52 unseen"`.
 
-1. **`acted`** — the headline has an active (non-dismissed) marker with a
-   non-null `action_ref`, OR the headline's ledger row is `acted` with an
-   `action_ref`.
-2. **`move`** — the headline has an active marker with a **null**
-   `action_ref` (JARVIS has something to say, Kevin hasn't opened it). This
-   is the existing dot — `move` is the only state that renders as one.
-3. **`changed`** — the headline OR any member line has a ledger row whose
-   stored hash no longer matches `lineTextHash` of its current text (edited
-   after JARVIS examined it), and neither rule above already applied.
-4. **`seen`** — every text-bearing line in the block has a ledger row (any
-   of `seen`/`acted`/`dismissed`/`done`) and none of 1–3 applied. Blank
-   member lines don't count against this. A block whose headline is
-   `done` or `dismissed` still reports `seen` here — carry-forward is what
-   removes a `done`/`dismissed` topic from tomorrow, not this state.
-5. **`unseen`** — otherwise: at least one text-bearing line in the block has
-   no ledger row at all.
+**Key rules:** Dismissed markers never → `move` or `acted`. Carried lines
+resolve through lineage — a line acted yesterday and carried forward today
+reports `acted`, not `unseen`. Move is the only dot.
 
-Dismissed markers never count toward `move` or `acted` (`activeNotepadMarkers`
-already excludes them). Reads go through `getNotepadLineState`, which
-resolves a carried line to its origin's ledger row — a line acted-on
-yesterday and carried forward today reports `acted`, never `unseen`.
-
-`scripts/notepad-block-state-check.mjs` (`npm run notepad:block-state-check`)
-proves each of the five states, the marker-outranks-an-edited-member
-precedence, a dismissed marker never producing `move`, a carried acted line
-resolving through lineage, and the node's own headline claim: a day where
-JARVIS examined every block and raised zero markers reports `seen` on every
-block and `unseen` on none.
-
-`scripts/notepad-gate-check.mjs` (`npm run notepad:gate-check`) and
-`scripts/notepad-review-check.mjs` (`npm run notepad:review-check`) cover the
-consumer wiring above at block granularity against a scratch DB with a
-stubbed model and zero claude spawns: wholesale disposal of an all-junk
-block, a mixed block reaching the model whole, block-keyed model/fallback/
-phantom-id verdicts, the `headline: null` block_id fallback, and the
-`[line_id N]` prefix on every rendered row (indented and blank rows
-included).
+**Verification:** `npm run notepad:block-state-check` proves all five states,
+precedence order, dismissed-marker guard, carried-line lineage, and the claim
+that a day with zero markers reports `seen` on every block.

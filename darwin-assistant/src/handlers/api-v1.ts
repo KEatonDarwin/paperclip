@@ -820,10 +820,25 @@ type ClaudeUsageRawLimit = {
   } | null;
 };
 
+// A dollar-denominated grant (e.g. the Nov-2026 $250 cloud-session credit).
+// Anthropic ships these under rotating codename keys at the TOP LEVEL of the
+// usage payload (the first one was `iguana_necktie`), so we never hardcode the
+// key — see claudeCreditWindows().
+type ClaudeUsageRawCredit = {
+  utilization?: number | null;
+  resets_at?: string | null;
+  limit_dollars?: number | null;
+  used_dollars?: number | null;
+  remaining_dollars?: number | null;
+  locked_reason?: string | null;
+};
+
 type ClaudeUsageRaw = {
   five_hour?: ClaudeUsageRawWindow | null;
   seven_day?: ClaudeUsageRawWindow | null;
   limits?: ClaudeUsageRawLimit[] | null;
+  /** Codename-keyed dollar grants live alongside the known fields. */
+  [key: string]: unknown;
 };
 
 const PROVIDER_USAGE_STALE_MS = 3 * 60 * 1000;
@@ -861,6 +876,48 @@ function scopedClaudeLimitWindow(limit: ClaudeUsageRawLimit): ProviderUsageWindo
   };
 }
 
+/**
+ * Dollar-grant meters ("$250 of cloud-session credits", expiring Nov 5 2026).
+ *
+ * The usage endpoint exposes each grant as a top-level object carrying
+ * limit_dollars / used_dollars / remaining_dollars under an opaque codename key
+ * that Anthropic rotates per promotion. Rather than hardcode today's name we
+ * detect the SHAPE: any top-level object with a numeric limit_dollars > 0 that
+ * isn't one of the known rate-limit windows. An account without the grant has
+ * the key set to null (account B today) and contributes no bar.
+ */
+function claudeCreditWindows(raw: ClaudeUsageRaw): ProviderUsageWindow[] {
+  const SKIP = new Set(['five_hour', 'seven_day', 'limits', 'spend', 'extra_usage', 'seven_day_breakdown']);
+  const money = (n: number): string =>
+    `$${Number.isInteger(n) ? n.toFixed(0) : n.toFixed(2)}`;
+  const out: ProviderUsageWindow[] = [];
+  for (const [key, value] of Object.entries(raw)) {
+    if (SKIP.has(key) || !value || typeof value !== 'object') continue;
+    const credit = value as ClaudeUsageRawCredit;
+    if (typeof credit.limit_dollars !== 'number' || credit.limit_dollars <= 0) continue;
+    const left = typeof credit.remaining_dollars === 'number'
+      ? credit.remaining_dollars
+      : credit.limit_dollars - (typeof credit.used_dollars === 'number' ? credit.used_dollars : 0);
+    const expires = credit.resets_at ? Date.parse(credit.resets_at) : NaN;
+    const expiresLabel = Number.isFinite(expires)
+      ? new Date(expires).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/Chicago' })
+      : null;
+    out.push({
+      label: 'Cloud credits',
+      // Percent CONSUMED, same polarity as every other bar in the widget.
+      used_percentage: typeof credit.utilization === 'number'
+        ? credit.utilization
+        : Math.max(0, Math.min(100, ((credit.limit_dollars - left) / credit.limit_dollars) * 100)),
+      // Deliberately null: this is an expiry, not a rolling reset, and the bar
+      // would otherwise render it as "resets in 39d".
+      resets_at: null,
+      value_label: `${money(left)} of ${money(credit.limit_dollars)} left${expiresLabel ? ` · expires ${expiresLabel}` : ''}`,
+      detail: credit.locked_reason ?? null,
+    });
+  }
+  return out;
+}
+
 function parseClaudeUsageRaw(raw: ClaudeUsageRaw): Pick<ClaudeProviderUsage, 'five_hour' | 'seven_day' | 'windows'> {
   const five_hour = claudeRawWindow('5-hour', raw.five_hour);
   const seven_day = claudeRawWindow('7-day', raw.seven_day);
@@ -871,6 +928,7 @@ function parseClaudeUsageRaw(raw: ClaudeUsageRaw): Pick<ClaudeProviderUsage, 'fi
     const scoped = scopedClaudeLimitWindow(limit);
     if (scoped) windows.push(scoped);
   }
+  windows.push(...claudeCreditWindows(raw));
   return { five_hour, seven_day, windows };
 }
 

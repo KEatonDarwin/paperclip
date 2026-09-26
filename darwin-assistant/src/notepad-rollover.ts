@@ -164,7 +164,12 @@ export function carryForwardInto(
                   l.origin_line_id AS origin_line_id, l.origin_day AS origin_day,
                   s.state AS state
            FROM notepad_lines l
-           LEFT JOIN notepad_line_state s ON s.line_id = l.id
+           -- Lineage-aware join (CARRY-FORWARD.md 2.3): a carried line's state
+           -- lives under its origin_line_id, never under its own id, so joining
+           -- on l.id would read every carried line as having no ledger row --
+           -- and a dismissed/done thought would resurrect every single day.
+           LEFT JOIN notepad_line_state s
+                  ON s.line_id = CAST(COALESCE(l.origin_line_id, l.id) AS INTEGER)
            WHERE l.day = ?
            ORDER BY l.idx ASC, l.id ASC`
         )

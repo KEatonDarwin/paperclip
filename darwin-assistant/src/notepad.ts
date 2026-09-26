@@ -344,7 +344,7 @@ export function registerLedgerKeyResolver(resolver: LedgerKeyResolver): void {
   ledgerKeyResolver = resolver;
 }
 
-function resolveLedgerKeyForRead(lineId: number): number {
+function resolveLedgerKey(lineId: number): number {
   return ledgerKeyResolver ? ledgerKeyResolver(lineId) : lineId;
 }
 
@@ -413,7 +413,12 @@ function markLine(lineId: number, state: NotepadLineState, actionRef: string | n
   // Stamp the hash of the text that was ACTUALLY examined right now — never
   // a hash computed later — per §3's closing paragraph.
   const hash = lineTextHash(line.text);
-  upsertLineStateStmt.run(lineId, state, hash, actionRef, note);
+  // Writes resolve lineage exactly like the reads do (getNotepadLineState,
+  // unscannedLines): the ledger holds ONE row per origin thought, keyed by
+  // origin_line_id (CARRY-FORWARD.md §2.3). Writing under a carried line's
+  // own id would create a second row that no reader ever looks at -- the
+  // state would be silently lost and the thought re-acted on.
+  upsertLineStateStmt.run(resolveLedgerKey(lineId), state, hash, actionRef, note);
 }
 
 /** JARVIS examined the line's current text and judged it not actionable right now. */
@@ -483,7 +488,7 @@ export function unscannedLines(day: string): UnscannedNotepadLine[] {
       // genuinely 'unseen', resolve through its origin (node #886) -- a
       // carried line has a brand-new id but may have a prior incarnation's
       // state recorded under origin_line_id.
-      const resolvedKey = resolveLedgerKeyForRead(row.id);
+      const resolvedKey = resolveLedgerKey(row.id);
       if (resolvedKey !== row.id) {
         const originState = getLineStateStmt.get(resolvedKey);
         if (originState) {
@@ -519,10 +524,10 @@ const getLineStateStmt = sqliteDb.prepare<[number], NotepadLineStateRow>(`
 `);
 
 /**
- * Read the raw ledger row for one line, if any (route reads). Resolves
+ * Read the raw ledger row for one line, if any. Resolves
  * through the registered ledger key resolver first (node #886) so a carried
  * line finds its origin's ledger row instead of always looking unseen.
  */
 export function getNotepadLineState(lineId: number): NotepadLineStateRow | undefined {
-  return getLineStateStmt.get(resolveLedgerKeyForRead(lineId));
+  return getLineStateStmt.get(resolveLedgerKey(lineId));
 }

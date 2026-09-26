@@ -84,6 +84,18 @@ it has been carried across. A new day's carried lines find their prior state
 immediately, and there is no risk of "orphaned" state (a line's current `id` with no
 ledger, while a duplicate ledger row exists keyed under a past `id`).
 
+**The write side resolves too (node #106):** `markLine()` in `notepad.ts` —
+the one place `notepad_line_state` is ever written — resolves the same key
+before its upsert, and `carryForwardInto()`'s own open/closed query joins the
+ledger on `CAST(COALESCE(l.origin_line_id, l.id) AS INTEGER)`. Both were
+originally keyed on the line's raw `id` while the readers resolved lineage,
+which split one thought across two ledger rows: a state set on a carried line
+was invisible to every reader (so JARVIS could act on the same thought again
+the next day), and a thought marked `done`/`dismissed` on a carried line rolled
+forward again every single morning. The guard is
+`scripts/notepad-ledger-key-check.mjs` (`npm run notepad:ledger-key-check`),
+which fails if either side regresses.
+
 **Wired into the live path (node #886):** `resolveLedgerKey()` is registered
 with `src/notepad.ts` at module load, via `registerLedgerKeyResolver()`, so
 `notepad.ts`'s own `getNotepadLineState()` and `unscannedLines()` — the

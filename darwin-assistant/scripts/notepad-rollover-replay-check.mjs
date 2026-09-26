@@ -83,8 +83,13 @@ function rawLines(day) {
 }
 
 const stateStmt = sqliteDb.prepare(`SELECT state FROM notepad_line_state WHERE line_id = ?`);
-function stateOf(lineId) {
-  return stateStmt.get(lineId)?.state ?? null;
+// The ledger holds ONE row per origin thought, keyed by origin_line_id
+// (CARRY-FORWARD.md 2.3) -- both the readers (notepad.ts getNotepadLineState /
+// unscannedLines) and the writers (markLine*) resolve through it. This oracle
+// must resolve the same way: looking the state up under a CARRIED line's own
+// id finds nothing and reports a closed thought as still open.
+function stateOf(line) {
+  return stateStmt.get(Number(line.origin_line_id ?? line.id))?.state ?? null;
 }
 
 /**
@@ -98,7 +103,7 @@ function stateOf(lineId) {
 function openIdentitySet(day) {
   const out = new Set();
   for (const l of rawLines(day)) {
-    const st = stateOf(l.id);
+    const st = stateOf(l);
     if (st === 'dismissed' || st === 'done') continue;
     out.add(l.origin_line_id ?? String(l.id));
   }

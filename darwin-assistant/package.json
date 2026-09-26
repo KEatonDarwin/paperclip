@@ -43,7 +43,8 @@
     "work-switch:check": "node scripts/work-switch-check.mjs",
     "health:check": "npm run build && JARVIS_DB_PATH=/tmp/health-check.db JARVIS_SIM=1 node --import ./scripts/health-check.hooks.mjs scripts/health-check.mjs",
     "health:route-check": "npm run build && node scripts/health-route-check.mjs",
-    "health:sim": "npm run build && JARVIS_DB_PATH=/tmp/health-sim.db JARVIS_SIM=1 npx tsx scripts/health-sim.ts"
+    "health:sim": "npm run build && JARVIS_DB_PATH=/tmp/health-sim.db JARVIS_SIM=1 npx tsx scripts/health-sim.ts",
+    "unpark:check": "npm run build && JARVIS_DB_PATH=/tmp/unpark-check.db JARVIS_SIM=1 node scripts/unpark-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

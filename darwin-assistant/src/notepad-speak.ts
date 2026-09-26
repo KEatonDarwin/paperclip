@@ -147,7 +147,15 @@ export async function runNotepadSpeak(
       for (const lineId of block.member_line_ids) {
         const text = textByLineId.get(lineId);
         if (text === undefined || BLANK_RE.test(text)) continue;
-        if (getNotepadLineState(lineId)?.action_ref) continue;
+        // NEVER downgrade a TERMINAL ledger state to `seen`. An action_ref is
+        // not the only way a line is finished with: `dismissed` (Kevin closed
+        // the marker) and `done` (he closed the thought) both mean the line is
+        // settled, and notepad-rollover.ts:207 leaves exactly those behind when
+        // it carries the day forward. Overwriting either with `seen` puts a
+        // topic Kevin explicitly closed back on tomorrow's note — and then
+        // every tomorrow after that, because the silent pass re-runs daily.
+        const prior = getNotepadLineState(lineId);
+        if (prior && (prior.action_ref || prior.state === 'dismissed' || prior.state === 'done')) continue;
         markLineSeen(lineId);
       }
     }

@@ -329,5 +329,47 @@ const DAY_FALLBACK = '2026-09-21';
   check('(1054b) no marker was created either', notepadBlockStates(DAY_FALLBACK).every((r) => r.state === 'unseen'));
 }
 
+// -- (C) A TERMINAL STATE IS NEVER DOWNGRADED BY A SILENT PASS. The seen-loop
+//    from (A) skipped lines carrying an action_ref, but `dismissed` and `done`
+//    are ALSO finished states -- and notepad-rollover.ts leaves exactly those
+//    behind when it carries the day forward. Stamping `seen` over a dismissal
+//    puts a topic Kevin explicitly closed back on tomorrow's note, and on
+//    every tomorrow after that, because the silent pass re-runs daily. This is
+//    the regression verifier #1056 caught; these are its assertions. ---------
+const DAY_TERMINAL = '2026-09-22';
+{
+  const NOTE = ['Topic Golf', '  - golf detail one', 'Topic Hotel', '  - hotel detail one'].join('\n');
+  const saved = saveAtTick(DAY_TERMINAL, NOTE, 6000);
+  const golfId = lineIdByText(saved, 'Topic Golf');
+  const hotelId = lineIdByText(saved, 'Topic Hotel');
+
+  // Kevin sees a move on Golf and dismisses it; Hotel he marks done outright.
+  reconcileNotepadMarker(golfId, { kind: 'take_it', reason: 'JARVIS can take Golf' });
+  dismissNotepadMarker(golfId);
+  check('(1054c) precondition: the dismissed headline reads dismissed', getNotepadLineState(golfId)?.state === 'dismissed');
+
+  // A later silent pass over the same day — the ordinary case after any dismissal.
+  const silent = async (prompt) => {
+    if (prompt.includes('complete_thought')) {
+      const blockIds = [...new Set([...prompt.matchAll(/block_id (\d+)/g)].map((m) => Number(m[1])))];
+      return JSON.stringify({ verdicts: blockIds.map((block_id) => ({ block_id, complete_thought: true })) });
+    }
+    return JSON.stringify({ moves: [] });
+  };
+  const result = await runNotepadSpeak(DAY_TERMINAL, { now: tickDate(6000 + 20 + 1), runOneShot: silent });
+
+  check('(1054c) the silent pass really ran over this block', (result.moves?.candidate_block_ids ?? []).includes(golfId));
+  check('(1054c) THE FIX: a DISMISSED headline is still dismissed after a silent pass', getNotepadLineState(golfId)?.state === 'dismissed');
+  check('(1054c) the block it never closed did get marked seen (the loop still works)', stateFor(DAY_TERMINAL, 'Topic Hotel')?.state === 'seen');
+
+  // The consequence the verifier proved end-to-end: rollover must still leave it behind.
+  const carried = carryForwardInto(sqliteDb, '2026-09-23', { now: tickDate(9000) });
+  const tomorrow = getNotepadDay('2026-09-23');
+  const carriedTexts = tomorrow.lines.map((l) => l.text);
+  check('(1054c) THE CONSEQUENCE: a dismissed topic is NOT carried into the new day', !carriedTexts.includes('Topic Golf'));
+  check('(1054c) the still-open topic IS carried', carriedTexts.includes('Topic Hotel'));
+  void hotelId; void carried;
+}
+
 console.log(failed ? '\nFAILED' : '\nALL PASS');
 process.exit(failed ? 1 : 0);

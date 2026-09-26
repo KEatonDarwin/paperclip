@@ -45,6 +45,7 @@ import {
   parkGoalNode,
   postCue,
   recordAutopilotVerdict,
+  reevaluateGoalNodeUnparks,
   renderGoalTreeSnapshot,
   setGoalAutopilot,
   setGoalFocus,
@@ -56,6 +57,7 @@ import {
   type GoalTree,
   type PlanJson,
 } from './goals.js';
+import { evaluateUnparks, parseUnparkCondition, type UnparkCondition, type UnparkTarget } from './unpark.js';
 import {
   ancestorsBlock,
   composeCueText,
@@ -245,6 +247,9 @@ export interface NightItemRow {
   started_at: string | null;
   finished_at: string | null;
   result_summary: string | null;
+  // PARALLEL-CONTRACT.md §6 — JSON `UnparkCondition`; null = no condition park
+  // is standing on this item (its park, if any, is expressed purely by `status`).
+  unpark_when: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -314,6 +319,10 @@ const LAZY_COLUMNS: Array<{ table: string; column: string; ddl: string }> = [
   { table: 'night_runs', column: 'brief', ddl: 'TEXT' },
   { table: 'night_runs', column: 'label', ddl: 'TEXT' },
   { table: 'night_runs', column: 'dials_at_start', ddl: 'TEXT' },
+  // PARALLEL-CONTRACT.md §6 — machine-checkable unpark condition, JSON
+  // `UnparkCondition`. NULL = today's behavior (only an explicit re-queue moves
+  // the item); a condition-carrying item self-clears via `reevaluateNightItemUnparks`.
+  { table: 'night_items', column: 'unpark_when', ddl: 'TEXT' },
 ];
 
 export function ensureNightShiftTables(): void {
@@ -1843,7 +1852,10 @@ function onItemBlocked(run: NightRunRow, item: NightItemRow, detail: string): vo
   finishItem(run, item, 'blocked', detail);
   if (priorUnblock) {
     if (OPEN_STATUSES.has(priorUnblock.status)) finishItem(run, priorUnblock, 'failed', 'node blocked again after its unblock pass');
-    parkNode(run, item, `tree ${item.tree_id ?? '?'} blocked again after an unblock pass`);
+    // §6 table: tree-blocked-after-unblock park → {kind:'tree_done'} — once the
+    // tree itself finishes (however that happens), the park is no longer valid.
+    parkNode(run, item, `tree ${item.tree_id ?? '?'} blocked again after an unblock pass`,
+      item.tree_id ? { kind: 'tree_done', tree_id: item.tree_id } : undefined);
     return;
   }
   if (item.kind === 'unblock' || item.node_id == null) return;
@@ -1855,10 +1867,55 @@ function onItemBlocked(run: NightRunRow, item: NightItemRow, detail: string): vo
   }]);
 }
 
-function parkNode(run: NightRunRow, item: NightItemRow, reason: string): void {
+/** `condition` (PARALLEL-CONTRACT.md §6, table in §6): omitted = `{kind:'manual'}`
+ *  — today's behavior, only Kevin unparks it. */
+function parkNode(run: NightRunRow, item: NightItemRow, reason: string, condition?: UnparkCondition): void {
   if (item.node_id == null) return;
-  try { parkGoalNode(item.goal_id, item.node_id, 'system', reason.slice(0, 500)); }
+  try { parkGoalNode(item.goal_id, item.node_id, 'system', reason.slice(0, 500), condition); }
   catch (err) { console.error('[night-shift] park failed', err); }
+}
+
+/**
+ * PARALLEL-CONTRACT.md §6 — the unpark re-check for night items carrying their
+ * own `unpark_when` (independent of whether their goal node is parked; see
+ * `reevaluateGoalNodeUnparks` in goals.ts for that side). Re-run every tick by
+ * `tickNightShift`, before `fillLanes` so a freshly re-queued item is picked up
+ * in the SAME tick it clears.
+ *
+ * Only items NOT already open (`queued`/`running`) or terminal-`done` are
+ * candidates — an item is condition-parked by some caller setting `status` to
+ * `blocked`/`failed` AND `unpark_when` in the same write; this pass is what
+ * turns that back into `status='queued'` the moment the condition holds.
+ */
+export function reevaluateNightItemUnparks(run: NightRunRow): NightItemRow[] {
+  const candidates = listNightItems(run.id).filter((i) => i.unpark_when && i.status !== 'queued' && i.status !== 'running' && i.status !== 'done');
+  if (!candidates.length) return [];
+
+  const targets: UnparkTarget<number>[] = [];
+  const byRef = new Map<number, { item: NightItemRow; condition: UnparkCondition }>();
+  for (const item of candidates) {
+    let condition: UnparkCondition;
+    try {
+      const parsed = JSON.parse(item.unpark_when as string) as UnparkCondition;
+      if (!parsed || typeof parsed !== 'object' || typeof parsed.kind !== 'string') continue;
+      condition = parsed;
+    } catch { continue; }
+    byRef.set(item.id, { item, condition });
+    targets.push({ ref: item.id, condition });
+  }
+
+  const requeued: NightItemRow[] = [];
+  for (const verdict of evaluateUnparks(targets)) {
+    if (!verdict.met) continue;
+    const entry = byRef.get(verdict.ref);
+    if (!entry) continue;
+    const fresh = setItem(entry.item.id, { status: 'queued', unpark_when: null, finished_at: null, result_summary: null });
+    insertNightEvent(run.id, entry.item.id, 'system', 'item_unparked',
+      `#${entry.item.position} ${entry.item.kind} ${entry.item.title} — unpark condition met: ${JSON.stringify(entry.condition)}`.slice(0, 500),
+      { condition: entry.condition });
+    requeued.push(fresh);
+  }
+  return requeued;
 }
 
 /** Apply a VERIFY verdict to a `check` node exactly the way autopilot P1 does. */
@@ -2315,6 +2372,102 @@ function runModelItem(run: NightRunRow, item: NightItemRow, lane: number, total:
   console.log(`[night-shift] run #${run.id} item #${item.position} ${item.kind} G${item.goal_id}#${node.id} → lane ${lane}`);
 }
 
+// ---------------------------------------------------------------------------
+// PARALLEL-CONTRACT.md §7 — THE NEVER-IDLE RULE
+//
+// `runnable()`'s three "implicit throttle" refusals (`waits on #X`, `is working
+// the same branch`, `already at its parallel cap`) are eligible for a one-
+// worker serial fallback when the driver would otherwise idle: Kevin's "couldn't
+// you just have put one worker on the ones that needed finishing first? Even if
+// it's much slower, wouldn't that keep us moving?" A `parked-or-ghost ancestor`
+// refusal, a human-gated node, or a condition-parked item with an unmet
+// condition are NOT eligible — those are genuine stops.
+// ---------------------------------------------------------------------------
+
+const SERIAL_FALLBACK_ELIGIBLE: RegExp[] = [
+  /^waits on #/,
+  /is working the same branch$/,
+  /already at its parallel cap/,
+];
+
+/** §7 step 3. Called only after `replanTail()` and the unpark re-check both
+ *  found nothing this tick. Scans every `queued` item with an EMPTY running
+ *  set (nothing else is running — that is the precondition for reaching this
+ *  branch at all) and, among the ones refused for one of the three throttle
+ *  reasons above, force-dispatches the lowest-position one as the one worker.
+ *  Returns the dispatched item, or null if no item is eligible (a genuine
+ *  stop — every remaining item is ancestor-blocked, human-gated, or
+ *  condition-parked with an unmet condition). */
+function serialFallbackDispatch(run: NightRunRow): NightItemRow | null {
+  const trees = new Map<number, GoalTree>();
+  for (const gid of run.goal_ids) { const t = getGoalTree(gid); if (t) trees.set(gid, t); }
+  const eligible = listNightItems(run.id)
+    .filter((i) => i.status === 'queued' && i.kind !== 'predicted')
+    .map((item) => ({ item, r: runnable(run, item, [], trees) }))
+    .filter(({ r }) => !r.ok && SERIAL_FALLBACK_ELIGIBLE.some((re) => re.test(r.why)))
+    .sort((a, b) => a.item.position - b.item.position);
+  const picked = eligible[0]?.item;
+  if (!picked) return null;
+  if (isServerKind(picked.kind)) runServerItem(run, picked, trees);
+  else runModelItem(run, picked, 1, listNightItems(run.id).length, trees);
+  return picked;
+}
+
+/** Human-readable label for an unpark condition, for the stuck report. */
+function conditionLabel(cond: UnparkCondition | null): string {
+  if (!cond || cond.kind === 'manual') return 'waiting on you';
+  if (cond.kind === 'node_done') return `waiting: node #${cond.node_id} done`;
+  if (cond.kind === 'tree_done') return `waiting: tree ${cond.tree_id} done`;
+  if (cond.kind === 'branch_pushed') return `waiting: branch_pushed ${cond.repo}@${cond.branch}`;
+  if (cond.kind === 'file_exists') return `waiting: file_exists ${cond.path}`;
+  return 'waiting on you';
+}
+
+/** §7 — "the stop record + morning report must list each remaining item WITH
+ *  its reason, never a bare 'stuck'." One line per genuinely-open item
+ *  (queued-but-blocked night items, per-item condition-parked night items) plus
+ *  one line per node that never got an item at all (human leaves, parked
+ *  goal nodes, a goal root ready for Kevin's verify) — deduped by node so a
+ *  parked node with both an item and a `needs_you` entry shows once. */
+function describeStuckState(run: NightRunRow): { line: string; entries: Array<{ position: number | null; title: string; reason: string }> } {
+  const trees = new Map<number, GoalTree>();
+  for (const gid of run.goal_ids) { const t = getGoalTree(gid); if (t) trees.set(gid, t); }
+  const entries: Array<{ position: number | null; title: string; reason: string }> = [];
+  const seenNode = new Set<number>();
+
+  for (const item of listNightItems(run.id)) {
+    if (item.kind === 'predicted') continue;
+    if (item.status === 'queued') {
+      const r = runnable(run, item, [], trees);
+      if (!r.ok) entries.push({ position: item.position, title: item.title, reason: r.why });
+      if (item.node_id != null) seenNode.add(item.node_id);
+    } else if (item.status === 'blocked' && item.unpark_when) {
+      entries.push({ position: item.position, title: item.title, reason: `parked, ${conditionLabel(parseUnparkCondition(item.unpark_when))}` });
+      if (item.node_id != null) seenNode.add(item.node_id);
+    }
+  }
+
+  for (const nu of needsYouFor(run)) {
+    if (nu.node_id != null && seenNode.has(nu.node_id)) continue;
+    let reason: string;
+    if (nu.reason === 'human') reason = 'human-gated (leaf_kind=human)';
+    else if (nu.reason === 'awaiting_weigh_in') reason = 'awaiting your weigh-in';
+    else if (nu.reason === 'root_ready_to_verify') reason = 'goal root ready for your verify';
+    else if (nu.reason === 'parked') {
+      const node = nu.node_id != null ? getRawGoalNode(nu.node_id) : null;
+      const cond = node?.unpark_when ? parseUnparkCondition(node.unpark_when) : null;
+      reason = cond ? `parked, ${conditionLabel(cond)}` : `parked${node?.parked_reason ? `: ${node.parked_reason}` : ''}`;
+    } else reason = nu.reason;
+    entries.push({ position: null, title: nu.title, reason });
+    if (nu.node_id != null) seenNode.add(nu.node_id);
+  }
+
+  entries.sort((a, b) => (a.position ?? Infinity) - (b.position ?? Infinity));
+  const header = `stuck: ${entries.length} item(s) remain, none runnable`;
+  const lines = entries.map((e) => `  ${e.position != null ? `#${e.position}` : '—'} ${e.title}  ${e.reason}`.slice(0, 200));
+  return { line: [header, ...lines].join('\n'), entries };
+}
+
 function fillLanes(run: NightRunRow): { started: number; waiting: string | null } {
   const items = listNightItems(run.id);
   const total = items.length;
@@ -2403,6 +2556,13 @@ export async function tickNightShift(reason = 'loop'): Promise<void> {
     }
     noteHold(after, null, '');
 
+    // PARALLEL-CONTRACT.md §6 — re-check every unpark condition standing on
+    // this run's goal nodes and night items BEFORE filling lanes, so anything
+    // that clears this tick is immediately eligible instead of waiting one
+    // more tick idle. Cheap (a couple of indexed SELECTs), zero model calls.
+    reevaluateGoalNodeUnparks();
+    reevaluateNightItemUnparks(after);
+
     let { started, waiting } = fillLanes(after);
     lastWaiting = waiting;
 
@@ -2416,50 +2576,86 @@ export async function tickNightShift(reason = 'loop'): Promise<void> {
     // budget, not on a momentarily empty list.
     if (!open.length) {
       const appended = replanTail(after);
-      if (!appended) {
-        // REVIEW (node #833) — only the PLANNER coming up empty means complete.
-        // A spent re-plan ceiling means we stopped being allowed to look, which
-        // is a `stuck` (it bells red and names the ceiling) — never a `complete`
-        // that tells Kevin his goal is finished when it is not.
-        if (replanCeilingReached(after.id)) {
-          insertNightEvent(after.id, null, 'system', 'hold',
-            `re-plan ceiling reached (${maxReplans()} tail re-plans, settings-KV night_max_replans) — the list is drained but the planner was not consulted again. Raise night_max_replans or plan a new shift.`,
-            { replan_ceiling: maxReplans() });
-          stopNightRun(after.id, 'stuck', 'system');
-          return;
-        }
+      if (appended) {
+        const refilled = fillLanes(getNightRun(after.id)!);
+        started += refilled.started;
+        waiting = refilled.waiting ?? waiting;
+        lastWaiting = waiting;
+        items = listNightItems(after.id);
+        open = items.filter((i) => OPEN_STATUSES.has(i.status));
+        driver.idleTicks = 0;
+        return;
+      }
+      // REVIEW (node #833) — only the PLANNER coming up empty means complete.
+      // A spent re-plan ceiling means we stopped being allowed to look, which
+      // is a `stuck` (it bells red and names the ceiling) — never a `complete`
+      // that tells Kevin his goal is finished when it is not.
+      if (replanCeilingReached(after.id)) {
+        insertNightEvent(after.id, null, 'system', 'hold',
+          `re-plan ceiling reached (${maxReplans()} tail re-plans, settings-KV night_max_replans) — the list is drained but the planner was not consulted again. Raise night_max_replans or plan a new shift.`,
+          { replan_ceiling: maxReplans() });
+        stopNightRun(after.id, 'stuck', 'system');
+        return;
+      }
+      // PARALLEL-CONTRACT.md §7 — an empty list with nothing to append is NOT
+      // automatically `complete`: a node parked with a LIVE unpark condition
+      // (§6) may still self-clear on some future tick (the condition is
+      // re-checked every tick, at the very top, before this code even runs),
+      // so ending the run here would strand it forever — exactly the "9 hours
+      // unused" failure §0 describes, just reached via the empty-list path
+      // instead of the nothing-runnable path. Only when NOTHING at all needs
+      // anyone (no queued work, no needs-you) is this a genuine, immediate
+      // `complete` — `root_ready_to_verify` doesn't count against that: it IS
+      // the ordinary successful end state (every node done, awaiting Kevin's
+      // sign-off), not a blocker. Anything else falls through to the SAME
+      // never-idle sequence below (running/started are both necessarily empty
+      // here), which gives a live condition real ticks to clear before the
+      // `idleTicks` ceiling ever calls it `stuck`.
+      if (!needsYouFor(after).some((n) => n.reason === 'human' || n.reason === 'parked' || n.reason === 'awaiting_weigh_in')) {
         stopNightRun(after.id, 'complete', 'system');
         return;
       }
-      const refilled = fillLanes(getNightRun(after.id)!);
-      started += refilled.started;
-      waiting = refilled.waiting ?? waiting;
-      lastWaiting = waiting;
-      items = listNightItems(after.id);
-      open = items.filter((i) => OPEN_STATUSES.has(i.status));
-      driver.idleTicks = 0;
-      return;
     }
 
+    // PARALLEL-CONTRACT.md §7 — THE NEVER-IDLE RULE. Nothing runnable is only
+    // step 0 of the test; the driver may not increment `idleTicks` until all
+    // three of these have been tried, in order: (1) replanTail(), already run
+    // above — SHIFTS v1 §3.3.3 (a settled parent blocking its siblings with
+    // nobody asking the planner again is how run #1 died). (2) re-check every
+    // unpark condition — cheap and idempotent even though it already ran once
+    // this tick (before `fillLanes`, above); a park that cleared as a SIDE
+    // EFFECT of this tick's fillLanes/replanTail pass would otherwise wait a
+    // full extra tick. (3) SERIAL FALLBACK — Kevin's "couldn't you just have
+    // put one worker on the ones that needed finishing first? Even if it's
+    // much slower, wouldn't that keep us moving?" Only when all three come up
+    // empty may the driver call it `stuck`, and the stop record must name
+    // every remaining item and why — "nothing runnable" alone is no longer an
+    // acceptable reason.
     const running = open.filter((i) => i.status === 'running');
     if (!running.length && !started) {
-      // SHIFTS v1 §3.3.3 — STUCK MUST MEAN STUCK. Nothing runnable is only half
-      // the test; the other half is "and a re-plan produced nothing either".
-      // Run #1 stopped `stuck` at 02:14 with real work left, because a settled
-      // parent was blocking its siblings and nobody asked the planner again.
-      const appended = replanTail(after);
-      if (appended) {
+      reevaluateGoalNodeUnparks();
+      const requeued = reevaluateNightItemUnparks(after);
+      if (requeued.length) {
         const refilled = fillLanes(getNightRun(after.id)!);
         started += refilled.started;
         lastWaiting = refilled.waiting ?? waiting;
         driver.idleTicks = 0;
-      } else {
-        driver.idleTicks += 1;
-        if (driver.idleTicks >= STUCK_TICKS) {
-          insertNightEvent(after.id, null, 'system', 'hold',
-            `nothing runnable for ${driver.idleTicks} ticks and a re-plan found no work — ${waiting ?? 'no reason recorded'}`);
-          stopNightRun(after.id, 'stuck', 'system');
-        }
+        return;
+      }
+      const fb = serialFallbackDispatch(after);
+      if (fb) {
+        insertNightEvent(after.id, fb.id, 'system', 'serial_fallback',
+          `#${fb.position} ${fb.title} — never-idle §7: forced through as the one worker, no parallelism`);
+        driver.idleTicks = 0;
+        return;
+      }
+      driver.idleTicks += 1;
+      if (driver.idleTicks >= STUCK_TICKS) {
+        const stuck = describeStuckState(after);
+        insertNightEvent(after.id, null, 'system', 'hold',
+          `${stuck.line}\n(idle for ${driver.idleTicks} ticks; a re-plan, an unpark re-check and the serial fallback all found nothing.)`,
+          { items: stuck.entries });
+        stopNightRun(after.id, 'stuck', 'system');
       }
     } else {
       driver.idleTicks = 0;

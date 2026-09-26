@@ -38,6 +38,7 @@ import {
   insertEvent,
   emitGoal,
   registerAutopilotHooks,
+  reevaluateGoalNodeUnparks,
   AUTOPILOT_DEFAULTS,
   type AutopilotConfig,
   type AutopilotVerdict,
@@ -635,6 +636,11 @@ async function tickGoal(goalId: number, reason: string): Promise<void> {
     const cfg = cfgOf(goal);
     let tree = getGoalTree(goalId);
     if (!tree) return;
+
+    // PARALLEL-CONTRACT.md §6 — re-check this goal's parked nodes for a machine-
+    // checkable unpark condition before anything else this tick. Zero model
+    // calls; a hit re-loads the tree so the rest of the tick sees the fresh state.
+    if (reevaluateGoalNodeUnparks(goalId).length) tree = getGoalTree(goalId) ?? tree;
 
     // Pre-pass always runs (no model calls).
     if (prePass(goal, tree, s)) tree = getGoalTree(goalId) ?? tree;

@@ -1,4 +1,5 @@
 import { listCommitments } from '../commitments.js';
+import { parseUnparkCondition } from '../unpark.js';
 import { gatherBigBoardSnapshot, BIG_BOARD_KIOSK_TOKEN_SETTING, BIG_BOARD_KIOSK_EVENT_TYPES, type BigBoardProviders } from '../big-board.js';
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { spawn } from 'node:child_process';
@@ -3385,11 +3386,16 @@ export function createApiV1Router(): Router {
   router.post('/goals/:id/nodes/:nodeId/park', (req: AuthedRequest, res) => {
     const goalId = parseInt(String(req.params.id), 10);
     const nodeId = parseInt(String(req.params.nodeId), 10);
-    const body = (req.body ?? {}) as { actor?: unknown; reason?: unknown };
+    const body = (req.body ?? {}) as { actor?: unknown; reason?: unknown; condition?: unknown };
+    // PARALLEL-CONTRACT.md §6 — optional machine-checkable unpark condition.
+    // Omitted or malformed = undefined = manual (today's behavior).
+    const condition = parseUnparkCondition(
+      body.condition && typeof body.condition === 'object' ? JSON.stringify(body.condition) : null,
+    );
     try {
       // v0.4 §15.2 — reason is REQUIRED for system/jarvis parks on an autopilot
       // goal (enforced in parkGoalNode); Kevin's park may omit it.
-      res.json({ node: parkGoalNode(goalId, nodeId, body.actor, typeof body.reason === 'string' ? body.reason : undefined) });
+      res.json({ node: parkGoalNode(goalId, nodeId, body.actor, typeof body.reason === 'string' ? body.reason : undefined, condition) });
     } catch (err) {
       sendCaughtGoalError(res, err);
     }

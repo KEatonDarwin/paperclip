@@ -28,6 +28,7 @@ import {
   type HopperNodeRow,
 } from './hopper-engine.js';
 import { buildVerifyPlanNode } from './goals-autopilot-verify.js';
+import { evaluateUnparks, type UnparkCondition, type UnparkTarget } from './unpark.js';
 
 // ---------------------------------------------------------------------------
 // Types (mirrors CONTRACT.md §1 / §3.0 exactly — additive-only if extended)
@@ -186,6 +187,10 @@ export interface GoalNodeDbRow {
   autopilot_attempts: number;
   autopilot_verdict: string | null;
   parked_reason: string | null;
+  // v0.5 (PARALLEL-CONTRACT.md §6) — machine-checkable unpark condition, JSON
+  // `UnparkCondition`. NULL (or `{kind:'manual'}`) = today's behavior: only
+  // Kevin unparks it.
+  unpark_when: string | null;
   sort_order: number;
   verified_at: string | null;
   created_at: string;
@@ -392,6 +397,8 @@ ensureGoalNodeColumn('autopilot_set', `autopilot_set INTEGER NOT NULL DEFAULT 0`
 ensureGoalNodeColumn('autopilot_attempts', `autopilot_attempts INTEGER NOT NULL DEFAULT 0`);
 ensureGoalNodeColumn('autopilot_verdict', `autopilot_verdict TEXT`);
 ensureGoalNodeColumn('parked_reason', `parked_reason TEXT`);
+// PARALLEL-CONTRACT.md §6 — additive, nullable; null = today's behavior exactly.
+ensureGoalNodeColumn('unpark_when', `unpark_when TEXT`);
 
 // ---------------------------------------------------------------------------
 // Low-level accessors
@@ -2252,7 +2259,13 @@ export function verifyGoalNode(goalId: number, nodeId: number, passed: boolean, 
   return deriveSingleNode(getRawNodeStmt.get(nodeId) as GoalNodeDbRow);
 }
 
-export function parkGoalNode(goalId: number, nodeId: number, actor?: unknown, reason?: string): GoalNodeRow {
+/**
+ * `condition` (PARALLEL-CONTRACT.md §6) — omitted or `{kind:'manual'}` = today's
+ * behavior exactly: only Kevin (or an explicit `unpark`) clears the park. Any
+ * other condition is re-checked every tick by `reevaluateGoalNodeUnparks()` and
+ * clears itself the moment it is met.
+ */
+export function parkGoalNode(goalId: number, nodeId: number, actor?: unknown, reason?: string, condition?: UnparkCondition | null): GoalNodeRow {
   const node = requireNode(goalId, nodeId);
   if (!['set', 'planned', 'check', 'working'].includes(node.state)) {
     throw new GoalError(409, 'invalid_transition', `node is ${node.state}, cannot be parked`, { from: node.state, to: 'parked' });
@@ -2264,8 +2277,9 @@ export function parkGoalNode(goalId: number, nodeId: number, actor?: unknown, re
   if (apCfg && act !== 'kevin' && !trimmedReason) {
     throw new GoalError(400, 'reason_required', 'park on an autopilot goal requires a reason');
   }
-  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'parked', parked_reason = ?, updated_at = datetime('now') WHERE id = ?`).run(trimmedReason, nodeId);
-  insertEvent(goalId, nodeId, act, 'node_parked', trimmedReason ? `Parked (was ${node.state}): ${trimmedReason}` : `Parked (was ${node.state}).`, { from: node.state, reason: trimmedReason });
+  const unparkWhen = condition && condition.kind !== 'manual' ? JSON.stringify(condition) : null;
+  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'parked', parked_reason = ?, unpark_when = ?, updated_at = datetime('now') WHERE id = ?`).run(trimmedReason, unparkWhen, nodeId);
+  insertEvent(goalId, nodeId, act, 'node_parked', trimmedReason ? `Parked (was ${node.state}): ${trimmedReason}` : `Parked (was ${node.state}).`, { from: node.state, reason: trimmedReason, unpark_when: condition ?? null });
   if (apCfg && act !== 'kevin') {
     insertEvent(goalId, nodeId, act, 'autopilot_parked', trimmedReason ?? 'parked', { reason: trimmedReason, attempts: node.autopilot_attempts });
   }
@@ -2302,11 +2316,61 @@ export function unparkGoalNode(goalId: number, nodeId: number, actor?: unknown):
   }
 
   // v0.4 §15.2 — unpark = "try again": reason cleared, attempt budget reset.
-  sqliteDb.prepare(`UPDATE goal_nodes SET state = ?, parked_reason = NULL, autopilot_attempts = 0, updated_at = datetime('now') WHERE id = ?`).run(restoreTo, nodeId);
+  // §6 — unpark_when cleared too: a manual unpark (Kevin, or `unpark`) fully
+  // resets the park, condition included, whether or not it had fired.
+  sqliteDb.prepare(`UPDATE goal_nodes SET state = ?, parked_reason = NULL, unpark_when = NULL, autopilot_attempts = 0, updated_at = datetime('now') WHERE id = ?`).run(restoreTo, nodeId);
   insertEvent(goalId, nodeId, act, 'node_unparked', `Unparked to ${restoreTo}.`);
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
   return deriveSingleNode(fresh);
+}
+
+/**
+ * PARALLEL-CONTRACT.md §6 — the unpark re-check. Re-run every tick by BOTH the
+ * night driver (`night-shift.ts`'s `tickNightShift`) and goals autopilot
+ * (`goals-autopilot.ts`'s `tickGoal`) — this function is where the actual
+ * `unparkGoalNode` call and event line live, so both callers get identical
+ * behavior instead of two competing implementations.
+ *
+ * `goalId` scopes the pass to one goal (autopilot's per-goal tick); omitted =
+ * every parked, condition-carrying node in the DB (the night driver's tick,
+ * which may own several goals in one run).
+ */
+export function reevaluateGoalNodeUnparks(goalId?: number): Array<{ goal_id: number; node_id: number; condition: UnparkCondition }> {
+  const rows = (goalId == null
+    ? sqliteDb.prepare(`SELECT id, goal_id, unpark_when FROM goal_nodes WHERE state = 'parked' AND unpark_when IS NOT NULL`).all()
+    : sqliteDb.prepare(`SELECT id, goal_id, unpark_when FROM goal_nodes WHERE state = 'parked' AND unpark_when IS NOT NULL AND goal_id = ?`).all(goalId)
+  ) as Array<{ id: number; goal_id: number; unpark_when: string }>;
+  if (!rows.length) return [];
+
+  const byRef = new Map<number, { id: number; goal_id: number; condition: UnparkCondition }>();
+  const targets: UnparkTarget<number>[] = [];
+  for (const row of rows) {
+    let condition: UnparkCondition;
+    try {
+      const parsed = JSON.parse(row.unpark_when) as UnparkCondition;
+      if (!parsed || typeof parsed !== 'object' || typeof parsed.kind !== 'string') continue;
+      condition = parsed;
+    } catch { continue; }
+    byRef.set(row.id, { id: row.id, goal_id: row.goal_id, condition });
+    targets.push({ ref: row.id, condition });
+  }
+
+  const unparked: Array<{ goal_id: number; node_id: number; condition: UnparkCondition }> = [];
+  for (const verdict of evaluateUnparks(targets)) {
+    if (!verdict.met) continue;
+    const entry = byRef.get(verdict.ref);
+    if (!entry) continue;
+    insertEvent(entry.goal_id, entry.id, 'system', 'node_unpark_condition_met',
+      `Unpark condition met: ${JSON.stringify(entry.condition)}`, { condition: entry.condition });
+    try {
+      unparkGoalNode(entry.goal_id, entry.id, 'system');
+      unparked.push({ goal_id: entry.goal_id, node_id: entry.id, condition: entry.condition });
+    } catch (err) {
+      console.error('[goals] auto-unpark failed', entry.goal_id, entry.id, err);
+    }
+  }
+  return unparked;
 }
 
 // ---------------------------------------------------------------------------

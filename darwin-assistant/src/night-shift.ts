@@ -45,6 +45,7 @@ import {
   parkGoalNode,
   postCue,
   recordAutopilotVerdict,
+  reevaluateGoalNodeUnparks,
   renderGoalTreeSnapshot,
   setGoalAutopilot,
   setGoalFocus,
@@ -56,6 +57,7 @@ import {
   type GoalTree,
   type PlanJson,
 } from './goals.js';
+import { evaluateUnparks, type UnparkCondition, type UnparkTarget } from './unpark.js';
 import {
   ancestorsBlock,
   composeCueText,
@@ -245,6 +247,9 @@ export interface NightItemRow {
   started_at: string | null;
   finished_at: string | null;
   result_summary: string | null;
+  // PARALLEL-CONTRACT.md §6 — JSON `UnparkCondition`; null = no condition park
+  // is standing on this item (its park, if any, is expressed purely by `status`).
+  unpark_when: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -314,6 +319,10 @@ const LAZY_COLUMNS: Array<{ table: string; column: string; ddl: string }> = [
   { table: 'night_runs', column: 'brief', ddl: 'TEXT' },
   { table: 'night_runs', column: 'label', ddl: 'TEXT' },
   { table: 'night_runs', column: 'dials_at_start', ddl: 'TEXT' },
+  // PARALLEL-CONTRACT.md §6 — machine-checkable unpark condition, JSON
+  // `UnparkCondition`. NULL = today's behavior (only an explicit re-queue moves
+  // the item); a condition-carrying item self-clears via `reevaluateNightItemUnparks`.
+  { table: 'night_items', column: 'unpark_when', ddl: 'TEXT' },
 ];
 
 export function ensureNightShiftTables(): void {
@@ -1843,7 +1852,10 @@ function onItemBlocked(run: NightRunRow, item: NightItemRow, detail: string): vo
   finishItem(run, item, 'blocked', detail);
   if (priorUnblock) {
     if (OPEN_STATUSES.has(priorUnblock.status)) finishItem(run, priorUnblock, 'failed', 'node blocked again after its unblock pass');
-    parkNode(run, item, `tree ${item.tree_id ?? '?'} blocked again after an unblock pass`);
+    // §6 table: tree-blocked-after-unblock park → {kind:'tree_done'} — once the
+    // tree itself finishes (however that happens), the park is no longer valid.
+    parkNode(run, item, `tree ${item.tree_id ?? '?'} blocked again after an unblock pass`,
+      item.tree_id ? { kind: 'tree_done', tree_id: item.tree_id } : undefined);
     return;
   }
   if (item.kind === 'unblock' || item.node_id == null) return;
@@ -1855,10 +1867,55 @@ function onItemBlocked(run: NightRunRow, item: NightItemRow, detail: string): vo
   }]);
 }
 
-function parkNode(run: NightRunRow, item: NightItemRow, reason: string): void {
+/** `condition` (PARALLEL-CONTRACT.md §6, table in §6): omitted = `{kind:'manual'}`
+ *  — today's behavior, only Kevin unparks it. */
+function parkNode(run: NightRunRow, item: NightItemRow, reason: string, condition?: UnparkCondition): void {
   if (item.node_id == null) return;
-  try { parkGoalNode(item.goal_id, item.node_id, 'system', reason.slice(0, 500)); }
+  try { parkGoalNode(item.goal_id, item.node_id, 'system', reason.slice(0, 500), condition); }
   catch (err) { console.error('[night-shift] park failed', err); }
+}
+
+/**
+ * PARALLEL-CONTRACT.md §6 — the unpark re-check for night items carrying their
+ * own `unpark_when` (independent of whether their goal node is parked; see
+ * `reevaluateGoalNodeUnparks` in goals.ts for that side). Re-run every tick by
+ * `tickNightShift`, before `fillLanes` so a freshly re-queued item is picked up
+ * in the SAME tick it clears.
+ *
+ * Only items NOT already open (`queued`/`running`) or terminal-`done` are
+ * candidates — an item is condition-parked by some caller setting `status` to
+ * `blocked`/`failed` AND `unpark_when` in the same write; this pass is what
+ * turns that back into `status='queued'` the moment the condition holds.
+ */
+export function reevaluateNightItemUnparks(run: NightRunRow): NightItemRow[] {
+  const candidates = listNightItems(run.id).filter((i) => i.unpark_when && i.status !== 'queued' && i.status !== 'running' && i.status !== 'done');
+  if (!candidates.length) return [];
+
+  const targets: UnparkTarget<number>[] = [];
+  const byRef = new Map<number, { item: NightItemRow; condition: UnparkCondition }>();
+  for (const item of candidates) {
+    let condition: UnparkCondition;
+    try {
+      const parsed = JSON.parse(item.unpark_when as string) as UnparkCondition;
+      if (!parsed || typeof parsed !== 'object' || typeof parsed.kind !== 'string') continue;
+      condition = parsed;
+    } catch { continue; }
+    byRef.set(item.id, { item, condition });
+    targets.push({ ref: item.id, condition });
+  }
+
+  const requeued: NightItemRow[] = [];
+  for (const verdict of evaluateUnparks(targets)) {
+    if (!verdict.met) continue;
+    const entry = byRef.get(verdict.ref);
+    if (!entry) continue;
+    const fresh = setItem(entry.item.id, { status: 'queued', unpark_when: null, finished_at: null, result_summary: null });
+    insertNightEvent(run.id, entry.item.id, 'system', 'item_unparked',
+      `#${entry.item.position} ${entry.item.kind} ${entry.item.title} — unpark condition met: ${JSON.stringify(entry.condition)}`.slice(0, 500),
+      { condition: entry.condition });
+    requeued.push(fresh);
+  }
+  return requeued;
 }
 
 /** Apply a VERIFY verdict to a `check` node exactly the way autopilot P1 does. */
@@ -2402,6 +2459,13 @@ export async function tickNightShift(reason = 'loop'): Promise<void> {
       return;
     }
     noteHold(after, null, '');
+
+    // PARALLEL-CONTRACT.md §6 — re-check every unpark condition standing on
+    // this run's goal nodes and night items BEFORE filling lanes, so anything
+    // that clears this tick is immediately eligible instead of waiting one
+    // more tick idle. Cheap (a couple of indexed SELECTs), zero model calls.
+    reevaluateGoalNodeUnparks();
+    reevaluateNightItemUnparks(after);
 
     let { started, waiting } = fillLanes(after);
     lastWaiting = waiting;

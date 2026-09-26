@@ -89,6 +89,9 @@ const distDir = path.join(__dirname, '..', 'dist');
 const { putNotepadDay, getNotepadLineState, getNotepadDay, getNotepadLineDay } = await import(path.join(distDir, 'notepad.js'));
 const { parseNotepadBlocks, notepadBlockId } = await import(path.join(distDir, 'notepad-blocks.js'));
 const { reconcileNotepadMarker, getNotepadMarker } = await import(path.join(distDir, 'notepad-markers.js'));
+const { resolveActionRef: resolveNotepadActionRef } = await import(
+  path.join(distDir, 'notepad-action-resolver.js')
+);
 const { openNotepadHandoff, buildNotepadHandoffPrompt, notepadHandoffThreadExt } = await import(
   path.join(distDir, 'notepad-handoff.js')
 );
@@ -218,12 +221,25 @@ let threadExt = null;
   check('the seed post targeted the right thread ext', postCalls[0]?.externalId === threadExt);
   check('the seed post used a turn:<id>:0 message id', /^turn:\d+:0$/.test(postCalls[0]?.messageId ?? ''));
 
+  // CANONICAL FORM. These two assertions used to expect the BARE external_id,
+  // which is what the handoff wrote -- and that is exactly why every handoff
+  // rendered as a dead link in #110's "what it became" column: parseActionRef
+  // in notepad-dispatch.ts only understands the prefixed schemes, so a bare
+  // ext parsed as null and resolved broken. The prefixed form is the contract
+  // (notepad-dispatch.ts documents `thread:<thread_ext>` as canonical and
+  // re-stamps the ledger with it), so the CHECK conforms, not the contract.
+  const canonicalRef = `thread:${threadExt}`;
+
   const marker = getNotepadMarker(lineA);
-  check("the marker's action_ref now holds the thread ext", marker?.action_ref === threadExt);
+  check("the marker's action_ref holds the canonical thread: ref", marker?.action_ref === canonicalRef);
 
   const ledger = getNotepadLineState(lineA);
   check("the per-line ledger records state 'acted'", ledger?.state === 'acted');
-  check("the per-line ledger's action_ref holds the thread ext", ledger?.action_ref === threadExt);
+  check("the per-line ledger's action_ref holds the canonical thread: ref", ledger?.action_ref === canonicalRef);
+  check(
+    'that ref resolves to a LIVE target (the dead-link regression)',
+    resolveNotepadActionRef(canonicalRef).exists === true,
+  );
 
   check('the conversation was actually created', !!getConversation(threadExt));
 }

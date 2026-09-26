@@ -143,8 +143,16 @@ export async function openNotepadHandoff(
   const dossier = await buildTopicDossier(block ? { block } : { line_id: lineId }, opts.dossierOpts);
   const prompt = buildNotepadHandoffPrompt(line, marker, dossier, block);
 
-  setNotepadMarkerActionRef(lineId, externalId);
-  markLineActed(lineId, externalId);
+  // CANONICAL `thread:<ext>` form, not the bare external_id. notepad-dispatch's
+  // parseActionRef only understands the four prefixed schemes (goal: / hopper: /
+  // workstream: / thread:), so a bare `cockpit:notepad-line-115` parsed as null
+  // and the action resolver behind #110's "what it became" column rendered every
+  // handoff as a DEAD link -- struck through with an unlink icon -- even though
+  // the conversation existed and opened fine. Same string, one prefix, two nodes
+  // that never met.
+  const actionRef = `thread:${externalId}`;
+  setNotepadMarkerActionRef(lineId, actionRef);
+  markLineActed(lineId, actionRef);
 
   const post = opts.postMessage ?? processMessage;
   post(prompt, externalId, `turn:${conv.id}:0`).catch((err: unknown) => {

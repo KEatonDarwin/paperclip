@@ -61,6 +61,17 @@ One format per sink, defined once in `notepad-dispatch.ts`
 match one of these four shapes (e.g. a stale ref written before this scheme
 existed).
 
+Node #877 is the resolver this section promised: `resolveActionRef`
+(`src/notepad-action-resolver.ts`) takes any action_ref string and resolves
+it to `{ kind, id, exists, label, url, broken_reason }` — a live target's
+`label`/`url` for the cockpit to render, or `exists:false` with a
+`broken_reason` for a ref whose target row is gone or that never parsed in
+the first place (never omitted, never a silent success). `GET
+/api/v1/notepad/:date/actions` uses it to expose every ACTED line for a day
+with its resolution attached — see that file's own module doc for the exact
+`url` convention per sink (confirmed against the real cockpit routes in
+`jarvis-command-center/src/routes/`, not guessed).
+
 ## 4. Idempotency
 
 The idempotency key is the notepad line's **`line_id`**

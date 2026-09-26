@@ -52,7 +52,8 @@
     "notepad:handoff-route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-handoff-route-check.db node scripts/notepad-handoff-route-check.mjs",
     "notepad:route-rule-check": "npm run build && node scripts/notepad-route-rule-check.mjs",
     "notepad:dispatch-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-dispatch-check.db node scripts/notepad-dispatch-check.mjs",
-    "notepad:route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-route-check.db node scripts/notepad-route-check.mjs"
+    "notepad:route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-route-check.db node scripts/notepad-route-check.mjs",
+    "notepad:actions-route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-actions-route-check.db node scripts/notepad-actions-route-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

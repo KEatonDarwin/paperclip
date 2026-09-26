@@ -75,6 +75,7 @@ import {
 } from '../notepad.js';
 import { activeNotepadMarkers, dismissNotepadMarker, getNotepadMarker } from '../notepad-markers.js';
 import { openNotepadHandoff } from '../notepad-handoff.js';
+import { listNotepadActedActions } from '../notepad-action-resolver.js';
 import {
   listNotifications,
   unreadNotificationCount,
@@ -1783,6 +1784,19 @@ export function createApiV1Router(): Router {
       markLineSeen(lineId);
     }
     res.json({ line_id: lineId, state: getNotepadLineState(lineId) });
+  });
+
+  // Read side of the routing chain (node #877): every ACTED line for `day`,
+  // resolved back to its live target. Same 400 shape as GET /notepad on a
+  // malformed date. Always a bare array — empty on a day with no acted
+  // lines, never null.
+  router.get('/notepad/:date/actions', (req: AuthedRequest, res) => {
+    const day = typeof req.params.date === 'string' ? req.params.date : '';
+    if (!isValidNotepadDate(day)) {
+      sendError(res, 400, 'invalid_date', 'date must be YYYY-MM-DD');
+      return;
+    }
+    res.json(listNotepadActedActions(day));
   });
 
   // == Quick-capture todo widget (DAR-737) =====================================

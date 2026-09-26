@@ -100,7 +100,9 @@ async function runClaudeClassifier(prompt: string): Promise<string> {
 
     const child = spawn(
       process.env.CLAUDE_CLI_PATH || 'claude',
-      ['--print', '-', '--output-format', 'stream-json', '--model', AUTO_GROUP_MODEL],
+      // --verbose is REQUIRED alongside --print + stream-json; without it the CLI
+      // exits 1 and every auto-group attempt failed silently (seen live 2026-09-26).
+      ['--print', '-', '--output-format', 'stream-json', '--verbose', '--model', AUTO_GROUP_MODEL],
       { env, stdio: ['pipe', 'pipe', 'pipe'] },
     );
 

@@ -202,7 +202,21 @@ export function assertModelSpawnAllowed(): void {
 
 const CLAUDE_BIN = process.env.UX_REVIEWER_CLAUDE_BIN || 'claude';
 const DEFAULT_GATE_MODEL = 'claude-haiku-4-5-20251001';
-const DEFAULT_GATE_TIMEOUT_MS = 20 * 1000;
+// A REAL day's note is one prompt of every candidate block at once, and the
+// haiku one-shot needs minutes, not seconds, to answer it. The original 20s
+// was measured against toy fixtures; against Kevin's actual 73-line note the
+// call always timed out, the verdict degraded to `fallback` (= "no complete
+// thought"), and the whole chain went permanently, silently quiet -- no
+// error, no marker, looked exactly like a calm day. The dry-run script needed
+// 540s to get a real answer, which is what set this floor.
+const DEFAULT_GATE_TIMEOUT_MS = 300 * 1000;
+
+/** Settings-KV override so a slow day can be widened without a deploy. */
+function gateTimeoutMs(): number {
+  const raw = getSetting('notepad_gate_timeout_ms');
+  const n = raw === null ? NaN : Number(raw);
+  return Number.isFinite(n) && n >= 5_000 ? n : DEFAULT_GATE_TIMEOUT_MS;
+}
 
 /** Why a gate verdict has the value it does. */
 export type GateVerdictReason = 'model' | 'prefilter' | 'fallback';
@@ -239,7 +253,7 @@ function defaultRunOneShot(prompt: string): Promise<string> {
     execFile(
       CLAUDE_BIN,
       ['-p', prompt, '--output-format', 'json', '--model', model],
-      { timeout: DEFAULT_GATE_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, env },
+      { timeout: gateTimeoutMs(), maxBuffer: 16 * 1024 * 1024, env },
       (err, stdout, stderr) => {
         if (err && !stdout) {
           reject(new Error(`notepad gate call failed: ${err.message}${stderr ? ` | ${stderr.slice(0, 300)}` : ''}`));
@@ -376,7 +390,7 @@ export async function runNotepadGate(
     assertModelSpawnAllowed();
   }
   const runOneShot = opts?.runOneShot ?? defaultRunOneShot;
-  const timeoutMs = opts?.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
+  const timeoutMs = opts?.timeoutMs ?? gateTimeoutMs();
   const prompt = buildGatePrompt(candidates);
 
   let modelVerdicts: Map<number, boolean>;

@@ -110,7 +110,18 @@ export interface NotepadMovesResult {
 
 const CLAUDE_BIN = process.env.UX_REVIEWER_CLAUDE_BIN || 'claude';
 const DEFAULT_MOVES_MODEL = 'claude-sonnet-5';
-const DEFAULT_MOVES_TIMEOUT_MS = 30 * 1000;
+// Same correction as the gate's (see notepad-gate.ts): the moves prompt is
+// the whole reviewable day plus every dossier, and 30s never once survived a
+// real note -- it fell back to "no moves", which is indistinguishable from a
+// quiet day. The dry run needed 1,140s; this is the production floor.
+const DEFAULT_MOVES_TIMEOUT_MS = 600 * 1000;
+
+/** Settings-KV override so a slow day can be widened without a deploy. */
+function movesTimeoutMs(): number {
+  const raw = getSetting('notepad_moves_timeout_ms');
+  const n = raw === null ? NaN : Number(raw);
+  return Number.isFinite(n) && n >= 5_000 ? n : DEFAULT_MOVES_TIMEOUT_MS;
+}
 
 // Goal #62's whole point: "a normal day produces a handful of markers, not
 // one per line." The prompt ASKS the model to stay silent, but a prompt is
@@ -150,7 +161,7 @@ function defaultRunOneShot(prompt: string): Promise<string> {
     execFile(
       CLAUDE_BIN,
       ['-p', prompt, '--output-format', 'json', '--model', model],
-      { timeout: DEFAULT_MOVES_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, env },
+      { timeout: movesTimeoutMs(), maxBuffer: 16 * 1024 * 1024, env },
       (err, stdout, stderr) => {
         if (err && !stdout) {
           reject(new Error(`notepad moves call failed: ${err.message}${stderr ? ` | ${stderr.slice(0, 300)}` : ''}`));
@@ -373,7 +384,7 @@ export async function decideNotepadMoves(
     assertModelSpawnAllowed();
   }
   const runOneShot = opts?.runOneShot ?? defaultRunOneShot;
-  const timeoutMs = opts?.timeoutMs ?? DEFAULT_MOVES_TIMEOUT_MS;
+  const timeoutMs = opts?.timeoutMs ?? movesTimeoutMs();
   const prompt = buildMovesPrompt(review, candidates);
   const candidatesById = new Map(candidates.map((c) => [c.block_id, c]));
 

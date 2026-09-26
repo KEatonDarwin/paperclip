@@ -17,6 +17,7 @@ import './tree-cue.js';
 // autopilot stand-down probe and starts the Night Shift driver (NIGHT_SHIFT_DRIVER=0 disables).
 import './night-shift.js';
 import { startFoundry } from './foundry.js';
+import { startNotepadDriver } from './notepad-driver.js';
 import { startMonitorScheduler } from './monitors.js';
 import { startHealthMonitor } from './health-monitor.js';
 
@@ -123,6 +124,11 @@ async function main() {
   // fire on node state writes); the 60s interval inside is only the safety net.
   startHopperEngine(processMessage);
   startFoundry();
+
+  // The notepad brain (goal #6). Settle -> gate -> whole-note re-read ->
+  // speak, once per quiet period. Cheap at rest; `notepad_speak_enabled=0`
+  // or the work switch stops it without touching saves.
+  startNotepadDriver();
 
   // 🩺 Cockpit Health — the box sampler (cpu/mem/event-loop lag/disk/db/workload)
   // plus the spike → suggestion loop. Plain code, zero model calls except one

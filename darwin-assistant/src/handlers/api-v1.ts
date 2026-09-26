@@ -59,7 +59,6 @@ import { resolveNativeServer, nativeListTools } from '../tools/mcp-native.js';
 import { listNotes, createNote } from '../notes-db.js';
 import { triageNote } from '../notes.js';
 import {
-  getNotepadDay,
   putNotepadDay,
   listNotepadDays,
   isValidNotepadDate,
@@ -73,6 +72,7 @@ import {
   markLineDismissed,
   type NotepadLineState,
 } from '../notepad.js';
+import { openNotepadDay } from '../notepad-rollover.js';
 import { activeNotepadMarkers, dismissNotepadMarker, getNotepadMarker } from '../notepad-markers.js';
 import { openNotepadHandoff } from '../notepad-handoff.js';
 import { listNotepadActedActions } from '../notepad-action-resolver.js';
@@ -1654,7 +1654,7 @@ export function createApiV1Router(): Router {
   // the field is always an array, never null/omitted, so an empty/clean day
   // still gets `markers: []`.
   function notepadDayWithMarkers(day: string) {
-    const base = getNotepadDay(day);
+    const base = openNotepadDay(day);
     const markers = activeNotepadMarkers(day).map((m) => ({
       line_id: m.line_id,
       kind: m.kind,

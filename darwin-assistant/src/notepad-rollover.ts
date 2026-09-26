@@ -5,7 +5,8 @@ import type { Database as DatabaseType } from 'better-sqlite3';
 // has to land first.
 import './notepad.js';
 import { sqliteDb } from './conversation-db.js';
-import type { NotepadLineState } from './notepad.js';
+import { getNotepadDay, getNotepadLineState } from './notepad.js';
+import type { NotepadDay, NotepadLineState, NotepadLineStateRow } from './notepad.js';
 
 // Carry-forward engine (goal: "Yesterday rolls forward" — node #881).
 // Copies yesterday's still-OPEN lines into a newly-opened day as fresh line
@@ -197,4 +198,104 @@ export function carryForwardInto(
   });
 
   return runTx();
+}
+
+// == Day-open wiring (node #882) ===============================================
+//
+// Wires carryForwardInto() into the real day-open path. A day is "opened" by
+// GET /notepad (see handlers/api-v1.ts). The FIRST open of a given day (no
+// notepad_days row yet, or a row with no rolled_over_at stamp -- e.g. one
+// created by a PUT that landed before the day was ever opened) runs the
+// carry-forward engine for it. Every subsequent open of the same day is a
+// fast path: it reads notepad_days.rolled_over_at, sees it's already set,
+// and returns without calling into the engine at all -- carryForwardInto's
+// own structural dedupe would also make a second call a no-op, but the
+// stamp check means opening a day ten times only ever does the query work
+// once.
+
+const getDayRowStmt = sqliteDb.prepare<[string], { rolled_over_at: string | null }>(
+  `SELECT rolled_over_at FROM notepad_days WHERE day = ?`
+);
+
+// Same "most recent day with lines strictly before this one" lookup
+// carryForwardInto uses internally -- re-run here (rather than trusting a
+// carryForwardInto return value that may be from a much earlier call) so
+// carriedFrom is correct on both the very first open and every fast-path
+// open after it.
+const sourceDayStmt = sqliteDb.prepare<[string], { day: string }>(
+  `SELECT d.day AS day
+   FROM notepad_days d
+   WHERE d.day < ? AND EXISTS (SELECT 1 FROM notepad_lines l WHERE l.day = d.day)
+   ORDER BY d.day DESC
+   LIMIT 1`
+);
+
+const carriedCountStmt = sqliteDb.prepare<[string], { n: number }>(
+  `SELECT COUNT(*) AS n FROM notepad_lines WHERE day = ? AND carried_from_line_id IS NOT NULL`
+);
+
+export interface NotepadDayOpened extends NotepadDay {
+  /** The day carried lines on this day originated from, or null if none were carried. */
+  carriedFrom: string | null;
+  /** How many of this day's lines are carried-forward (not originally typed here). */
+  carriedCount: number;
+}
+
+/**
+ * The real day-open entry point. Ensures carryForwardInto() runs exactly
+ * once per day, then returns the day's lines plus a small additive summary
+ * of what (if anything) was carried, so a caller (the cockpit) can say
+ * "7 lines carried from Tuesday" without a second request.
+ */
+export function openNotepadDay(day: string, opts: CarryForwardOptions = {}): NotepadDayOpened {
+  const existing = getDayRowStmt.get(day);
+  if (!existing?.rolled_over_at) {
+    carryForwardInto(sqliteDb, day, opts);
+  }
+  const carriedCount = carriedCountStmt.get(day)?.n ?? 0;
+  const carriedFrom = carriedCount > 0 ? sourceDayStmt.get(day)?.day ?? null : null;
+  return { ...getNotepadDay(day), carriedFrom, carriedCount };
+}
+
+// == Lineage-aware ledger read (node #882) =====================================
+//
+// The per-line state ledger (notepad_line_state, docs/notepad/LINE-IDENTITY.md)
+// is keyed by line_id. A carried line is a NEW row with a NEW id, so a naive
+// ledger lookup on that id would always come back empty -- the thought would
+// look brand-new even though yesterday's incarnation already has a
+// last_seen/last_action recorded against it. Resolving through
+// origin_line_id first fixes that without duplicating any ledger rows: there
+// is still exactly one ledger row per origin thought, and every incarnation
+// of that thought (today's and every future carried day's) resolves to it.
+
+const getLineOriginStmt = sqliteDb.prepare<[number], { origin_line_id: string | null }>(
+  `SELECT origin_line_id FROM notepad_lines WHERE id = ?`
+);
+
+/**
+ * Resolve the ledger key for a line id. carryForwardInto (above) always
+ * copies the source line's own origin_line_id forward as-is -- never
+ * replaces it with the source line's id -- so origin_line_id already points
+ * straight at the first (day-zero) incarnation of a thought no matter how
+ * many days it has been carried across. This is always a single hop, never
+ * a walk up a chain. A line with no origin_line_id IS its own origin and
+ * resolves to itself.
+ */
+export function resolveLedgerKey(lineId: number): number {
+  const origin = getLineOriginStmt.get(lineId)?.origin_line_id;
+  if (origin) {
+    const parsed = Number(origin);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return lineId;
+}
+
+/**
+ * Lineage-aware ledger read: resolves lineId to its origin (see
+ * resolveLedgerKey) before reading notepad_line_state, so a carried line
+ * finds its prior incarnation's seen/acted/dismissed state (and action_ref,
+ * if one exists) instead of always looking unseen.
+ */
+export function getLedgerStateForLine(lineId: number): NotepadLineStateRow | undefined {
+  return getNotepadLineState(resolveLedgerKey(lineId));
 }

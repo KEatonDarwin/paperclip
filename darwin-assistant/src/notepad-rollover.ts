@@ -63,7 +63,16 @@ if (addedRolledOverAtColumn) {
   // added — never again on a later boot where the column already exists,
   // since addedRolledOverAtColumn is only true on the ALTER that actually
   // creates it.
-  sqliteDb.prepare(`UPDATE notepad_days SET rolled_over_at = ? WHERE rolled_over_at IS NULL`).run(new Date().toISOString());
+  //
+  // `day < today` is load-bearing (node #887's verifier caught this): an
+  // unfiltered backfill also stamps TODAY's row, and a stamped day is a
+  // rolled day, so the first real open after the deploy skips carry-forward
+  // and Kevin's morning starts blank — the exact retention failure that sends
+  // him back to his .txt file. Only days that are already over get the
+  // "treat as rolled" stamp; today must stay unstamped so it can still carry.
+  sqliteDb
+    .prepare(`UPDATE notepad_days SET rolled_over_at = ? WHERE rolled_over_at IS NULL AND day < ?`)
+    .run(new Date().toISOString(), todayNotepadDate());
 }
 
 // == Carry-forward =============================================================

@@ -39,7 +39,7 @@ for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) fs.rmSync(p, { fo
 console.log(`[notepad-rollover-wire-check] DB: ${DB_PATH}`);
 
 const distDir = path.join(__dirname, '..', 'dist');
-const { getNotepadDay, putNotepadDay, markLineSeen } = await import(path.join(distDir, 'notepad.js'));
+const { getNotepadDay, putNotepadDay, markLineSeen, markLineActed, unscannedLines } = await import(path.join(distDir, 'notepad.js'));
 const { openNotepadDay, getLedgerStateForLine, resolveLedgerKey } = await import(path.join(distDir, 'notepad-rollover.js'));
 const { sqliteDb } = await import(path.join(distDir, 'conversation-db.js'));
 
@@ -67,7 +67,12 @@ const seenLine = aLines.find((l) => l.text === 'Call Mike about the invoice');
 markLineSeen(seenLine.id);
 
 // -- (a) open day B via the REAL day-open path, injected clock -----------------
-const opened1 = openNotepadDay(DAY_B, { now: '2026-09-25T12:00:00.000Z' });
+// `now`'s calendar date (Central time) must equal DAY_B itself: node #886
+// gates carry-forward on the requested day being TODAY, and openNotepadDay
+// treats an injected `now` as "today" too (see isOpeningToday in
+// notepad-rollover.ts) so this stays deterministic without touching the real
+// system clock.
+const opened1 = openNotepadDay(DAY_B, { now: '2026-09-24T12:00:00.000Z' });
 check('(a) both lines carried onto B', opened1.lines.length === 2);
 check(
   '(a) B lines match A texts, in order',
@@ -77,7 +82,7 @@ check('(a) carriedFrom reports A', opened1.carriedFrom === DAY_A);
 check('(a) carriedCount reports 2', opened1.carriedCount === 2);
 
 const dayBRow1 = sqliteDb.prepare(`SELECT rolled_over_at FROM notepad_days WHERE day = ?`).get(DAY_B);
-check('(a) rolled_over_at stamped on B by the wiring call', dayBRow1?.rolled_over_at === '2026-09-25T12:00:00.000Z');
+check('(a) rolled_over_at stamped on B by the wiring call', dayBRow1?.rolled_over_at === '2026-09-24T12:00:00.000Z');
 
 // -- (b) lineage-aware ledger read on the carried line -------------------------
 const carriedSeenLine = opened1.lines.find((l) => l.text === 'Call Mike about the invoice');
@@ -108,14 +113,46 @@ check('(c) carriedCount still reports 2 on the second open', opened2.carriedCoun
 const dayBRow2 = sqliteDb.prepare(`SELECT rolled_over_at FROM notepad_days WHERE day = ?`).get(DAY_B);
 check(
   '(c) fast path taken -- rolled_over_at NOT re-stamped by the second open (still the first call\'s clock value)',
-  dayBRow2?.rolled_over_at === '2026-09-25T12:00:00.000Z'
+  dayBRow2?.rolled_over_at === '2026-09-24T12:00:00.000Z'
 );
 
 // -- opening a virgin day with nothing before it still works -------------------
-const opened3 = openNotepadDay('2000-01-01', { now: '2026-09-25T14:00:00.000Z' });
+const opened3 = openNotepadDay('2000-01-01', { now: '2000-01-01T14:00:00.000Z' });
 check('(d) virgin day with no prior day -> carriedCount 0', opened3.carriedCount === 0);
 check('(d) virgin day with no prior day -> carriedFrom null', opened3.carriedFrom === null);
 check('(d) virgin day with no prior day -> no lines', opened3.lines.length === 0);
+
+// -- fix #886(1): a day request that is NOT today is a pure read --------------
+// Opening DAY_A ('2026-09-23') again, now, with `now` set to a date that
+// does NOT match DAY_A, must not touch it at all: no new carry-forward, no
+// rolled_over_at stamp. DAY_A currently has no rolled_over_at (it was never
+// opened via openNotepadDay -- only written via putNotepadDay above).
+const dayARowBefore = sqliteDb.prepare(`SELECT rolled_over_at FROM notepad_days WHERE day = ?`).get(DAY_A);
+check('(e) date-gate precondition: A has no rolled_over_at yet', dayARowBefore?.rolled_over_at == null);
+const openedNonToday = openNotepadDay(DAY_A, { now: '2026-09-25T12:00:00.000Z' }); // today != DAY_A
+check('(e) non-today open of A returns A\'s own lines untouched', openedNonToday.lines.length === aLines.length);
+check('(e) non-today open of A does not report anything carried', openedNonToday.carriedCount === 0 && openedNonToday.carriedFrom === null);
+const dayARowAfter = sqliteDb.prepare(`SELECT rolled_over_at FROM notepad_days WHERE day = ?`).get(DAY_A);
+check('(e) non-today open of A still has no rolled_over_at stamp (pure read)', dayARowAfter?.rolled_over_at == null);
+
+// -- fix #886(3): the REAL scan path (unscannedLines) resolves lineage too ----
+// A carried line whose origin was already marked 'acted' (and whose text is
+// unchanged) must not surface as new/unseen material -- that's the whole
+// point of carrying lineage forward at all.
+const DAY_G = '2026-09-27';
+const DAY_H = '2026-09-28';
+putNotepadDay(DAY_G, 'Call the vendor about pricing');
+const actedLineG = getNotepadDay(DAY_G).lines[0];
+markLineActed(actedLineG.id, 'thread:test-789');
+const openedH = openNotepadDay(DAY_H, { now: '2026-09-28T12:00:00.000Z' });
+check('(f) acted line carried from G to H', openedH.lines.length === 1 && openedH.lines[0].text === 'Call the vendor about pricing');
+const carriedActedLine = openedH.lines[0];
+check('(f) carried line has a NEW id (not G\'s)', carriedActedLine.id !== actedLineG.id);
+const unscannedH = unscannedLines(DAY_H);
+check(
+  '(f) unscannedLines(H) -- the real scan path -- does NOT report the carried acted line as unseen/new',
+  !unscannedH.some((u) => u.line_id === carriedActedLine.id)
+);
 
 console.log(failed ? '\nFAILED' : '\nALL PASS');
 process.exit(failed ? 1 : 0);

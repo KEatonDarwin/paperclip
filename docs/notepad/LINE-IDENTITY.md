@@ -154,7 +154,7 @@ no reason to invent a weaker one.
 
 ---
 
-## 3. The four line states
+## 3. The five line states
 
 A line id, at any moment, is in exactly one of these states:
 
@@ -181,8 +181,17 @@ A line id, at any moment, is in exactly one of these states:
   its own, e.g. small talk, a stray character) or Kevin (an explicit
   dismiss on a marker per node #62), via `markLineDismissed(lineId, note)`,
   which stamps the current normalized hash and an optional `note` (why).
+- **`done`** (node #886) — Kevin (or JARVIS) has finished with the line
+  entirely. Unlike `acted`, which only means JARVIS took some action while
+  the thought may still be open, `done` means there is nothing left to
+  track: notepad-rollover.ts's carry-forward will not carry it forward, and
+  it will not resurface via `unscannedLines`. Set via `markLineDone(lineId,
+  note)`, which stamps the current normalized hash and an optional `note`.
+  **There is no UI affordance for setting this state yet** — it is
+  ledger-only for now, exercised by `scripts/notepad-rollover-check.mjs`. A
+  UI button is a later node (docs/notepad/CARRY-FORWARD.md §6).
 
-All three marking functions stamp the hash of the text *that was actually
+All four marking functions stamp the hash of the text *that was actually
 examined* — never a hash computed later — so the next comparison is always
 against what was truly looked at, per node #92's spec.
 
@@ -201,13 +210,23 @@ per node #92) does with that line.
 | **`seen`** | **Skip.** Already looked at; the text is exactly what was judged not-actionable, so there is nothing new to judge. | **Surface as new material.** The judgment "not actionable" was made against the *old* text. Different text has never been judged — it is a fresh candidate for a first look, not a reconciliation (there is no prior action to reconcile against). |
 | **`acted`** | **Skip.** This is the "a typo fix never re-fires a nag" rule: the text looks exactly as it did when the action was taken, so there is nothing to reconsider. | **Surface for reconciliation, carrying the existing `action_ref`.** Never spawn a second, sibling action. Re-examine whether the action already on file still matches what the line now says, and update that action if it doesn't. |
 | **`dismissed`** | **Skip.** The ruling (Kevin's or JARVIS's) was made against this exact text and still stands. | **Surface as new material.** A dismissal is a judgment about *specific prior text* — it does not extend to different text. Treat it as a first look, not as "already dismissed." |
+| **`done`** (node #886) | **Skip.** The line was explicitly finished against this exact text and still stands finished. | **Surface as new material.** Same reasoning as `dismissed` — a "done" ruling is about *specific prior text*; different text has never been judged. |
 
 A line with **no ledger row** (`unseen`) has no recorded hash to compare
 against at all, so both columns collapse to the same outcome: it always
 surfaces for a first look. This is exactly `unscannedLines(day)`'s
 contract per node #92 — return every `unseen` line, **plus** every
-`seen`/`acted`/`dismissed` line whose current hash no longer matches its
-recorded hash.
+`seen`/`acted`/`dismissed`/`done` line whose current hash no longer matches
+its recorded hash.
+
+**Lineage (node #886):** a line carried forward by notepad-rollover.ts's
+carry-forward engine is a brand-new row with a brand-new id, so this table's
+"state" lookup resolves through the line's `origin_line_id` first (see
+docs/notepad/CARRY-FORWARD.md §2.3) — a carried line finds its prior
+incarnation's state via that resolution instead of always reading as
+`unseen`. This is wired into `unscannedLines()` and `getNotepadLineState()`
+in `src/notepad.ts` via a runtime-registered resolver (see the finish note
+for node #886 on why it's a registration rather than a static import).
 
 **The load-bearing reasoning, stated plainly:** the hash can only ever say
 *"this line's normalized text changed"* — it cannot distinguish a cosmetic

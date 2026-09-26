@@ -7,10 +7,11 @@
 // day2 -> day3:
 //
 //   - day2 opens and carries all 5 of day1's lines, in original order.
-//   - on day2, 2 lines get closed (1 acted, 1 dismissed) and 2 new lines are
-//     added; day3 opens and carries exactly 3 + 2 = 5 lines, the 2 closed
-//     ones are gone, and the 3 survivors still carry origin_day = day1 (a
-//     TWO-HOP lineage walk, not one).
+//   - on day2, 2 lines get closed (1 done, 1 dismissed -- node #886: 'acted'
+//     alone does NOT close a line) and 2 new lines are added; day3 opens and
+//     carries exactly 3 + 2 = 5 lines, the 2 closed ones are gone, and the 3
+//     survivors still carry origin_day = day1 (a TWO-HOP lineage walk, not
+//     one).
 //   - NO DUPLICATES: origin_line_id is unique per day, on every day.
 //   - NO OPEN LINE LOST: the set of open thought-identities on day N-1 is
 //     EXACTLY the set present on day N (a set comparison, not just a count).
@@ -46,7 +47,7 @@ for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) fs.rmSync(p, { fo
 console.log(`[notepad-rollover-replay-check] DB: ${DB_PATH}`);
 
 const distDir = path.join(__dirname, '..', 'dist');
-const { getNotepadDay, putNotepadDay, markLineActed, markLineDismissed } = await import(path.join(distDir, 'notepad.js'));
+const { getNotepadDay, putNotepadDay, markLineDismissed, markLineDone } = await import(path.join(distDir, 'notepad.js'));
 const { openNotepadDay } = await import(path.join(distDir, 'notepad-rollover.js'));
 const { sqliteDb } = await import(path.join(distDir, 'conversation-db.js'));
 
@@ -90,14 +91,15 @@ function stateOf(lineId) {
  * The "open thought identity" of a line: its origin_line_id if it has one
  * (a carried line), else its own id (a line that has never been carried —
  * exactly the fallback carryForwardInto itself uses when it later carries
- * this line forward). Only lines that are still open (no state row, or
- * 'seen') count — 'acted'/'dismissed' lines are closed.
+ * this line forward). Only lines that are still open (no state row, 'seen',
+ * or 'acted' — node #886: acting on a line does not mean it's done) count —
+ * 'dismissed'/'done' lines are closed.
  */
 function openIdentitySet(day) {
   const out = new Set();
   for (const l of rawLines(day)) {
     const st = stateOf(l.id);
-    if (st === 'acted' || st === 'dismissed') continue;
+    if (st === 'dismissed' || st === 'done') continue;
     out.add(l.origin_line_id ?? String(l.id));
   }
   return out;
@@ -140,7 +142,11 @@ const day1OpenSet = openIdentitySet(DAY1);
 check('day1: all 5 lines are open (none acted/dismissed yet)', day1OpenSet.size === 5);
 
 // -- day 2 opens: carries all 5 of day1's lines, in original order ----------
-const opened2a = openNotepadDay(DAY2, { now: '2026-09-23T09:00:00.000Z' });
+// `now`'s calendar date must equal the day being opened (node #886 gates
+// carry-forward on the requested day being "today"; an injected `now`
+// stands in for today deterministically -- see isOpeningToday in
+// notepad-rollover.ts).
+const opened2a = openNotepadDay(DAY2, { now: '2026-09-21T09:00:00.000Z' });
 check('day2 open: 5 lines carried', opened2a.lines.length === 5);
 check(
   'day2 open: lines match day1 texts, in original order',
@@ -180,9 +186,12 @@ check(
 }
 
 // -- on day2: close 2 of the carried lines, add 2 new ones -------------------
+// Closed (node #886) means 'dismissed' or 'done' -- 'acted' alone would NOT
+// close a line (it still carries forward), so both lines here use a truly
+// closed state to keep this chain's "2 finished lines are gone" property.
 const q3DeckLine = opened2a.lines.find((l) => l.text === 'Draft the Q3 deck');
 const legalLine = opened2a.lines.find((l) => l.text === 'Ping legal about the contract');
-markLineActed(q3DeckLine.id, 'test:action:q3-deck-drafted');
+markLineDone(q3DeckLine.id, 'test:done:q3-deck-drafted');
 markLineDismissed(legalLine.id, 'legal already looped in elsewhere');
 
 const NEW_DAY2_TEXTS = ['Email the vendor', 'Check on the server migration'];
@@ -204,7 +213,7 @@ check(
 );
 
 // -- day 3 opens: carries exactly 3 + 2 = 5 lines -----------------------------
-const opened3a = openNotepadDay(DAY3, { now: '2026-09-24T09:00:00.000Z' });
+const opened3a = openNotepadDay(DAY3, { now: '2026-09-22T09:00:00.000Z' });
 check('day3 open: exactly 3 + 2 = 5 lines', opened3a.lines.length === 5, `got ${opened3a.lines.length}`);
 check('day3 open: carriedFrom reports day2', opened3a.carriedFrom === DAY2);
 check('day3 open: carriedCount reports 5', opened3a.carriedCount === 5);
@@ -277,7 +286,7 @@ for (const [label, opened] of [['2nd open', opened3b], ['3rd open', opened3c]]) 
 const day3RowFinal = sqliteDb.prepare(`SELECT rolled_over_at FROM notepad_days WHERE day = ?`).get(DAY3);
 check(
   'IDEMPOTENCE: rolled_over_at NOT re-stamped by the 2nd/3rd open (fast path taken)',
-  day3RowFinal?.rolled_over_at === '2026-09-24T09:00:00.000Z',
+  day3RowFinal?.rolled_over_at === '2026-09-22T09:00:00.000Z',
   `got ${day3RowFinal?.rolled_over_at}`
 );
 
@@ -319,12 +328,15 @@ check(
 }
 
 {
+  // Under the #886 acted-vs-done contract, 'acted' is OPEN (it carries) --
+  // only 'dismissed' and 'done' are CLOSED. So "everything closed on the
+  // previous day" must use those two states, not acted+dismissed.
   const ALLDONE_DAY = '2026-10-15';
   const ALLDONE_TARGET = '2026-10-16';
   putNotepadDay(ALLDONE_DAY, ['Task A', 'Task B'].join('\n'));
   const allDoneLines = getNotepadDay(ALLDONE_DAY).lines;
-  markLineActed(allDoneLines[0].id, 'test:action:alldone-a');
-  markLineDismissed(allDoneLines[1].id, 'no longer needed');
+  markLineDismissed(allDoneLines[0].id, 'no longer needed');
+  markLineDone(allDoneLines[1].id, 'finished for real');
 
   let threw = false;
   let openedAllDone;

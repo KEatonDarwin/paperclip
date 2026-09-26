@@ -9,7 +9,7 @@ import { getNotepadDay, getNotepadLineState, unscannedLines } from './notepad.js
 // very thing it's reporting on) — it only reads notepad.ts's existing
 // exports and renders what they say.
 
-export type NotepadLineState = 'unseen' | 'seen' | 'acted' | 'dismissed';
+export type NotepadLineState = 'unseen' | 'seen' | 'acted' | 'dismissed' | 'done';
 
 export interface ReviewLine {
   line_id: number;
@@ -31,6 +31,7 @@ export interface NotepadReviewContext {
     seen: number;
     acted: number;
     dismissed: number;
+    done: number;
     surfaced: number;
   };
 }
@@ -51,7 +52,7 @@ export function buildNotepadReviewContext(day: string): NotepadReviewContext {
     surfacedKindByLineId.set(u.line_id, u.kind);
   }
 
-  const counts = { total: 0, unseen: 0, seen: 0, acted: 0, dismissed: 0, surfaced: 0 };
+  const counts = { total: 0, unseen: 0, seen: 0, acted: 0, dismissed: 0, done: 0, surfaced: 0 };
   const lines: ReviewLine[] = rawLines.map((line) => {
     const stateRow = getNotepadLineState(line.id);
     // No row -> 'unseen' per LINE-IDENTITY.md §3: absence of a record, not a
@@ -108,6 +109,13 @@ function renderReviewLine(line: ReviewLine): string {
       return `[NEW — previously dismissed, text changed] ${text}`;
     }
     return `[dismissed] ${text}`;
+  }
+
+  if (state === 'done') {
+    if (surfaced && surfaced_kind === 'first_look') {
+      return `[NEW — previously done, text changed] ${text}`;
+    }
+    return `[done] ${text}`;
   }
 
   if (state === 'seen') {

@@ -290,7 +290,7 @@ export function putNotepadDay(day: string, text: string): NotepadDay {
 // about diffing/identity — it only tracks, per line id, whether JARVIS has
 // looked at that line's CURRENT text yet.
 
-export type NotepadLineState = 'seen' | 'acted' | 'dismissed';
+export type NotepadLineState = 'seen' | 'acted' | 'dismissed' | 'done';
 
 export interface NotepadLineStateRow {
   line_id: number;
@@ -317,6 +317,35 @@ export interface UnscannedNotepadLine {
   text: string;
   kind: 'first_look' | 'reconcile';
   action_ref: string | null;
+}
+
+// == Lineage-aware ledger key resolution (node #886) ==========================
+//
+// notepad-rollover.ts carries a line forward as a NEW row with a NEW id, so a
+// naive ledger lookup on that id always finds nothing -- the line looks
+// brand-new even though a prior incarnation already has state recorded. The
+// fix is to resolve a line's ledger key through its origin (origin_line_id)
+// before reading notepad_line_state -- notepad-rollover.ts owns that column
+// and the resolution logic (resolveLedgerKey), and registers it here at
+// module load via registerLedgerKeyResolver so getNotepadLineState() and
+// unscannedLines() below pick it up automatically.
+//
+// This is a runtime registration, not a static import of notepad-rollover.ts,
+// because notepad-rollover.ts's own migration relies on THIS module's CREATE
+// TABLE statements (above) running before its ALTER TABLE ones -- a static
+// import cycle here would risk notepad-rollover.ts's top-level code running
+// first whenever some other module imports notepad.js before it imports
+// notepad-rollover.js (verified empirically; see node #886's finish note).
+type LedgerKeyResolver = (lineId: number) => number;
+let ledgerKeyResolver: LedgerKeyResolver | null = null;
+
+/** Registered by notepad-rollover.ts (registerLedgerKeyResolver(resolveLedgerKey)) at module load. */
+export function registerLedgerKeyResolver(resolver: LedgerKeyResolver): void {
+  ledgerKeyResolver = resolver;
+}
+
+function resolveLedgerKeyForRead(lineId: number): number {
+  return ledgerKeyResolver ? ledgerKeyResolver(lineId) : lineId;
 }
 
 const BULLET_MARKER_RE = /^[-*•]\s*/;
@@ -409,6 +438,20 @@ export function markLineDismissed(lineId: number, note?: string): void {
   markLine(lineId, 'dismissed', null, note && note.trim() ? note : null);
 }
 
+/**
+ * Kevin (or JARVIS) has finished with the line entirely -- unlike `acted`
+ * (JARVIS did something, but the thought may still be open), `done` means
+ * there is nothing left to track: notepad-rollover.ts's carry-forward will
+ * not carry it, and it will not resurface via unscannedLines.
+ *
+ * There is no UI affordance for setting this state yet (node #886) -- it is
+ * ledger-only for now, exercised by scripts/notepad-rollover-check.mjs. A UI
+ * button is a later node (see docs/notepad/CARRY-FORWARD.md §6).
+ */
+export function markLineDone(lineId: number, note?: string): void {
+  markLine(lineId, 'done', null, note && note.trim() ? note : null);
+}
+
 const listLineStatesForDayStmt = sqliteDb.prepare<
   [string],
   { id: number; idx: number; text: string; state: NotepadLineState | null; hash: string | null; action_ref: string | null }
@@ -432,21 +475,39 @@ export function unscannedLines(day: string): UnscannedNotepadLine[] {
   const rows = listLineStatesForDayStmt.all(day);
   const out: UnscannedNotepadLine[] = [];
   for (const row of rows) {
-    if (row.state === null || row.hash === null) {
-      // No ledger row at all -> 'unseen'. No recorded hash to compare
-      // against, so it always surfaces as a first look.
+    let state = row.state;
+    let hash = row.hash;
+    let actionRef = row.action_ref;
+    if (state === null) {
+      // No ledger row under this line's OWN id. Before treating it as
+      // genuinely 'unseen', resolve through its origin (node #886) -- a
+      // carried line has a brand-new id but may have a prior incarnation's
+      // state recorded under origin_line_id.
+      const resolvedKey = resolveLedgerKeyForRead(row.id);
+      if (resolvedKey !== row.id) {
+        const originState = getLineStateStmt.get(resolvedKey);
+        if (originState) {
+          state = originState.state;
+          hash = originState.hash;
+          actionRef = originState.action_ref;
+        }
+      }
+    }
+    if (state === null || hash === null) {
+      // No ledger row at all (own or origin's) -> 'unseen'. No recorded hash
+      // to compare against, so it always surfaces as a first look.
       out.push({ line_id: row.id, idx: row.idx, text: row.text, kind: 'first_look', action_ref: null });
       continue;
     }
     const currentHash = lineTextHash(row.text);
-    if (currentHash === row.hash) continue; // unchanged since last recorded -> skip
-    if (row.state === 'acted') {
+    if (currentHash === hash) continue; // unchanged since last recorded -> skip
+    if (state === 'acted') {
       // Hash changed on an acted line -> reconciliation, carrying the
       // existing action_ref. Never a bare first-look for this state.
-      out.push({ line_id: row.id, idx: row.idx, text: row.text, kind: 'reconcile', action_ref: row.action_ref });
+      out.push({ line_id: row.id, idx: row.idx, text: row.text, kind: 'reconcile', action_ref: actionRef });
     } else {
-      // seen/dismissed judged specific prior text; different text has never
-      // been judged -> first look, not "already seen/dismissed".
+      // seen/dismissed/done judged specific prior text; different text has
+      // never been judged -> first look, not "already seen/dismissed/done".
       out.push({ line_id: row.id, idx: row.idx, text: row.text, kind: 'first_look', action_ref: null });
     }
   }
@@ -457,7 +518,11 @@ const getLineStateStmt = sqliteDb.prepare<[number], NotepadLineStateRow>(`
   SELECT * FROM notepad_line_state WHERE line_id = ?
 `);
 
-/** Read the raw ledger row for one line, if any (route reads). */
+/**
+ * Read the raw ledger row for one line, if any (route reads). Resolves
+ * through the registered ledger key resolver first (node #886) so a carried
+ * line finds its origin's ledger row instead of always looking unseen.
+ */
 export function getNotepadLineState(lineId: number): NotepadLineStateRow | undefined {
-  return getLineStateStmt.get(lineId);
+  return getLineStateStmt.get(resolveLedgerKeyForRead(lineId));
 }

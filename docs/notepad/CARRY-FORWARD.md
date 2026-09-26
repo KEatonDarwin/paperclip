@@ -18,19 +18,23 @@ every **open** line in that day, copies each to the new day as a fresh `notepad_
 row, and stamps the new day's `rolled_over_at` so a second open of the same day
 skips this work.
 
-**Open** is defined narrowly: a line with either **no ledger row** (`unseen`,
-per docs/notepad/LINE-IDENTITY.md §3) **or state = `seen`** (examined but judged
-not actionable — still an open thought that deserves another look). It is **not**:
-- `acted` — JARVIS took real action because of this line, so it's resolved and will
-  not recur next day unless the user re-types it
+**Open** is defined as: a line with **no ledger row** (`unseen`, per
+docs/notepad/LINE-IDENTITY.md §3), **state = `seen`** (examined but judged not
+actionable — still an open thought that deserves another look), or **state =
+`acted`** (JARVIS took real action because of this line — but node #886's
+contract is that acting on a thought is **not** the same as being done with
+it; silently dropping a line just because JARVIS did something with it is the
+exact failure that would send Kevin back to a plain .txt file). It is **not**:
 - `dismissed` — Kevin or JARVIS explicitly ruled it out, and it stays out until the
   text changes (per the decision table in LINE-IDENTITY.md §4)
+- `done` (node #886) — Kevin (or JARVIS) explicitly marked the thought finished.
+  There is no UI affordance for setting this state yet — see §6.
 
 Additionally, a line is skipped if it is blank (trimmed text is empty) — there is
 nothing to carry.
 
-**Closed** lines (state = `acted` or `dismissed`) and blank lines **stay behind**.
-Every other line **carries forward**.
+**Closed** lines (state = `dismissed` or `done`) and blank lines **stay behind**.
+Every other line — including `acted` lines — **carries forward**.
 
 ---
 
@@ -79,6 +83,20 @@ The result is exactly one ledger row per origin thought, regardless of how many 
 it has been carried across. A new day's carried lines find their prior state
 immediately, and there is no risk of "orphaned" state (a line's current `id` with no
 ledger, while a duplicate ledger row exists keyed under a past `id`).
+
+**Wired into the live path (node #886):** `resolveLedgerKey()` is registered
+with `src/notepad.ts` at module load, via `registerLedgerKeyResolver()`, so
+`notepad.ts`'s own `getNotepadLineState()` and `unscannedLines()` — the
+functions every production caller (notepad-markers.ts, notepad-dispatch.ts,
+notepad-action-resolver.ts, notepad-review.ts, notepad-gate.ts, and the
+`GET /notepad` route) actually reads through — resolve lineage automatically.
+This is a **runtime registration**, not `notepad.ts` statically importing
+this file: `notepad-rollover.ts`'s own migration (§2 above) depends on
+`notepad.ts`'s `CREATE TABLE` statements running before its `ALTER TABLE`
+ones, and a static import cycle in the other direction was verified to break
+that ordering whenever some other module imports `notepad.js` before
+`notepad-rollover.js` (which several production modules do). See node #886's
+finish note for the empirical proof.
 
 ---
 
@@ -161,8 +179,9 @@ Three scripts validate the carry-forward mechanism, run in this order:
 ### 5.1 `npm run notepad:rollover-check` (node #881)
 
 Calls `carryForwardInto()` directly with a single source day and asserts:
-- Every line marked `unseen` or `seen` is copied
-- Every line marked `acted` or `dismissed` is **not** copied
+- Every line marked `unseen`, `seen`, or `acted` is copied (node #886: acting on
+  a line does not close it)
+- Every line marked `dismissed` or `done` is **not** copied
 - Blank lines are skipped
 - The `origin_line_id` chain is correctly set up (day-zero lines have NULL
   `origin_line_id`, carried lines inherit theirs)
@@ -175,13 +194,19 @@ npm run build && JARVIS_DB_PATH=/tmp/notepad-rollover-check.db \
   node scripts/notepad-rollover-check.mjs
 ```
 
-### 5.2 `npm run notepad:rollover-wire-check` (node #882)
+### 5.2 `npm run notepad:rollover-wire-check` (node #882, extended by #886)
 
 Calls `openNotepadDay()` (the day-open entry point) twice for the same day and asserts:
 - The first open runs carry-forward and stamps `rolled_over_at`
 - The second open sees the stamp and **does not re-run** the engine (fast path works)
 - The `carried_count` and `carriedFrom` summary fields are correct
 - The same lines are present both times (zero new inserts on the second open)
+- **(node #886) The date gate:** opening a day that is NOT today (relative to
+  the real clock, or an injected `now`) is a pure read — no carry, no
+  `rolled_over_at` stamp
+- **(node #886) The live scan path:** `unscannedLines()` — not just
+  `getLedgerStateForLine()` in isolation — does not report a carried `acted`
+  line as unseen/new
 
 ```bash
 npm run build && JARVIS_DB_PATH=/tmp/notepad-rollover-wire-check.db \
@@ -192,7 +217,8 @@ npm run build && JARVIS_DB_PATH=/tmp/notepad-rollover-wire-check.db \
 
 Replays **three consecutive days** through the real day-open path and asserts:
 - Day1 is opened with 5 lines; day2 opens and carries all 5 in order
-- On day2, 2 lines are closed (`acted` and `dismissed`) and 2 new lines are added
+- On day2, 2 lines are closed (`done` and `dismissed` — node #886: `acted` alone
+  does not close a line) and 2 new lines are added
 - Day3 opens and carries exactly 3 (the survivors) + 2 (the new ones) = 5 lines
 - The 2 closed lines are **gone** (not carried)
 - The 3 survivors still have `origin_day = day1` (a two-hop lineage: day3 ← day2 ← day1)
@@ -231,6 +257,9 @@ define:
   ledger and settlement pass (node **#61**).
 - **Carried-line markers or styling** — whether the cockpit visually distinguishes a
   carried line from an original one is a UI concern, not a ledger concern.
+- **Marking a line `done`** — the `done` ledger state (node **#886**) exists and is
+  exercised by `notepad:rollover-check`, but there is no UI affordance yet for
+  setting it. A button/action in the cockpit is a later node.
 
 Implementing any of those here would be scope creep on a node whose job is the
 contract and the engine, not the UI or the downstream routing.

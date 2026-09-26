@@ -5,7 +5,7 @@ import type { Database as DatabaseType } from 'better-sqlite3';
 // has to land first.
 import './notepad.js';
 import { sqliteDb } from './conversation-db.js';
-import { getNotepadDay, getNotepadLineState } from './notepad.js';
+import { getNotepadDay, getNotepadLineState, registerLedgerKeyResolver, todayNotepadDate } from './notepad.js';
 import type { NotepadDay, NotepadLineState, NotepadLineStateRow } from './notepad.js';
 
 // Carry-forward engine (goal: "Yesterday rolls forward" — node #881).
@@ -47,10 +47,23 @@ sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_notepad_lines_origin_line_id ON no
 // (whether or not it actually carried anything), so the wiring node can
 // cheaply tell a rolled day from a virgin one without re-deriving it from
 // the lines themselves.
+let addedRolledOverAtColumn = false;
 try {
   sqliteDb.exec(`ALTER TABLE notepad_days ADD COLUMN rolled_over_at TEXT`);
+  addedRolledOverAtColumn = true;
 } catch {
   // column already exists — re-running the migration is a no-op
+}
+if (addedRolledOverAtColumn) {
+  // Backfill: the live DB already holds days written before this column
+  // existed. Without this, every one of them looks "never rolled" and the
+  // first real open of each would needlessly re-derive/rewrite it (and, pre
+  // node #886's date gate, could even misfire carry-forward against a
+  // decades-old day). Runs exactly once, at the moment the column is
+  // added — never again on a later boot where the column already exists,
+  // since addedRolledOverAtColumn is only true on the ALTER that actually
+  // creates it.
+  sqliteDb.prepare(`UPDATE notepad_days SET rolled_over_at = ? WHERE rolled_over_at IS NULL`).run(new Date().toISOString());
 }
 
 // == Carry-forward =============================================================
@@ -95,13 +108,15 @@ function resolveNow(now: CarryForwardOptions['now']): string {
  * origin_line_id/origin_day (docs/notepad/LINE-IDENTITY.md's identity model,
  * extended across days).
  *
- * "Open" = a line with no state-ledger row, or `seen` (examined but judged
- * not actionable — still an open thought, not a resolved one). "Closed" (not
- * carried) = `acted` (the closest existing state to "done" — JARVIS already
- * took real action because of this line) or `dismissed`. The existing
- * vocabulary (docs/notepad/LINE-IDENTITY.md §3) has no separate "done"
- * state, so `acted` is the deliberate stand-in — this is a judgment call,
- * not a discovered fact.
+ * "Open" = a line with no state-ledger row, `seen` (examined but judged not
+ * actionable — still an open thought, not a resolved one), or `acted`
+ * (JARVIS took real action, but that does NOT mean Kevin is finished with
+ * the thought — acting on a line is not the same as being done with it, and
+ * silently dropping it because JARVIS did something is the exact failure
+ * that sends Kevin back to a plain .txt file). "Closed" (not carried) =
+ * `dismissed` (explicitly ruled out) or `done` (explicitly finished — node
+ * #886; there is no UI affordance for setting it yet, see
+ * docs/notepad/CARRY-FORWARD.md §6).
  *
  * Idempotent: running this twice for the same targetDay carries nothing new
  * the second time. This is enforced structurally — before inserting, a
@@ -175,7 +190,7 @@ export function carryForwardInto(
       );
 
       for (const line of sourceLines) {
-        if (line.state === 'acted' || line.state === 'dismissed') continue; // closed — not carried
+        if (line.state === 'dismissed' || line.state === 'done') continue; // closed — not carried
         if (line.text.trim() === '') continue; // blank line — nothing to carry
 
         const originLineId = line.origin_line_id ?? String(line.id);
@@ -241,15 +256,37 @@ export interface NotepadDayOpened extends NotepadDay {
   carriedCount: number;
 }
 
+// The GET /notepad route accepts an arbitrary `?date=` (even though the UI
+// never offers one), so `day` here is not trustworthy as "today" on its own.
+// A PAST date must be a pure read: carrying into it would insert rows into a
+// day that's done, and stamping it would make the real day it belongs to
+// look "already rolled" if it's ever opened for real. A FUTURE date is worse:
+// carrying into tomorrow today, and stamping tomorrow's rolled_over_at,
+// makes the real morning open of that day see the stamp and skip
+// carry-forward entirely -- silently losing that day's open lines. So
+// carry-forward runs ONLY when the requested day IS today.
+//
+// `opts.now`, when provided, is treated as "today" too (not just a stamp
+// value) -- consistent with this file's existing "now is the only place the
+// real clock may be read" rule, and what lets a scratch-DB proof control
+// "today" deterministically without touching the real system clock. The real
+// HTTP route never passes `now`, so it always uses the genuine wall clock.
+function isOpeningToday(day: string, now: CarryForwardOptions['now']): boolean {
+  if (now === undefined) return day === todayNotepadDate();
+  const iso = resolveNow(now);
+  return day === new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Chicago' }).format(new Date(iso));
+}
+
 /**
  * The real day-open entry point. Ensures carryForwardInto() runs exactly
- * once per day, then returns the day's lines plus a small additive summary
- * of what (if anything) was carried, so a caller (the cockpit) can say
- * "7 lines carried from Tuesday" without a second request.
+ * once per day -- and only for TODAY (see isOpeningToday above) -- then
+ * returns the day's lines plus a small additive summary of what (if
+ * anything) was carried, so a caller (the cockpit) can say "7 lines carried
+ * from Tuesday" without a second request.
  */
 export function openNotepadDay(day: string, opts: CarryForwardOptions = {}): NotepadDayOpened {
   const existing = getDayRowStmt.get(day);
-  if (!existing?.rolled_over_at) {
+  if (isOpeningToday(day, opts.now) && !existing?.rolled_over_at) {
     carryForwardInto(sqliteDb, day, opts);
   }
   const carriedCount = carriedCountStmt.get(day)?.n ?? 0;
@@ -293,9 +330,22 @@ export function resolveLedgerKey(lineId: number): number {
 /**
  * Lineage-aware ledger read: resolves lineId to its origin (see
  * resolveLedgerKey) before reading notepad_line_state, so a carried line
- * finds its prior incarnation's seen/acted/dismissed state (and action_ref,
- * if one exists) instead of always looking unseen.
+ * finds its prior incarnation's seen/acted/dismissed/done state (and
+ * action_ref, if one exists) instead of always looking unseen.
  */
 export function getLedgerStateForLine(lineId: number): NotepadLineStateRow | undefined {
   return getNotepadLineState(resolveLedgerKey(lineId));
 }
+
+// Wire resolveLedgerKey into the REAL scan/marker path (node #886). Before
+// this, resolveLedgerKey/getLedgerStateForLine had zero production callers --
+// nothing in the running system read the lineage this module writes, so a
+// carried line always looked brand-new to JARVIS. notepad.ts's own
+// getNotepadLineState() (used by notepad-markers.ts, notepad-dispatch.ts,
+// notepad-action-resolver.ts, notepad-review.ts, the GET /notepad/lines/:id
+// route, and -- via unscannedLines()'s use of the same registered resolver --
+// notepad-gate.ts) is the actual chokepoint every one of those reads through,
+// so registering here wires all of them at once. See registerLedgerKeyResolver
+// in notepad.ts for why this is a runtime registration rather than notepad.ts
+// statically importing this file.
+registerLedgerKeyResolver(resolveLedgerKey);

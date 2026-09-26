@@ -159,6 +159,58 @@ function treesPlantedSince(goalId: number, hours: number): number {
   return row?.n ?? 0;
 }
 
+const DEFAULT_MAX_TREES_PER_DAY = 8;
+
+/**
+ * When the OLDEST plant currently inside the `hours` window leaves it — i.e. the
+ * instant the budget frees up by one. Null when nothing is in the window (then
+ * the budget cannot be the thing blocking, so there is nothing to wait for).
+ *
+ * This is what makes a budget park self-clearing: the gate below hands it to
+ * `parkGoalNode` as an `{kind:'after'}` unpark condition, and the unpark pass
+ * that already runs at the top of every goal tick resumes the node on its own.
+ * Before this, a budget park was a `{kind:'manual'}` park in all but name — a
+ * rate limit that silently became a full stop until Kevin noticed.
+ */
+function treeBudgetFreesAt(goalId: number, hours: number): string | null {
+  const row = sqliteDb
+    .prepare<[number], { oldest: string | null }>(
+      `SELECT MIN(created_at) AS oldest FROM goal_events
+        WHERE goal_id = ? AND kind = 'tree_planted'
+          AND created_at > datetime('now', '-${Number(hours)} hours')`,
+    )
+    .get(goalId);
+  if (!row?.oldest) return null;
+  // goal_events.created_at is SQLite UTC ('YYYY-MM-DD HH:MM:SS'), which
+  // Date.parse reads as LOCAL time. Pin the zone explicitly.
+  const ms = Date.parse(`${row.oldest.replace(' ', 'T')}Z`);
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms + hours * 3600 * 1000).toISOString();
+}
+
+/**
+ * The tree budget, or `null` for NO CAP.
+ *
+ * Kevin's rule, 2026-09-26: *"Whatever is stopping you from doing that, I want
+ * the ability to turn that off. If I say something needs to be done, then it
+ * needs to be done."* The original gate read the setting as
+ * `Number(getSetting(...) ?? '') || 8`, which meant **`0` fell back to 8** — the
+ * one value anyone would reach for to disable a cap was the one value that
+ * couldn't. There was no off switch at all, and the park message only ever told
+ * him to *raise* the number.
+ *
+ * Off: `0`, `off`, `none`, `unlimited`, or `-1`. Unset / unparsable / negative-
+ * other: the default 8, because a typo must not silently remove a brake.
+ */
+export function treeBudgetSetting(raw?: string | null): number | null {
+  const v = (raw ?? '').trim().toLowerCase();
+  if (v === '') return DEFAULT_MAX_TREES_PER_DAY;
+  if (['0', 'off', 'none', 'unlimited', 'false', '-1'].includes(v)) return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MAX_TREES_PER_DAY;
+  return Math.floor(n);
+}
+
 // ---------------------------------------------------------------------------
 // §15.4 decision table (pure over a GoalTree read)
 // ---------------------------------------------------------------------------
@@ -659,14 +711,30 @@ async function tickGoal(goalId: number, reason: string): Promise<void> {
     // now a ceiling: a goal may plant at most `autopilot_max_trees_per_day` (default
     // 8) in a rolling 24h. Over it, the goal parks instead of planting — the work is
     // preserved and Kevin decides, rather than the box discovering the limit for us.
+    //
+    // 2026-09-26 — TWO defects in the above, both found the hard way when goal 6's
+    // last three nodes sat parked all evening:
+    //   1. There was no OFF. `Number(setting) || 8` turned `0` back into 8, so the
+    //      cap could be raised but never removed. `treeBudgetSetting` now honours
+    //      0/off/none/unlimited, and the park message says so.
+    //   2. The park was STICKY. No `unpark_when` meant a 24h rate limit became an
+    //      indefinite stop. It now parks with `{kind:'after'}` and resumes itself.
     if (d.action === 'plan' || d.action === 'replan') {
-      const budget = Number(getSetting('autopilot_max_trees_per_day') ?? '') || 8;
-      const planted = treesPlantedSince(goalId, 24);
-      if (planted >= budget) {
+      const budget = treeBudgetSetting(getSetting('autopilot_max_trees_per_day'));
+      const planted = budget === null ? 0 : treesPlantedSince(goalId, 24);
+      if (budget !== null && planted >= budget) {
+        const freesAt = treeBudgetFreesAt(goalId, 24);
         const why = `tree budget reached — goal ${goalId} planted ${planted} trees in the last 24h (cap ${budget}). ` +
-          `Parking instead of planting another. Raise settings-KV autopilot_max_trees_per_day, or look at why this goal keeps re-planning.`;
+          `Parking instead of planting another. ` +
+          (freesAt ? `This park CLEARS ITSELF at ${freesAt} when the window rolls. ` : '') +
+          `To turn the cap OFF entirely, set settings-KV autopilot_max_trees_per_day to 0 (or "off"); ` +
+          `to raise it, set a number. Or look at why this goal keeps re-planning.`;
         console.log(`[autopilot] goal ${goalId}: ${why}`);
-        if (d.node_id) parkGoalNode(goalId, d.node_id, 'system', why);
+        // Self-clearing: the unpark pass at the top of this same tick resumes the
+        // node once the window rolls. `manual` only if we somehow can't tell when.
+        if (d.node_id) {
+          parkGoalNode(goalId, d.node_id, 'system', why, freesAt ? { kind: 'after', at: freesAt } : { kind: 'manual' });
+        }
         noteHold(goalId, s, 'tree_budget');
         return;
       }

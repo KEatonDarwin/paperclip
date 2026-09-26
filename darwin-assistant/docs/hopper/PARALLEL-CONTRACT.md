@@ -378,6 +378,7 @@ type UnparkCondition =
   | { kind: 'tree_done';      tree_id: string }
   | { kind: 'branch_pushed';  repo: string; branch: string }
   | { kind: 'file_exists';    path: string }
+  | { kind: 'after';          at: string }        // ISO-8601 instant
   | { kind: 'manual' };
 ```
 
@@ -393,7 +394,17 @@ Evaluation — `evaluateUnpark(cond): boolean`, pure, no model calls, no network
 | `tree_done` | `getHopperTree(tree_id)?.status === 'done'` |
 | `branch_pushed` | `git -C <repo> rev-parse --verify refs/remotes/origin/<branch>` resolves |
 | `file_exists` | `fs.existsSync(path)` |
+| `after` | `Date.now() >= Date.parse(at)` — for parks whose blocker is the CLOCK |
 | `manual` | never |
+
+`after` exists because a **rate limit must not silently become a full stop.** The
+tree budget gate (`goals-autopilot.ts` §3.5) parks a goal for planting N trees
+inside a rolling 24h window; the only thing that can clear it is that window
+rolling, which no node/tree/branch/file condition can express. It parks with
+`{kind:'after', at:<when the oldest counted plant leaves the window>}` and
+resumes itself. An `after` whose `at` does not parse is rejected by
+`parseUnparkCondition` rather than degrading to "never".
+
 
 Re-evaluated **every tick** by both the night driver (`tickNightShift`, before
 the stuck test — §7) and goals autopilot. A met condition:

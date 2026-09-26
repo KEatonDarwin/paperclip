@@ -152,6 +152,47 @@ console.log('\n[UC-5] evaluateUnpark: file_exists');
 }
 
 // ===========================================================================
+// Added 2026-09-26 with the `after` kind, for the tree-budget park (goals-
+// autopilot.ts §3.5). A budget park's blocker is the CLOCK — no node/tree/
+// branch/file condition can express "when the rolling 24h window rolls" — and
+// before this kind existed it had to park `manual`, i.e. a rate limit that
+// silently became an indefinite stop.
+console.log('\n[UC-5b] evaluateUnpark: after (the clock)');
+{
+  const past = new Date(Date.now() - 60_000).toISOString();
+  const future = new Date(Date.now() + 3_600_000).toISOString();
+  check('at in the past -> true', hopperGit.evaluateUnpark({ kind: 'after', at: past }) === true);
+  check('at in the future -> false', hopperGit.evaluateUnpark({ kind: 'after', at: future }) === false);
+  check('valid after parses', hopperGit.parseUnparkCondition(JSON.stringify({ kind: 'after', at: future }))?.kind === 'after');
+  // An unparsable `at` must be REJECTED, not silently evaluate as never-met:
+  // that would turn a typo into a manual park, which is the exact failure this
+  // kind exists to end.
+  check('after with garbage `at` -> null', hopperGit.parseUnparkCondition(JSON.stringify({ kind: 'after', at: 'whenever' })) === null);
+  check('after with missing `at` -> null', hopperGit.parseUnparkCondition(JSON.stringify({ kind: 'after' })) === null);
+}
+
+// ===========================================================================
+console.log('\n[UC-5c] tree budget: the cap can actually be turned OFF');
+{
+  // Kevin, 2026-09-26: "Whatever is stopping you from doing that, I want the
+  // ability to turn that off." The old gate read `Number(setting) || 8`, so 0 ->
+  // 8: there was no off switch at all. Drives the REAL exported parser.
+  const { treeBudgetSetting } = await import(path.join(dist, 'goals-autopilot.js'));
+  check('unset -> default 8', treeBudgetSetting(null) === 8);
+  check('empty string -> default 8', treeBudgetSetting('  ') === 8);
+  check('"0" -> OFF (null), not 8', treeBudgetSetting('0') === null);
+  check('"off" -> OFF', treeBudgetSetting('off') === null);
+  check('"none" -> OFF', treeBudgetSetting('none') === null);
+  check('"unlimited" -> OFF', treeBudgetSetting('unlimited') === null);
+  check('"-1" -> OFF', treeBudgetSetting('-1') === null);
+  check('"20" -> 20', treeBudgetSetting('20') === 20);
+  check('"3.7" -> 3 (floored)', treeBudgetSetting('3.7') === 3);
+  // A typo must NOT remove the brake — that direction fails safe, unlike OFF,
+  // which is an explicit instruction.
+  check('"banana" -> default 8, brake NOT removed', treeBudgetSetting('banana') === 8);
+}
+
+// ===========================================================================
 console.log('\n[UC-6] evaluateUnpark: branch_pushed (REAL git, LOCAL only — §10)');
 {
   const gitRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'unpark-check-git-'));
@@ -206,6 +247,28 @@ console.log('\n[UC-8] goal node: manual park (park is one-way by default)');
   check('reevaluate touches nothing', unparked.length === 0);
   node = goals.getRawGoalNode(nodeId);
   check('still parked after reevaluate — manual never self-clears', node.state === 'parked');
+}
+
+// ===========================================================================
+console.log('\n[UC-8b] goal node: an `after` park SELF-CLEARS once the clock passes');
+{
+  const { goalId, nodeId } = makeGoalWithNode();
+  const future = new Date(Date.now() + 3_600_000).toISOString();
+  goals.parkGoalNode(goalId, nodeId, 'system', 'tree budget reached (test)', { kind: 'after', at: future });
+  let node = goals.getRawGoalNode(nodeId);
+  check('parked with a stored after condition', node.state === 'parked' && JSON.parse(node.unpark_when).kind === 'after');
+  check('reevaluate before the instant: still parked', goals.reevaluateGoalNodeUnparks(goalId).length === 0);
+  check('still parked', goals.getRawGoalNode(nodeId).state === 'parked');
+
+  // Move the stored instant into the past — the same thing the passage of real
+  // time does — and the node must come back on its own, with no Kevin.
+  const past = new Date(Date.now() - 1_000).toISOString();
+  sqliteDb.prepare(`UPDATE goal_nodes SET unpark_when = ? WHERE id = ?`).run(JSON.stringify({ kind: 'after', at: past }), nodeId);
+  const fired = goals.reevaluateGoalNodeUnparks(goalId);
+  check('reevaluate after the instant: condition fires', fired.length === 1 && fired[0].condition.kind === 'after');
+  node = goals.getRawGoalNode(nodeId);
+  check('node is no longer parked — no human needed', node.state !== 'parked');
+  check('unpark_when cleared', node.unpark_when === null);
 }
 
 // ===========================================================================

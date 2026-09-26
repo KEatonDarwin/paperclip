@@ -171,6 +171,13 @@ export type UnparkCondition =
   | { kind: 'tree_done'; tree_id: string }
   | { kind: 'branch_pushed'; repo: string; branch: string }
   | { kind: 'file_exists'; path: string }
+  // A park whose blocker is the CLOCK, not a node/tree/branch/file. The tree
+  // budget gate (goals-autopilot.ts §3.5) is the first: it parks because N trees
+  // were planted inside a rolling 24h window, and the only thing that can clear
+  // it is that window rolling. Without this kind, such a park had to be
+  // `{kind:'manual'}`, which meant the goal sat dead until Kevin noticed — a
+  // rate limit silently became a full stop. `at` is an ISO-8601 instant.
+  | { kind: 'after'; at: string }
   | { kind: 'manual' };
 
 // ---------------------------------------------------------------------------
@@ -821,7 +828,11 @@ export function parseUnparkCondition(json: string | null | undefined): UnparkCon
     const parsed: unknown = JSON.parse(json);
     if (!parsed || typeof parsed !== 'object' || typeof (parsed as { kind?: unknown }).kind !== 'string') return null;
     const kind = (parsed as { kind: string }).kind;
-    if (!['node_done', 'tree_done', 'branch_pushed', 'file_exists', 'manual'].includes(kind)) return null;
+    if (!['node_done', 'tree_done', 'branch_pushed', 'file_exists', 'after', 'manual'].includes(kind)) return null;
+    // `after` without a parsable instant is not a condition, it is a typo that
+    // would evaluate as "never" (NaN comparisons are false) and quietly become a
+    // manual park — reject it at the boundary instead.
+    if (kind === 'after' && !Number.isFinite(Date.parse(String((parsed as { at?: unknown }).at)))) return null;
     return parsed as UnparkCondition;
   } catch {
     return null;
@@ -846,6 +857,8 @@ export function evaluateUnpark(cond: UnparkCondition | null): boolean {
       return remoteBranchExists(cond.repo, cond.branch);
     case 'file_exists':
       return fs.existsSync(cond.path);
+    case 'after':
+      return Date.now() >= Date.parse(cond.at);
     default:
       return false;
   }

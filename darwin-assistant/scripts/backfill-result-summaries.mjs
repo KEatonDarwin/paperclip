@@ -124,6 +124,9 @@ async function runClaudeSummarizer(prompt) {
       resolve(text.trim());
     });
 
+    // The child may exit before reading stdin — without a listener the EPIPE
+    // is an unhandled 'error' event and kills the backfill mid-batch.
+    child.stdin.on('error', () => {});
     child.stdin.end(prompt);
   });
 }

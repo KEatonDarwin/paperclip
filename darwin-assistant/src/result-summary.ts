@@ -115,6 +115,10 @@ async function runClaudeSummarizer(prompt: string): Promise<string> {
       resolve(text.trim());
     });
 
+    // The child may exit before reading stdin (auth failure, spent subscription,
+    // rejected flag) — without a listener that write's EPIPE is an unhandled
+    // 'error' event and kills the whole engine process.
+    child.stdin.on('error', () => {});
     child.stdin.end(prompt);
   });
 }

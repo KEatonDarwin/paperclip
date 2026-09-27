@@ -1,0 +1,746 @@
+{
+  "captured_at": "2026-09-27T00:15:07.590Z",
+  "source": "live jarvis.db notepad_lines, days 2026-09-25 and 2026-09-26",
+  "days": [
+    {
+      "day": "2026-09-25",
+      "lines": [
+        {
+          "line_id": 1,
+          "sort_order": 0,
+          "text": "Universal KPI Goal"
+        },
+        {
+          "line_id": 2,
+          "sort_order": 1,
+          "text": " - Ran all last night, got really far"
+        },
+        {
+          "line_id": 3,
+          "sort_order": 2,
+          "text": " - Seems to be some kind of a block where the non merged branches can't \"talk to eachother\" or something like that and I'm meant to fix it?"
+        },
+        {
+          "line_id": 4,
+          "sort_order": 3,
+          "text": "    - Figure out how in the future if something like this happens, it can be cleared without my help. Cuz it seems like this typoe problem would happen more"
+        },
+        {
+          "line_id": 14,
+          "sort_order": 4,
+          "text": " - Need to get it to a point where I can start feeding it KPI's to monitor. Ian again just asked me about leads going into the summa money ongage list (they were accidentally being put there before from a faulty brand relocator in the media buy intake system). I turned off the relocator a while back, but this is perfect for the KPI thing. Basically have it look and see how many actual leads were added to each brand."
+        },
+        {
+          "line_id": 15,
+          "sort_order": 5,
+          "text": " - Need to set up and physically test the conversational KPI setup. Make sure that it actually works from a conversation and then start using it"
+        },
+        {
+          "line_id": 16,
+          "sort_order": 6,
+          "text": " - Need to figure out where I'm going to deploy this KPI monitoring tool, deploy it, and make full on mcp tools to be able to query the data and create new things to track as well. Time to start using it."
+        },
+        {
+          "line_id": 17,
+          "sort_order": 7,
+          "text": "   - Active Response should be monitored, things like:"
+        },
+        {
+          "line_id": 18,
+          "sort_order": 8,
+          "text": "     - Sends, Opens, Clicks, Revenue, Unsubscribes, Avg. sends per day, avg. sends per email address"
+        },
+        {
+          "line_id": 19,
+          "sort_order": 9,
+          "text": "     - But I want to be able to do those on a per brand basis."
+        },
+        {
+          "line_id": 5,
+          "sort_order": 10,
+          "text": ""
+        },
+        {
+          "line_id": 6,
+          "sort_order": 11,
+          "text": "MBI Numbers in monitoring goal"
+        },
+        {
+          "line_id": 7,
+          "sort_order": 12,
+          "text": " - Ran all night, but the \"Verify the UI and reporting are correct\" has all of it's sub items completed"
+        },
+        {
+          "line_id": 8,
+          "sort_order": 13,
+          "text": "  - The purpose of this goal was to make sure that what was being shown on the UI was what was supposed to be shown, not necessarily number checks"
+        },
+        {
+          "line_id": 9,
+          "sort_order": 14,
+          "text": "   - By that I mean I've seen specific situations on the media buy live dashboard where it shows seq. offer data dfor day 0 but no quantum, and when I click into it, the individual page DOES show quantum. So I know the person was given quantum, but it's not in the \"actions\" part at the bottom which is the place where day 0 (and all rev) is calculated. So there are situations where the live (and probably the intel version of the dashboard) is \"missing\" some day 0 stuff. And I think that may take some manual checking and debugging. But Jarvis may be able to do it if I explain it well enough, to find the issue."
+        },
+        {
+          "line_id": 10,
+          "sort_order": 15,
+          "text": " - The media buy intel dashboard was built before the live one, and I think the media buy intel dashboard tha tshows all of the numbers going into each brand may still need a crunching cron that isn't actually being ran."
+        },
+        {
+          "line_id": 11,
+          "sort_order": 16,
+          "text": "  - Need to audit the current setup, and make sure that what is being shown is true so we can rely on the numbers"
+        },
+        {
+          "line_id": 12,
+          "sort_order": 17,
+          "text": ""
+        },
+        {
+          "line_id": 20,
+          "sort_order": 18,
+          "text": "IPInfo"
+        },
+        {
+          "line_id": 21,
+          "sort_order": 19,
+          "text": " - I think a convo yesterday with Jarvis showed me we were using it wrong. It's mapped wrong right now. Map it correctly in every spot that needs it (intake, seq. offer raw php include file on the server, and perclickity)"
+        },
+        {
+          "line_id": 22,
+          "sort_order": 20,
+          "text": ""
+        },
+        {
+          "line_id": 13,
+          "sort_order": 21,
+          "text": "Free models"
+        },
+        {
+          "line_id": 24,
+          "sort_order": 22,
+          "text": " - Not as important, but I need to explore the possibility of using \"always running\" Free models. Overnight, during the day, etc. and it has the same type of hopper style work that the night shift system has"
+        },
+        {
+          "line_id": 25,
+          "sort_order": 23,
+          "text": ""
+        },
+        {
+          "line_id": 26,
+          "sort_order": 24,
+          "text": "AI to AI message board"
+        },
+        {
+          "line_id": 27,
+          "sort_order": 25,
+          "text": " - ALready started this, want to get thru it today and test it"
+        },
+        {
+          "line_id": 28,
+          "sort_order": 26,
+          "text": ""
+        },
+        {
+          "line_id": 29,
+          "sort_order": 27,
+          "text": "Night shift"
+        },
+        {
+          "line_id": 30,
+          "sort_order": 28,
+          "text": " - I *really* like how it worked last night. It went thru alot! I have some questions on it tho"
+        },
+        {
+          "line_id": 31,
+          "sort_order": 29,
+          "text": "   - Why did it stop at 2am?"
+        },
+        {
+          "line_id": 33,
+          "sort_order": 30,
+          "text": "   - What exactly was done, but in like a properly layman's style (don't get technical with the recap, literally just tell me what parts of what was done, which parts were skipped and why, and what I need to check/clear this morning)"
+        },
+        {
+          "line_id": 32,
+          "sort_order": 31,
+          "text": " - This is \"night shift\" by design, but I do want to have the ability to keep it going as long as we need to. So like if I have a boatload of credits because augment just re-upped or something like that, and if I have alot to get done and I need things to be done while I'm manually working, I'd like the ability to basically tell the \"night shift auto pilot\" to kieep running, like turn it back on. But tell it to only use augment, and stop it softly at like 65% or something, and leave Claude A and B for my day work, etc. Some kind if *really easy* way to have it keep running under my control until I hit a button to say stop."
+        },
+        {
+          "line_id": 34,
+          "sort_order": 32,
+          "text": ""
+        },
+        {
+          "line_id": 35,
+          "sort_order": 33,
+          "text": "Big Dashboard"
+        },
+        {
+          "line_id": 36,
+          "sort_order": 34,
+          "text": " - Optimize it a bit. There are things I don't use on it all that much, but I still *really* like the concept and want to keep it. It'll take a few renditions to get this right."
+        },
+        {
+          "line_id": 37,
+          "sort_order": 35,
+          "text": ""
+        },
+        {
+          "line_id": 38,
+          "sort_order": 36,
+          "text": "Perclickity v2"
+        },
+        {
+          "line_id": 39,
+          "sort_order": 37,
+          "text": " - Mike held the preview until Monday, so I have today and the weekend to test every possible scenario and get this right."
+        },
+        {
+          "line_id": 40,
+          "sort_order": 38,
+          "text": "  - Pretty sure Jarvis has automatically tested quite a bit of it, but I haven't looked thru the results"
+        },
+        {
+          "line_id": 41,
+          "sort_order": 39,
+          "text": ""
+        },
+        {
+          "line_id": 42,
+          "sort_order": 40,
+          "text": "Testing Tool??"
+        },
+        {
+          "line_id": 43,
+          "sort_order": 41,
+          "text": " - Just thought about this with Perclickity. When I say \"pretty sure Jarvis has automatically done this, bvut I haven't looked thru the results\" it just occured to me that I truly don't know where to look, and if I did, I would still need to manage it because it would be technical most likely."
+        },
+        {
+          "line_id": 44,
+          "sort_order": 42,
+          "text": " - Need to explore the idea that once something gets to a certain testing phase, I can have it run thru the testing system. Not necessarily something that aides in testing, more like something that serves as a really intuitive window into the testing process. In my head, there would be a \"topic\" or a \"goal\" or whatever that is being tested, and under it (or next to it) would be the list of things that it's going to test with the ability for me to add new things in there manually if I want. I *really* like the way that the night shift 3 lane system works, I was watching it last night in awe. So maybe something like that a list of the testing topics, clicking each one brings up all of the testing fields on the right (or filters by them maybe). But having none of them selected shows all of the testing that will be done in a row (vertical list in order of testing, just like night shift). So in the case of perclickity, it could be all of these different things it's about to test (like setting up a test to make sure that the clawback feature works based on zoom 3 results or something). Clicking on the test row lets me add notes to it before the test runs or something, could help steer the agent or clarify or something. Then as each one is done, just like night shift, it gives the status (complete/working, fail x ? times, skipped, needs kevin, etc). And some sort of a simple loop algorithm, like if the test is attempted once and it's clear that it could be something that Jarvis could fix, then the fix would be attempted, it would run again, etc. and up to 3 attempts or failures. Remember this is ALL JUST SUGGESTIONS. I don't even know if this would be a feasible or worth while thing, just mind dumping."
+        },
+        {
+          "line_id": 45,
+          "sort_order": 43,
+          "text": ""
+        },
+        {
+          "line_id": 47,
+          "sort_order": 44,
+          "text": "Smart notepad"
+        },
+        {
+          "line_id": 48,
+          "sort_order": 45,
+          "text": " - First time using this thing, I think this is *exactly* what I had in mind. Simple. My only question is, when do you (Jarvis) kick in here? I'm going to alt+tab away from it and leave all this alone for like 30 mins, see if you ever come by and what you do when you do. I can already think of some cool features to add to this, but for now I think let's just make sure it works well!"
+        },
+        {
+          "line_id": 46,
+          "sort_order": 46,
+          "text": ""
+        },
+        {
+          "line_id": 49,
+          "sort_order": 47,
+          "text": "Data archiving"
+        },
+        {
+          "line_id": 50,
+          "sort_order": 48,
+          "text": " - Touched on this once before, but this is a problem that needs a solution very quickly. We have MASSIVE amounts of data in our leads, lg_leads, email_activity, active_response_readonly, api audit logs, basically everything in our entire system. I think we need to set up a goal where the target is \"Full autonomous archiving of all major data with zero affect to our operations\" then go from there."
+        },
+        {
+          "line_id": 51,
+          "sort_order": 49,
+          "text": ""
+        },
+        {
+          "line_id": 52,
+          "sort_order": 50,
+          "text": "MDR's Dashboards"
+        },
+        {
+          "line_id": 53,
+          "sort_order": 51,
+          "text": " - In response to the embarrassing shit of me putting in place a redirector of brands on lead purchase and then realizing that a shitload of leads were going to places we didn't know about, our list stagnating, and nobody being able to answer wtf happens to the leads after purchase, where do they go, and how much money do they make us, I created the dashboards to help us understand that info immediately, all on the dashboards.intake.thedarwinhub.com setup."
+        },
+        {
+          "line_id": 54,
+          "sort_order": 52,
+          "text": "   - media-buy-intel"
+        },
+        {
+          "line_id": 55,
+          "sort_order": 53,
+          "text": "   - media-buy-live"
+        },
+        {
+          "line_id": 56,
+          "sort_order": 54,
+          "text": "   - perclickity-media-buy-stats"
+        },
+        {
+          "line_id": 57,
+          "sort_order": 55,
+          "text": "   - active-response-live"
+        },
+        {
+          "line_id": 58,
+          "sort_order": 56,
+          "text": " - It's great those exist, especially the live ones, I use them alot to make sure whatever thing we put in plcae (filter, etc) actually takes as I watch the traffic in real time. But I'm scared that they are going to fall by the wayside somehow. That MDR isn't going to use it very much"
+        },
+        {
+          "line_id": 59,
+          "sort_order": 57,
+          "text": " - My thought is to have him describe what his dream dashboard would be, and we put that together for him. Basically what he needs to look at in the morning, what would make it easier for him to do. Maybe even just have a \"home base\" page for him in the morning that gives him quick stat cards up top, a quick link to these other dashboards, and maybe even give him a way to type in questions or things he wants to see that immediately get routed into our jarvis system and set up as a work tree to give him access to it."
+        },
+        {
+          "line_id": 60,
+          "sort_order": 58,
+          "text": ""
+        },
+        {
+          "line_id": 61,
+          "sort_order": 59,
+          "text": "Dashboards"
+        },
+        {
+          "line_id": 62,
+          "sort_order": 60,
+          "text": " - See above, MDR's dashboards - I'm making a shitload of dashboards. I think I need to break all of these off into their own repo. Something that handles all of these dashboards so it's not just some extension of the DarwinIntakeSystem repo, which should really *only* be used for intake"
+        },
+        {
+          "line_id": 63,
+          "sort_order": 61,
+          "text": ""
+        },
+        {
+          "line_id": 82,
+          "sort_order": 62,
+          "text": "Jarvis Harness Upgrades"
+        },
+        {
+          "line_id": 83,
+          "sort_order": 63,
+          "text": " - All said and done, I know for a fact running this on node and all that is not the best look. Ths can't be efficient. So..."
+        },
+        {
+          "line_id": 84,
+          "sort_order": 64,
+          "text": "   - Need to talk with a high end Jarvis for a bit about what the best course of action is"
+        },
+        {
+          "line_id": 85,
+          "sort_order": 65,
+          "text": "    - New base/language? Compiled?"
+        },
+        {
+          "line_id": 73,
+          "sort_order": 66,
+          "text": ""
+        },
+        {
+          "line_id": 64,
+          "sort_order": 67,
+          "text": "Multiple node local hardware \"slaves\""
+        },
+        {
+          "line_id": 69,
+          "sort_order": 68,
+          "text": " - This one would be cool, but I only really want to consider it if we are having hardware issues (like if the speed i want to move at is faster than my current system can handle or something)."
+        },
+        {
+          "line_id": 70,
+          "sort_order": 69,
+          "text": " - I'm thinking of a basic intranet protocol between the main Jarvis cockpit computer, and other computers on the network. In this case a raspberry pi. It would have a simple internal protocol that lets the main Jarvis computer offload claude executions to things like a raspberry pi or even other laptops maybe. But basically it sits and waits until Jarvis pings it with instructions, and executes the instructions. Typically would be running the actual claude (or whatever) binary with the arguments provided. It would run the binary, and a service would monitor it and send status updates back to Jarvis regularly. And the \"work\" folder can be on the network here, shared with the slave/pi. So when it needs to make edits to something, it could worktree itself a copy of whatever it is on it's own hard drive/storage, do the work, and push up the finished branch to github. It could even do the whole tree, so it's responsible for it's own checks and stuff like that and pushes it back when it's done. But it updates the master in real time."
+        },
+        {
+          "line_id": 71,
+          "sort_order": 70,
+          "text": " - This method would allow for near infinite scalability. Divy the work up over X amount of active local network slaves and ping/monitor it's progress and handle the result. So it would need to be done carefully, but I think we're getting close to that point"
+        },
+        {
+          "line_id": 72,
+          "sort_order": 71,
+          "text": " - Database would be centralized in a local hard drive (probably a network storage, a SSD that has backups occuring every hour or something that are moved off site. Could even just be naother raspberry pi honestly"
+        },
+        {
+          "line_id": 74,
+          "sort_order": 72,
+          "text": ""
+        }
+      ]
+    },
+    {
+      "day": "2026-09-26",
+      "lines": [
+        {
+          "line_id": 86,
+          "sort_order": 0,
+          "text": "Universal KPI Goal"
+        },
+        {
+          "line_id": 87,
+          "sort_order": 1,
+          "text": " - Ran all last night, got really far"
+        },
+        {
+          "line_id": 88,
+          "sort_order": 2,
+          "text": " - Seems to be some kind of a block where the non merged branches can't \"talk to eachother\" or something like that and I'm meant to fix it?"
+        },
+        {
+          "line_id": 89,
+          "sort_order": 3,
+          "text": "    - Figure out how in the future if something like this happens, it can be cleared without my help. Cuz it seems like this typoe problem would happen more"
+        },
+        {
+          "line_id": 90,
+          "sort_order": 4,
+          "text": " - Need to get it to a point where I can start feeding it KPI's to monitor. Ian again just asked me about leads going into the summa money ongage list (they were accidentally being put there before from a faulty brand relocator in the media buy intake system). I turned off the relocator a while back, but this is perfect for the KPI thing. Basically have it look and see how many actual leads were added to each brand."
+        },
+        {
+          "line_id": 91,
+          "sort_order": 5,
+          "text": " - Need to set up and physically test the conversational KPI setup. Make sure that it actually works from a conversation and then start using it"
+        },
+        {
+          "line_id": 92,
+          "sort_order": 6,
+          "text": " - Need to figure out where I'm going to deploy this KPI monitoring tool, deploy it, and make full on mcp tools to be able to query the data and create new things to track as well. Time to start using it."
+        },
+        {
+          "line_id": 93,
+          "sort_order": 7,
+          "text": "   - Active Response should be monitored, things like:"
+        },
+        {
+          "line_id": 94,
+          "sort_order": 8,
+          "text": "     - Sends, Opens, Clicks, Revenue, Unsubscribes, Avg. sends per day, avg. sends per email address"
+        },
+        {
+          "line_id": 95,
+          "sort_order": 9,
+          "text": "     - But I want to be able to do those on a per brand basis."
+        },
+        {
+          "line_id": 144,
+          "sort_order": 10,
+          "text": ""
+        },
+        {
+          "line_id": 96,
+          "sort_order": 11,
+          "text": "MBI Numbers in monitoring goal"
+        },
+        {
+          "line_id": 97,
+          "sort_order": 12,
+          "text": " - Ran all night, but the \"Verify the UI and reporting are correct\" has all of it's sub items completed"
+        },
+        {
+          "line_id": 98,
+          "sort_order": 13,
+          "text": "  - The purpose of this goal was to make sure that what was being shown on the UI was what was supposed to be shown, not necessarily number checks"
+        },
+        {
+          "line_id": 99,
+          "sort_order": 14,
+          "text": "   - By that I mean I've seen specific situations on the media buy live dashboard where it shows seq. offer data dfor day 0 but no quantum, and when I click into it, the individual page DOES show quantum. So I know the person was given quantum, but it's not in the \"actions\" part at the bottom which is the place where day 0 (and all rev) is calculated. So there are situations where the live (and probably the intel version of the dashboard) is \"missing\" some day 0 stuff. And I think that may take some manual checking and debugging. But Jarvis may be able to do it if I explain it well enough, to find the issue."
+        },
+        {
+          "line_id": 100,
+          "sort_order": 15,
+          "text": " - The media buy intel dashboard was built before the live one, and I think the media buy intel dashboard tha tshows all of the numbers going into each brand may still need a crunching cron that isn't actually being ran."
+        },
+        {
+          "line_id": 101,
+          "sort_order": 16,
+          "text": "  - Need to audit the current setup, and make sure that what is being shown is true so we can rely on the numbers"
+        },
+        {
+          "line_id": 145,
+          "sort_order": 17,
+          "text": ""
+        },
+        {
+          "line_id": 102,
+          "sort_order": 18,
+          "text": "IPInfo"
+        },
+        {
+          "line_id": 103,
+          "sort_order": 19,
+          "text": " - I think a convo yesterday with Jarvis showed me we were using it wrong. It's mapped wrong right now. Map it correctly in every spot that needs it (intake, seq. offer raw php include file on the server, and perclickity)"
+        },
+        {
+          "line_id": 146,
+          "sort_order": 20,
+          "text": ""
+        },
+        {
+          "line_id": 104,
+          "sort_order": 21,
+          "text": "Free models"
+        },
+        {
+          "line_id": 105,
+          "sort_order": 22,
+          "text": " - Not as important, but I need to explore the possibility of using \"always running\" Free models. Overnight, during the day, etc. and it has the same type of hopper style work that the night shift system has"
+        },
+        {
+          "line_id": 147,
+          "sort_order": 23,
+          "text": ""
+        },
+        {
+          "line_id": 106,
+          "sort_order": 24,
+          "text": "AI to AI message board"
+        },
+        {
+          "line_id": 107,
+          "sort_order": 25,
+          "text": " - ALready started this, want to get thru it today and test it"
+        },
+        {
+          "line_id": 148,
+          "sort_order": 26,
+          "text": ""
+        },
+        {
+          "line_id": 108,
+          "sort_order": 27,
+          "text": "Night shift"
+        },
+        {
+          "line_id": 109,
+          "sort_order": 28,
+          "text": " - I'd like something of a \"layman's glance\" layer."
+        },
+        {
+          "line_id": 158,
+          "sort_order": 29,
+          "text": "   - Basically what that would mean is instead of super detailed reports when I'm reviewing the night's run, it would tell me basically what each step/job/queued item in the process is in non technical terms, basically what it does for the system. And the outcome would be in semi-layman's terms too. Do not go into detail until I tell it to if this \"mode\" is turned on"
+        },
+        {
+          "line_id": 159,
+          "sort_order": 30,
+          "text": "   - I'm thinking maybe it is in fact a mode? Turn it on, and all of the text on the goal pages are simplified greatly and the deep details are left out of it."
+        },
+        {
+          "line_id": 160,
+          "sort_order": 31,
+          "text": "    - That would continue into the night shift mode since it's goal oriented text change/overlay - the list inside of the night shift session would be able to be simplified into laymans terms, what it does basically. Then clicking something could change it back. Almost like a global setting for the goals maybe?"
+        },
+        {
+          "line_id": 161,
+          "sort_order": 32,
+          "text": "   - ALso would need to figure out how to factor this 'feature' into the report at the end. Give me the simplified version of each goal, and what happened with it (if it was stopped, explain why, but layman's style. simplified)"
+        },
+        {
+          "line_id": 149,
+          "sort_order": 33,
+          "text": ""
+        },
+        {
+          "line_id": 150,
+          "sort_order": 34,
+          "text": ""
+        },
+        {
+          "line_id": 151,
+          "sort_order": 35,
+          "text": ""
+        },
+        {
+          "line_id": 113,
+          "sort_order": 36,
+          "text": "Big Dashboard"
+        },
+        {
+          "line_id": 114,
+          "sort_order": 37,
+          "text": " - Optimize it a bit. There are things I don't use on it all that much, but I still *really* like the concept and want to keep it. It'll take a few renditions to get this right."
+        },
+        {
+          "line_id": 152,
+          "sort_order": 38,
+          "text": ""
+        },
+        {
+          "line_id": 115,
+          "sort_order": 39,
+          "text": "Perclickity v2"
+        },
+        {
+          "line_id": 116,
+          "sort_order": 40,
+          "text": " - Mike held the preview until Monday, so I have today and the weekend to test every possible scenario and get this right."
+        },
+        {
+          "line_id": 117,
+          "sort_order": 41,
+          "text": "  - Pretty sure Jarvis has automatically tested quite a bit of it, but I haven't looked thru the results"
+        },
+        {
+          "line_id": 153,
+          "sort_order": 42,
+          "text": ""
+        },
+        {
+          "line_id": 118,
+          "sort_order": 43,
+          "text": "Testing Tool??"
+        },
+        {
+          "line_id": 119,
+          "sort_order": 44,
+          "text": " - Just thought about this with Perclickity. When I say \"pretty sure Jarvis has automatically done this, bvut I haven't looked thru the results\" it just occured to me that I truly don't know where to look, and if I did, I would still need to manage it because it would be technical most likely."
+        },
+        {
+          "line_id": 120,
+          "sort_order": 45,
+          "text": " - Need to explore the idea that once something gets to a certain testing phase, I can have it run thru the testing system. Not necessarily something that aides in testing, more like something that serves as a really intuitive window into the testing process. In my head, there would be a \"topic\" or a \"goal\" or whatever that is being tested, and under it (or next to it) would be the list of things that it's going to test with the ability for me to add new things in there manually if I want. I *really* like the way that the night shift 3 lane system works, I was watching it last night in awe. So maybe something like that a list of the testing topics, clicking each one brings up all of the testing fields on the right (or filters by them maybe). But having none of them selected shows all of the testing that will be done in a row (vertical list in order of testing, just like night shift). So in the case of perclickity, it could be all of these different things it's about to test (like setting up a test to make sure that the clawback feature works based on zoom 3 results or something). Clicking on the test row lets me add notes to it before the test runs or something, could help steer the agent or clarify or something. Then as each one is done, just like night shift, it gives the status (complete/working, fail x ? times, skipped, needs kevin, etc). And some sort of a simple loop algorithm, like if the test is attempted once and it's clear that it could be something that Jarvis could fix, then the fix would be attempted, it would run again, etc. and up to 3 attempts or failures. Remember this is ALL JUST SUGGESTIONS. I don't even know if this would be a feasible or worth while thing, just mind dumping."
+        },
+        {
+          "line_id": 154,
+          "sort_order": 46,
+          "text": ""
+        },
+        {
+          "line_id": 155,
+          "sort_order": 47,
+          "text": ""
+        },
+        {
+          "line_id": 123,
+          "sort_order": 48,
+          "text": "Data archiving"
+        },
+        {
+          "line_id": 124,
+          "sort_order": 49,
+          "text": " - Touched on this once before, but this is a problem that needs a solution very quickly. We have MASSIVE amounts of data in our leads, lg_leads, email_activity, active_response_readonly, api audit logs, basically everything in our entire system. I think we need to set up a goal where the target is \"Full autonomous archiving of all major data with zero affect to our operations\" then go from there."
+        },
+        {
+          "line_id": 156,
+          "sort_order": 50,
+          "text": ""
+        },
+        {
+          "line_id": 125,
+          "sort_order": 51,
+          "text": "MDR's Dashboards"
+        },
+        {
+          "line_id": 126,
+          "sort_order": 52,
+          "text": " - In response to the embarrassing shit of me putting in place a redirector of brands on lead purchase and then realizing that a shitload of leads were going to places we didn't know about, our list stagnating, and nobody being able to answer wtf happens to the leads after purchase, where do they go, and how much money do they make us, I created the dashboards to help us understand that info immediately, all on the dashboards.intake.thedarwinhub.com setup."
+        },
+        {
+          "line_id": 127,
+          "sort_order": 53,
+          "text": "   - media-buy-intel"
+        },
+        {
+          "line_id": 128,
+          "sort_order": 54,
+          "text": "   - media-buy-live"
+        },
+        {
+          "line_id": 129,
+          "sort_order": 55,
+          "text": "   - perclickity-media-buy-stats"
+        },
+        {
+          "line_id": 130,
+          "sort_order": 56,
+          "text": "   - active-response-live"
+        },
+        {
+          "line_id": 131,
+          "sort_order": 57,
+          "text": " - It's great those exist, especially the live ones, I use them alot to make sure whatever thing we put in plcae (filter, etc) actually takes as I watch the traffic in real time. But I'm scared that they are going to fall by the wayside somehow. That MDR isn't going to use it very much"
+        },
+        {
+          "line_id": 132,
+          "sort_order": 58,
+          "text": " - My thought is to have him describe what his dream dashboard would be, and we put that together for him. Basically what he needs to look at in the morning, what would make it easier for him to do. Maybe even just have a \"home base\" page for him in the morning that gives him quick stat cards up top, a quick link to these other dashboards, and maybe even give him a way to type in questions or things he wants to see that immediately get routed into our jarvis system and set up as a work tree to give him access to it."
+        },
+        {
+          "line_id": 157,
+          "sort_order": 59,
+          "text": ""
+        },
+        {
+          "line_id": 133,
+          "sort_order": 60,
+          "text": "Dashboards"
+        },
+        {
+          "line_id": 134,
+          "sort_order": 61,
+          "text": " - See above, MDR's dashboards - I'm making a shitload of dashboards. I think I need to break all of these off into their own repo. Something that handles all of these dashboards so it's not just some extensio\tn of the DarwinIntakeSystem repo, which should really *only* be used for intake"
+        },
+        {
+          "line_id": 162,
+          "sort_order": 62,
+          "text": ""
+        },
+        {
+          "line_id": 135,
+          "sort_order": 63,
+          "text": "Jarvis Harness Upgrades"
+        },
+        {
+          "line_id": 136,
+          "sort_order": 64,
+          "text": " - All said and done, I know for a fact running this on node and all that is not the best look. Ths can't be efficient. So..."
+        },
+        {
+          "line_id": 137,
+          "sort_order": 65,
+          "text": "   - Need to talk with a high end Jarvis for a bit about what the best course of action is"
+        },
+        {
+          "line_id": 138,
+          "sort_order": 66,
+          "text": "    - New base/language? Compiled?"
+        },
+        {
+          "line_id": 163,
+          "sort_order": 67,
+          "text": ""
+        },
+        {
+          "line_id": 139,
+          "sort_order": 68,
+          "text": "Multiple node local hardware \"slaves\""
+        },
+        {
+          "line_id": 140,
+          "sort_order": 69,
+          "text": " - This one would be cool, but I only really want to consider it if we are having hardware issues (like if the speed i want to move at is faster than my current system can handle or something)."
+        },
+        {
+          "line_id": 141,
+          "sort_order": 70,
+          "text": " - I'm thinking of a basic intranet protocol between the main Jarvis cockpit computer, and other computers on the network. In this case a raspberry pi. It would have a simple internal protocol that lets the main Jarvis computer offload claude executions to things like a raspberry pi or even other laptops maybe. But basically it sits and waits until Jarvis pings it with instructions, and executes the instructions. Typically would be running the actual claude (or whatever) binary with the arguments provided. It would run the binary, and a service would monitor it and send status updates back to Jarvis regularly. And the \"work\" folder can be on the network here, shared with the slave/pi. So when it needs to make edits to something, it could worktree itself a copy of whatever it is on it's own hard drive/storage, do the work, and push up the finished branch to github. It could even do the whole tree, so it's responsible for it's own checks and stuff like that and pushes it back when it's done. But it updates the master in real time."
+        },
+        {
+          "line_id": 142,
+          "sort_order": 71,
+          "text": " - This method would allow for near infinite scalability. Divy the work up over X amount of active local network slaves and ping/monitor it's progress and handle the result. So it would need to be done carefully, but I think we're getting close to that point"
+        },
+        {
+          "line_id": 143,
+          "sort_order": 72,
+          "text": " - Database would be centralized in a local hard drive (probably a network storage, a SSD that has backups occuring every hour or something that are moved off site. Could even just be naother raspberry pi honestly"
+        }
+      ]
+    }
+  ]
+}

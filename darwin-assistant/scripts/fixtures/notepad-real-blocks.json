@@ -1,0 +1,394 @@
+{
+  "captured_at": "2026-09-27T00:15:07.590Z",
+  "source": "live jarvis.db notepad_lines, days 2026-09-25 and 2026-09-26",
+  "days": [
+    {
+      "day": "2026-09-25",
+      "blocks": [
+        {
+          "day": "2026-09-25",
+          "block_id": 1,
+          "headline": "Universal KPI Goal",
+          "member_line_ids": [
+            1,
+            2,
+            3,
+            4,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            5
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 6,
+          "headline": "MBI Numbers in monitoring goal",
+          "member_line_ids": [
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 20,
+          "headline": "IPInfo",
+          "member_line_ids": [
+            20,
+            21,
+            22
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 13,
+          "headline": "Free models",
+          "member_line_ids": [
+            13,
+            24,
+            25
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 26,
+          "headline": "AI to AI message board",
+          "member_line_ids": [
+            26,
+            27,
+            28
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 29,
+          "headline": "Night shift",
+          "member_line_ids": [
+            29,
+            30,
+            31,
+            33,
+            32,
+            34
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 35,
+          "headline": "Big Dashboard",
+          "member_line_ids": [
+            35,
+            36,
+            37
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 38,
+          "headline": "Perclickity v2",
+          "member_line_ids": [
+            38,
+            39,
+            40,
+            41
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 42,
+          "headline": "Testing Tool??",
+          "member_line_ids": [
+            42,
+            43,
+            44,
+            45
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 47,
+          "headline": "Smart notepad",
+          "member_line_ids": [
+            47,
+            48,
+            46
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 49,
+          "headline": "Data archiving",
+          "member_line_ids": [
+            49,
+            50,
+            51
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 52,
+          "headline": "MDR's Dashboards",
+          "member_line_ids": [
+            52,
+            53,
+            54,
+            55,
+            56,
+            57,
+            58,
+            59,
+            60
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 61,
+          "headline": "Dashboards",
+          "member_line_ids": [
+            61,
+            62,
+            63
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 82,
+          "headline": "Jarvis Harness Upgrades",
+          "member_line_ids": [
+            82,
+            83,
+            84,
+            85,
+            73
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-25",
+          "block_id": 64,
+          "headline": "Multiple node local hardware \"slaves\"",
+          "member_line_ids": [
+            64,
+            69,
+            70,
+            71,
+            72,
+            74
+          ],
+          "expected_sink": null
+        }
+      ]
+    },
+    {
+      "day": "2026-09-26",
+      "blocks": [
+        {
+          "day": "2026-09-26",
+          "block_id": 86,
+          "headline": "Universal KPI Goal",
+          "member_line_ids": [
+            86,
+            87,
+            88,
+            89,
+            90,
+            91,
+            92,
+            93,
+            94,
+            95,
+            144
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-26",
+          "block_id": 96,
+          "headline": "MBI Numbers in monitoring goal",
+          "member_line_ids": [
+            96,
+            97,
+            98,
+            99,
+            100,
+            101,
+            145
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-26",
+          "block_id": 102,
+          "headline": "IPInfo",
+          "member_line_ids": [
+            102,
+            103,
+            146
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-26",
+          "block_id": 104,
+          "headline": "Free models",
+          "member_line_ids": [
+            104,
+            105,
+            147
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-26",
+          "block_id": 106,
+          "headline": "AI to AI message board",
+          "member_line_ids": [
+            106,
+            107,
+            148
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-26",
+          "block_id": 108,
+          "headline": "Night shift",
+          "member_line_ids": [
+            108,
+            109,
+            158,
+            159,
+            160,
+            161,
+            149,
+            150,
+            151
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-26",
+          "block_id": 113,
+          "headline": "Big Dashboard",
+          "member_line_ids": [
+            113,
+            114,
+            152
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-26",
+          "block_id": 115,
+          "headline": "Perclickity v2",
+          "member_line_ids": [
+            115,
+            116,
+            117,
+            153
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-26",
+          "block_id": 118,
+          "headline": "Testing Tool??",
+          "member_line_ids": [
+            118,
+            119,
+            120,
+            154,
+            155
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-26",
+          "block_id": 123,
+          "headline": "Data archiving",
+          "member_line_ids": [
+            123,
+            124,
+            156
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-26",
+          "block_id": 125,
+          "headline": "MDR's Dashboards",
+          "member_line_ids": [
+            125,
+            126,
+            127,
+            128,
+            129,
+            130,
+            131,
+            132,
+            157
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-26",
+          "block_id": 133,
+          "headline": "Dashboards",
+          "member_line_ids": [
+            133,
+            134,
+            162
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-26",
+          "block_id": 135,
+          "headline": "Jarvis Harness Upgrades",
+          "member_line_ids": [
+            135,
+            136,
+            137,
+            138,
+            163
+          ],
+          "expected_sink": null
+        },
+        {
+          "day": "2026-09-26",
+          "block_id": 139,
+          "headline": "Multiple node local hardware \"slaves\"",
+          "member_line_ids": [
+            139,
+            140,
+            141,
+            142,
+            143
+          ],
+          "expected_sink": null
+        }
+      ]
+    }
+  ]
+}

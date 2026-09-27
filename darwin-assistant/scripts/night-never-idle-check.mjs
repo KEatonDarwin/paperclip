@@ -232,7 +232,7 @@ console.log('\n[NVI-C] a queue of only human items stops WITH per-item reasons i
     return Array.isArray(data.items) && data.items.some((e) => e.title.includes('NVI-C human step') && /human/.test(e.reason));
   })());
 
-  const report = night.buildNightShiftReport(runId);
+  const report = await night.buildNightShiftReport(runId);
   check('C7: the morning report "Needs you" section names the human item', report.markdown.includes('NVI-C human step'));
 }
 

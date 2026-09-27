@@ -195,7 +195,13 @@ export function generateAndStoreSummary(opts: GenerateAndStoreSummaryOpts): void
         console.error(`[layman-summary] refused write to unlisted ${opts.table}.${opts.column}`);
         return;
       }
-      const idColumn = opts.idColumn ?? allowed.idColumn;
+      // The id column is interpolated into SQL, so it must match the whitelist
+      // entry too — never a caller-supplied string (review 1078 advisory B).
+      const idColumn = allowed.idColumn;
+      if (opts.idColumn !== undefined && opts.idColumn !== allowed.idColumn) {
+        console.error(`[layman-summary] refused unlisted id column ${opts.table}.${opts.idColumn}`);
+        return;
+      }
       const summary = await summarizeForLayman(opts.input);
       if (!summary) return;
       sqliteDb

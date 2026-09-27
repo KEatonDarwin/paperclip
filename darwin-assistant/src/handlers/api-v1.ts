@@ -1920,7 +1920,11 @@ export function createApiV1Router(): Router {
     }
     forceNotepadBlockRead(resolved.day, blockId)
       .then((result) => {
-        res.json({ ...notepadDayWithMarkers(resolved.day), read: { outcome: result.outcome, marker: result.marker } });
+        // #191 -- the cockpit needs the thread to link the hover to.
+        res.json({
+          ...notepadDayWithMarkers(resolved.day),
+          read: { outcome: result.outcome, marker: result.marker, thread_ext: result.thread_ext },
+        });
       })
       .catch((err: unknown) => {
         const message = err instanceof Error ? err.message : String(err);

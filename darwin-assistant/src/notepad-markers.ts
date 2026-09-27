@@ -317,7 +317,17 @@ const upsertDismissedMarkerStmt = sqliteDb.prepare<[number, string, string, stri
  * behavior in notepad.ts: a caller passing a bad id or a bad move is a bug
  * to surface loudly, never a silent no-op.
  */
-export function reconcileNotepadMarker(lineId: number, move: NotepadMarkerMove): NotepadMarker {
+export function reconcileNotepadMarker(
+  lineId: number,
+  move: NotepadMarkerMove,
+  opts?: {
+    /** Node #191 -- Kevin EXPLICITLY asked (Read & respond). His click today
+     *  outranks his dismissal yesterday: skip every dismissal signal and
+     *  write an ACTIVE marker. The unprompted background pass never sets
+     *  this -- dismissal memory (#104) stays fully in force there. */
+    forced?: boolean;
+  },
+): NotepadMarker {
   const line = getNotepadLine(lineId);
   if (!line) throw new Error(`notepad line ${lineId} not found`);
   if (!MARKER_KINDS.has(move.kind)) throw new Error(`invalid marker kind '${move.kind}'`);
@@ -326,6 +336,12 @@ export function reconcileNotepadMarker(lineId: number, move: NotepadMarkerMove):
 
   const hash = lineTextHash(line.text);
   const existing = getMarkerRowStmt.get(lineId);
+
+  if (opts?.forced) {
+    const actionRef = move.action_ref && move.action_ref.trim() ? move.action_ref.trim() : null;
+    upsertActiveMarkerStmt.run(lineId, move.kind, reason, actionRef, hash);
+    return getNotepadMarker(lineId)!;
+  }
 
   if (existing && existing.dismissed_hash === hash) {
     // Signal 1: this exact row already carries this dismissal -- leave the

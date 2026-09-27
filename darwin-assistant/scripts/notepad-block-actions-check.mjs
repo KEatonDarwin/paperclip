@@ -94,7 +94,7 @@ const { notepadBlockStates } = await import(path.join(distDir, 'notepad-block-st
 const { resolveActionRef: resolveNotepadActionRef } = await import(path.join(distDir, 'notepad-action-resolver.js'));
 const { openNotepadHandoff, notepadHandoffThreadExt } = await import(path.join(distDir, 'notepad-handoff.js'));
 const { forceNotepadBlockRead } = await import(path.join(distDir, 'notepad-force-read.js'));
-const { getConversation } = await import(path.join(distDir, 'conversation-db.js'));
+const { getConversation, getTurns } = await import(path.join(distDir, 'conversation-db.js'));
 const { mintApiKey } = await import(path.join(distDir, 'api-keys.js'));
 const { startUiServer } = await import(path.join(distDir, 'ui-server.js'));
 await import(path.join(distDir, 'goals.js')); // side effect only: creates goals/goal_nodes/goal_events
@@ -233,25 +233,42 @@ let moveHeadlineId;
   const saved = putNotepadDay(D_READ_MOVE, ['Topic Read Move', '  - alpha read'].join('\n'));
   moveHeadlineId = lineIdByText(saved, 'Topic Read Move');
 
-  const stub = async () => JSON.stringify({ moves: [{ block_id: moveHeadlineId, kind: 'take_it', reason: 'JARVIS can take this' }] });
+  // #191 contract: a forced read ALWAYS answers. The stub returns the
+  // {kind, take, one_liner} shape the rewritten forceNotepadBlockRead asks for.
+  const stub = async () => JSON.stringify({ kind: 'take_it', take: 'JARVIS can take this — full take here.', one_liner: 'JARVIS can take this' });
   const result = await readRoute(moveHeadlineId, { runOneShot: stub });
 
-  check('read (move): 200', result.status === 200);
-  check('read (move): read.outcome is move', result.body.read.outcome === 'move');
-  check('read (move): read.marker matches the decided kind/reason', result.body.read.marker?.kind === 'take_it' && result.body.read.marker?.reason === 'JARVIS can take this');
+  check('read (answered): 200', result.status === 200);
+  check('read (answered): read.outcome is answered', result.body.read.outcome === 'answered');
+  check('read (answered): read.marker carries kind + the ONE-LINER as reason', result.body.read.marker?.kind === 'take_it' && result.body.read.marker?.reason === 'JARVIS can take this');
   check(
-    'read (move): response markers[] ALREADY carries the new marker -- no second fetch needed',
+    'read (answered): response markers[] ALREADY carries the new marker -- no second fetch needed',
     result.body.markers.some((m) => m.line_id === moveHeadlineId && m.kind === 'take_it'),
   );
   check(
-    'read (move): response blocks[] ALREADY reports gutter state move -- no second fetch needed',
-    result.body.blocks.find((b) => b.headline_line_id === moveHeadlineId)?.state === 'move',
+    // The forced read now writes `acted` + a thread link, so the gutter state
+    // is ACTED (linked), which outranks `move` in the block-state precedence.
+    'read (answered): response blocks[] ALREADY reports gutter state acted -- no second fetch needed',
+    result.body.blocks.find((b) => b.headline_line_id === moveHeadlineId)?.state === 'acted',
+  );
+  check(
+    'read (answered): the take landed IN THE THREAD as an assistant turn',
+    (() => {
+      const conv = getConversation(notepadHandoffThreadExt(moveHeadlineId));
+      if (!conv) return false;
+      const turns = getTurns(conv.id);
+      return turns.some((t) => t.role === 'assistant' && /full take here/.test(t.content ?? ''));
+    })(),
+  );
+  check(
+    'read (answered): marker action_ref is the canonical thread:<ext>',
+    result.body.read.marker?.action_ref === `thread:${notepadHandoffThreadExt(moveHeadlineId)}`,
   );
 
   // Cross-check against a real HTTP GET, proving this file's dayWithMarkers()
   // composition matches the real route's, not a divergent reimplementation.
   const httpView = await httpGet(`/notepad?date=${D_READ_MOVE}`);
-  check('read (move): a real GET /notepad sees the same marker', httpView.body.markers.some((m) => m.line_id === moveHeadlineId && m.kind === 'take_it'));
+  check('read (answered): a real GET /notepad sees the same marker', httpView.body.markers.some((m) => m.line_id === moveHeadlineId && m.kind === 'take_it'));
 }
 
 // ── (4) /read happy path -- SILENT outcome (direct call, stubbed model) ────
@@ -261,19 +278,21 @@ const D_READ_SILENT = '2026-09-11';
   const headlineId = lineIdByText(saved, 'Topic Read Silent');
   const childId = lineIdByText(saved, '  - beta silent');
 
+  // #191 KILLED the silent outcome for forced reads -- "read, nothing to
+  // add" was a non-answer to a direct question (Kevin, 2026-09-27). The
+  // old moves-shaped empty response is now GARBAGE to the parser (no
+  // `take` field), so it must land as FALLBACK: nothing written anywhere.
   const stub = async () => JSON.stringify({ moves: [] });
   const result = await readRoute(headlineId, { runOneShot: stub });
 
-  check('read (silent): 200', result.status === 200);
-  check('read (silent): read.outcome is silent', result.body.read.outcome === 'silent');
-  check('read (silent): read.marker is null', result.body.read.marker === null);
-  check('read (silent): response markers[] stays empty', result.body.markers.length === 0);
-  check(
-    'read (silent): response blocks[] ALREADY flips off unseen to seen -- no second fetch needed',
-    result.body.blocks.find((b) => b.headline_line_id === headlineId)?.state === 'seen',
-  );
-  check('read (silent): the headline was marked seen in the store', getNotepadLineState(headlineId)?.state === 'seen');
-  check('read (silent): the member line was marked seen in the store', getNotepadLineState(childId)?.state === 'seen');
+  check('read (no-silent): 200', result.status === 200);
+  check('read (no-silent): outcome is fallback, NEVER silent', result.body.read.outcome === 'fallback');
+  check("read (no-silent): the outcome vocabulary no longer contains 'silent'", ['answered', 'fallback'].includes(result.body.read.outcome));
+  check('read (no-silent): read.marker is null', result.body.read.marker === null);
+  check('read (no-silent): response markers[] stays empty', result.body.markers.length === 0);
+  check('read (no-silent): NOTHING written -- headline has no ledger row', getNotepadLineState(headlineId) === undefined);
+  check('read (no-silent): NOTHING written -- member line has no ledger row', getNotepadLineState(childId) === undefined);
+  check('read (no-silent): NO thread was created', getConversation(notepadHandoffThreadExt(headlineId)) === undefined);
 }
 
 // ── (5) /chat on a MARKERLESS block -- creation (direct call, stubbed model)

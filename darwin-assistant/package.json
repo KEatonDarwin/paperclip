@@ -62,7 +62,7 @@
     "notepad:handoff-route-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-handoff-route-check.db node scripts/notepad-handoff-route-check.mjs",
     "notepad:route-rule-check": "npm run build && node scripts/notepad-route-rule-check.mjs",
     "notepad:route-replay-check": "npm run build && node scripts/notepad-route-replay-check.mjs",
-    "notepad:route-wire-check": "npm run build && node scripts/notepad-route-wire-check.mjs",
+    "notepad:route-wire-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-route-wire-check.db JARVIS_SIM=1 node scripts/notepad-route-wire-check.mjs",
     "notepad:blocks-check": "npm run build && node scripts/notepad-blocks-check.mjs",
     "notepad:fixture-check": "npm run build && node scripts/notepad-fixture-check.mjs",
     "notepad:dispatch-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-dispatch-check.db node scripts/notepad-dispatch-check.mjs",

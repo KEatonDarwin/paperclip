@@ -357,6 +357,54 @@ for (const key of ['goal', 'hopper', 'workstream', 'question']) {
   check('no sink module references Paperclip/DAR in any form', hits.length === 0);
 }
 
+// -- (7b) A PARKED resolved parent must NOT demote the block to a chat -------
+// #190's verifier: on Kevin's real 2026-09-26 note the dossier resolved BOTH
+// blocks the done_means names to goal #5 node #129, and all eight non-discarded
+// nodes on goal #5 were parked -- so proposeGoalNodes threw parent_not_set every
+// time, actOnGoalProposal's bare catch swallowed it, and both blocks landed in a
+// thread. The feature's headline promise was false on real data. Drive the REAL
+// dispatch against a REAL parked parent and assert the goal still wins.
+{
+  const { parkGoalNode } = await import(path.join(distDir, 'goals.js'));
+  const pGoal = createGoal({ title: 'Parked-parent goal (#190 verifier gap)', done_means: 'the check passes', authored_by: 'kevin' });
+  const pNode = createGoalNode(pGoal.goal.id, { title: 'A parent that gets parked', done_means: 'n/a', authored_by: 'kevin' });
+  parkGoalNode(pGoal.goal.id, pNode.id, 'kevin', 'parked on purpose for this check');
+
+  const treeBefore = getGoalTree(pGoal.goal.id);
+  check('(7b) precondition: the resolved parent really is parked',
+    treeBefore.nodes.find((n) => n.id === pNode.id)?.state === 'parked');
+
+  // Same construction (6b) uses -- putNotepadDay returns the day with its lines.
+  const pDay = putNotepadDay('2026-09-14', ['Parked Parent Topic', '  - needs a home'].join('\n'));
+  const pParsed = parseNotepadBlocks(pDay.lines.map((l) => ({ id: l.id, idx: l.idx, text: l.text })));
+  check('(7b) the day parses into exactly 1 topic block', pParsed.length === 1);
+  const pLineById = new Map(pDay.lines.map((l) => [l.id, l]));
+  const pBlock = {
+    block_id: notepadBlockId(pParsed[0]),
+    headline_line_id: pParsed[0].headline_line_id,
+    headline: pParsed[0].headline,
+    lines: pParsed[0].member_line_ids.map((id) => ({ line_id: id, idx: pLineById.get(id).idx, text: pLineById.get(id).text })),
+  };
+  reconcileNotepadMarker(pBlock.block_id, { kind: 'take_it', reason: '#190 verifier gap check' });
+
+  const res = await dispatchNotepadBlock({
+    block: pBlock,
+    move: { kind: 'take_it', reason: 'dossier resolved this to a goal whose node is parked' },
+    dossier: { confidence: 'strong', goal: { goal_id: pGoal.goal.id, node_id: pNode.id, title: pNode.title } },
+    handoffOpts: stubHandoffOpts,
+  });
+
+  check('(7b) THE FIX: a parked parent still lands on the GOAL, not a thread', res.sink === 'goal_proposal');
+  const parsedRef = parseActionRef(res.action_ref);
+  check('(7b) the ref is goal:<goal_id>:<node_id> for that goal',
+    parsedRef?.sink === 'goal_proposal' && parsedRef.goal_id === pGoal.goal.id);
+  const treeAfter = getGoalTree(pGoal.goal.id);
+  const created = treeAfter.nodes.find((n) => n.id === parsedRef?.node_id);
+  check('(7b) the proposed node really exists on that goal', !!created);
+  check('(7b) it was proposed at the goal ROOT (the parked node could not parent it)', created?.parent_id === null);
+  check('(7b) and it is a GHOST awaiting Kevin, never set behind his back', created?.state === 'ghost');
+}
+
 // -- (8) zero net new claude processes spawned across the whole run ---------
 const spawnsAfter = claudeProcessCount();
 check(`no net new claude processes spawned (before=${spawnsBefore}, after=${spawnsAfter})`, spawnsAfter <= spawnsBefore);

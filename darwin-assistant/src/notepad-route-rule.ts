@@ -480,6 +480,15 @@ function blockGoalShapeReason(block: RouteBlockInput): string | null {
  * non-null node_id regardless of whether the dossier named one. There is no
  * "malformed ref" case for this router to avoid: it only ever hands dispatch
  * a sink decision, never a half-built ref.
+ *
+ * CORRECTION (#190's verifier): the paragraph above was right that
+ * `parent_id: null` is legal and wrong about where the danger was. The real
+ * failure mode is a NON-null node_id naming a node that is `parked` or `done` --
+ * proposeGoalNodes rejects it with `parent_not_set`, and dispatch used to
+ * swallow that in a bare catch and report a thread. It now retries at the goal
+ * root and logs the rejection. So this router still has nothing to validate,
+ * but do not read the old paragraph as "dispatch cannot fail here" -- it can,
+ * and the recovery lives in actOnGoalProposal, not here.
  */
 function dossierGoalReason(dossier: Pick<TopicDossier, 'confidence' | 'goal'> | null | undefined): string | null {
   const goal = dossier?.goal ?? null;

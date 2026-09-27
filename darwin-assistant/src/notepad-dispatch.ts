@@ -274,24 +274,55 @@ async function actOnGoalProposal(
     ]
       .filter(Boolean)
       .join('\n\n');
-    const { nodes } = proposeGoalNodes(target.goal_id, {
-      parent_id: target.node_id,
-      items: [
-        {
-          title,
-          done_means: goalProposalDoneMeans(title),
-          notes: notes || undefined,
-        },
-      ],
-      actor: 'jarvis',
-    });
+    const item = {
+      title,
+      done_means: goalProposalDoneMeans(title),
+      notes: notes || undefined,
+    };
+
+    // The resolved node is the PREFERRED parent, not the only one. A goal node
+    // is only a legal parent while it is set/planned/working/check -- if it is
+    // `parked` (or done), proposeGoalNodes throws `parent_not_set`.
+    //
+    // #190's verifier proved this is the common case, not an edge: on 2026-09-26
+    // the dossier resolved BOTH of the blocks this node's done_means names
+    // ("Universal KPI Goal", "MBI Numbers in monitoring goal") to goal #5 node
+    // #129 -- and ALL EIGHT non-discarded nodes on goal #5 were parked (on the
+    // then-sticky tree-budget cap). So the throw fired every time, the bare
+    // `catch` below silently swallowed it, and both blocks landed in a CHAT.
+    // The feature's headline promise was false on real data for a reason that
+    // had nothing to do with the feature.
+    //
+    // A parked parent is not a reason to give up on the goal -- the goal itself
+    // is still the right home. Fall back to the goal ROOT (parent_id: null),
+    // which goals.ts already accepts, and which the verifier proved succeeds
+    // against the real goal #5. Only a failure THERE means we genuinely have no
+    // home and a thread is the honest answer.
+    let nodes;
+    try {
+      ({ nodes } = proposeGoalNodes(target.goal_id, { parent_id: target.node_id, items: [item], actor: 'jarvis' }));
+    } catch (err) {
+      // NEVER silent. A swallowed GoalError here is what hid this bug: the
+      // router reported a thread and looked like it had simply decided that.
+      console.warn(
+        `[notepad-dispatch] goal ${target.goal_id} node ${target.node_id ?? 'null'} rejected as parent ` +
+          `(${err instanceof Error ? err.message : String(err)}) -- retrying at the goal root`,
+      );
+      ({ nodes } = proposeGoalNodes(target.goal_id, { parent_id: null, items: [item], actor: 'jarvis' }));
+    }
     const node = nodes[0];
     return {
       sink: 'goal_proposal',
       action_ref: buildActionRef({ sink: 'goal_proposal', goal_id: target.goal_id, node_id: node.id }),
       detail: { goal_id: target.goal_id, node_id: node.id },
     };
-  } catch {
+  } catch (err) {
+    // The goal genuinely has no home for this (even its root refused). Say so
+    // out loud rather than reporting a thread as if it were a free choice.
+    console.warn(
+      `[notepad-dispatch] goal ${target.goal_id} could not take this block ` +
+        `(${err instanceof Error ? err.message : String(err)}) -- falling back to a thread`,
+    );
     return actOnThread(subject, handoffOpts);
   }
 }

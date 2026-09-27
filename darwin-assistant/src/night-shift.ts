@@ -250,6 +250,9 @@ export interface NightItemRow {
   // PARALLEL-CONTRACT.md §6 — JSON `UnparkCondition`; null = no condition park
   // is standing on this item (its park, if any, is expressed purely by `status`).
   unpark_when: string | null;
+  // Layman layer everywhere (tree-9e15d8a7): plain-English gloss of this
+  // item's result. NULL until glossed (or forever, on summarization failure).
+  result_gloss: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -323,6 +326,11 @@ const LAZY_COLUMNS: Array<{ table: string; column: string; ddl: string }> = [
   // `UnparkCondition`. NULL = today's behavior (only an explicit re-queue moves
   // the item); a condition-carrying item self-clears via `reevaluateNightItemUnparks`.
   { table: 'night_items', column: 'unpark_when', ddl: 'TEXT' },
+  // Layman layer everywhere (tree-9e15d8a7) — plain-English gloss of an
+  // item's result, via layman-summary.ts. Distinct from `result_summary`,
+  // which is a short raw status string (e.g. "skipped by kevin", a raw
+  // VERDICT line) rather than layman prose.
+  { table: 'night_items', column: 'result_gloss', ddl: 'TEXT' },
 ];
 
 export function ensureNightShiftTables(): void {

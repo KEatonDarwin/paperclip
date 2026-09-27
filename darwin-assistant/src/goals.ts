@@ -191,6 +191,11 @@ export interface GoalNodeDbRow {
   // `UnparkCondition`. NULL (or `{kind:'manual'}`) = today's behavior: only
   // Kevin unparks it.
   unpark_when: string | null;
+  // Layman layer everywhere (tree-9e15d8a7): plain-English gloss of the last
+  // autopilot verify verdict, via layman-summary.ts. NULL until a verdict has
+  // been glossed (or forever, on summarization failure) — the cockpit falls
+  // back to the raw `autopilot_verdict`.
+  verdict_summary: string | null;
   sort_order: number;
   verified_at: string | null;
   created_at: string;
@@ -399,6 +404,8 @@ ensureGoalNodeColumn('autopilot_verdict', `autopilot_verdict TEXT`);
 ensureGoalNodeColumn('parked_reason', `parked_reason TEXT`);
 // PARALLEL-CONTRACT.md §6 — additive, nullable; null = today's behavior exactly.
 ensureGoalNodeColumn('unpark_when', `unpark_when TEXT`);
+// Layman layer everywhere (tree-9e15d8a7) — plain-English gloss of autopilot_verdict.
+ensureGoalNodeColumn('verdict_summary', `verdict_summary TEXT`);
 
 // ---------------------------------------------------------------------------
 // Low-level accessors

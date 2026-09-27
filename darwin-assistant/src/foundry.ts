@@ -144,6 +144,10 @@ export interface FoundryProjectRow {
   planner_model: string | null;
   origin_thread_ext: string | null;
   last_error: string | null;
+  // Layman layer everywhere (tree-9e15d8a7): one-to-three plain sentences on
+  // what broke, via layman-summary.ts. NULL until glossed (or forever, on
+  // summarization failure) — the cockpit falls back to the raw `last_error`.
+  last_error_summary: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -392,7 +396,7 @@ sqliteDb.exec(`
     ON foundry_modules(project_id, stage);
 `);
 
-for (const col of ['last_error TEXT', 'origin_thread_ext TEXT']) {
+for (const col of ['last_error TEXT', 'origin_thread_ext TEXT', 'last_error_summary TEXT']) {
   try { sqliteDb.exec(`ALTER TABLE foundry_projects ADD COLUMN ${col}`); } catch {}
 }
 

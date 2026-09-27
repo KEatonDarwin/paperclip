@@ -4,6 +4,7 @@ import path from 'node:path';
 import { getConversation, getOrCreateConversation, setThreadModelOverride, sqliteDb } from './conversation-db.js';
 import { getFoundrySetting } from './foundry-settings.js';
 import { getFoundrySkillDir, renderTemplate } from './foundry-templates.js';
+import { generateAndStoreSummary } from './layman-summary.js';
 import {
   agreeHopperTree,
   createHopperTree,
@@ -193,6 +194,10 @@ export interface FoundryStageNodeResponse {
   attempts: number;
   worker_thread_ext: string | null;
   result: string | null;
+  // Layman layer everywhere (tree-9e15d8a7): plain-English gloss of `result`,
+  // read live off hopper_nodes.result_summary at serialize time — no separate
+  // mirror step, so it shows up the moment the async summary lands.
+  result_summary: string | null;
 }
 
 export interface FoundryModuleResponse extends Omit<FoundryModuleRow, 'contract' | 'acceptance' | 'depends_on' | 'stage_nodes'> {
@@ -200,6 +205,9 @@ export interface FoundryModuleResponse extends Omit<FoundryModuleRow, 'contract'
   acceptance: string[];
   depends_on: string[];
   stage_nodes: Record<'build' | 'test' | 'doc', FoundryStageNodeResponse>;
+  // Layman gloss of blockedReason() — a blocked_question's question text as-is
+  // (meant to be read in full), or the blocked node's result_summary.
+  blocked_summary: string | null;
 }
 
 export interface FoundryIntegrationNodeResponse {
@@ -627,6 +635,18 @@ function blockedReason(row: FoundryModuleRow): string | null {
     const node = stageNode(row, stage);
     if (node?.status === 'blocked') return node.result ?? `${stage} stage is blocked`;
     if (node?.status === 'blocked_question') return node.question ?? `${stage} stage needs an answer`;
+  }
+  return null;
+}
+
+// Layman gloss of blockedReason(): a blocked_question's question is already
+// meant to be read in full, so it passes through unglossed; a plain `blocked`
+// node's raw result gets its result_summary instead.
+function blockedSummary(row: FoundryModuleRow): string | null {
+  for (const stage of STAGE_KEYS) {
+    const node = stageNode(row, stage);
+    if (node?.status === 'blocked') return node.result_summary ?? null;
+    if (node?.status === 'blocked_question') return node.question ?? null;
   }
   return null;
 }
@@ -1130,9 +1150,9 @@ function stageNodeFromRaw(raw: unknown, stage: 'build' | 'test' | 'doc'): Foundr
     : isRecord(value) && typeof value.node_id === 'number'
       ? value.node_id
       : null;
-  if (nodeId == null) return { node_id: null, status: 'missing', model: null, attempts: 0, worker_thread_ext: null, result: null };
+  if (nodeId == null) return { node_id: null, status: 'missing', model: null, attempts: 0, worker_thread_ext: null, result: null, result_summary: null };
   const node = getHopperNode(nodeId);
-  if (!node) return { node_id: nodeId, status: 'missing', model: null, attempts: 0, worker_thread_ext: null, result: null };
+  if (!node) return { node_id: nodeId, status: 'missing', model: null, attempts: 0, worker_thread_ext: null, result: null, result_summary: null };
   return {
     node_id: node.id,
     status: node.status,
@@ -1140,6 +1160,7 @@ function stageNodeFromRaw(raw: unknown, stage: 'build' | 'test' | 'doc'): Foundr
     attempts: node.attempts,
     worker_thread_ext: node.worker_thread_ext,
     result: node.result,
+    result_summary: node.result_summary,
   };
 }
 
@@ -1155,6 +1176,7 @@ export function serializeFoundryModule(row: FoundryModuleRow): FoundryModuleResp
       test: stageNodeFromRaw(rawStageNodes, 'test'),
       doc: stageNodeFromRaw(rawStageNodes, 'doc'),
     },
+    blocked_summary: blockedSummary(row),
   };
 }
 
@@ -1311,9 +1333,22 @@ export function markProjectPlanning(id: string, plannerModel?: string | null): F
 /** Only a project still in 'planning' drops back to draft — a late planner
  *  failure can never drag a launched/building project backwards. */
 export function markProjectPlannerFailed(id: string, message: string): FoundryProjectResponse | null {
-  const info = setPlannerFailedStmt.run(message.slice(0, 1000), id);
+  const clipped = message.slice(0, 1000);
+  const info = setPlannerFailedStmt.run(clipped, id);
   const row = getProjectStmt.get(id) ?? null;
-  if (row && info.changes === 1) emitProject('updated', row);
+  if (row && info.changes === 1) {
+    emitProject('updated', row);
+    generateAndStoreSummary({
+      table: 'foundry_projects',
+      id,
+      column: 'last_error_summary',
+      input: { kind: 'foundry_error', title: row.name, text: clipped },
+      afterStore: () => {
+        const latest = getProjectStmt.get(id);
+        if (latest) emitProject('updated', latest);
+      },
+    });
+  }
   return row ? serializeFoundryProject(row) : null;
 }
 
@@ -1565,6 +1600,16 @@ function blockProjectForFoundation(project: FoundryProjectRow, code: string, mes
   setProjectBlockedStmt.run(clipped, project.id);
   const updated = getProjectStmt.get(project.id);
   if (updated) emitProject('updated', updated, projectModulesStmt.all(project.id));
+  generateAndStoreSummary({
+    table: 'foundry_projects',
+    id: project.id,
+    column: 'last_error_summary',
+    input: { kind: 'foundry_error', title: project.name, text: clipped },
+    afterStore: () => {
+      const latest = getProjectStmt.get(project.id);
+      if (latest) emitProject('updated', latest, projectModulesStmt.all(project.id));
+    },
+  });
   createNotification({
     severity: 'error',
     title: `🏭 ${project.name} foundation is blocked`,
@@ -2240,6 +2285,16 @@ function handleIntegrationTreeEvent(project: FoundryProjectRow, node: HopperNode
     const reason = blockedQuestion.question ?? `${blockedQuestion.title} needs an answer`;
     if (project.status !== 'blocked' || project.last_error !== reason) {
       setProjectBlockedStmt.run(reason, project.id);
+      generateAndStoreSummary({
+        table: 'foundry_projects',
+        id: project.id,
+        column: 'last_error_summary',
+        input: { kind: 'foundry_error', title: project.name, text: reason },
+        afterStore: () => {
+          const latest = getProjectStmt.get(project.id);
+          if (latest) emitProject('updated', latest, projectModulesStmt.all(project.id));
+        },
+      });
       createNotification({
         severity: 'warning',
         title: `🏭 ${project.name} integration needs your call`,
@@ -2257,6 +2312,16 @@ function handleIntegrationTreeEvent(project: FoundryProjectRow, node: HopperNode
     const reason = blocked.result ?? `${blocked.title} blocked`;
     if (project.status !== 'blocked' || project.last_error !== reason) {
       setProjectBlockedStmt.run(reason, project.id);
+      generateAndStoreSummary({
+        table: 'foundry_projects',
+        id: project.id,
+        column: 'last_error_summary',
+        input: { kind: 'foundry_error', title: project.name, text: reason },
+        afterStore: () => {
+          const latest = getProjectStmt.get(project.id);
+          if (latest) emitProject('updated', latest, projectModulesStmt.all(project.id));
+        },
+      });
       createNotification({
         severity: 'error',
         title: `🏭 ${project.name} integration is blocked`,

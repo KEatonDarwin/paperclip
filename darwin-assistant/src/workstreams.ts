@@ -35,6 +35,9 @@ export interface WorkstreamTimelineEventRow {
   workstream_id: number;
   actor: WorkstreamActor;
   text: string;
+  // Layman layer everywhere (tree-9e15d8a7): set only when `text` was capped
+  // at insert time — holds the full, uncapped line so the UI can expand it.
+  detail: string | null;
   created_at: string;
 }
 
@@ -94,6 +97,16 @@ sqliteDb.exec(`
   CREATE INDEX IF NOT EXISTS idx_workstream_events_workstream
     ON workstream_events(workstream_id, created_at DESC, id DESC);
 `);
+
+// Layman layer everywhere (tree-9e15d8a7): additive column for the uncapped
+// timeline text (see insertWorkstreamEvent below).
+for (const col of ['detail TEXT']) {
+  try {
+    sqliteDb.exec(`ALTER TABLE workstream_events ADD COLUMN ${col}`);
+  } catch {
+    /* column already exists */
+  }
+}
 
 const VALID_TURNS = new Set<WorkstreamTurn>(['jarvis', 'kevin', 'external', 'parked', 'done']);
 const VALID_LINK_KINDS = new Set<WorkstreamLinkKind>(['thread', 'tree', 'todo_root', 'commitment', 'url']);
@@ -241,10 +254,29 @@ const deleteLinkStmt = sqliteDb.prepare<[number]>(`
   DELETE FROM workstream_links WHERE id = ?
 `);
 
-const insertEventStmt = sqliteDb.prepare<[number, WorkstreamActor, string]>(`
-  INSERT INTO workstream_events (workstream_id, actor, text)
-  VALUES (?, ?, ?)
+const insertEventRawStmt = sqliteDb.prepare<[number, WorkstreamActor, string, string | null]>(`
+  INSERT INTO workstream_events (workstream_id, actor, text, detail)
+  VALUES (?, ?, ?, ?)
 `);
+
+// Layman layer everywhere (tree-9e15d8a7): the ONE writer of
+// workstream_events.text — every caller routes through this so no timeline
+// line can grow unbounded. Text over the cap is stored in full in `detail`
+// (additive column) and shortened at a sentence/word boundary in `text`.
+const EVENT_TEXT_CAP = 600;
+function capEventText(text: string, maxLen = EVENT_TEXT_CAP): { text: string; detail: string | null } {
+  if (text.length <= maxLen) return { text, detail: null };
+  const slice = text.slice(0, maxLen);
+  const sentenceEnd = Math.max(slice.lastIndexOf('. '), slice.lastIndexOf('! '), slice.lastIndexOf('? '));
+  const spaceEnd = slice.lastIndexOf(' ');
+  const cut = sentenceEnd > maxLen * 0.4 ? sentenceEnd + 1 : spaceEnd > maxLen * 0.4 ? spaceEnd : maxLen;
+  return { text: `${slice.slice(0, cut).trimEnd()}…`, detail: text };
+}
+
+function insertWorkstreamEvent(workstreamId: number, actor: WorkstreamActor, text: string): void {
+  const capped = capEventText(text);
+  insertEventRawStmt.run(workstreamId, actor, capped.text, capped.detail);
+}
 
 function waitingTurn(turn: WorkstreamTurn): boolean {
   return turn === 'kevin' || turn === 'external';
@@ -346,7 +378,7 @@ export function createWorkstream(args: {
   const eventText =
     args.event_text?.trim()
     || `Created workstream${turn !== 'parked' ? `; turn: ${turn}` : ''}.`;
-  insertEventStmt.run(id, args.actor ?? 'system', eventText);
+  insertWorkstreamEvent(id, args.actor ?? 'system', eventText);
   const created = getWorkstream(id);
   if (!created) throw new Error('Failed to load workstream after insert');
   emit('created', created);
@@ -394,7 +426,7 @@ export function updateWorkstream(id: number, patch: {
       emit_event: false,
     });
   } else if (patch.event_text?.trim()) {
-    insertEventStmt.run(id, patch.actor ?? 'system', patch.event_text.trim());
+    insertWorkstreamEvent(id, patch.actor ?? 'system', patch.event_text.trim());
   }
 
   return emitById(id);
@@ -425,7 +457,7 @@ export function flipTurn(id: number, turn: WorkstreamTurn, opts: {
 
   flipTurnStmt.run(turn, turn, id);
   const text = opts.text?.trim() || `Turn changed: ${existing.turn} -> ${turn}.`;
-  insertEventStmt.run(id, opts.actor ?? 'system', text);
+  insertWorkstreamEvent(id, opts.actor ?? 'system', text);
   return opts.emit_event === false ? getWorkstream(id) : emitById(id);
 }
 
@@ -444,7 +476,7 @@ export function attachWorkstreamLink(args: {
   if (existing) {
     if (args.label !== undefined && args.label !== existing.label) {
       updateLinkLabelStmt.run(args.label, existing.id);
-      insertEventStmt.run(args.workstream_id, 'system', `Updated ${kind} link label: ${args.label ?? ref}`);
+      insertWorkstreamEvent(args.workstream_id, 'system', `Updated ${kind} link label: ${args.label ?? ref}`);
       emitById(args.workstream_id);
       return getLinkByIdStmt.get(existing.id) ?? existing;
     }
@@ -452,7 +484,7 @@ export function attachWorkstreamLink(args: {
   }
 
   insertLinkStmt.run(args.workstream_id, kind, ref, args.label ?? null);
-  insertEventStmt.run(args.workstream_id, 'system', `Linked ${kind}: ${args.label ?? ref}`);
+  insertWorkstreamEvent(args.workstream_id, 'system', `Linked ${kind}: ${args.label ?? ref}`);
   emitById(args.workstream_id);
   return getExistingLinkStmt.get(args.workstream_id, kind, ref) ?? null;
 }
@@ -461,7 +493,7 @@ export function deleteWorkstreamLink(workstreamId: number, linkId: number): Work
   const row = getLinkByIdStmt.get(linkId) ?? null;
   if (!row || row.workstream_id !== workstreamId) return null;
   deleteLinkStmt.run(linkId);
-  insertEventStmt.run(workstreamId, 'system', `Removed ${row.kind}: ${row.label ?? row.ref}`);
+  insertWorkstreamEvent(workstreamId, 'system', `Removed ${row.kind}: ${row.label ?? row.ref}`);
   emitById(workstreamId);
   return row;
 }
@@ -474,7 +506,7 @@ export function logWorkstreamEvent(
   if (!getByIdStmt.get(workstreamId)) return null;
   const clean = text.trim();
   if (!clean) throw new Error('text is required');
-  insertEventStmt.run(workstreamId, assertActor(String(actor)), clean);
+  insertWorkstreamEvent(workstreamId, assertActor(String(actor)), clean);
   const event = listRecentEventsStmt.all(workstreamId, 1)[0] ?? null;
   emitById(workstreamId);
   return event;
@@ -484,7 +516,7 @@ export function completeWorkstreamStep(id: number, note?: string | null): Workst
   const existing = getByIdStmt.get(id);
   if (!existing) return null;
   const completed = note?.trim() || existing.next_action || 'Kevin marked this step done.';
-  insertEventStmt.run(id, 'kevin', `Done: ${completed}`);
+  insertWorkstreamEvent(id, 'kevin', `Done: ${completed}`);
   clearNextActionStmt.run(id);
   flipTurn(id, 'jarvis', {
     actor: 'system',
@@ -560,7 +592,7 @@ export function jotWorkstream(text: string): { matched: boolean; workstream: Wor
   }
 
   if (best) {
-    insertEventStmt.run(best.row.id, 'kevin', `Jot: ${note}`);
+    insertWorkstreamEvent(best.row.id, 'kevin', `Jot: ${note}`);
     const workstream = emitById(best.row.id);
     if (!workstream) throw new Error('Failed to load matched workstream');
     return { matched: true, workstream };

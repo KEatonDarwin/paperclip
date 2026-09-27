@@ -17,6 +17,21 @@ import {
 } from './throttle.js';
 import { laneHoldReason } from './work-switch.js';
 import { summarizeNodeResult } from './result-summary.js';
+
+// Layman layer everywhere (tree-9e15d8a7): notification bodies should never
+// dump a worker's entire raw result — cap at a sentence/word boundary and
+// point at the tree for the rest. Callers that already cap at 1000 are left
+// alone; this is only for the ones that were pushing unbounded text.
+const NOTIFICATION_BODY_CAP = 300;
+function capNotificationBody(text: string, maxLen = NOTIFICATION_BODY_CAP): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxLen) return trimmed;
+  const slice = trimmed.slice(0, maxLen);
+  const sentenceEnd = Math.max(slice.lastIndexOf('. '), slice.lastIndexOf('! '), slice.lastIndexOf('? '));
+  const spaceEnd = slice.lastIndexOf(' ');
+  const cut = sentenceEnd > maxLen * 0.4 ? sentenceEnd + 1 : spaceEnd > maxLen * 0.4 ? spaceEnd : maxLen;
+  return `${slice.slice(0, cut).trimEnd()}…`;
+}
 // PARALLEL-CONTRACT.md §9 — the ONE git surface. This module never shells out to
 // git itself; every path, branch name and safety guard lives in hopper-git.ts.
 // (hopper-git imports getHopperNode/getHopperTree from here for §6 unpark
@@ -1101,7 +1116,9 @@ function createIntegrationRepairNode(
     createNotification({
       severity: 'warning',
       title: `🧩 Merge-back failed: ${node.title.slice(0, 90)}`,
-      body: `${headline} (${reason}) merging ${node.node_branch} → ${tree.integration_branch}.\nThe integration branch was left unchanged. Node #${created?.id} "integrate n${node.id}" was created to fix it and is claimable now.`,
+      body: capNotificationBody(
+        `${headline} (${reason}) merging ${node.node_branch} → ${tree.integration_branch}.\nThe integration branch was left unchanged. Node #${created?.id} "integrate n${node.id}" was created to fix it and is claimable now.`,
+      ),
       source: 'hopper-engine',
     });
   }
@@ -1276,7 +1293,7 @@ export function finishHopperNode(
       createNotification({
         severity: 'error',
         title: `🚧 Hopper task blocked: ${node.title.slice(0, 100)}`,
-        body: `${payload.result ?? 'No reason given.'}\nNode ${id}, tree ${node.tree_id}.`,
+        body: `${capNotificationBody(payload.result ?? 'No reason given.')}\nNode ${id}, tree ${node.tree_id} — open the tree for full details.`,
         source: 'hopper-engine',
       });
     }

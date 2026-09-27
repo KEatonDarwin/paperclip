@@ -1207,10 +1207,14 @@ export function composeSpikeCue(event: HealthEvent, sample: HealthSample): strin
     'LAST 15 MINUTES:',
     spark || '(no points yet)',
     '',
-    'Write Kevin a 3–5 line suggestion: what is most likely causing this, and the ONE dial or action you would change (naming the exact setting and value). Then store it with:',
-    `  health ack {"event_id": ${event.id}, "suggestion": "<your 3-5 lines>"}`,
+    'Write Kevin a suggestion, in this exact shape:',
+    '  Line 1: ONE plain-English sentence saying what to do about it — no setting keys, no jargon, and no numbers unless truly unavoidable.',
+    '  Then a blank line.',
+    '  Then your existing 3-5 line technical breakdown: what is most likely causing this, and the ONE dial or action you would change (naming the exact setting and value).',
+    'Then store the whole thing (plain sentence + blank line + technical lines) with:',
+    `  health ack {"event_id": ${event.id}, "suggestion": "<plain sentence>\\n\\n<your 3-5 technical lines>"}`,
     '',
-    'Do NOT change any dial yourself — this surface is suggestions only; Kevin turns the dials. Reply in ≤5 lines.',
+    'Do NOT change any dial yourself — this surface is suggestions only; Kevin turns the dials.',
   ].join('\n');
 }
 

@@ -300,6 +300,48 @@ for (const key of ['goal', 'hopper', 'workstream', 'question']) {
   );
 }
 
+// -- (6b) NODE #1065 — a real headline with NO text shape (no "goal:" cue, no
+// "Potential Goals:" heading) routes to goal_proposal purely because the
+// dossier already resolved a goal, and a node_id: null goal target proposes a
+// child at the goal's ROOT (proposeGoalNodes' parent_id: null), never a
+// malformed/unparseable ref. This is Kevin's actual bug: 'Universal KPI Goal'
+// and 'MBI Numbers in monitoring goal' name no repo/branch, so the dossier
+// that resolves them is 'weak', not 'strong' — the gate this proves is
+// dossier.goal !== null, not confidence.
+{
+  const rootGoal = createGoal({ title: 'Root-target goal (node #1065 check)', done_means: 'the check passes', authored_by: 'kevin' });
+  const dossierGoalNoNode = { confidence: 'weak', goal: { goal_id: rootGoal.goal.id, node_id: null, title: rootGoal.goal.title } };
+
+  const day2 = putNotepadDay('2026-09-24', ['Universal KPI Goal', '  - one base class, one append-only value store'].join('\n'));
+  const parsed2 = parseNotepadBlocks(day2.lines.map((l) => ({ id: l.id, idx: l.idx, text: l.text })));
+  check('(6b) the dossier-only day parses into exactly 1 topic block', parsed2.length === 1);
+  const lineById2 = new Map(day2.lines.map((l) => [l.id, l]));
+  const noTextShapeBlock = {
+    block_id: notepadBlockId(parsed2[0]),
+    headline_line_id: parsed2[0].headline_line_id,
+    headline: parsed2[0].headline,
+    lines: parsed2[0].member_line_ids.map((id) => ({ line_id: id, idx: lineById2.get(id).idx, text: lineById2.get(id).text })),
+  };
+  reconcileNotepadMarker(noTextShapeBlock.block_id, { kind: 'take_it', reason: 'node #1065 check' });
+
+  const before2 = getGoalTree(rootGoal.goal.id).nodes.length;
+  const r2 = await dispatchNotepadBlock({
+    block: noTextShapeBlock,
+    move: { kind: 'take_it', reason: 'dossier resolved this to the goal' },
+    dossier: dossierGoalNoNode,
+    handoffOpts: stubHandoffOpts,
+  });
+  check('(6b) a headline with NO text shape still routes to goal_proposal (dossier alone)', r2.decision.sink === 'goal_proposal');
+  check('(6b) dispatch actually lands on goal_proposal (no thread fallback)', r2.sink === 'goal_proposal');
+  const parsedRef2 = parseActionRef(r2.action_ref);
+  check('(6b) the emitted ref parses as goal_proposal with a REAL (non-null) node_id', parsedRef2?.sink === 'goal_proposal' && Number.isInteger(parsedRef2?.node_id));
+  check('(6b) the ref round-trips through buildActionRef', buildActionRef(parsedRef2) === r2.action_ref);
+  const tree2 = getGoalTree(rootGoal.goal.id);
+  check('(6b) exactly one new node appeared under the goal', tree2.nodes.length === before2 + 1);
+  const createdNode2 = tree2.nodes.find((n) => n.id === parsedRef2.node_id);
+  check('(6b) the created node resolves and sits at the GOAL ROOT (parent_id null) — node_id:null means "propose at root", not an error', !!createdNode2 && createdNode2.parent_id === null);
+}
+
 // -- (7) nothing was written to any DAR / Paperclip surface ------------------
 // Static proof, not a guess: grep the compiled sink modules this check
 // actually exercised for any reference to Paperclip/DAR. There is no client,

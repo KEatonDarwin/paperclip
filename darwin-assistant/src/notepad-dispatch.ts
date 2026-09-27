@@ -427,7 +427,7 @@ export async function dispatchNotepadBlock(input: DispatchNotepadBlockInput): Pr
   const decision = routeNotepadBlock({
     block: input.block,
     move: input.move,
-    dossier: input.dossier ? { confidence: input.dossier.confidence } : undefined,
+    dossier: input.dossier ? { confidence: input.dossier.confidence, goal: input.dossier.goal } : undefined,
   });
   return dispatchSubject(blockSubject(input.block), decision, input.move, input.dossier ?? null, input.handoffOpts);
 }

@@ -34,6 +34,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.join(__dirname, '..', 'dist');
 const { routeNotepadLine, routeNotepadBlock } = await import(path.join(distDir, 'notepad-route-rule.js'));
+const { buildActionRef, parseActionRef } = await import(path.join(distDir, 'notepad-dispatch.js'));
 
 let pass = 0;
 let fail = 0;
@@ -343,6 +344,137 @@ checkBlock(
   } else {
     fail++;
     console.log(`FAIL  B11. expected hopper naming line ${firedLineId}, got ${decision.sink} (why: ${decision.why})`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NODE #1065 — the dossier's RESOLVED GOAL drives block routing, gated on
+// `dossier.goal !== null`, never on `dossier.confidence === 'strong'`.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── C1: Kevin's real shape — a headline that names no repo/branch and no
+// `goal:`/`Goals:` text cue (so nothing else in the table would ever fire),
+// but the dossier already resolved it to a real goal. Confidence is 'weak'
+// on purpose (see notepad-dossier.ts: strong requires a repo/branch too) —
+// this is the exact case the 'strong' gate would still lose. ──────────────
+checkBlock(
+  'C1. dossier-resolved goal (confidence weak, node_id present) routes to goal_proposal',
+  {
+    block: block(1200, 'Universal KPI Goal', ['  - one base class, one append-only value store']),
+    move: { kind: 'take_it' },
+    dossier: { confidence: 'weak', goal: { goal_id: 5, node_id: 42, title: 'Universal KPI tracker' } },
+  },
+  'goal_proposal',
+  'high',
+);
+
+// ── C2: Kevin's second real headline, same shape ───────────────────────────
+checkBlock(
+  'C2. second real headline (dossier weak) also routes to goal_proposal',
+  {
+    block: block(1300, 'MBI Numbers in monitoring goal', ['  - surface daily in the cockpit']),
+    move: { kind: 'take_it' },
+    dossier: { confidence: 'weak', goal: { goal_id: 5, node_id: null, title: 'Universal KPI tracker' } },
+  },
+  'goal_proposal',
+  'high',
+);
+
+// ── C3: dossier.goal with node_id: null still routes to goal_proposal — the
+// router only decides the SINK; it is dispatch's job (actOnGoalProposal in
+// notepad-dispatch.ts) to propose a node under the goal's ROOT
+// (proposeGoalNodes' parent_id: null) and stamp the ref with that NEW node's
+// id, so node_id is never null in the ref actually written. This fixture
+// proves the router doesn't choke on (or special-case away from
+// goal_proposal because of) a null node_id. ────────────────────────────────
+{
+  const decision = routeNotepadBlock({
+    block: block(1400, 'A headline with no node yet', ['  - just an idea']),
+    move: { kind: 'take_it' },
+    dossier: { confidence: 'weak', goal: { goal_id: 9, node_id: null, title: 'Some goal' } },
+  });
+  if (decision.sink === 'goal_proposal' && decision.confidence === 'high') {
+    pass++;
+    console.log(`PASS  C3. dossier.goal with node_id:null still routes to goal_proposal/high — ${decision.why}`);
+  } else {
+    fail++;
+    console.log(`FAIL  C3. expected goal_proposal/high, got ${decision.sink}/${decision.confidence}`);
+  }
+}
+
+// ── C3b: the action_ref SCHEME itself never has to represent a null
+// node_id — dispatch always hands buildActionRef the id of the node it just
+// created (see the comment on dossierGoalReason). Documented here with the
+// id dispatch would actually produce, proving the round-trip the real
+// pipeline depends on. ──────────────────────────────────────────────────────
+{
+  const ref = buildActionRef({ sink: 'goal_proposal', goal_id: 9, node_id: 501 });
+  const parsed = parseActionRef(ref);
+  const ok = ref === 'goal:9:501' && parsed?.sink === 'goal_proposal' && parsed.goal_id === 9 && parsed.node_id === 501 && buildActionRef(parsed) === ref;
+  if (ok) {
+    pass++;
+    console.log(`PASS  C3b. the goal_proposal action_ref (built with dispatch's freshly-created node id) round-trips through parseActionRef`);
+  } else {
+    fail++;
+    console.log(`FAIL  C3b. ref round-trip failed: ref=${ref} parsed=${JSON.stringify(parsed)}`);
+  }
+}
+
+// ── C4: dossier.goal === null behaves EXACTLY as before — the same headline
+// as C1, but with no goal resolved, must still fall through to thread (the
+// pre-fix behaviour, and the exact bug this node fixes when the dossier
+// HASN'T resolved anything). ────────────────────────────────────────────────
+checkBlock(
+  'C4. same real headline with dossier.goal=null still falls to thread (unchanged pre-fix behaviour)',
+  {
+    block: block(1500, 'Universal KPI Goal', ['  - one base class, one append-only value store']),
+    move: { kind: 'take_it' },
+    dossier: { confidence: 'weak', goal: null },
+  },
+  'thread',
+  'low',
+);
+
+// ── C5: no dossier at all (undefined) — same as before this node existed —
+// must ALSO still fall to thread. ───────────────────────────────────────────
+checkBlock(
+  'C5. same real headline with no dossier passed at all still falls to thread',
+  {
+    block: block(1600, 'Universal KPI Goal', ['  - one base class, one append-only value store']),
+    move: { kind: 'take_it' },
+  },
+  'thread',
+  'low',
+);
+
+// ── C6: REGRESSION — dossier.goal=null must not silently change the outcome
+// for any of the pre-existing shapes (B1-B4, B7-B9). Re-run each with an
+// explicit dossier carrying goal:null and diff against the no-dossier result
+// from earlier in this file. ────────────────────────────────────────────────
+{
+  const nullGoalDossier = { confidence: 'weak', goal: null };
+  const regressionCases = [
+    ['B1 (goal heading)', block(1700, 'Potential Goals:', ['  - A universal KPI tracker across every brand'])],
+    ['B3 (build child)', block(1701, 'Smart notepad', ['\t- Fix the composer auto-grow bug in notepad.ts'])],
+    ['B4 (waiting-on child)', block(1702, 'Suppression files', ['  - Waiting on Mike to approve the FC gate'])],
+    ['B7 (nothing matches)', block(1703, 'Groceries', ['  - milk, eggs, bread'])],
+  ];
+  let allMatch = true;
+  for (const [label, b] of regressionCases) {
+    const without = routeNotepadBlock({ block: b, move: { kind: 'take_it' } });
+    const withNullGoal = routeNotepadBlock({ block: b, move: { kind: 'take_it' }, dossier: nullGoalDossier });
+    const same = without.sink === withNullGoal.sink && without.why === withNullGoal.why && without.confidence === withNullGoal.confidence;
+    if (!same) {
+      allMatch = false;
+      console.log(`  MISMATCH ${label}: without=${without.sink}/${without.confidence} withNullGoal=${withNullGoal.sink}/${withNullGoal.confidence}`);
+    }
+  }
+  if (allMatch) {
+    pass++;
+    console.log('PASS  C6. dossier.goal=null reproduces the exact no-dossier decision for every pre-existing shape checked');
+  } else {
+    fail++;
+    console.log('FAIL  C6. dossier.goal=null silently changed a pre-existing decision — see MISMATCH lines above');
   }
 }
 

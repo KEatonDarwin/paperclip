@@ -318,9 +318,15 @@ export interface RouteBlockInput {
 export interface RouteNotepadBlockInput {
   block: RouteBlockInput;
   move: RouteMoveInput;
-  /** Same forward-compatibility seam as the per-line form — accepted, never
-   *  consulted, never able to change the deterministic answer. */
-  dossier?: Pick<TopicDossier, 'confidence'> | null;
+  /** Node #1065 — unlike the per-line form's dossier seam (accepted, never
+   *  consulted), the block form DOES consult `.goal`: node #107's dossier
+   *  resolver (notepad-dossier.ts's resolveGoal) already reads `goal:<id>
+   *  [#<node>]` evidence refs and the goal-node-owning-a-matching-tree_id
+   *  fallback — routing away from that resolved goal and defaulting to
+   *  `thread` would throw away work already done. `.confidence` is still
+   *  accepted but, per dossierGoalReason's doc comment below, is NOT the
+   *  gate. */
+  dossier?: Pick<TopicDossier, 'confidence' | 'goal'> | null;
 }
 
 /**
@@ -365,9 +371,48 @@ function blockGoalShapeReason(block: RouteBlockInput): string | null {
   return firstMemberReason(block, goalCueReason);
 }
 
+/**
+ * Node #1065 — the dossier already RESOLVED a goal (notepad-dossier.ts's
+ * goalRefFromEvidence, run for us upstream): a real `goal_id` (and, when the
+ * evidence named one, a `node_id`) proved off `goal:<id>[#<node>]` evidence
+ * refs or a matching tree_id, not a guess. When present, that outranks
+ * silence: two of Kevin's real headlines ('Universal KPI Goal', 'MBI
+ * Numbers in monitoring goal') name no repo/branch and no `goal:`/`Goals:`
+ * text shape, so nothing else in this table would ever fire for them — they
+ * would fall to the `thread` default and the dossier's work would be thrown
+ * away for nothing.
+ *
+ * THE GATE IS `dossier.goal !== null` — NOT `dossier.confidence === 'strong'`.
+ * notepad-dossier.ts's own confidence derivation is
+ * `foundGoalOrTree && foundRepoOrBranch ? 'strong' : 'weak'` (see its
+ * buildTopicDossier): a block can name a goal with total certainty and still
+ * be 'weak' simply because it mentions no repo or branch — which is exactly
+ * Kevin's two real headlines above. Gating on 'strong' would leave precisely
+ * the blocks this rule exists to fix still going to thread. The goal
+ * resolver itself has no fuzzy middle: it either found a real evidence-backed
+ * goal id (and returned it) or it found nothing (and returned null) — so
+ * `!== null` is a clean, total gate, never a heuristic threshold. Do not
+ * "tighten" this back to a confidence check.
+ *
+ * This never builds an action_ref and does not care whether `goal.node_id`
+ * is null — that is dispatch's job (notepad-dispatch.ts's actOnGoalProposal),
+ * which always calls proposeGoalNodes with `parent_id: target.node_id`
+ * (goals.ts treats `parent_id: null` as "propose at the goal's root", not an
+ * error) and stamps the action_ref with the ID of the NODE IT JUST CREATED —
+ * so the emitted `goal:<goal_id>:<node_id>` ref always carries a concrete,
+ * non-null node_id regardless of whether the dossier named one. There is no
+ * "malformed ref" case for this router to avoid: it only ever hands dispatch
+ * a sink decision, never a half-built ref.
+ */
+function dossierGoalReason(dossier: Pick<TopicDossier, 'confidence' | 'goal'> | null | undefined): string | null {
+  const goal = dossier?.goal ?? null;
+  if (!goal) return null;
+  return `dossier already resolved this topic to goal #${goal.goal_id}${goal.node_id != null ? ` node #${goal.node_id}` : ''} ("${goal.title}")`;
+}
+
 interface BlockRouteRule {
   sink: NotepadRouteSink;
-  match: (block: RouteBlockInput, move: RouteMoveInput) => string | null;
+  match: (block: RouteBlockInput, move: RouteMoveInput, dossier: Pick<TopicDossier, 'confidence' | 'goal'> | null) => string | null;
 }
 
 // Same sinks, same priority order, same tie-break semantics as ROUTE_RULES.
@@ -380,6 +425,10 @@ const BLOCK_ROUTE_RULES: BlockRouteRule[] = [
   {
     sink: 'thread',
     match: (block) => firstMemberReason(block, alreadyAnnotatedReason),
+  },
+  {
+    sink: 'goal_proposal',
+    match: (_block, _move, dossier) => dossierGoalReason(dossier),
   },
   {
     sink: 'goal_proposal',
@@ -401,9 +450,10 @@ const BLOCK_ROUTE_RULES: BlockRouteRule[] = [
  * identical contract to routeNotepadLine, one topic wider.
  */
 export function routeNotepadBlock(input: RouteNotepadBlockInput): NotepadRouteDecision {
+  const dossier = input.dossier ?? null;
   const matches: Array<{ rule: BlockRouteRule; reason: string }> = [];
   for (const rule of BLOCK_ROUTE_RULES) {
-    const reason = rule.match(input.block, input.move);
+    const reason = rule.match(input.block, input.move, dossier);
     if (reason) matches.push({ rule, reason });
   }
 

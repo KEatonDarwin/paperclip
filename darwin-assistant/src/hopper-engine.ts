@@ -16,6 +16,7 @@ import {
   setThrottlePausedTreesProvider,
 } from './throttle.js';
 import { laneHoldReason } from './work-switch.js';
+import { summarizeNodeResult } from './result-summary.js';
 // PARALLEL-CONTRACT.md §9 — the ONE git surface. This module never shells out to
 // git itself; every path, branch name and safety guard lives in hopper-git.ts.
 // (hopper-git imports getHopperNode/getHopperTree from here for §6 unpark
@@ -113,6 +114,10 @@ export interface HopperNodeRow {
   resources: string | null;
   /** The node whose failed merge-back this node exists to repair (§3.5); null normally. */
   integrates_node_id: number | null;
+  /** Layman 2-4 sentence summary of `result`, generated async at finish time by
+   *  result-summary.ts. Null until generation completes (or forever, on failure) —
+   *  the cockpit falls back to showing `result` raw when this is null. */
+  result_summary: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -266,6 +271,9 @@ for (const col of [
   // alternative was re-parsing the `integrate nX` title, i.e. engine state living
   // in a display string.
   'integrates_node_id INTEGER',
+  // Readable-node-results (tree-bf5f54d9): layman summary of `result`, generated
+  // fire-and-forget at finish time. Null on every existing row until backfilled.
+  'result_summary TEXT',
 ]) {
   try {
     sqliteDb.exec(`ALTER TABLE hopper_nodes ADD COLUMN ${col}`);
@@ -1200,6 +1208,16 @@ async function integrateFinishedNode(nodeId: number): Promise<void> {
 }
 
 /** Worker report-back — the ONE place execution writes tree state. */
+// Readable-node-results (tree-bf5f54d9): fire-and-forget layman summary of a
+// finished node's `result` text. summarizeNodeResult() already swallows its
+// own errors and returns null on any failure (timeout, CLI missing, bad
+// output) — result_summary simply stays null and the cockpit falls back to
+// the raw `result`. This function must never throw into the finish path.
+async function generateAndStoreResultSummary(id: number, title: string, outcome: string, resultText: string): Promise<void> {
+  const summary = await summarizeNodeResult({ title, outcome, resultText });
+  if (summary) setNode(id, { result_summary: summary });
+}
+
 export function finishHopperNode(
   id: number,
   outcome: 'done' | 'split' | 'blocked_question' | 'blocked',
@@ -1264,8 +1282,17 @@ export function finishHopperNode(
     }
     notifyTreeStatusListeners(node.tree_id, 'blocked');
   }
+  const finalNode = getNodeStmt.get(id) ?? null;
+  // Fire-and-forget: only 'done' and 'blocked' ever write non-empty `result`
+  // (split writes children, blocked_question writes `question`), so this
+  // naturally scopes to the two outcomes readable-node-results targets.
+  if (finalNode?.result && finalNode.result.trim()) {
+    void generateAndStoreResultSummary(id, finalNode.title, outcome, finalNode.result).catch((err) => {
+      console.error(`[hopper-engine] result-summary generation failed for node ${id}:`, err);
+    });
+  }
   queueMicrotask(() => void dispatchTick('node_finished'));
-  return getNodeStmt.get(id) ?? null;
+  return finalNode;
 }
 
 /** Kevin answers a blocking question → node re-queues with the answer injected. */

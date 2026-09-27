@@ -127,6 +127,7 @@ export interface SpawnMonitorNodeDetail {
   question: string | null;
   answer: string | null;
   result: string | null;
+  result_summary: string | null;
   worker_thread_ext: string | null;
   lease_expires_at: string | null;
   adapter: string | null;
@@ -398,6 +399,7 @@ export function buildSpawnMonitorTreeDetail(
     question: n.question,
     answer: n.answer,
     result: n.result,
+    result_summary: n.result_summary,
     worker_thread_ext: n.worker_thread_ext,
     lease_expires_at: n.lease_expires_at,
     adapter: n.adapter,

@@ -51,6 +51,7 @@ import {
 } from './goals.js';
 import { VAULT_ROOT } from './goals-autopilot-verify.js';
 import { laneStopped } from './work-switch.js';
+import { summarizeForLayman } from './layman-summary.js';
 
 // NIGHT SHIFT §4.5 — night-shift.ts imports this module (predicates, cue text,
 // verdict parser), so we must NOT import it back. It registers its ownership
@@ -658,13 +659,13 @@ function countUnblockCues(goalId: number, nodeId: number): number {
 }
 
 /** After a `wrap` cue's turn ended: flip off + fallback report (§15.4 row 9). */
-function finalizeWrap(goal: GoalRow, tree: GoalTree, s: GoalDriverState): void {
+async function finalizeWrap(goal: GoalRow, tree: GoalTree, s: GoalDriverState): Promise<void> {
   const allDone = tree.nodes.every((n) => n.state === 'done' || (n.state === 'check' && n.parent_id == null));
   const reason = allDone ? 'complete' : 'stuck';
   const startedId = runStartEventId(goal.id, null);
   const hasReport = startedId != null && !!sqliteDb.prepare(`SELECT 1 FROM goal_events WHERE goal_id = ? AND kind = 'autopilot_report' AND id >= ? LIMIT 1`).get(goal.id, startedId);
   if (!hasReport) {
-    try { buildNightReport(goal.id); } catch (err) { console.error(`[autopilot] goal #${goal.id} fallback report failed`, err); }
+    try { await buildNightReport(goal.id); } catch (err) { console.error(`[autopilot] goal #${goal.id} fallback report failed`, err); }
   }
   setAutopilotOff(goal.id, reason, 'system');
   s.lastCue = null;
@@ -749,7 +750,7 @@ async function tickGoal(goalId: number, reason: string): Promise<void> {
 
     // A wrap cue whose turn has ended (we passed gate 4) → close the night.
     if (s.lastCue?.action === 'wrap') {
-      finalizeWrap(goal, tree, s);
+      await finalizeWrap(goal, tree, s);
       return;
     }
 
@@ -792,7 +793,7 @@ async function tickGoal(goalId: number, reason: string): Promise<void> {
           if (cuedNode) {
             try { parkGoalNode(goalId, cuedNode.id, 'system', 'cue ignored twice'); } catch (err) { console.error('[autopilot] park after ignored cues failed', err); }
           } else {
-            finalizeWrap(goal, tree, s);
+            await finalizeWrap(goal, tree, s);
           }
           s.lastCue = null;
           return;
@@ -1000,7 +1001,7 @@ function stateMarker(n: GoalNodeRow, cfg: AutopilotConfig): string {
   return out;
 }
 
-export function buildNightReport(goalId: number, date?: string | null): { markdown: string; path: string; written: boolean } {
+export async function buildNightReport(goalId: number, date?: string | null): Promise<{ markdown: string; path: string; written: boolean }> {
   const goal = getRawGoal(goalId);
   if (!goal) throw new GoalError(404, 'goal_not_found', 'goal not found');
   const startId = runStartEventId(goalId, date ?? null);
@@ -1033,6 +1034,7 @@ export function buildNightReport(goalId: number, date?: string | null): { markdo
   out.push('');
 
   // What ran
+  const whatRanStart = out.length;
   out.push('## What ran');
   const dispatches = events.filter((e) => e.kind === 'autopilot_dispatched');
   const verdicts = events.filter((e) => e.kind === 'autopilot_verdict');
@@ -1064,8 +1066,10 @@ export function buildNightReport(goalId: number, date?: string | null): { markdo
     if (failBlocks.length) { out.push(''); out.push(...failBlocks.flatMap((b) => [b, ''])); }
   }
   out.push('');
+  const whatRanText = out.slice(whatRanStart, out.length).join('\n');
 
   // Waiting on you
+  const waitingStart = out.length;
   out.push("## What's waiting on you");
   const waiting: string[] = [];
   for (const n of live) {
@@ -1087,8 +1091,10 @@ export function buildNightReport(goalId: number, date?: string | null): { markdo
   }
   out.push(...(waiting.length ? waiting : ['_none_']));
   out.push('');
+  const waitingText = out.slice(waitingStart, out.length).join('\n');
 
   // Where it stopped
+  const stoppedStart = out.length;
   out.push('## Where it stopped and why');
   const lastCue = [...events].reverse().find((e) => e.kind === 'autopilot_cue');
   const offEv = [...events].reverse().find((e) => e.kind === 'autopilot_off');
@@ -1099,6 +1105,7 @@ export function buildNightReport(goalId: number, date?: string | null): { markdo
   for (const h of holds) out.push(`- held ${fmtDuration((h.to ?? nowMs()) - h.from)} — ${h.reason}`);
   if (!lastCue && !offEv && !holds.length) out.push('_none_');
   out.push('');
+  const stoppedText = out.slice(stoppedStart, out.length).join('\n');
 
   // Orchestrator's own read
   out.push("## The orchestrator's own read");
@@ -1115,6 +1122,23 @@ export function buildNightReport(goalId: number, date?: string | null): { markdo
   out.push('');
   out.push('</details>');
   out.push('');
+
+  // Layman layer everywhere (tree-9e15d8a7): TL;DR first, same treatment as
+  // night-shift.ts's buildNightShiftReport — awaited (report building is not
+  // a hot path), deterministic fallback if the CLI is unavailable/times out.
+  const passCount = verdicts.filter((v) => eventData(v).verdict === 'PASS').length;
+  const failCount = verdicts.filter((v) => eventData(v).verdict === 'FAIL').length;
+  const deterministicTldr = [
+    `${dispatches.length} dispatch${dispatches.length === 1 ? '' : 'es'} — ${passCount} passed, ${failCount} failed.`,
+    waiting.length ? `Needs you: ${waiting[0].replace(/^-\s*/, '')}.` : 'Nothing needs you right now.',
+  ].join(' ');
+  const tldr = await summarizeForLayman({
+    kind: 'shift_report',
+    title: `Autopilot night report — goal #${goalId} "${goal.title}"`,
+    outcome: `stop: ${cfg.stop_reason ?? (goal.autopilot === 1 ? 'still running' : '—')}`,
+    text: [whatRanText, waitingText, stoppedText].join('\n\n'),
+  }) ?? deterministicTldr;
+  out.splice(3, 0, '## TL;DR', tldr, '');
 
   const markdown = out.join('\n');
   const rel = path.join('outbox', 'goals', `autopilot-${goalId}-${reportDate}.md`);

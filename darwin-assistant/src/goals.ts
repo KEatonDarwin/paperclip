@@ -28,6 +28,7 @@ import {
   type HopperNodeRow,
 } from './hopper-engine.js';
 import { buildVerifyPlanNode } from './goals-autopilot-verify.js';
+import { generateAndStoreSummary } from './layman-summary.js';
 import { evaluateUnparks, type UnparkCondition, type UnparkTarget } from './unpark.js';
 
 // ---------------------------------------------------------------------------
@@ -965,6 +966,25 @@ export function recordAutopilotVerdict(goalId: number, nodeId: number, verdict: 
     { ...verdict, attempt: attempts });
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
   emitNode('updated', fresh);
+  const maxAttempts = requireGoal(goalId).autopilot_config?.max_attempts ?? AUTOPILOT_DEFAULTS.max_attempts;
+  const verdictText = [verdict.evidence, verdict.gaps.length ? `Gaps:\n${verdict.gaps.map((g) => `- ${g}`).join('\n')}` : '']
+    .filter(Boolean)
+    .join('\n\n');
+  generateAndStoreSummary({
+    table: 'goal_nodes',
+    id: nodeId,
+    column: 'verdict_summary',
+    input: {
+      kind: 'verify_verdict',
+      title: node.title,
+      outcome: `${verdict.verdict} ${attempts}/${maxAttempts}`,
+      text: verdictText || `VERDICT: ${verdict.verdict}`,
+    },
+    afterStore: () => {
+      const latest = getRawNodeStmt.get(nodeId) as GoalNodeDbRow | undefined;
+      if (latest) emitNode('updated', latest);
+    },
+  });
   return deriveSingleNode(fresh);
 }
 

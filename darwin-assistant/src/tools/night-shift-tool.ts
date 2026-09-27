@@ -153,7 +153,7 @@ export const nightShift: ToolDef = {
         case 'resume':
           return { run: resumeNightRun(requireRun(args.run_id, ext), 'jarvis') };
         case 'stop':
-          return { run: stopNightRun(requireRun(args.run_id, ext), 'kevin', 'jarvis') };
+          return { run: await stopNightRun(requireRun(args.run_id, ext), 'kevin', 'jarvis') };
         case 'move': {
           if (args.item_id === undefined || args.position === undefined) return { error: 'item_id and position are required' };
           const items = moveNightItem(requireRun(args.run_id, ext), Number(args.item_id), Number(args.position), 'jarvis');
@@ -182,7 +182,7 @@ export const nightShift: ToolDef = {
         }
         case 'report': {
           const runId = requireRun(args.run_id, ext);
-          const report = buildNightShiftReport(runId);
+          const report = await buildNightShiftReport(runId);
           nightOrchestratorLog(`night report built → ${report.path ?? '(not written)'}`, 'orchestrator_log', runId);
           return { markdown: report.markdown, path: report.path, written: report.written };
         }

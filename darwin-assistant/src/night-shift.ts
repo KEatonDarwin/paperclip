@@ -24,6 +24,7 @@ import path from 'node:path';
 import { sqliteDb, getConversation, getOrCreateConversation, renameConversation, setConversationStatus, getSetting, setSetting, setThreadModelOverride } from './conversation-db.js';
 import { sseBus, type NightRunEvent, type NightItemEvent } from './sse-bus.js';
 import { createNotification } from './notifications.js';
+import { generateAndStoreSummary, summarizeForLayman } from './layman-summary.js';
 import { registerTreeStatusListener, getHopperTree, getHopperNode, setNightShiftPausedTreesProvider, listTreeNodes } from './hopper-engine.js';
 import { governorCheck, governorStatusAll, type GovernorVerdict } from './hopper-governor.js';
 // SHIFTS v1 §3.2 — the dial snapshot. throttle-status.ts imports throttle /
@@ -1691,9 +1692,9 @@ export function resumeNightRun(runId: number, actor: 'kevin' | 'jarvis' = 'kevin
 }
 
 /** §2.1 the wrap — ONE code path for stop AND complete. */
-export function stopNightRun(
+export async function stopNightRun(
   runId: number, reason: NightStopReason = 'kevin', actor: 'kevin' | 'jarvis' | 'system' = 'kevin',
-): NightRunRow {
+): Promise<NightRunRow> {
   const run = getNightRun(runId);
   if (!run) throw new NightError(404, 'night_run_not_found', 'night run not found');
   if (run.status === 'stopped' || run.status === 'complete') return run;
@@ -1732,7 +1733,7 @@ export function stopNightRun(
   // 3) report + cue + bell + commitment.
   let reportPath: string | null = null;
   try {
-    const report = buildNightShiftReport(runId);
+    const report = await buildNightShiftReport(runId);
     reportPath = report.written ? report.path : null;
   } catch (err) {
     console.error('[night-shift] report build failed', err);
@@ -1848,6 +1849,16 @@ function finishItem(run: NightRunRow, item: NightItemRow, status: NightItemStatu
   const fresh = setItem(item.id, { status, lane: null, finished_at: nowIso(), result_summary: summary.slice(0, 1000) });
   const kind = status === 'done' ? 'item_done' : status === 'blocked' ? 'item_blocked' : status === 'skipped' ? 'item_skipped' : 'item_failed';
   insertNightEvent(run.id, item.id, 'system', kind, `#${item.position} ${item.kind} ${item.title} — ${summary.split('\n')[0]}`.slice(0, 500));
+  generateAndStoreSummary({
+    table: 'night_items',
+    id: item.id,
+    column: 'result_gloss',
+    input: { kind: 'shift_item', title: item.title, outcome: status, text: summary },
+    afterStore: () => {
+      const latest = getItem(item.id);
+      if (latest) emitItem('updated', latest);
+    },
+  });
   return fresh;
 }
 
@@ -2558,7 +2569,7 @@ export async function tickNightShift(reason = 'loop'): Promise<void> {
       // that window resets, it is the pacing loop, not the end of the budget —
       // and neither is `usage_stale`/`kevin_active`, which are transient.
       if (after.mode === 'until_budget' && BUDGET_EXHAUSTED_HOLDS.has(hold.reason)) {
-        stopNightRun(after.id, 'budget', 'system');
+        await stopNightRun(after.id, 'budget', 'system');
       }
       return;
     }
@@ -2602,7 +2613,7 @@ export async function tickNightShift(reason = 'loop'): Promise<void> {
         insertNightEvent(after.id, null, 'system', 'hold',
           `re-plan ceiling reached (${maxReplans()} tail re-plans, settings-KV night_max_replans) — the list is drained but the planner was not consulted again. Raise night_max_replans or plan a new shift.`,
           { replan_ceiling: maxReplans() });
-        stopNightRun(after.id, 'stuck', 'system');
+        await stopNightRun(after.id, 'stuck', 'system');
         return;
       }
       // PARALLEL-CONTRACT.md §7 — an empty list with nothing to append is NOT
@@ -2620,7 +2631,7 @@ export async function tickNightShift(reason = 'loop'): Promise<void> {
       // here), which gives a live condition real ticks to clear before the
       // `idleTicks` ceiling ever calls it `stuck`.
       if (!needsYouFor(after).some((n) => n.reason === 'human' || n.reason === 'parked' || n.reason === 'awaiting_weigh_in')) {
-        stopNightRun(after.id, 'complete', 'system');
+        await stopNightRun(after.id, 'complete', 'system');
         return;
       }
     }
@@ -2663,7 +2674,7 @@ export async function tickNightShift(reason = 'loop'): Promise<void> {
         insertNightEvent(after.id, null, 'system', 'hold',
           `${stuck.line}\n(idle for ${driver.idleTicks} ticks; a re-plan, an unpark re-check and the serial fallback all found nothing.)`,
           { items: stuck.entries });
-        stopNightRun(after.id, 'stuck', 'system');
+        await stopNightRun(after.id, 'stuck', 'system');
       }
     } else {
       driver.idleTicks = 0;
@@ -3057,7 +3068,7 @@ const GLYPH: Record<NightItemStatus, string> = {
   queued: '·', running: '▶', done: '✓', failed: '✗', blocked: '⛔', skipped: '⏭', expanded: '↳',
 };
 
-export function buildNightShiftReport(runId: number): { markdown: string; path: string | null; written: boolean } {
+export async function buildNightShiftReport(runId: number): Promise<{ markdown: string; path: string | null; written: boolean }> {
   const run = getNightRun(runId);
   if (!run) throw new NightError(404, 'night_run_not_found', 'night run not found');
   const items = listNightItems(runId);
@@ -3082,6 +3093,7 @@ export function buildNightShiftReport(runId: number): { markdown: string; path: 
   if (!items.length) out.push('| — | — | — | _none_ | — | — | — |');
   out.push('');
 
+  const whatHappenedStart = out.length;
   out.push('## What actually happened');
   out.push('| pos | | title | est → actual | attempt | lane | tree | result |');
   out.push('|---|---|---|---|---|---|---|---|');
@@ -3093,7 +3105,9 @@ export function buildNightShiftReport(runId: number): { markdown: string; path: 
   }
   if (!items.length) out.push('| — | — | _none_ | — | — | — | — | — |');
   out.push('');
+  const whatHappenedText = out.slice(whatHappenedStart, out.length).join('\n');
 
+  const statsStart = out.length;
   out.push('## Stats');
   out.push('| metric | value |');
   out.push('|---|---|');
@@ -3108,6 +3122,7 @@ export function buildNightShiftReport(runId: number): { markdown: string; path: 
   out.push(`| commits (parsed) | ${stats.commits} |`);
   out.push(`| tests (parsed) | ${stats.tests} |`);
   out.push('');
+  const statsText = out.slice(statsStart, out.length).join('\n');
 
   out.push('## Per goal');
   for (const gid of run.goal_ids) {
@@ -3120,7 +3135,7 @@ export function buildNightShiftReport(runId: number): { markdown: string; path: 
     out.push(`### G${gid} — ${goal.title}`);
     out.push(`progress ${done}/${live.length} done · ${mine.filter((i) => i.status === 'done').length}/${mine.length} night items done`);
     try {
-      const per = buildNightReport(gid, date);
+      const per = await buildNightReport(gid, date);
       const whatRan = per.markdown.split('\n');
       const start = whatRan.findIndex((l) => l.trim() === '## What ran');
       if (start >= 0) {
@@ -3131,10 +3146,13 @@ export function buildNightShiftReport(runId: number): { markdown: string; path: 
     out.push('');
   }
 
+  const needsYouStart = out.length;
   out.push('## Needs you');
   const needs = needsYouFor(run);
-  out.push(...(needs.length ? needs.map((n) => `- ${n.reason} — G${n.goal_id}${n.node_id != null ? ` #${n.node_id}` : ''} ${n.title}`) : ['_none_']));
+  const needsYouLines = needs.length ? needs.map((n) => `- ${n.reason} — G${n.goal_id}${n.node_id != null ? ` #${n.node_id}` : ''} ${n.title}`) : ['_none_'];
+  out.push(...needsYouLines);
   out.push('');
+  const needsYouText = out.slice(needsYouStart, out.length).join('\n');
 
   out.push('## Holds');
   out.push('| reason | from → to | minutes |');
@@ -3170,6 +3188,23 @@ export function buildNightShiftReport(runId: number): { markdown: string; path: 
   out.push('');
   out.push('</details>');
   out.push('');
+
+  // Layman layer everywhere (tree-9e15d8a7): a plain-English TL;DR is the
+  // FIRST section Kevin sees. Report building runs once per stop, not a hot
+  // path, so this awaits the summarizer (45s cap) rather than firing and
+  // forgetting — a stale/missing TL;DR on the morning report is worse than a
+  // few extra seconds before it lands.
+  const deterministicTldr = [
+    `${stats.items.done} done, ${stats.items.failed} failed, ${stats.items.blocked} blocked, ${stats.items.skipped} skipped.`,
+    needs.length ? `Needs you: ${needs[0].reason} — G${needs[0].goal_id}${needs[0].node_id != null ? ` #${needs[0].node_id}` : ''} ${needs[0].title}.` : 'Nothing needs you right now.',
+  ].join(' ');
+  const tldr = await summarizeForLayman({
+    kind: 'shift_report',
+    title: `Night Shift run #${run.id} (${date})`,
+    outcome: `${run.status} (${run.stop_reason ?? 'n/a'})`,
+    text: [whatHappenedText, statsText, needsYouText].join('\n\n'),
+  }) ?? deterministicTldr;
+  out.splice(3, 0, '## TL;DR', tldr, '');
 
   const markdown = out.join('\n');
   const rel = path.join('outbox', 'night', `night-${date}.md`);

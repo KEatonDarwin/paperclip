@@ -623,7 +623,7 @@ export const goals: ToolDef = {
 
       if (op === 'night_report') {
         assertGoalLevelAllowed('night_report');
-        const report = buildNightReport(goalId, str(args.date) ?? null);
+        const report = await buildNightReport(goalId, str(args.date) ?? null);
         // §15.7 — link the wrap turn's account and the file in the event log.
         insertEvent(goalId, null, 'jarvis', 'log', `autopilot: night report written → ${report.path}`);
         emitGoal('updated', goalId);

@@ -3055,8 +3055,8 @@ export function createApiV1Router(): Router {
   router.post('/night/runs/:id/resume', (req: AuthedRequest, res) => {
     try { res.json({ run: resumeNightRun(parseInt(String(req.params.id), 10), 'kevin') }); } catch (err) { sendNightError(res, err); }
   });
-  router.post('/night/runs/:id/stop', (req: AuthedRequest, res) => {
-    try { res.json({ run: stopNightRun(parseInt(String(req.params.id), 10), 'kevin', 'kevin') }); } catch (err) { sendNightError(res, err); }
+  router.post('/night/runs/:id/stop', async (req: AuthedRequest, res) => {
+    try { res.json({ run: await stopNightRun(parseInt(String(req.params.id), 10), 'kevin', 'kevin') }); } catch (err) { sendNightError(res, err); }
   });
 
   router.post('/night/runs/:id/items', (req: AuthedRequest, res) => {
@@ -3087,9 +3087,9 @@ export function createApiV1Router(): Router {
     } catch (err) { sendNightError(res, err); }
   });
 
-  router.get('/night/runs/:id/report', (req: AuthedRequest, res) => {
+  router.get('/night/runs/:id/report', async (req: AuthedRequest, res) => {
     try {
-      const r = buildNightShiftReport(parseInt(String(req.params.id), 10));
+      const r = await buildNightShiftReport(parseInt(String(req.params.id), 10));
       res.json({ markdown: r.markdown, path: r.path, written: r.written });
     } catch (err) { sendNightError(res, err); }
   });
@@ -3626,7 +3626,7 @@ export function createApiV1Router(): Router {
   // The report route is registered FIRST so `/goals/:id/autopilot/report` is
   // never shadowed by the plain `/goals/:id/autopilot` GET.
 
-  router.get('/goals/:id/autopilot/report', (req: AuthedRequest, res) => {
+  router.get('/goals/:id/autopilot/report', async (req: AuthedRequest, res) => {
     const goalId = parseInt(String(req.params.id), 10);
     const dateRaw = typeof req.query.date === 'string' ? req.query.date : undefined;
     if (dateRaw !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(dateRaw)) {
@@ -3634,7 +3634,7 @@ export function createApiV1Router(): Router {
       return;
     }
     try {
-      res.json(buildNightReport(goalId, dateRaw ?? null));
+      res.json(await buildNightReport(goalId, dateRaw ?? null));
     } catch (err) {
       sendCaughtGoalError(res, err);
     }

@@ -70,6 +70,8 @@
     "notepad:rollover-replay-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-rollover-replay-check.db node scripts/notepad-rollover-replay-check.mjs",
     "notepad:provenance-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-provenance-check.db node scripts/notepad-provenance-check.mjs",
     "notepad:block-state-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-block-state-check.db node scripts/notepad-block-state-check.mjs",
+    "notepad:force-read-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-force-read-check.db JARVIS_SIM=1 node scripts/notepad-force-read-check.mjs",
+    "notepad:block-actions-check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-block-actions-check.db JARVIS_SIM=1 node scripts/notepad-block-actions-check.mjs",
     "unpark:check": "npm run build && JARVIS_DB_PATH=/tmp/unpark-check.db JARVIS_SIM=1 node scripts/unpark-check.mjs",
     "night:never-idle:check": "npm run build && JARVIS_DB_PATH=/tmp/night-never-idle-check.db JARVIS_SIM=1 node scripts/night-never-idle-check.mjs",
     "hopper-git:check": "npm run build && JARVIS_DB_PATH=/tmp/hopper-git-check.db JARVIS_SIM=1 node scripts/hopper-git-check.mjs",

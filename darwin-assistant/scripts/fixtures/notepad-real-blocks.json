@@ -22,7 +22,8 @@
             19,
             5
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "multiple \"Need to <verb>\" / \"Figure out\" lines describing concrete KPI-tooling work"
         },
         {
           "day": "2026-09-25",
@@ -37,7 +38,8 @@
             11,
             12
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "line 11 \"Need to audit the current setup...\" is a concrete ask, even though the block opens with a status line"
         },
         {
           "day": "2026-09-25",
@@ -48,7 +50,8 @@
             21,
             22
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "line 21 \"Map it correctly in every spot that needs it\" is a concrete, scoped fix across 3 named systems"
         },
         {
           "day": "2026-09-25",
@@ -59,7 +62,8 @@
             24,
             25
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "the only ask (\"I need to explore the possibility...\") is explicitly hedged (\"Not as important\") and never opens its own sentence \u2014 a musing, not a commitment"
         },
         {
           "day": "2026-09-25",
@@ -70,7 +74,8 @@
             27,
             28
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "\"ALready started this, want to get thru it today and test it\" is a status update on work already underway, not a new ask"
         },
         {
           "day": "2026-09-25",
@@ -84,7 +89,8 @@
             32,
             34
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "genuinely mixed: a literal question (\"Why did it stop at 2am?\"), a recap request, and a hedged speculative feature idea (\"Some kind of *really easy* way...\") \u2014 no single sink fits the whole topic"
         },
         {
           "day": "2026-09-25",
@@ -95,7 +101,8 @@
             36,
             37
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "\"Optimize it a bit\" is a concrete, if modest, imperative ask about the Big Dashboard"
         },
         {
           "day": "2026-09-25",
@@ -107,7 +114,8 @@
             40,
             41
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "a personal testing-plan commitment (\"I have today and the weekend to test...\") and a note he hasn't reviewed results yet \u2014 nothing here is a discrete ask for JARVIS"
         },
         {
           "day": "2026-09-25",
@@ -119,7 +127,8 @@
             44,
             45
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "the headline itself ends in \"??\" \u2014 Kevin is thinking out loud about whether a testing tool is worth building, not asking for one yet, even though the body elaborates a feature in detail"
         },
         {
           "day": "2026-09-25",
@@ -130,7 +139,8 @@
             48,
             46
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "Kevin dogfooding the notepad itself and asking a question (\"when do you kick in here?\") buried in the body, not the headline \u2014 an observation, not an ask"
         },
         {
           "day": "2026-09-25",
@@ -141,7 +151,8 @@
             50,
             51
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "\"I think we need to set up a goal where the target is ...\" names a concrete goal target directly"
         },
         {
           "day": "2026-09-25",
@@ -158,7 +169,8 @@
             59,
             60
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "a brainstorm about what MDR needs from a dashboard (\"My thought is to have him describe...\") \u2014 no concrete, committed ask yet"
         },
         {
           "day": "2026-09-25",
@@ -169,7 +181,8 @@
             62,
             63
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "\"I think I need to break all of these off into their own repo\" is a concrete, if hedge-prefixed, ask"
         },
         {
           "day": "2026-09-25",
@@ -182,7 +195,8 @@
             85,
             73
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "\"Need to talk with a high end Jarvis for a bit about what the best course of action is\" is a direct ask"
         },
         {
           "day": "2026-09-25",
@@ -196,7 +210,8 @@
             72,
             74
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "explicitly hedged speculative idea (\"This one would be cool, but I only really want to consider it if...\") \u2014 not a current ask"
         }
       ]
     },
@@ -220,7 +235,8 @@
             95,
             144
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "same shape as day 1 block 1 \u2014 multiple \"Need to\" / \"Figure out\" lines"
         },
         {
           "day": "2026-09-26",
@@ -235,7 +251,8 @@
             101,
             145
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "same shape as day 1 block 6 \u2014 line 101 \"Need to audit the current setup...\""
         },
         {
           "day": "2026-09-26",
@@ -246,7 +263,8 @@
             103,
             146
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "same shape as day 1 block 20 \u2014 line 103 \"Map it correctly in every spot that needs it\""
         },
         {
           "day": "2026-09-26",
@@ -257,7 +275,8 @@
             105,
             147
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "same hedged musing as day 1 block 13, verbatim"
         },
         {
           "day": "2026-09-26",
@@ -268,7 +287,8 @@
             107,
             148
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "same status update as day 1 block 26, verbatim"
         },
         {
           "day": "2026-09-26",
@@ -285,7 +305,8 @@
             150,
             151
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "different from day 1's Night shift: \"I'd like something of a 'layman's glance' layer.\" opens its own sentence as a clean, concrete feature ask"
         },
         {
           "day": "2026-09-26",
@@ -296,7 +317,8 @@
             114,
             152
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "same shape as day 1 block 35 \u2014 \"Optimize it a bit\""
         },
         {
           "day": "2026-09-26",
@@ -308,7 +330,8 @@
             117,
             153
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "same personal testing-plan commentary as day 1 block 38, verbatim"
         },
         {
           "day": "2026-09-26",
@@ -321,7 +344,8 @@
             154,
             155
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "same \"??\" headline as day 1 block 42, verbatim"
         },
         {
           "day": "2026-09-26",
@@ -332,7 +356,8 @@
             124,
             156
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "same shape as day 1 block 49 \u2014 \"I think we need to set up a goal...\""
         },
         {
           "day": "2026-09-26",
@@ -349,7 +374,8 @@
             132,
             157
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "same MDR brainstorm as day 1 block 52, verbatim"
         },
         {
           "day": "2026-09-26",
@@ -360,7 +386,8 @@
             134,
             162
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "same shape as day 1 block 61 \u2014 \"I think I need to break...\""
         },
         {
           "day": "2026-09-26",
@@ -373,7 +400,8 @@
             138,
             163
           ],
-          "expected_sink": null
+          "expected_sink": "hopper",
+          "why": "same shape as day 1 block 82 \u2014 \"Need to talk with a high end Jarvis...\""
         },
         {
           "day": "2026-09-26",
@@ -386,7 +414,8 @@
             142,
             143
           ],
-          "expected_sink": null
+          "expected_sink": "thread",
+          "why": "same hedged speculative idea as day 1 block 64, verbatim"
         }
       ]
     }

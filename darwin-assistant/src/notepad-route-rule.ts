@@ -144,6 +144,83 @@ function buildShapeReason(text: string): string | null {
   return `imperative build cue ('${verb[0].trim()}') naming a concrete artifact ('${artifact[0]}')`;
 }
 
+// Node #1066 — Kevin does not write "implement X". BUILD_VERB_RE/ARTIFACT_RE
+// above were invented against phrasing he has never once used in two real
+// captured days (scripts/fixtures/notepad-real-days.json) — every "Need to
+// set up..." line fails ARTIFACT_RE outright, so buildShapeReason above never
+// fires on his actual notepad. NATURAL_BUILD_CUE_RE below is derived FROM
+// those fixtures instead of imagined: the four cues the node's done_means
+// names explicitly ('Need to <verb>', 'Figure out', 'Set up', 'Map it'),
+// plus three more found sweeping the same two days for the identical
+// shape — a bare imperative ('Optimize it a bit.'), a stated desire ("I'd
+// like something of a...") and a hedge-then-ask ("I think I need to break
+// all of these off...") — each checked against every real occurrence in the
+// fixture before being added, never against an invented example.
+//
+// Kevin crams several thoughts into one dash-line rather than one ask per
+// line (docs/notepad/BLOCKS.md), so every alternative below is anchored to
+// the START OF A SENTENCE, not the start of the raw line: "Map it correctly
+// in every spot that needs it" only ever shows up after "It's mapped wrong
+// right now.", never at column zero, and "...and what I need to check/clear
+// this morning)" — a real line — stays UNMATCHED on purpose because "need
+// to" there opens no sentence of its own, it is a clause inside someone
+// else's. This is what lets the cue list stay precise without falling back
+// to the old artifact-noun requirement: precision comes from WHERE a cue
+// sits, not from demanding it name a repo/file/page it never names.
+function sentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+const NATURAL_BUILD_CUE_RE =
+  /^(need\s+to\s+\w+|figure\s+out\b|set\s+up\b|map\s+it\b|optimize\b|i.?d\s+like\b|i\s+think\s+(?:i|we)\s+need\s+to\s+\w+)/i;
+
+function naturalBuildCueReason(text: string): string | null {
+  for (const s of sentences(text)) {
+    const m = s.match(NATURAL_BUILD_CUE_RE);
+    if (m) return `natural build cue ('${m[0].trim()}') opening a sentence`;
+  }
+  return null;
+}
+
+/** Kevin's real "I'm still deciding, not asking for work yet" shape: a topic
+ *  headline ending in one or more '?' — his actual 'Testing Tool??'. That
+ *  block's own body goes on to describe a feature in real detail ("Need to
+ *  explore the idea that...") and even says so directly ("Remember this is
+ *  ALL JUST SUGGESTIONS... just mind dumping"), so this is checked ahead of
+ *  the build-shape rule below on purpose: a headline he ended with a
+ *  question mark means he hasn't decided the topic is worth building, no
+ *  matter how build-shaped the body reads. */
+function questionHeadlineReason(headline: string | null): string | null {
+  if (headline === null) return null;
+  const t = headline.trim();
+  if (!/\?+$/.test(t)) return null;
+  return `the block's own headline ends in a question mark ("${t}") — Kevin is still deciding, not asking for work yet`;
+}
+
+/** Kevin's real "narrating, not asking" shape: a block whose opener is a
+ *  status report on what already ran or already started — 'Ran all last
+ *  night, got really far', 'ALready started this, want to get thru it
+ *  today'. A status note must never itself become a hopper card (that is
+ *  exactly the noise that makes him stop trusting the notepad), but this
+ *  rule sits BELOW goal/hopper/workstream in the table on purpose: a block
+ *  that opens with a status line and THEN asks for something ('Ran all
+ *  night, but... Need to audit the current setup...') must still surface the
+ *  real ask, never get silenced by the status line that happens to come
+ *  first. This only wins when nothing else in the whole block matched
+ *  anything more actionable. */
+const CONTEXT_STATUS_RE = /^(ran\b|already\s+\w)/i;
+
+function contextStatusReason(text: string): string | null {
+  for (const s of sentences(text)) {
+    const m = s.match(CONTEXT_STATUS_RE);
+    if (m) return `context/status opener ('${m[0].trim()}') — narrating, not asking`;
+  }
+  return null;
+}
+
 /** Something ongoing, waiting on someone/something else — not a discrete
  *  build JARVIS could just go do. */
 const BALL_IN_AIR_RE = /\b(waiting on|blocked on|following up|follow up with|pending on)\b/i;
@@ -416,6 +493,13 @@ interface BlockRouteRule {
 }
 
 // Same sinks, same priority order, same tie-break semantics as ROUTE_RULES.
+// Node #1066 adds three rows (question-headline, the natural-cue fallback
+// folded into the existing hopper row, and context/status) — every one of
+// them derived from Kevin's own two real days, none of them loosening what
+// was already here: buildShapeReason above still requires verb+artifact on
+// the SAME line exactly as before (B9 in notepad-route-rule-check.mjs proves
+// it), naturalBuildCueReason is a genuinely NEW alternative path to the same
+// 'hopper' sink, tried only when the old one finds nothing.
 const BLOCK_ROUTE_RULES: BlockRouteRule[] = [
   {
     sink: 'thread',
@@ -427,6 +511,10 @@ const BLOCK_ROUTE_RULES: BlockRouteRule[] = [
     match: (block) => firstMemberReason(block, alreadyAnnotatedReason),
   },
   {
+    sink: 'thread',
+    match: (block) => questionHeadlineReason(block.headline),
+  },
+  {
     sink: 'goal_proposal',
     match: (_block, _move, dossier) => dossierGoalReason(dossier),
   },
@@ -436,11 +524,15 @@ const BLOCK_ROUTE_RULES: BlockRouteRule[] = [
   },
   {
     sink: 'hopper',
-    match: (block) => firstMemberReason(block, buildShapeReason),
+    match: (block) => firstMemberReason(block, (text) => buildShapeReason(text) ?? naturalBuildCueReason(text)),
   },
   {
     sink: 'workstream',
     match: (block) => firstMemberReason(block, ballInAirReason),
+  },
+  {
+    sink: 'thread',
+    match: (block) => firstMemberReason(block, contextStatusReason),
   },
 ];
 

@@ -402,7 +402,16 @@ const upsertLineStateStmt = sqliteDb.prepare<[number, NotepadLineState, string, 
     state      = excluded.state,
     hash       = excluded.hash,
     scanned_at = excluded.scanned_at,
-    action_ref = excluded.action_ref,
+    -- COALESCE, never a bare overwrite. An action_ref is a HISTORICAL FACT --
+    -- this thought became that thread / goal node / hopper card -- and a later
+    -- state transition that carries no ref of its own must not erase it.
+    -- Found by #188's verifier: "Mark done" calls markLine(..., null, ...), so a
+    -- bare "= excluded.action_ref" silently NULLed the link for the block Kevin
+    -- had just opened a chat from. The gutter fell back to 'looked at it' and
+    -- the thread became unreachable from the note. Same hazard in
+    -- markLineDismissed/markLineSeen. Nothing legitimately un-becomes its own
+    -- action, so preserving is correct for every state, not just 'done'.
+    action_ref = COALESCE(excluded.action_ref, notepad_line_state.action_ref),
     note       = excluded.note,
     updated_at = excluded.updated_at
 `);
@@ -449,9 +458,13 @@ export function markLineDismissed(lineId: number, note?: string): void {
  * there is nothing left to track: notepad-rollover.ts's carry-forward will
  * not carry it, and it will not resurface via unscannedLines.
  *
- * There is no UI affordance for setting this state yet (node #886) -- it is
- * ledger-only for now, exercised by scripts/notepad-rollover-check.mjs. A UI
- * button is a later node (see docs/notepad/CARRY-FORWARD.md §6).
+ * Set from the gutter menu's `Mark done` (node #188): POST
+ * /notepad/blocks/:blockId/done marks every text-bearing member line of the
+ * block, so the whole topic leaves the standing list. Also exercised by
+ * scripts/notepad-rollover-check.mjs.
+ *
+ * Marking done PRESERVES any existing action_ref (see the UPSERT above) -- a
+ * finished thought still shows what it became.
  */
 export function markLineDone(lineId: number, note?: string): void {
   markLine(lineId, 'done', null, note && note.trim() ? note : null);

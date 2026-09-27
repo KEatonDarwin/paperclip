@@ -375,6 +375,30 @@ const D_DONE_NEXT = '2026-09-14';
   check('done: calling it twice is not an error (idempotent)', again.status === 200);
   check('done: still done after the second call', getNotepadLineState(alphaId)?.state === 'done');
 
+  // #188 VERIFIER GAP 1 -- `Mark done` must not erase what the block BECAME.
+  // Drive the REAL chain: open a chat on this block (writes action_ref
+  // `thread:<ext>` + an `acted` ledger row), THEN mark it done, THEN ask the
+  // STORE whether the link survived. The bug this pins was a bare
+  // `action_ref = excluded.action_ref` in notepad.ts's UPSERT, which NULLed the
+  // ref on every state that carries none -- so a finished topic silently lost
+  // the thread Kevin had just opened from it.
+  {
+    const chat = await httpPost(`/notepad/blocks/${headlineId}/chat`);
+    // 201 on first creation, 200 on reuse -- the route's own documented shape.
+    check('done+ref: chat on the block first -> 200/201', chat.status === 200 || chat.status === 201);
+    const refAfterChat = getNotepadLineState(headlineId)?.action_ref ?? null;
+    check('done+ref: the chat wrote a thread: action_ref', !!refAfterChat && refAfterChat.startsWith('thread:'));
+
+    const reDone = await httpPost(`/notepad/blocks/${headlineId}/done`);
+    check('done+ref: marking done again -> 200', reDone.status === 200);
+    const st = getNotepadLineState(headlineId);
+    check('done+ref: state is done', st?.state === 'done');
+    check(
+      'done+ref: the action_ref SURVIVED being marked done (not NULLed)',
+      st?.action_ref === refAfterChat,
+    );
+  }
+
   const rolled = await httpGet(`/notepad?date=${D_DONE_NEXT}`);
   const rolledTexts = rolled.body.lines.map((l) => l.text);
   check(

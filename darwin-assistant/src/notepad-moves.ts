@@ -159,6 +159,10 @@ function movesMaxPerDaySetting(): number {
  * shape as notepad-gate.ts/jarvis-brief.ts/workbench.ts. Re-asserts the
  * guard defensively at the actual spawn site, same discipline as the gate.
  */
+export function notepadOneShot(prompt: string): Promise<string> {
+  return defaultRunOneShot(prompt);
+}
+
 function defaultRunOneShot(prompt: string): Promise<string> {
   assertModelSpawnAllowed();
   const model = movesModelSetting();

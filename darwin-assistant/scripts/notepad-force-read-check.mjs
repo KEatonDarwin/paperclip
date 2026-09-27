@@ -1,16 +1,22 @@
 #!/usr/bin/env node
-// NOTEPAD FORCE-READ CHECK — exercises src/notepad-force-read.ts
-// (forceNotepadBlockRead) against node #1059's done_means: a forced,
-// block-scoped read that ignores the settle gate and the daily marker
-// budget entirely, makes exactly ONE claude-sonnet-5 one-shot, and never
-// launders a broken pass into silence. Hermetic — scratch DB, JARVIS_SIM=1,
-// no ANTHROPIC_API_KEY, every model call stubbed via the runOneShot seam.
+// NOTEPAD FORCE-READ CHECK — exercises src/notepad-force-read.ts against
+// node #191's done_means, which SUPERSEDED node #1059's: a forced read
+// ALWAYS answers ("read — nothing to add" was a non-answer to a direct
+// question, Kevin 2026-09-27), the full take lands in the block's chat
+// thread as a real assistant message, the one-liner lands on the marker
+// (the hover) with action_ref = thread:<ext>, and a broken model call
+// still writes NOTHING anywhere. Silence no longer exists on this path —
+// it stays a feature of the UNPROMPTED pass only (notepad-speak.ts, #62).
+//
+// Hermetic — scratch DB, JARVIS_SIM=1, no ANTHROPIC_API_KEY, every model
+// call stubbed via the runOneShot seam, zero claude processes.
 //
 //   npm run build && JARVIS_DB_PATH=/tmp/notepad-force-read-check.db JARVIS_SIM=1 node scripts/notepad-force-read-check.mjs
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -33,14 +39,24 @@ for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) fs.rmSync(p, { fo
 
 console.log(`[notepad-force-read-check] DB: ${DB_PATH}`);
 
+function claudeProcessCount() {
+  try {
+    return Number(execSync("pgrep -c -f 'claude.*--output-format json' || true", { encoding: 'utf8' }).trim() || '0');
+  } catch {
+    return 0;
+  }
+}
+const spawnsBefore = claudeProcessCount();
+
 const distDir = path.join(__dirname, '..', 'dist');
-const { putNotepadDay, markLineActed, markLineDismissed, markLineDone, getNotepadLineState } = await import(
-  path.join(distDir, 'notepad.js')
-);
+const { putNotepadDay, getNotepadLineState } = await import(path.join(distDir, 'notepad.js'));
 const { checkNotepadSettle } = await import(path.join(distDir, 'notepad-settle.js'));
-const { getNotepadMarker, listNotepadMarkers } = await import(path.join(distDir, 'notepad-markers.js'));
-const { setSetting } = await import(path.join(distDir, 'conversation-db.js'));
-const { forceNotepadBlockRead } = await import(path.join(distDir, 'notepad-force-read.js'));
+const { getNotepadMarker, dismissNotepadMarker, reconcileNotepadMarker } = await import(
+  path.join(distDir, 'notepad-markers.js'),
+);
+const { getConversation, getTurns } = await import(path.join(distDir, 'conversation-db.js'));
+const { forceNotepadBlockRead, parseForcedTake } = await import(path.join(distDir, 'notepad-force-read.js'));
+const { notepadHandoffThreadExt } = await import(path.join(distDir, 'notepad-handoff.js'));
 
 let failed = false;
 function check(label, ok) {
@@ -68,185 +84,124 @@ function countingStub(impl) {
   return fn;
 }
 
-// ── (1) UNSETTLED DAY STILL RUNS -- the settle gate is bypassed entirely ────
+const GOOD = JSON.stringify({
+  kind: 'take_it',
+  take: 'This could work, with a few caveats:\n\n- caveat one\n- caveat two\n\nNext step: prototype the router split.',
+  one_liner: 'Workable with two caveats — start by prototyping the router split.',
+});
+
+// ── (1) THE HEADLINE CONTRACT: a forced read ALWAYS answers ────────────────
+// Unsettled day (settle gate bypassed), stub returns a valid take: the
+// outcome is 'answered', the take is IN the thread, the one-liner is ON the
+// marker, and the marker links to the thread. Asserted by asking the STORES
+// (conversation-db + marker store + ledger), never by trusting the result.
 const D1 = '2026-09-01';
 {
-  const saved = putNotepadDay(D1, ['Topic one', '  - child one'].join('\n'));
-  const headlineId = lineIdByText(saved, 'Topic one');
+  const saved = putNotepadDay(D1, ['Jarvis Harness idea', '  - split into a stable of agents'].join('\n'));
+  const headlineId = lineIdByText(saved, 'Jarvis Harness idea');
 
-  // A fresh write is NOT settled (elapsed time since the write is ~0s,
-  // nowhere near notepad_settle_seconds) -- checkNotepadSettle proves it.
-  const settle = checkNotepadSettle(D1);
-  check('(1) precondition: the day is genuinely unsettled', settle === null);
+  check('(1) precondition: the day is genuinely unsettled', checkNotepadSettle(D1) === null);
 
-  const stub = countingStub(async () => JSON.stringify({ moves: [{ block_id: headlineId, kind: 'take_it', reason: 'JARVIS can take this' }] }));
-  const result = await forceNotepadBlockRead(D1, headlineId, { runOneShot: stub });
+  const stub = countingStub(() => GOOD);
+  const r = await forceNotepadBlockRead(D1, headlineId, { runOneShot: stub });
 
-  check('(1) THE FIX: a forced read on an unsettled day still runs', result.outcome === 'move');
-  check('(1) exactly one one-shot was issued', stub.calls() === 1);
-  check('(1) block_id echoes the target', result.block_id === headlineId);
-  check('(1) a marker was returned', result.marker?.line_id === headlineId && result.marker?.kind === 'take_it');
+  check('(1) outcome is answered — never silent', r.outcome === 'answered');
+  check('(1) exactly ONE one-shot was made', stub.calls() === 1);
+
+  const ext = notepadHandoffThreadExt(headlineId);
+  check('(1) result names the deterministic per-line thread ext', r.thread_ext === ext);
+  const conv = getConversation(ext);
+  check('(1) THE CHAT EXISTS — asked the conversation store, not the result', !!conv);
+  const turns = conv ? getTurns(conv.id) : [];
+  check('(1) thread holds the action record + the take (2 turns)', turns.length === 2);
+  check('(1) turn 1 is the visible [Read & respond] action record', turns[0]?.role === 'user' && /\[Read & respond\]/.test(turns[0]?.content ?? ''));
+  check('(1) turn 2 is the ASSISTANT take, verbatim', turns[1]?.role === 'assistant' && /caveat one/.test(turns[1]?.content ?? ''));
+
+  const marker = getNotepadMarker(headlineId);
+  check('(1) THE HOVER: marker reason is the one-liner', marker?.reason === 'Workable with two caveats — start by prototyping the router split.');
+  check('(1) THE LINK: marker action_ref is thread:<ext> (canonical prefix)', marker?.action_ref === `thread:${ext}`);
+  check('(1) marker is ACTIVE, kind carried from the model', marker?.dismissed === false && marker?.kind === 'take_it');
+  check('(1) ledger: headline is acted + linked', getNotepadLineState(headlineId)?.state === 'acted' && getNotepadLineState(headlineId)?.action_ref === `thread:${ext}`);
 }
 
-// ── (2) BUDGET-EXHAUSTED DAY STILL RUNS -- the daily cap never blocks a
-//        forced call, even when the day already has markers at the
-//        configured (very low) max ──────────────────────────────────────────
-const D2 = '2026-09-02';
+// ── (2) SECOND READ, SAME BLOCK: same thread, appended, never a duplicate ──
 {
-  const saved = putNotepadDay(D2, ['Topic A', '  - a1', 'Topic B', '  - b1'].join('\n'));
-  const aId = lineIdByText(saved, 'Topic A');
-  const bId = lineIdByText(saved, 'Topic B');
+  const saved = putNotepadDay(D1, ['Jarvis Harness idea', '  - split into a stable of agents'].join('\n'));
+  const headlineId = lineIdByText(saved, 'Jarvis Harness idea');
+  const r2 = await forceNotepadBlockRead(D1, headlineId, { runOneShot: countingStub(() => GOOD) });
+  check('(2) reuses the SAME thread (created:false)', r2.outcome === 'answered' && r2.thread_created === false);
+  const turns = getTurns(getConversation(notepadHandoffThreadExt(headlineId)).id);
+  check('(2) turns appended (4 total), no second conversation', turns.length === 4);
+}
 
-  setSetting('notepad_moves_max_per_day', '1');
-  try {
-    // Fill the "budget" with one real marker, via a forced read of block A.
-    const stubA = countingStub(async () => JSON.stringify({ moves: [{ block_id: aId, kind: 'take_it', reason: 'take A' }] }));
-    await forceNotepadBlockRead(D2, aId, { runOneShot: stubA });
-    check('(2) precondition: the day is now at the configured max (1 marker)', listNotepadMarkers(D2).length === 1);
+// ── (3) FORCED OVERRIDES DISMISSAL: his click today outranks yesterday's ✕ ─
+// The unprompted pass must NEVER resurrect a dismissed marker (#104). A
+// forced read is Kevin explicitly re-asking — it must.
+const D3 = '2026-09-03';
+{
+  const saved = putNotepadDay(D3, ['Dismissed topic', '  - detail line'].join('\n'));
+  const headlineId = lineIdByText(saved, 'Dismissed topic');
 
-    // A forced read on a DIFFERENT block must still run and still persist.
-    const stubB = countingStub(async () => JSON.stringify({ moves: [{ block_id: bId, kind: 'question', reason: 'needs Kevin' }] }));
-    const result = await forceNotepadBlockRead(D2, bId, { runOneShot: stubB });
+  reconcileNotepadMarker(headlineId, { kind: 'context', reason: 'first pass reason' });
+  dismissNotepadMarker(headlineId);
+  check('(3) precondition: marker is dismissed', getNotepadMarker(headlineId)?.dismissed === true);
 
-    check('(2) THE FIX: a forced read still runs once the day is at max_per_day', result.outcome === 'move');
-    check('(2) exactly one one-shot was issued for the forced block', stubB.calls() === 1);
-    check('(2) THE FIX: the budget did not block the second marker from persisting', listNotepadMarkers(D2).length === 2);
-  } finally {
-    setSetting('notepad_moves_max_per_day', '5');
+  // Control: the UNPROMPTED path (reconcile without forced) stays quiet on
+  // the same text — proves the forced flag is doing the work, not a hole in
+  // #104's memory.
+  const still = reconcileNotepadMarker(headlineId, { kind: 'context', reason: 'unprompted retry' });
+  check('(3) control: an unprompted reconcile does NOT resurrect it', still.dismissed === true);
+
+  const r = await forceNotepadBlockRead(D3, headlineId, { runOneShot: countingStub(() => GOOD) });
+  const marker = getNotepadMarker(headlineId);
+  check('(3) THE OVERRIDE: forced read answers on a dismissed block', r.outcome === 'answered');
+  check('(3) marker is ACTIVE again with the fresh one-liner', marker?.dismissed === false && /Workable with two caveats/.test(marker?.reason ?? ''));
+}
+
+// ── (4) FALLBACK WRITES NOTHING — thrown call and garbage JSON alike ───────
+const D4 = '2026-09-04';
+{
+  const saved = putNotepadDay(D4, ['Broken read topic', '  - child'].join('\n'));
+  const headlineId = lineIdByText(saved, 'Broken read topic');
+  const ext = notepadHandoffThreadExt(headlineId);
+
+  for (const [label, impl] of [
+    ['thrown call', () => { throw new Error('model exploded'); }],
+    ['garbage output', () => 'sorry, as an AI I cannot produce JSON today'],
+    ['JSON missing take', () => JSON.stringify({ kind: 'context', one_liner: 'no take field' })],
+  ]) {
+    const r = await forceNotepadBlockRead(D4, headlineId, { runOneShot: countingStub(impl) });
+    check(`(4) ${label} -> outcome fallback`, r.outcome === 'fallback');
+    check(`(4) ${label} -> NO thread created`, getConversation(ext) === undefined);
+    check(`(4) ${label} -> NO marker written`, getNotepadMarker(headlineId) === undefined);
+    check(`(4) ${label} -> NO ledger row`, getNotepadLineState(headlineId) === undefined);
   }
 }
 
-// ── (3) A MOVE PERSISTS EXACTLY ONE MARKER, ON THE HEADLINE LINE ───────────
-const D3 = '2026-09-03';
+// ── (5) parseForcedTake edges ──────────────────────────────────────────────
 {
-  const saved = putNotepadDay(D3, ['Topic Three', '  - three child one', '  - three child two'].join('\n'));
-  const headlineId = lineIdByText(saved, 'Topic Three');
-  const childId = lineIdByText(saved, '  - three child one');
-
-  const stub = countingStub(async () => JSON.stringify({ moves: [{ block_id: headlineId, kind: 'context', reason: 'here is context' }] }));
-  const result = await forceNotepadBlockRead(D3, headlineId, { runOneShot: stub });
-
-  check('(3) outcome is move', result.outcome === 'move');
-  check('(3) exactly one marker exists for the whole day', listNotepadMarkers(D3).length === 1);
-  check('(3) the marker lives on the HEADLINE line id, not a child', getNotepadMarker(headlineId)?.line_id === headlineId);
-  check('(3) a move outcome does not also stamp member lines seen', getNotepadLineState(childId) === undefined);
+  const fenced = parseForcedTake('```json\n' + GOOD + '\n```');
+  check('(5) tolerates code fences', fenced?.one_liner.startsWith('Workable'));
+  const noLiner = parseForcedTake(JSON.stringify({ kind: 'question', take: 'Line one of the take\nMore detail' }));
+  check('(5) missing one_liner degrades to the take’s first line — never to silence', noLiner?.one_liner === 'Line one of the take');
+  const badKind = parseForcedTake(JSON.stringify({ kind: 'banana', take: 'A take', one_liner: 'x' }));
+  check('(5) unknown kind degrades to context, still answers', badKind?.kind === 'context');
+  check('(5) pure garbage -> null (caller treats as fallback)', parseForcedTake('not json at all') === null);
 }
 
-// ── (4) A SILENT OUTCOME WRITES SEEN ON MEMBER LINES AND NO MARKER ─────────
-const D4 = '2026-09-04';
+// ── (6) unknown block id throws (route turns it into a 404) ────────────────
 {
-  const saved = putNotepadDay(D4, ['Topic Silent', '  - silent child one', '  - silent child two'].join('\n'));
-  const headlineId = lineIdByText(saved, 'Topic Silent');
-  const child1 = lineIdByText(saved, '  - silent child one');
-  const child2 = lineIdByText(saved, '  - silent child two');
-
-  const stub = countingStub(async () => JSON.stringify({ moves: [] }));
-  const result = await forceNotepadBlockRead(D4, headlineId, { runOneShot: stub });
-
-  check('(4) outcome is silent', result.outcome === 'silent');
-  check('(4) exactly one one-shot was issued', stub.calls() === 1);
-  check('(4) no marker was created', getNotepadMarker(headlineId) === undefined);
-  check('(4) the headline itself was marked seen', getNotepadLineState(headlineId)?.state === 'seen');
-  check('(4) member line one was marked seen', getNotepadLineState(child1)?.state === 'seen');
-  check('(4) member line two was marked seen', getNotepadLineState(child2)?.state === 'seen');
+  let threw = false;
+  try {
+    await forceNotepadBlockRead(D1, 999999999, { runOneShot: countingStub(() => GOOD) });
+  } catch {
+    threw = true;
+  }
+  check('(6) unknown block id throws — no silent no-op', threw);
 }
 
-// ── (5) A SILENT OUTCOME NEVER DOWNGRADES A TERMINAL LEDGER STATE ──────────
-// Mutation-tested by hand while building this check: removing the
-// `prior.action_ref || state === 'dismissed' || state === 'done'` guard in
-// src/notepad-force-read.ts made every assertion in this block fail (every
-// member line came back 'seen'), confirming the assertions actually bite.
-const D5 = '2026-09-05';
-{
-  const saved = putNotepadDay(
-    D5,
-    ['Topic Guard', '  - guard dismissed child', '  - guard done child', '  - guard acted child', '  - guard plain child'].join('\n'),
-  );
-  const headlineId = lineIdByText(saved, 'Topic Guard');
-  const dismissedChildId = lineIdByText(saved, '  - guard dismissed child');
-  const doneChildId = lineIdByText(saved, '  - guard done child');
-  const actedChildId = lineIdByText(saved, '  - guard acted child');
-  const plainChildId = lineIdByText(saved, '  - guard plain child');
-
-  markLineDismissed(dismissedChildId);
-  markLineDone(doneChildId);
-  markLineActed(actedChildId, 'cockpit:thread-force-read-test');
-
-  const stub = countingStub(async () => JSON.stringify({ moves: [] }));
-  const result = await forceNotepadBlockRead(D5, headlineId, { runOneShot: stub });
-
-  check('(5) outcome is silent', result.outcome === 'silent');
-  check('(5) THE GUARD: a dismissed member line stays dismissed', getNotepadLineState(dismissedChildId)?.state === 'dismissed');
-  check('(5) THE GUARD: a done member line stays done', getNotepadLineState(doneChildId)?.state === 'done');
-  check(
-    '(5) THE GUARD: an acted member line keeps its action_ref, not downgraded to seen',
-    getNotepadLineState(actedChildId)?.state === 'acted' && getNotepadLineState(actedChildId)?.action_ref === 'cockpit:thread-force-read-test',
-  );
-  check('(5) an untouched plain member line DOES get marked seen', getNotepadLineState(plainChildId)?.state === 'seen');
-  check('(5) the never-touched headline also gets marked seen', getNotepadLineState(headlineId)?.state === 'seen');
-}
-
-// ── (6) A FALLBACK OUTCOME WRITES NOTHING AT ALL ───────────────────────────
-const D6 = '2026-09-06';
-{
-  const saved = putNotepadDay(D6, ['Topic Fallback', '  - fallback child'].join('\n'));
-  const headlineId = lineIdByText(saved, 'Topic Fallback');
-  const childId = lineIdByText(saved, '  - fallback child');
-
-  const stub = countingStub(async () => {
-    throw new Error('simulated moves-model failure');
-  });
-  const result = await forceNotepadBlockRead(D6, headlineId, { runOneShot: stub, timeoutMs: 2000 });
-
-  check('(6) outcome is fallback', result.outcome === 'fallback');
-  check('(6) exactly one one-shot was attempted', stub.calls() === 1);
-  check('(6) marker is null', result.marker === null);
-  check('(6) THE GUARANTEE: no ledger row was written for the headline', getNotepadLineState(headlineId) === undefined);
-  check('(6) THE GUARANTEE: no ledger row was written for the child', getNotepadLineState(childId) === undefined);
-  check('(6) THE GUARANTEE: no marker was created', getNotepadMarker(headlineId) === undefined);
-}
-
-// ── (6b) A TIMEOUT ALSO RESOLVES TO FALLBACK, NOT A HANG OR A GUESS ────────
-const D6B = '2026-09-07';
-{
-  const saved = putNotepadDay(D6B, ['Topic Timeout', '  - timeout child'].join('\n'));
-  const headlineId = lineIdByText(saved, 'Topic Timeout');
-
-  const neverResolves = countingStub(() => new Promise(() => {}));
-  const result = await forceNotepadBlockRead(D6B, headlineId, { runOneShot: neverResolves, timeoutMs: 200 });
-
-  check('(6b) a timed-out call also resolves to fallback', result.outcome === 'fallback');
-  check('(6b) nothing was written on timeout either', getNotepadLineState(headlineId) === undefined);
-}
-
-// ── (7) JUDGEMENT IS SCOPED TO THE ONE BLOCK, EVEN WITH ANOTHER GENUINELY-
-//        SURFACED BLOCK ON THE SAME DAY ────────────────────────────────────
-const D7 = '2026-09-08';
-{
-  const saved = putNotepadDay(D7, ['Topic One', '  - one child', 'Topic Two', '  - two child'].join('\n'));
-  const idOne = lineIdByText(saved, 'Topic One');
-  const idTwo = lineIdByText(saved, 'Topic Two');
-
-  let capturedPrompt = null;
-  const stub = countingStub(async (prompt) => {
-    capturedPrompt = prompt;
-    return JSON.stringify({ moves: [] });
-  });
-  await forceNotepadBlockRead(D7, idOne, { runOneShot: stub });
-
-  const candidateLines = [...capturedPrompt.matchAll(/^- block (\d+):/gm)].map((m) => Number(m[1]));
-  check('(7) exactly one candidate block was put in front of the model', candidateLines.length === 1);
-  check('(7) it is the requested block, not the other one', candidateLines[0] === idOne && !candidateLines.includes(idTwo));
-}
-
-// ── (8) UNKNOWN BLOCK ID THROWS -- NO SILENT NO-OP ─────────────────────────
-{
-  await assert.rejects(
-    () => forceNotepadBlockRead(D7, 999999999, { runOneShot: async () => JSON.stringify({ moves: [] }) }),
-    /not found/,
-  );
-  check('(8) an unknown block id throws rather than silently no-opping', true);
-}
+// ── (7) zero net new claude processes across the whole run ─────────────────
+check(`(7) no net new claude processes (before=${spawnsBefore}, after=${claudeProcessCount()})`, claudeProcessCount() <= spawnsBefore);
 
 console.log(failed ? '\nFAILED' : '\nALL PASS');
 process.exit(failed ? 1 : 0);

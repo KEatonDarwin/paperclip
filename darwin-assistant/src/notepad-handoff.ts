@@ -39,7 +39,7 @@ const MARKER_KIND_LABEL: Record<NotepadMarkerKind, string> = {
  */
 export function buildNotepadHandoffPrompt(
   line: Pick<NotepadLine, 'text'>,
-  marker: Pick<NotepadMarker, 'kind' | 'reason'>,
+  marker: Pick<NotepadMarker, 'kind' | 'reason'> | null,
   dossier: TopicDossier,
   block?: DossierBlockInput | null,
 ): string {
@@ -53,11 +53,17 @@ export function buildNotepadHandoffPrompt(
         block.lines.map((l) => `[line_id ${l.line_id}] ${l.text}`).join('\n'),
       ]
     : [`The line: ${JSON.stringify(line.text)}`];
+  // Node #1060 — a block opened straight from its headline (no marker click)
+  // has no JARVIS judgement to report. Say that plainly rather than inventing
+  // a move kind that was never decided.
+  const opening = marker
+    ? 'Kevin clicked a marker on this notepad line — this chat exists to act on it, not to ask him what he meant.'
+    : 'Kevin opened this notepad topic himself, directly — there is no JARVIS judgement on it yet. This chat exists to work on it, not to ask him what he meant.';
   return [
-    "Kevin clicked a marker on this notepad line — this chat exists to act on it, not to ask him what he meant.",
+    opening,
     '',
     ...subject,
-    `${MARKER_KIND_LABEL[marker.kind] ?? marker.kind} — ${marker.reason}`,
+    ...(marker ? [`${MARKER_KIND_LABEL[marker.kind] ?? marker.kind} — ${marker.reason}`] : []),
     '',
     dossier.rendered,
     '',
@@ -98,6 +104,12 @@ export interface OpenNotepadHandoffOptions {
    *  scratch JARVIS_DB_PATH it no-ops instead of spawning a model, so even
    *  the unstubbed default is safe to exercise in a route check. */
   postMessage?: (text: string, externalId: string, messageId?: string) => Promise<string>;
+  /** Node #1060 — allow opening the handoff chat for a line/block with NO
+   *  marker at all (Kevin opened the topic himself; there is nothing JARVIS
+   *  proposed to click). Default false preserves node #869's original
+   *  contract for the marker-click route (POST /notepad/markers/:lineId/open),
+   *  which must keep 404ing on a markerless line. */
+  allowMarkerless?: boolean;
 }
 
 /**
@@ -123,8 +135,8 @@ export async function openNotepadHandoff(
   lineId: number,
   opts: OpenNotepadHandoffOptions = {},
 ): Promise<OpenNotepadHandoffResult> {
-  const marker = getNotepadMarker(lineId);
-  if (!marker) throw new Error(`no notepad marker on line ${lineId}`);
+  const marker = getNotepadMarker(lineId) ?? null;
+  if (!marker && !opts.allowMarkerless) throw new Error(`no notepad marker on line ${lineId}`);
   const line = getNotepadLine(lineId);
   if (!line) throw new Error(`notepad line ${lineId} not found`);
 
@@ -151,7 +163,12 @@ export async function openNotepadHandoff(
   // the conversation existed and opened fine. Same string, one prefix, two nodes
   // that never met.
   const actionRef = `thread:${externalId}`;
-  setNotepadMarkerActionRef(lineId, actionRef);
+  // A markerless open has no marker row to hang the ref on -- the per-line
+  // ledger write below is the only place it shows up (spec: "still write the
+  // per-line acted ledger row so the block shows it went somewhere").
+  if (marker) {
+    setNotepadMarkerActionRef(lineId, actionRef);
+  }
   markLineActed(lineId, actionRef);
 
   const post = opts.postMessage ?? processMessage;

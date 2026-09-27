@@ -72,12 +72,14 @@ import {
   markLineSeen,
   markLineActed,
   markLineDismissed,
+  markLineDone,
   type NotepadLineState,
 } from '../notepad.js';
 import { openNotepadDay } from '../notepad-rollover.js';
 import { activeNotepadMarkers, dismissNotepadMarker, getNotepadMarker } from '../notepad-markers.js';
 import { openNotepadHandoff } from '../notepad-handoff.js';
-import { parseNotepadBlocks, notepadBlockId } from '../notepad-blocks.js';
+import { forceNotepadBlockRead } from '../notepad-force-read.js';
+import { parseNotepadBlocks, notepadBlockId, type NotepadBlock } from '../notepad-blocks.js';
 import { notepadBlockStates } from '../notepad-block-state.js';
 import { listNotepadActedActions } from '../notepad-action-resolver.js';
 import {
@@ -1877,6 +1879,108 @@ export function createApiV1Router(): Router {
         const message = err instanceof Error ? err.message : String(err);
         sendError(res, 500, 'notepad_handoff_failed', message);
       });
+  });
+
+  /**
+   * Node #1060 — resolve a BLOCK id (always one of the block's own member
+   * line ids: the headline's, or the first member's when there's no
+   * headline, per notepadBlockId/docs/notepad/BLOCKS.md) to the day + block
+   * it currently names. Null when blockId doesn't exist at all, or exists
+   * but isn't itself the block's own anchor id right now (e.g. a child
+   * line's id, or a stale id from before an edit re-shaped the block) — both
+   * cases are "unknown block" from the caller's point of view. Shared 404
+   * gate for the three block-action routes below.
+   */
+  function resolveNotepadBlockAnchor(blockId: number): { day: string; block: NotepadBlock } | null {
+    const day = getNotepadLineDay(blockId);
+    if (!day) return null;
+    const { lines } = getNotepadDay(day);
+    const block = parseNotepadBlocks(lines).find((b) => notepadBlockId(b) === blockId);
+    if (!block) return null;
+    return { day, block };
+  }
+
+  // Force JARVIS to read+judge ONE block right now, bypassing the settle
+  // gate and the daily noise budget entirely (node #1059's
+  // forceNotepadBlockRead — Kevin clicking this IS the trigger). Can
+  // legitimately take minutes (a real sonnet one-shot) — no route timeout is
+  // added on top of it. Returns the refreshed day payload (the established
+  // convention for every notepad mutation route) plus the outcome of this
+  // one read.
+  router.post('/notepad/blocks/:blockId/read', (req: AuthedRequest, res) => {
+    const blockId = Number(req.params.blockId);
+    if (!Number.isInteger(blockId) || blockId <= 0) {
+      sendError(res, 400, 'invalid_block_id', 'blockId must be a positive integer');
+      return;
+    }
+    const resolved = resolveNotepadBlockAnchor(blockId);
+    if (!resolved) {
+      sendError(res, 404, 'block_not_found', `no notepad block with id '${blockId}'`);
+      return;
+    }
+    forceNotepadBlockRead(resolved.day, blockId)
+      .then((result) => {
+        res.json({ ...notepadDayWithMarkers(resolved.day), read: { outcome: result.outcome, marker: result.marker } });
+      })
+      .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        sendError(res, 500, 'notepad_force_read_failed', message);
+      });
+  });
+
+  // Node #1060 — the #108 handoff, opened straight from a block's headline,
+  // no marker required. A block with no marker gets a seed prompt that says
+  // plainly there is no JARVIS judgement on it (never invents a move kind).
+  // Same find-or-create thread, same dossier priming, same canonical
+  // `thread:<ext>` action_ref as the marker-click route above; where there's
+  // no marker to hang that ref on, the per-line ledger write alone records
+  // that the block went somewhere.
+  router.post('/notepad/blocks/:blockId/chat', (req: AuthedRequest, res) => {
+    const blockId = Number(req.params.blockId);
+    if (!Number.isInteger(blockId) || blockId <= 0) {
+      sendError(res, 400, 'invalid_block_id', 'blockId must be a positive integer');
+      return;
+    }
+    const resolved = resolveNotepadBlockAnchor(blockId);
+    if (!resolved) {
+      sendError(res, 404, 'block_not_found', `no notepad block with id '${blockId}'`);
+      return;
+    }
+    openNotepadHandoff(blockId, { block: notepadBlockForLine(blockId), allowMarkerless: true })
+      .then((result) => {
+        res.status(result.created ? 201 : 200).json({ ...notepadDayWithMarkers(resolved.day), chat: result });
+      })
+      .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        sendError(res, 500, 'notepad_handoff_failed', message);
+      });
+  });
+
+  // Node #1060 — CARRY-FORWARD.md §6's missing button: mark every
+  // text-bearing member line of a block `done` in one shot, so
+  // notepad-rollover.ts leaves the whole topic behind tomorrow (its
+  // carry-forward loop already skips 'done'/'dismissed' lines — this is the
+  // only route that reaches 'done'). Idempotent: a line already `done` is
+  // just re-written `done`.
+  router.post('/notepad/blocks/:blockId/done', (req: AuthedRequest, res) => {
+    const blockId = Number(req.params.blockId);
+    if (!Number.isInteger(blockId) || blockId <= 0) {
+      sendError(res, 400, 'invalid_block_id', 'blockId must be a positive integer');
+      return;
+    }
+    const resolved = resolveNotepadBlockAnchor(blockId);
+    if (!resolved) {
+      sendError(res, 404, 'block_not_found', `no notepad block with id '${blockId}'`);
+      return;
+    }
+    const { lines } = getNotepadDay(resolved.day);
+    const textById = new Map(lines.map((l) => [l.id, l.text]));
+    for (const lineId of resolved.block.member_line_ids) {
+      const text = textById.get(lineId);
+      if (text === undefined || !text.trim()) continue; // blank line -- nothing to close
+      markLineDone(lineId);
+    }
+    res.json(notepadDayWithMarkers(resolved.day));
   });
 
   const NOTEPAD_LINE_STATES: NotepadLineState[] = ['seen', 'acted', 'dismissed'];

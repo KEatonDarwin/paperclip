@@ -904,6 +904,56 @@ await check('NS-25', '§12.12: a locked row keeps its ABSOLUTE position when an 
   assert.equal(inserted.join(','), '3,4', `inserted rows landed at ${inserted.join(',')}, expected 3,4`);
 });
 
+// F2 (premature-check incident, outbox/shifts/premature-check-incident-2026-09-27.md
+// §F2) — the goal-8/shift-#9 shape: a parent forced into `check` with no
+// verdict of its own while its machine children still sit open. Before the
+// fix this yielded an instant-fail verify and silently dropped the children;
+// after it, no verify for the parent and the open children get planned.
+await check('NS-26', 'F2: a verdict-less check parent with open machine children never gets an instant-fail verify — its open children get planned instead', async () => {
+  const g8 = await mkGoal('Sim goal eight — premature check shape', 'the PerClickity-matrix family lands');
+  const g8Parent = await mkNode(g8, 'Family #120 (parent)');
+  const g8Child1 = await mkNode(g8, 'child leaf 1 (open)', { parent_id: g8Parent, leaf_kind: 'machine' });
+  const g8Child2 = await mkNode(g8, 'child leaf 2 (open)', { parent_id: g8Parent, leaf_kind: 'machine' });
+  await acceptNode(g8, g8Child1);
+  await acceptNode(g8, g8Child2);
+  // Simulate the incident data shape directly (F1 blocks this transition
+  // going forward; this reproduces a state that could already exist, and
+  // proves the planner no longer trusts it blindly).
+  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'check' WHERE id = ?`).run(g8Parent);
+
+  const planned = await post('/night/plan', { mode: 'until_stop', goal_ids: [g8], config: { lanes: 2 } });
+  assert.equal(planned.status, 200, JSON.stringify(planned.json));
+  const runId = planned.json.run.id;
+  const items = itemsOf(runId);
+  assert.equal(items.find((i) => i.node_id === g8Parent && i.kind === 'verify'), undefined,
+    'F2 regression: a verdict-less check parent with open children emitted an instant-fail verify');
+  const childKinds = [g8Child1, g8Child2].map((id) => items.find((i) => i.node_id === id)?.kind);
+  assert.equal(childKinds.filter((k) => k === 'plan').length, 2, `expected both open children planned, got kinds ${JSON.stringify(childKinds)}`);
+  await post(`/night/runs/${runId}/stop`, {});
+});
+
+await check('NS-27', 'F2: a check node WITH its own verdict still yields a normal verify (unchanged); a true check leaf with no verdict still gets a verify, flagged needs_evidence', async () => {
+  const g9 = await mkGoal('Sim goal nine — verdict leaf', 'a check node with a verdict of its own still verifies');
+  const g9Leaf = await mkNode(g9, 'leaf with its own verdict', { leaf_kind: 'machine' });
+  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'check', autopilot_verdict = ? WHERE id = ?`)
+    .run(JSON.stringify({ verdict: 'PASS', evidence: 'looks good', gaps: [], tree_id: 'sim-tree', at: new Date().toISOString() }), g9Leaf);
+
+  const g10 = await mkGoal('Sim goal ten — verdict-less leaf', 'a true check leaf with no verdict still gets a verify, not silently dropped');
+  const g10Leaf = await mkNode(g10, 'true leaf, no verdict, no children');
+  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'check' WHERE id = ?`).run(g10Leaf);
+
+  const planned = await post('/night/plan', { mode: 'until_stop', goal_ids: [g9, g10], config: { lanes: 2 } });
+  assert.equal(planned.status, 200, JSON.stringify(planned.json));
+  const runId = planned.json.run.id;
+  const items = itemsOf(runId);
+  const verdictLeafItem = items.find((i) => i.node_id === g9Leaf);
+  assert.ok(verdictLeafItem && verdictLeafItem.kind === 'verify', 'a check node with its own verdict must still yield a verify item');
+  const noVerdictLeafItem = items.find((i) => i.node_id === g10Leaf);
+  assert.ok(noVerdictLeafItem && noVerdictLeafItem.kind === 'verify', 'a true check leaf with no verdict must still get a verify item, not be silently dropped');
+  assert.match(noVerdictLeafItem.why, /needs_evidence/, 'the verdict-less leaf verify should be flagged needs_evidence');
+  await post(`/night/runs/${runId}/stop`, {});
+});
+
 } catch (err) {
   console.error('\n[night-sim] FATAL', err);
   results.push({ id: 'FATAL', description: 'sim crashed', pass: false, error: String(err?.stack ?? err) });

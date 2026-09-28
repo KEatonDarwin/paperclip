@@ -676,6 +676,22 @@ function elapsedMinutes(iso: string | null | undefined, at: number): number {
   return Math.max(0, Math.round((at - ms) / 60_000));
 }
 
+/** F2 (premature-check incident, outbox/shifts/premature-check-incident-2026-09-27.md
+ *  §F2) — mirrors goals.ts's isPrematureCheck() off the in-memory tree index
+ *  the planner already has: true when `n` has at least one descendant that
+ *  isn't done/parked/discarded. Used to keep the planner from treating a
+ *  verdict-less `check` parent as a leaf while its real work sits open and
+ *  invisible underneath it (goal-8's shift #9 death spiral). */
+function hasOpenDescendants(ix: TreeIndex, n: GoalNodeRow): boolean {
+  const stack = [...(ix.childrenOf.get(n.id) ?? [])];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    if (cur.state !== 'done' && cur.state !== 'parked' && cur.state !== 'discarded') return true;
+    for (const child of ix.childrenOf.get(cur.id) ?? []) stack.push(child);
+  }
+  return false;
+}
+
 /** §3.1 — one goal's predicted action stream, in DFS order, with a MUTABLE
  *  simulated-settled set so later siblings see earlier emissions as settled. */
 function simulateGoal(
@@ -746,7 +762,19 @@ function simulateGoal(
     }
     // 3 — a tree that landed: verify it (server action).
     if (n.state === 'check') {
-      push(n, 'verify', cfg.est.verify, n.title, 'node is in `check`');
+      if (n.autopilot_verdict != null) {
+        push(n, 'verify', cfg.est.verify, n.title, 'node is in `check`');
+        return;
+      }
+      // F2 (premature-check incident) — no verdict of its own. NEVER emit an
+      // instant-fail verify for this: if it still has open machine
+      // descendants, plan those instead (this DFS loop visits them on their
+      // own turn right below — no item here just means "no item AT THIS
+      // NODE", exactly like rule 11's parent-with-children case). Only a true
+      // leaf (nothing open underneath) gets a verify, flagged needs_evidence
+      // so its failure message points at reopen-or-run instead of a dead end.
+      if (hasOpenDescendants(ix, n)) return;
+      push(n, 'verify', cfg.est.verify, n.title, 'needs_evidence: check leaf has no verdict of its own — reopen or run it');
       return;
     }
     // 4 — plan approved, plant failed: replant (server action).
@@ -1361,7 +1389,7 @@ export function addNightItem(runId: number, goalId: number, nodeId: number, afte
   const node = tree?.nodes.find((n) => n.id === nodeId);
   if (!tree || !node) throw new NightError(404, 'goal_node_not_found', 'goal node not found');
   const cfg = run.config;
-  const kind = deriveKind(node, cfg);
+  const kind = deriveKind(node, cfg, tree);
   if (!kind) throw new NightError(409, 'night_item_not_schedulable', `node #${nodeId} is ${node.state}/${node.leaf_kind} — nothing to schedule`);
   const est = estimateFor(kind, cfg, node);
   const [row] = insertAfter(run, afterItemId ?? null, [{
@@ -1372,10 +1400,17 @@ export function addNightItem(runId: number, goalId: number, nodeId: number, afte
   return row;
 }
 
-function deriveKind(node: GoalNodeRow, cfg: NightRunConfig): NightItemKind | null {
+function deriveKind(node: GoalNodeRow, cfg: NightRunConfig, tree?: GoalTree | null): NightItemKind | null {
   if (node.state === 'working' && node.tree_status_cache === 'blocked') return 'unblock';
   if (node.state === 'working') return 'finish';
-  if (node.state === 'check') return 'verify';
+  if (node.state === 'check') {
+    if (node.autopilot_verdict != null) return 'verify';
+    // F2 (premature-check incident) — same rule as simulateGoal's rule 3: a
+    // verdict-less check node with open descendants is not schedulable as a
+    // verify (that's the instant-fail); schedule its open children instead.
+    if (tree && hasOpenDescendants(indexTree(tree.nodes), node)) return null;
+    return 'verify';
+  }
   if (node.state === 'planned') return 'replant';
   if (node.review_state === 'awaiting_jarvis') return 'weigh_in';
   if (node.state === 'set' && node.leaf_kind === 'machine' && node.plan_state === 'none') {
@@ -2110,7 +2145,7 @@ function expandPredicted(run: NightRunRow, decomposeItem: NightItemRow): void {
   const children = tree.nodes.filter((n) => n.parent_id === parent.id && n.state !== 'discarded');
   const specs: InsertSpec[] = [];
   for (const c of children) {
-    const kind = deriveKind(c, cfg);
+    const kind = deriveKind(c, cfg, tree);
     if (!kind) continue;
     specs.push({
       goal_id: decomposeItem.goal_id, node_id: c.id, kind, title: c.title,
@@ -2365,7 +2400,12 @@ function runServerItem(run: NightRunRow, item: NightItemRow, trees: Map<number, 
     finishItem(run, fresh, 'done', 'every child verified');
     return;
   }
-  finishItem(run, fresh, 'failed', 'check node has no machine verdict — needs a human read');
+  // F2 (premature-check incident) — simulateGoal/deriveKind now refuse to
+  // schedule a verify for a check node with open descendants left (they get
+  // planned instead), so reaching here with open children should be
+  // structurally impossible; this is now only the true-leaf, needs_evidence
+  // case — reopen or run it, never a dead end.
+  finishItem(run, fresh, 'failed', 'check leaf has no machine verdict of its own — reopen it or run it to produce one');
 }
 
 const KIND_TO_ACTION: Record<string, Decision['action']> = {

@@ -30,6 +30,7 @@ import {
 import { buildVerifyPlanNode } from './goals-autopilot-verify.js';
 import { generateAndStoreSummary } from './layman-summary.js';
 import { evaluateUnparks, type UnparkCondition, type UnparkTarget } from './unpark.js';
+import { createNotification } from './notifications.js';
 
 // ---------------------------------------------------------------------------
 // Types (mirrors CONTRACT.md §1 / §3.0 exactly — additive-only if extended)
@@ -197,6 +198,10 @@ export interface GoalNodeDbRow {
   // been glossed (or forever, on summarization failure) — the cockpit falls
   // back to the raw `autopilot_verdict`.
   verdict_summary: string | null;
+  // F1 (premature-check incident 2026-09-27) — non-null while a plain check
+  // transition was refused because the node still has open descendants and no
+  // verdict of its own. See transitionNodeToCheck().
+  premature_check_reason: string | null;
   sort_order: number;
   verified_at: string | null;
   created_at: string;
@@ -407,6 +412,14 @@ ensureGoalNodeColumn('parked_reason', `parked_reason TEXT`);
 ensureGoalNodeColumn('unpark_when', `unpark_when TEXT`);
 // Layman layer everywhere (tree-9e15d8a7) — plain-English gloss of autopilot_verdict.
 ensureGoalNodeColumn('verdict_summary', `verdict_summary TEXT`);
+// F1 (premature-check incident 2026-09-27, outbox/shifts/premature-check-incident-2026-09-27.md
+// §F1) — set instead of `state='check'` when a plain transition into check is
+// refused because the node still has open descendants and no verdict of its
+// own. A NEW column rather than widening `review_state`'s CHECK: that column's
+// constraint is baked in on ALTER TABLE ADD COLUMN and can't be widened for an
+// already-migrated live goal_nodes table without a full rebuild. NULL = not
+// currently flagged.
+ensureGoalNodeColumn('premature_check_reason', `premature_check_reason TEXT`);
 
 // ---------------------------------------------------------------------------
 // Low-level accessors
@@ -989,6 +1002,78 @@ export function recordAutopilotVerdict(goalId: number, nodeId: number, verdict: 
 }
 
 // ---------------------------------------------------------------------------
+// F1 (premature-check incident 2026-09-27) — check-state invariant. Every
+// transition INTO 'check' in this file routes through transitionNodeToCheck()
+// so the state model can never lie: a node cannot land in `check` while it
+// still has open work underneath it and no verdict of its own. See
+// outbox/shifts/premature-check-incident-2026-09-27.md §F1.
+// ---------------------------------------------------------------------------
+
+/** True when `node` has at least one descendant that isn't done/parked/discarded
+ *  AND `node` itself carries no machine verdict — the exact shape that starved
+ *  shift #9 (parents flipped to `check` while goal-8's real work sat open
+ *  underneath them, invisible to the planner). Leaves (no descendants) are
+ *  never premature — there is nothing under them to lie about. */
+function isPrematureCheck(node: GoalNodeDbRow): boolean {
+  if (node.autopilot_verdict != null) return false; // has its own machine verdict
+  const all = listRawNodesForGoal(node.goal_id, true);
+  const byParent = new Map<number, GoalNodeDbRow[]>();
+  for (const n of all) {
+    if (n.parent_id != null) {
+      if (!byParent.has(n.parent_id)) byParent.set(n.parent_id, []);
+      byParent.get(n.parent_id)!.push(n);
+    }
+  }
+  const stack = [...(byParent.get(node.id) ?? [])];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    if (cur.state !== 'done' && cur.state !== 'parked' && cur.state !== 'discarded') return true;
+    for (const child of byParent.get(cur.id) ?? []) stack.push(child);
+  }
+  return false;
+}
+
+/** The single choke point for every `state='check'` write in this file.
+ *  `override:true` is for paths where the invariant structurally can't fire —
+ *  humanDoneNode requires a leaf (setLeafKind's `node_has_children` guard
+ *  forbids leaf_kind on a node with children), and a finished hopper tree /
+ *  promoted-goal stub are leaf transitions too — so it documents "this path
+ *  can't have open descendants" rather than opening a loophole.
+ *
+ *  On refusal: state is left exactly as it was, `premature_check_reason` is
+ *  set instead, a `goal_events` row + a warning notification are raised. The
+ *  autopilot driver (goals-autopilot.ts) must treat that flag as "keep
+ *  working the children", never as verify-ready. Returns true iff the node
+ *  actually transitioned to `check`. */
+function transitionNodeToCheck(
+  node: GoalNodeDbRow,
+  opts: { override?: boolean; actor: GoalActor; kind: string; text: string; data?: unknown },
+): boolean {
+  if (!opts.override && isPrematureCheck(node)) {
+    const reason = `Blocked: "${node.title}" still has open work underneath it with no verdict of its own.`;
+    sqliteDb.prepare(`UPDATE goal_nodes SET premature_check_reason = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(reason, node.id);
+    insertEvent(node.goal_id, node.id, 'system', 'premature_check_blocked', reason, { blocked_kind: opts.kind });
+    emitNode('updated', getRawNodeStmt.get(node.id) as GoalNodeDbRow);
+    try {
+      createNotification({
+        severity: 'warning',
+        title: `Premature check blocked: ${node.title}`,
+        body: reason,
+        source: 'goals',
+        link: `/goals/${node.goal_id}`,
+      });
+    } catch (err) { console.error('[goals] premature_check notification failed', err); }
+    return false;
+  }
+  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'check', premature_check_reason = NULL, updated_at = datetime('now') WHERE id = ?`)
+    .run(node.id);
+  insertEvent(node.goal_id, node.id, opts.actor, opts.kind, opts.text, opts.data);
+  emitNode('updated', getRawNodeStmt.get(node.id) as GoalNodeDbRow);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // §2.4(1) — child settles → parent check (the only auto-flip this file owns;
 // tree-done→check and tree-blocked badges are BACKEND B's hopper-hook wiring).
 // ---------------------------------------------------------------------------
@@ -1010,10 +1095,12 @@ function settleParentIfComplete(parentId: number): void {
   const relevant = nonDiscarded.filter((c) => c.state !== 'parked');
   if (relevant.length === 0) return; // every remaining child parked — never vacuously complete
   if (!relevant.every((c) => c.state === 'done')) return;
-  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'check', updated_at = datetime('now') WHERE id = ?`).run(parent.id);
-  insertEvent(parent.goal_id, parent.id, 'system', 'node_check', `All subtasks done: ${parent.title}`);
-  emitNode('updated', getRawNodeStmt.get(parent.id) as GoalNodeDbRow);
-  maybeSettleParent(parent.id); // naturally terminates: parent is now 'check', not 'done'
+  const transitioned = transitionNodeToCheck(parent, {
+    actor: 'system',
+    kind: 'node_check',
+    text: `All subtasks done: ${parent.title}`,
+  });
+  if (transitioned) maybeSettleParent(parent.id); // naturally terminates: parent is now 'check', not 'done'
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,9 +1363,16 @@ function flipPromotedStubOnGoalDone(newGoalId: number): void {
   const stub = sqliteDb.prepare(`SELECT * FROM goal_nodes WHERE promoted_to_goal_id = ?`).get(newGoalId) as GoalNodeDbRow | undefined;
   if (!stub) return;
   if (stub.state === 'done' || stub.state === 'discarded' || stub.state === 'check') return;
-  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'check', updated_at = datetime('now') WHERE id = ?`).run(stub.id);
-  insertEvent(stub.goal_id, stub.id, 'system', 'node_check', `Promoted goal done: ${stub.title}`, { reason: 'promoted_goal_done' });
-  emitNode('updated', getRawNodeStmt.get(stub.id) as GoalNodeDbRow);
+  // A promoted stub is a leaf-by-construction (its real work lives in the
+  // other goal) — override:true documents that, it can never carry open
+  // descendants of its own.
+  transitionNodeToCheck(stub, {
+    override: true,
+    actor: 'system',
+    kind: 'node_check',
+    text: `Promoted goal done: ${stub.title}`,
+    data: { reason: 'promoted_goal_done' },
+  });
   maybeSettleParent(stub.id);
 }
 
@@ -2248,10 +2342,17 @@ export function humanDoneNode(goalId: number, nodeId: number, note?: string, act
     throw new GoalError(409, 'invalid_transition', `node is ${node.state}, not set`, { from: node.state, to: 'check' });
   }
   const act = assertActor(actor, 'kevin');
-  sqliteDb.prepare(`UPDATE goal_nodes SET state = 'check', updated_at = datetime('now') WHERE id = ?`).run(nodeId);
-  insertEvent(goalId, nodeId, act, 'human_done', note ? `Marked done: ${note}` : 'Marked done.', note ? { note } : undefined);
+  // setLeafKind forbids leaf_kind='human' on a node with children, so this is
+  // always a true leaf — override:true documents that (Kevin's explicit
+  // human_done must never be silently swallowed by the invariant).
+  transitionNodeToCheck(node, {
+    override: true,
+    actor: act,
+    kind: 'human_done',
+    text: note ? `Marked done: ${note}` : 'Marked done.',
+    data: note ? { note } : undefined,
+  });
   const fresh = getRawNodeStmt.get(nodeId) as GoalNodeDbRow;
-  emitNode('updated', fresh);
   return deriveSingleNode(fresh);
 }
 
@@ -2704,10 +2805,21 @@ export function goalsOnTreeStatus(treeId: string, status: 'done' | 'blocked' | '
     // on `check` instead of stranding it at `working` with a finished tree.
     sqliteDb.prepare(`UPDATE goal_nodes SET tree_status_cache = 'done', updated_at = datetime('now') WHERE id = ?`).run(node.id);
     if (node.state === 'working') {
-      sqliteDb.prepare(`UPDATE goal_nodes SET state = 'check', updated_at = datetime('now') WHERE id = ?`).run(node.id);
+      // A dispatched node is a machine leaf by construction (propose_plan/
+      // approve_plan require leaf_kind='machine', and setLeafKind forbids
+      // that on a node with children) — override:true documents it can never
+      // carry open descendants of its own.
+      transitionNodeToCheck(node, {
+        override: true,
+        actor: 'system',
+        kind: 'tree_done',
+        text: `Tree finished: ${node.title}`,
+        data: { tree_id: treeId, parked: false },
+      });
+    } else {
+      insertEvent(node.goal_id, node.id, 'system', 'tree_done', `Tree finished: ${node.title}`, { tree_id: treeId, parked: true });
+      emitNode('updated', getRawNodeStmt.get(node.id) as GoalNodeDbRow);
     }
-    insertEvent(node.goal_id, node.id, 'system', 'tree_done', `Tree finished: ${node.title}`, { tree_id: treeId, parked: node.state === 'parked' });
-    emitNode('updated', getRawNodeStmt.get(node.id) as GoalNodeDbRow);
   } else if (status === 'blocked') {
     if (node.tree_status_cache === 'blocked' || node.tree_status_cache === 'done') return; // fire once per transition
     sqliteDb.prepare(`UPDATE goal_nodes SET tree_status_cache = 'blocked', updated_at = datetime('now') WHERE id = ?`).run(node.id);

@@ -954,6 +954,91 @@ await check('NS-27', 'F2: a check node WITH its own verdict still yields a norma
   await post(`/night/runs/${runId}/stop`, {});
 });
 
+// F3 (premature-check incident, outbox/shifts/premature-check-incident-2026-09-27.md
+// §F3) — `priority_goal_ids` wins the item order FIRST, goal_score only breaks
+// ties among goals it doesn't mention.
+await check('NS-28', 'F3: priority_goal_ids ordering wins over goal_score', async () => {
+  const gP1 = await mkGoal('Sim goal priority A', 'its leaf lands');
+  const gP1Leaf = await mkNode(gP1, 'PA leaf', { leaf_kind: 'machine' });
+  await acceptNode(gP1, gP1Leaf);
+  const gP2 = await mkGoal('Sim goal priority B', 'its leaf lands');
+  const gP2Leaf = await mkNode(gP2, 'PB leaf', { leaf_kind: 'machine' });
+  await acceptNode(gP2, gP2Leaf);
+  const gP3 = await mkGoal('Sim goal priority C', 'its leaf lands');
+  const gP3Leaf = await mkNode(gP3, 'PC leaf', { leaf_kind: 'machine' });
+  await acceptNode(gP3, gP3Leaf);
+
+  // These three tie on goal_score (fresh, single unstarted leaf each), so the
+  // NATURAL order is ascending id: gP1, gP2, gP3. Ask for the opposite.
+  const planned = await post('/night/plan', {
+    mode: 'until_stop', goal_ids: [gP1, gP2, gP3],
+    priority_goal_ids: [gP3, gP1, gP2], config: { lanes: 3 },
+  });
+  assert.equal(planned.status, 200, JSON.stringify(planned.json));
+  const prioRun = planned.json.run.id;
+  assert.deepEqual(night.getNightRun(prioRun).priority_goal_ids, [gP3, gP1, gP2], 'priority_goal_ids did not round-trip on the run row');
+  const order = [];
+  for (const it of itemsOf(prioRun)) { if (!order.includes(it.goal_id)) order.push(it.goal_id); }
+  assert.equal(order.join(','), [gP3, gP1, gP2].join(','), `expected goal order ${gP3},${gP1},${gP2}, got ${order.join(',')}`);
+});
+
+await check('NS-29', 'F3: the #1 priority goal producing zero running work within 120s of Start fires ONE priority_goal_zero_yield alarm (event + warning notification + cue), and the run keeps going on fallbacks', async () => {
+  const gZ = await mkGoal('Sim goal zero-yield', 'its two leaves land');
+  const gZLeaf1 = await mkNode(gZ, 'Z1 leaf', { leaf_kind: 'machine' });
+  const gZLeaf2 = await mkNode(gZ, 'Z2 leaf', { leaf_kind: 'machine' });
+  await acceptNode(gZ, gZLeaf1);
+  await acceptNode(gZ, gZLeaf2);
+  const gFallback = await mkGoal('Sim goal fallback', 'its leaf lands');
+  const gFallbackLeaf = await mkNode(gFallback, 'FB leaf', { leaf_kind: 'machine' });
+  await acceptNode(gFallback, gFallbackLeaf);
+
+  const planned = await post('/night/plan', {
+    mode: 'until_stop', goal_ids: [gZ, gFallback], priority_goal_ids: [gZ], config: { lanes: 2 },
+  });
+  assert.equal(planned.status, 200, JSON.stringify(planned.json));
+  const zRun = planned.json.run.id;
+
+  const t0 = Date.now();
+  night.__setNightShiftTestOverrides({ governor: () => ({ allow: true, reason: 'ok', detail: 'sim' }), now: () => t0 });
+  assert.equal((await post(`/night/runs/${zRun}/start`, {})).status, 200);
+
+  // Force the priority goal's items to settle NEGATIVELY, FAST — the exact
+  // incident shape (all five instant-failed in ~1ms). Items are still
+  // `queued` here (no tick has run fillLanes yet), so skip is legal.
+  for (const nodeId of [gZLeaf1, gZLeaf2]) {
+    const it = itemsOf(zRun).find((i) => i.goal_id === gZ && i.node_id === nodeId);
+    assert.ok(it, `no item for gZ node #${nodeId}`);
+    assert.equal((await post(`/night/runs/${zRun}/items/${it.id}/skip`, {})).status, 200);
+  }
+
+  night.__setNightShiftTestOverrides({ governor: () => ({ allow: true, reason: 'ok', detail: 'sim' }), now: () => t0 + 30_000 });
+  await tick('zero-yield-check');
+
+  const events = night.listNightEvents(zRun, 200);
+  const alarm = events.find((e) => e.kind === 'priority_goal_zero_yield');
+  assert.ok(alarm, `no priority_goal_zero_yield event; saw kinds: ${events.map((e) => e.kind).join(',')}`);
+  assert.match(alarm.text ?? '', new RegExp(`priority goal #${gZ}`, 'i'));
+
+  const { listNotifications } = await import(path.join(distDir, 'notifications.js'));
+  const note = listNotifications(20).find((n) => n.severity === 'warning' && n.title.includes(`Shift #${zRun}`));
+  assert.ok(note, 'no warning notification for the zero-yield alarm');
+
+  const cue = nightCues(zRun).find((c) => c.correlationKey === `night:${zRun}:priority-zero-yield`);
+  assert.ok(cue, 'no priority-zero-yield cue posted to the run\'s own thread');
+  assert.match(cue.text, /PRIORITY_GOAL_ZERO_YIELD/);
+
+  // One alarm per run: a further tick inside the window must not re-fire it.
+  await tick('zero-yield-idempotent');
+  const fired = night.listNightEvents(zRun, 200).filter((e) => e.kind === 'priority_goal_zero_yield');
+  assert.equal(fired.length, 1, `the zero-yield alarm fired ${fired.length} times, expected exactly 1`);
+
+  // Loud, never silent-STOP: the run itself keeps going on the fallback goal.
+  const run = night.getNightRun(zRun);
+  assert.ok(run.status === 'running' || run.status === 'complete', `expected the run to keep going on fallbacks, got ${run.status}`);
+
+  await post(`/night/runs/${zRun}/stop`, {});
+});
+
 } catch (err) {
   console.error('\n[night-sim] FATAL', err);
   results.push({ id: 'FATAL', description: 'sim crashed', pass: false, error: String(err?.stack ?? err) });

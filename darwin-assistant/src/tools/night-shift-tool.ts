@@ -76,7 +76,7 @@ export const nightShift: ToolDef = {
     'A `move` LOCKS that item at its new position. `skip` only works on a queued item. `add {goal_id, node_id}` schedules an existing goal node — it never creates work. ' +
     '`runs` lists every session newest-first (label, brief, goals, duration, done/failed, status) and `run {run_id}` opens one with its per-goal and per-node minutes — that is how you answer "how long did you work on X two days ago". ' +
     'Inside a `cockpit:shift-<id>` chat every op defaults to THAT session, even a finished one, so an old shift chat always answers about its own run; a finished session is read-only (move/skip/add return `night_run_ended`). ' +
-    '`plan` takes `brief` (Kevin\'s instruction for the shift, verbatim — it is injected into the orchestrator every turn), `label` (a short name) and `config` ({lanes, per_goal_parallel, build_model, verify_model}). ' +
+    '`plan` takes `brief` (Kevin\'s instruction for the shift, verbatim — it is injected into the orchestrator every turn), `label` (a short name), `config` ({lanes, per_goal_parallel, build_model, verify_model}) and optional `priority_goal_ids` (an ordered array of goal ids — item ordering ranks by this order FIRST, goal_score second; the driver also alarms if the #1 goal produces zero running work in its first 120s). ' +
     '`report` builds the report markdown on demand.',
   parameters: {
     type: 'object',
@@ -95,6 +95,10 @@ export const nightShift: ToolDef = {
       limit: { type: 'number', description: 'For runs: how many sessions to return (default 20, max 500).' },
       status: { type: 'string', enum: ['planned', 'running', 'paused', 'stopped', 'complete'], description: 'For runs: filter by status.' },
       goal_ids: { type: 'array', items: { type: 'number' }, description: 'For plan: limit the night to these goals. Omit for every live goal.' },
+      priority_goal_ids: {
+        type: 'array', items: { type: 'number' },
+        description: 'For plan: ordered goal ids — item ordering ranks by this order FIRST, goal_score second. Omit for pure goal_score ordering.',
+      },
       item_id: { type: 'number', description: 'Target item id. Required for move and skip.' },
       position: { type: 'number', description: 'For move: the new 1-based position (clamped). The item locks there.' },
       goal_id: { type: 'number', description: 'For add: the goal the node belongs to.' },
@@ -138,6 +142,7 @@ export const nightShift: ToolDef = {
             config: Object.keys(base).length ? base : undefined,
             brief: typeof args.brief === 'string' ? args.brief : undefined,
             label: typeof args.label === 'string' ? args.label : undefined,
+            priority_goal_ids: Array.isArray(args.priority_goal_ids) ? args.priority_goal_ids : undefined,
             actor: 'jarvis',
           });
           return {

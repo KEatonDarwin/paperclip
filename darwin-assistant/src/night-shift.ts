@@ -219,6 +219,10 @@ export interface NightRunRow {
   label: string | null;
   /** SHIFTS v1 §3.2 — the throttle dials + account meters as they stood at Start. */
   dials_at_start: NightDialsSnapshot | null;
+  /** F3 (premature-check incident, 2026-09-27) — ordered goal ids from
+   *  `POST /night/plan`. Item ordering ranks by this order FIRST, goal_score
+   *  second; empty = today's pure goal_score behavior. */
+  priority_goal_ids: number[];
   planned_at: string | null;
   started_at: string | null;
   paused_at: string | null;
@@ -333,6 +337,9 @@ const LAZY_COLUMNS: Array<{ table: string; column: string; ddl: string }> = [
   // which is a short raw status string (e.g. "skipped by kevin", a raw
   // VERDICT line) rather than layman prose.
   { table: 'night_items', column: 'result_gloss', ddl: 'TEXT' },
+  // F3 (premature-check incident, 2026-09-27) — ordered priority goal ids for
+  // this run, JSON array; NULL/'[]' = no priority order set.
+  { table: 'night_runs', column: 'priority_goal_ids', ddl: 'TEXT' },
 ];
 
 export function ensureNightShiftTables(): void {
@@ -431,6 +438,7 @@ function parseRun(raw: Record<string, unknown> | undefined): NightRunRow | null 
     brief: (raw.brief as string | null) ?? null,
     label: (raw.label as string | null) ?? null,
     dials_at_start: parseJson<NightDialsSnapshot | null>(raw.dials_at_start as string, null),
+    priority_goal_ids: parseJson<number[]>(raw.priority_goal_ids as string, []),
   };
 }
 
@@ -544,6 +552,25 @@ export function normalizeNightConfig(input: unknown, base?: NightRunConfig | nul
       if (e[key] === undefined) continue;
       out.est[key] = intIn(e[key], 1, 600, `est.${key}`, out.est[key]);
     }
+  }
+  return out;
+}
+
+/** F3 — `POST /night/plan`'s optional `priority_goal_ids`: an ordered array
+ *  ranking item order FIRST, ahead of goal_score. Deduped, order preserved. */
+function normalizePriorityGoalIds(input: unknown): number[] {
+  if (input === undefined || input === null) return [];
+  if (!Array.isArray(input)) {
+    throw new NightError(400, 'night_config_invalid', 'priority_goal_ids must be an array of goal ids');
+  }
+  const seen = new Set<number>();
+  const out: number[] = [];
+  for (const v of input) {
+    const n = Number(v);
+    if (!Number.isInteger(n) || n <= 0) {
+      throw new NightError(400, 'night_config_invalid', 'priority_goal_ids must contain positive integer goal ids');
+    }
+    if (!seen.has(n)) { seen.add(n); out.push(n); }
   }
   return out;
 }
@@ -845,8 +872,15 @@ const goalThreadActivity = sqliteDb.prepare(`
   WHERE c.external_id = ? OR c.external_id LIKE ?
 `);
 
-/** §3.2 — "finish what's closest to done first, then what's moving, then the rest." */
-function rankGoals(entries: Array<{ goal: GoalRow; tree: GoalTree; stream: ItemDraft[] }>, at: number): GoalRank[] {
+/** §3.2 — "finish what's closest to done first, then what's moving, then the rest."
+ *  F3 — when `priorityGoalIds` is non-empty, its order wins FIRST; goal_score
+ *  (and the tie-break below) only decides among goals it doesn't mention, or
+ *  between goals that share no priority rank. */
+function rankGoals(
+  entries: Array<{ goal: GoalRow; tree: GoalTree; stream: ItemDraft[] }>, at: number,
+  priorityGoalIds: number[] = [],
+): GoalRank[] {
+  const priorityIndex = new Map<number, number>(priorityGoalIds.map((id, i) => [id, i]));
   const ranked = entries.map(({ goal, tree, stream }) => {
     const live = tree.nodes.filter((n) => n.state !== 'discarded');
     const total = live.length;
@@ -863,7 +897,12 @@ function rankGoals(entries: Array<{ goal: GoalRow; tree: GoalTree; stream: ItemD
     const score = 0.5 * momentum + 0.3 * closeness + 0.2 * freshness + bonus;
     return { goal, tree, score, momentum, closeness, freshness, bonus, rank: 0 };
   });
-  ranked.sort((a, b) => b.score - a.score || a.goal.id - b.goal.id);
+  ranked.sort((a, b) => {
+    const pa = priorityIndex.get(a.goal.id) ?? Infinity;
+    const pb = priorityIndex.get(b.goal.id) ?? Infinity;
+    if (pa !== pb) return pa - pb;
+    return b.score - a.score || a.goal.id - b.goal.id;
+  });
   ranked.forEach((r, i) => { r.rank = i + 1; });
   return ranked;
 }
@@ -1058,6 +1097,8 @@ export function planNight(input: {
   brief?: string | null;
   /** SHIFTS v1 §3.2 — a short human name for the session. */
   label?: string | null;
+  /** F3 — ordered goal ids; item ordering ranks by this order FIRST, goal_score second. */
+  priority_goal_ids?: unknown;
 } = {}): NightPlanPreview {
   const live = activeNightRun();
   if (live && live.status !== 'planned') {
@@ -1069,6 +1110,7 @@ export function planNight(input: {
   // reworded); the label is the session's short name on the Sessions table.
   const brief = typeof input.brief === 'string' && input.brief.trim() ? input.brief.trim().slice(0, 2000) : null;
   const label = typeof input.label === 'string' && input.label.trim() ? input.label.trim().slice(0, 80) : null;
+  const priorityGoalIds = normalizePriorityGoalIds(input.priority_goal_ids);
   // §3.4 — the lane sim runs at minute resolution, so the anchor is the top of
   // the current minute (two plans in the same minute are byte-identical).
   const at = Math.floor(nowMs() / 60_000) * 60_000;
@@ -1082,7 +1124,7 @@ export function planNight(input: {
     trees.set(goal.id, tree);
     entries.push({ goal, tree, stream: simulateGoal(goal, tree, cfg, at, needsYou) });
   }
-  const ranked = rankGoals(entries, at);
+  const ranked = rankGoals(entries, at, priorityGoalIds);
 
   // §3.3 assemble — (goal_rank, dfs_index), then every `finish` floats to the
   // top keeping its relative order (§12.5).
@@ -1117,8 +1159,8 @@ export function planNight(input: {
       sqliteDb.prepare(`DELETE FROM night_runs WHERE id = ?`).run(live.id);
     }
     const info = sqliteDb.prepare(
-      `INSERT INTO night_runs (status, mode, config, goal_ids, prior_autopilot, planned_at, brief, label) VALUES ('planned', ?, ?, ?, '{}', ?, ?, ?)`,
-    ).run(mode, JSON.stringify(cfg), JSON.stringify(ranked.map((r) => r.goal.id)), nowIso(), brief, label);
+      `INSERT INTO night_runs (status, mode, config, goal_ids, prior_autopilot, planned_at, brief, label, priority_goal_ids) VALUES ('planned', ?, ?, ?, '{}', ?, ?, ?, ?)`,
+    ).run(mode, JSON.stringify(cfg), JSON.stringify(ranked.map((r) => r.goal.id)), nowIso(), brief, label, JSON.stringify(priorityGoalIds));
     const runId = Number(info.lastInsertRowid);
     const insert = sqliteDb.prepare(
       `INSERT INTO night_items (run_id, position, goal_id, node_id, parent_item_id, kind, title, why, est_minutes, eta_at)
@@ -2585,6 +2627,52 @@ function fillLanes(run: NightRunRow): { started: number; waiting: string | null 
 let lastWaiting: string | null = null;
 export function nightWaitingReason(): string | null { return lastWaiting; }
 
+// F3 (premature-check incident, 2026-09-27) — the alarm half of the fix. A
+// goal_score-only order can silently starve Kevin's stated #1 priority while
+// the run looks healthy (fallbacks are running correctly). If every item of
+// that goal has already settled failed/skipped within 120s of Start, that IS
+// the incident's exact shape (5 instant-fail verifies in ~1ms) — say so loudly
+// instead of letting the run proceed silently on fallbacks. One alarm per run.
+const PRIORITY_ZERO_YIELD_WINDOW_MS = 120_000;
+const ZERO_YIELD_SETTLED: ReadonlySet<NightItemStatus> = new Set(['failed', 'skipped']);
+
+function checkPriorityZeroYield(run: NightRunRow): void {
+  const topGoalId = run.priority_goal_ids[0];
+  if (topGoalId == null || !run.started_at) return;
+  const startedMs = new Date(run.started_at).getTime();
+  if (!Number.isFinite(startedMs)) return;
+  const elapsedMs = nowMs() - startedMs;
+  if (elapsedMs > PRIORITY_ZERO_YIELD_WINDOW_MS) return;   // window closed — no more checking this run
+  const already = sqliteDb.prepare(
+    `SELECT COUNT(*) AS n FROM night_events WHERE run_id = ? AND kind = 'priority_goal_zero_yield'`,
+  ).get(run.id) as { n: number };
+  if (already.n > 0) return;
+  const items = listNightItems(run.id).filter((it) => it.goal_id === topGoalId);
+  if (!items.length || !items.every((it) => ZERO_YIELD_SETTLED.has(it.status))) return;
+
+  const goal = getRawGoal(topGoalId);
+  const text = `Priority goal #${topGoalId}${goal ? ` (${goal.title})` : ''} produced NO running work — `
+    + `all ${items.length} of its item(s) settled failed/skipped within ${Math.round(elapsedMs / 1000)}s of Start. `
+    + `The run continues on fallbacks — audit the tree states.`;
+  insertNightEvent(run.id, null, 'system', 'priority_goal_zero_yield', text, {
+    goal_id: topGoalId, items: items.map((it) => ({ id: it.id, status: it.status, title: it.title })),
+  });
+  createNotification({
+    severity: 'warning',
+    title: `Shift #${run.id}: priority goal #${topGoalId} produced zero running work`,
+    body: text,
+    source: 'night-shift',
+    link: '/night',
+  });
+  try {
+    const ext = seedRunThreadIfNew(run);
+    postCue(ext, `[night-shift PRIORITY_GOAL_ZERO_YIELD run #${run.id}] ${text}`,
+      `night:${run.id}:priority-zero-yield`, 'night-shift');
+  } catch (err) {
+    console.error('[night-shift] priority zero-yield cue failed', err);
+  }
+}
+
 export async function tickNightShift(reason = 'loop'): Promise<void> {
   if (driver.ticking) { driver.pendingKick = true; return; }
   // WORK SWITCH: the shift driver is the thing that cues the orchestrator, so a
@@ -2607,6 +2695,11 @@ export async function tickNightShift(reason = 'loop'): Promise<void> {
     prunePredicted(run);
     const after = getNightRun(run.id)!;
     if (after.status !== 'running') return;
+
+    // F3 — checked every tick regardless of hold: a held run can still be
+    // sitting on a zero-yield priority goal, and holds are exactly the kind of
+    // "looks fine, isn't" state this alarm exists to cut through.
+    checkPriorityZeroYield(after);
 
     if (hold) {
       noteHold(after, hold.reason, hold.detail);

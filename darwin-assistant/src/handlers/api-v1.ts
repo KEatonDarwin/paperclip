@@ -2995,7 +2995,10 @@ export function createApiV1Router(): Router {
   // SHIFTS v1 §3.2 — `brief` (Kevin's instruction, verbatim, ≤2000 chars) and
   // `label` (≤80) are what turn a run into a SESSION he can find again.
   router.post('/night/plan', (req: AuthedRequest, res) => {
-    const body = (req.body ?? {}) as { mode?: unknown; goal_ids?: unknown; config?: unknown; brief?: unknown; label?: unknown };
+    const body = (req.body ?? {}) as {
+      mode?: unknown; goal_ids?: unknown; config?: unknown; brief?: unknown; label?: unknown;
+      priority_goal_ids?: unknown;
+    };
     try {
       res.json(planNight({
         mode: body.mode as NightRunMode | undefined,
@@ -3003,6 +3006,9 @@ export function createApiV1Router(): Router {
         config: body.config,
         brief: typeof body.brief === 'string' ? body.brief : undefined,
         label: typeof body.label === 'string' ? body.label : undefined,
+        // F3 — optional ordered goal ids; item ordering ranks by this order
+        // FIRST, goal_score second.
+        priority_goal_ids: body.priority_goal_ids,
         actor: 'kevin',
       }));
     } catch (err) { sendNightError(res, err); }

@@ -62,7 +62,7 @@ Rules:
 - Plain text only — no markdown, no headers, no bullet points, no quotes around the output.`;
 }
 
-async function runClaudeSummarizer(prompt: string): Promise<string> {
+async function runClaudeSummarizer(prompt: string, model: string = SUMMARY_MODEL, timeoutMs: number = SUMMARY_TIMEOUT_MS): Promise<string> {
   return new Promise((resolve, reject) => {
     const env = { ...process.env };
     delete env.ANTHROPIC_API_KEY;
@@ -71,7 +71,7 @@ async function runClaudeSummarizer(prompt: string): Promise<string> {
     const child = spawn(
       process.env.CLAUDE_CLI_PATH || 'claude',
       // --verbose is required alongside --print + stream-json (see thread-autogroup.ts).
-      ['--print', '-', '--output-format', 'stream-json', '--verbose', '--model', SUMMARY_MODEL],
+      ['--print', '-', '--output-format', 'stream-json', '--verbose', '--model', model],
       { env, stdio: ['pipe', 'pipe', 'pipe'] },
     );
 
@@ -83,8 +83,8 @@ async function runClaudeSummarizer(prompt: string): Promise<string> {
       if (settled) return;
       settled = true;
       child.kill('SIGTERM');
-      reject(new Error(`layman-summary claude call timed out after ${SUMMARY_TIMEOUT_MS}ms`));
-    }, SUMMARY_TIMEOUT_MS);
+      reject(new Error(`layman-summary claude call timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
     timeout.unref?.();
 
     child.stdout.setEncoding('utf8');
@@ -153,6 +153,24 @@ export async function summarizeForLayman(input: SummarizeForLaymanInput): Promis
     return cleaned ? cleaned.slice(0, MAX_SUMMARY_CHARS) : null;
   } catch (err) {
     console.error('[layman-summary] summarization failed:', err);
+    return null;
+  }
+}
+
+/** Same subscription-CLI one-shot as `summarizeForLayman`, but the caller owns
+ *  the whole prompt (shift-narrator.ts's play-by-play voice needs a different
+ *  framing than the per-kind summaries above). Same guarantees: sim-guarded,
+ *  never throws, resolves null on any failure. Model defaults to the haiku
+ *  summarizer; callers that need better prose pass a heavier claude id. */
+export async function laymanFreeform(opts: { prompt: string; model?: string; timeoutMs?: number; maxChars?: number; where?: string }): Promise<string | null> {
+  if (!opts.prompt.trim()) return null;
+  if (refuseModelTurnInScratch(opts.where ?? 'laymanFreeform')) return null;
+  try {
+    const raw = await runClaudeSummarizer(opts.prompt, opts.model ?? SUMMARY_MODEL, opts.timeoutMs ?? SUMMARY_TIMEOUT_MS);
+    const cleaned = raw.trim();
+    return cleaned ? cleaned.slice(0, opts.maxChars ?? MAX_SUMMARY_CHARS) : null;
+  } catch (err) {
+    console.error(`[layman-summary] freeform (${opts.where ?? 'laymanFreeform'}) failed:`, err);
     return null;
   }
 }

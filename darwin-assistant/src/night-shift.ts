@@ -25,6 +25,7 @@ import { sqliteDb, getConversation, getOrCreateConversation, renameConversation,
 import { sseBus, type NightRunEvent, type NightItemEvent } from './sse-bus.js';
 import { createNotification } from './notifications.js';
 import { generateAndStoreSummary, summarizeForLayman } from './layman-summary.js';
+import { noteShiftEvent, flushShiftNarration, listShiftNarration } from './shift-narrator.js';
 import { registerTreeStatusListener, getHopperTree, getHopperNode, setNightShiftPausedTreesProvider, listTreeNodes } from './hopper-engine.js';
 import { governorCheck, governorStatusAll, type GovernorVerdict } from './hopper-governor.js';
 // SHIFTS v1 §3.2 — the dial snapshot. throttle-status.ts imports throttle /
@@ -470,6 +471,10 @@ export function insertNightEvent(
 ): void {
   sqliteDb.prepare(`INSERT INTO night_events (run_id, item_id, actor, kind, text, data) VALUES (?,?,?,?,?,?)`)
     .run(runId, itemId, actor, kind, text ?? null, data === undefined ? null : JSON.stringify(data));
+  // SHIFT NARRATOR — every transition that lands here is a candidate beat of
+  // the play-by-play in the shift chat (shift-narrator.ts decides, buffers,
+  // and never throws).
+  noteShiftEvent(runId, itemId, actor, kind, text, data);
 }
 
 function setRun(id: number, patch: Partial<Record<string, string | number | null>>): NightRunRow {
@@ -1731,6 +1736,9 @@ export async function stopNightRun(
   }
 
   // 3) report + cue + bell + commitment.
+  // Land the pending play-by-play beat first so the report's Play-by-play
+  // section is complete (the narrator otherwise waits out its debounce).
+  try { await flushShiftNarration(runId); } catch (err) { console.error('[night-shift] narration flush failed', err); }
   let reportPath: string | null = null;
   try {
     const report = await buildNightShiftReport(runId);
@@ -3175,6 +3183,13 @@ export async function buildNightShiftReport(runId: number): Promise<{ markdown: 
     holdRows += 1;
   }
   if (!holdRows) out.push('| — | — | _none_ |');
+  out.push('');
+
+  // SHIFT NARRATOR — the layman play-by-play as it was told live in the shift
+  // chat, replayed in order: the morning read Kevin asked for.
+  out.push('## Play-by-play (as narrated live)');
+  const beats = listShiftNarration(runId);
+  out.push(...(beats.length ? beats.map((b) => `- **${ctTime(b.at)} CT** — ${b.text.replace(/\n+/g, ' ')}`) : ['_none_']));
   out.push('');
 
   out.push("## The orchestrator's read");

@@ -849,7 +849,7 @@ export function deleteConversation(id: number): void {
   const txn = db.transaction(() => {
     db.prepare(`UPDATE conversations SET continued_to_id = NULL WHERE continued_to_id = ?`).run(id);
     db.prepare(`UPDATE conversations SET continued_from_id = NULL WHERE continued_from_id = ?`).run(id);
-    for (const table of ['thread_summaries', 'thread_reminders', 'thread_message_queue', 'jarvis_decisions', 'autonomy_ledger']) {
+    for (const table of ['thread_summaries', 'thread_reminders', 'thread_message_queue', 'jarvis_decisions', 'autonomy_ledger', 'thread_links', 'quick_chat_sessions']) {
       try { db.prepare(`DELETE FROM ${table} WHERE conversation_id = ?`).run(id); } catch {}
     }
     db.prepare(`DELETE FROM thread_todos WHERE conversation_id = ?`).run(id);

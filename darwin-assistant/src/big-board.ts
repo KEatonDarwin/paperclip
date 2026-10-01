@@ -20,6 +20,7 @@ import { listAllHopperTrees, listTreeNodes, type HopperTreeRow, type HopperNodeR
 import { listMonitors, type MonitorRow } from './monitors.js';
 import type { GlobalStreamEventType } from './sse-bus.js';
 import { listNotifications, type NotificationRow } from './notifications.js';
+import { listTechTasksForBoard, type TechTaskRow } from './tech-tasks.js';
 import { getLatestThreadSummary } from './thread-summaries.js';
 import { listAllSpawnTasks, type SpawnTaskRow } from './spawn-tasks.js';
 import { buildSpawnMonitorSnapshot, type SpawnMonitorTreeSummary } from './spawn-monitor.js';
@@ -51,7 +52,7 @@ export const BIG_BOARD_KIOSK_TOKEN_SETTING = 'big_board_kiosk_token';
 export const BIG_BOARD_KIOSK_EVENT_TYPES: ReadonlySet<string> = new Set([
   'hopper_node', 'goal', 'goal_node', 'goal_focus', 'goal_guard', 'monitor', 'monitor_run',
   'notification', 'dispatch', 'dispatch_cue', 'workstream', 'conversation_updated', 'status',
-  'night_run', 'night_item',
+  'night_run', 'night_item', 'tech_task',
 ] as const satisfies readonly GlobalStreamEventType[]);
 
 const SENTINEL_HEARTBEAT_FILE = '/tmp/jarvis-watchdog-heartbeat.json';
@@ -176,6 +177,8 @@ export interface BigBoardSnapshot {
   landed: BigBoardLandedEntry[];
   providers: BigBoardProviders;
   governor: GovernorVerdict & { providers: Record<GovernorProvider, GovernorVerdict> };
+  // Tech Tasks (2026-10-01): Ian's email pipeline — prominent board panel.
+  tech_tasks: { open: TechTaskRow[]; recent_closed: TechTaskRow[] };
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +208,7 @@ export interface BigBoardInputs {
   // (conversation_id -> who owes the next reply) — see gatherBigBoardSnapshot's
   // fetchWaitingOnMap. Never computed per-thread (would be N+1).
   waitingOnByConversationId: Map<number, 'kevin' | 'jarvis'>;
+  techTasks: { open: TechTaskRow[]; recent_closed: TechTaskRow[] };
 }
 
 function bySortOrder(a: { sort_order: number }, b: { sort_order: number }): number {
@@ -400,6 +404,7 @@ export function buildBigBoardSnapshot(input: BigBoardInputs): BigBoardSnapshot {
     landed: landed.slice(0, LANDED_CAP),
     providers: input.providers,
     governor: { ...input.governorDefault, providers: input.governorProviders },
+    tech_tasks: input.techTasks,
   };
 }
 
@@ -554,5 +559,6 @@ export function gatherBigBoardSnapshot(
     resolveThreadLite: toThreadLite,
     spawnTasksAll: listAllSpawnTasks(),
     waitingOnByConversationId,
+    techTasks: listTechTasksForBoard(),
   });
 }

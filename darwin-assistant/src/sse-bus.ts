@@ -201,6 +201,15 @@ export interface NotificationEvent {
   notification: NotificationRow;
 }
 
+// TECH TASKS (2026-10-01) — Ian's "Tech Task:" email pipeline. Global, same
+// treatment as NotificationEvent: the big board + dashboard card re-render on
+// row create/update (new email swept in, JARVIS flips working/handled/needs_kevin).
+export interface TechTaskEvent {
+  type: 'tech_task';
+  action: 'created' | 'updated';
+  task: import('./tech-tasks.js').TechTaskRow;
+}
+
 // DAR-782 — dispatch signaling. Fired on dispatch lifecycle (create/complete/ack/delete)
 // and worker status updates. Keyed to the orchestrator's conversationId.
 export interface DispatchEvent {
@@ -379,7 +388,8 @@ export type SSEEvent =
   | IntelRunEvent | IntelItemEvent | WorkbenchProposalEvent
   | GoalEvent | GoalNodeEvent | GoalFocusEvent | GoalGuardEvent
   | NightRunEvent | NightItemEvent
-  | HealthSampleEvent | HealthEventEvent;
+  | HealthSampleEvent | HealthEventEvent
+  | TechTaskEvent;
 
 // ---------------------------------------------------------------------------
 // THE GLOBAL-STREAM EVENT CONTRACT — one list, server-owned.
@@ -418,6 +428,7 @@ export const GLOBAL_STREAM_EVENT_TYPES = [
   'goal', 'goal_node', 'goal_focus', 'goal_guard',
   'night_run', 'night_item',   // Night Shift (node #679/#680): board + /night live updates
   'health_sample', 'health_event',   // Cockpit Health (node #858): live /health charts + spike markers
+  'tech_task',   // Tech Tasks (2026-10-01): email-pipeline rows on the big board + dashboard
 ] as const satisfies readonly SSEEvent['type'][];
 
 export type GlobalStreamEventType = (typeof GLOBAL_STREAM_EVENT_TYPES)[number];

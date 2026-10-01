@@ -38,6 +38,9 @@ const AUTOMATED_KEY_PREFIXES = [
   // turn per spike per cooldown, but it fires exactly when the box is already
   // under load — precisely the moment an ungated extra turn hurts most.
   'health:',
+  // TECH TASKS (2026-10-01): each new "Tech Task" email cues one JARVIS turn in
+  // cockpit:tech-tasks, minting `tech-task:<id>` — gated like every other cue.
+  'tech-task:',
 ];
 
 export function isAutomatedTurn(externalId: string, correlationKey?: string): boolean {

@@ -95,6 +95,13 @@ import {
   type NotificationMeta,
 } from '../notifications.js';
 import {
+  listTechTasks,
+  syncTechTasks,
+  updateTechTask,
+  type TechTaskStatus,
+  type TechTaskSyncItem,
+} from '../tech-tasks.js';
+import {
   listHopperItems,
   getHopperItem,
   createHopperItem,
@@ -2167,6 +2174,45 @@ export function createApiV1Router(): Router {
     }
     deleteNotification(id);
     res.status(204).end();
+  });
+
+  // == Tech Tasks (2026-10-01) ================================================
+  // Ian's "Tech Task:" email pipeline — see src/tech-tasks.ts. The inbox
+  // sweeper POSTs /tech-tasks/sync; JARVIS + the dashboard card PATCH status.
+
+  router.get('/tech-tasks', (req: AuthedRequest, res) => {
+    const limit = Math.max(1, Math.min(500, parseInt(String(req.query.limit ?? '100'), 10) || 100));
+    res.json({ tech_tasks: listTechTasks(limit) });
+  });
+
+  router.post('/tech-tasks/sync', (req: AuthedRequest, res) => {
+    const items = Array.isArray(req.body?.items) ? (req.body.items as TechTaskSyncItem[]) : null;
+    if (!items) {
+      sendError(res, 400, 'items_required', 'body must carry an items array');
+      return;
+    }
+    const result = syncTechTasks(items);
+    res.json({ created: result.created, known: result.known });
+  });
+
+  router.patch('/tech-tasks/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const status = typeof req.body?.status === 'string' ? req.body.status as TechTaskStatus : undefined;
+    const VALID_TT_STATUSES: TechTaskStatus[] = ['new', 'jarvis_working', 'handled', 'needs_kevin', 'done', 'dismissed'];
+    if (status !== undefined && !VALID_TT_STATUSES.includes(status)) {
+      sendError(res, 400, 'invalid_status', `status must be one of ${VALID_TT_STATUSES.join(', ')}`);
+      return;
+    }
+    const task = updateTechTask(id, {
+      status,
+      jarvis_note: typeof req.body?.jarvis_note === 'string' ? req.body.jarvis_note : undefined,
+      report_link: typeof req.body?.report_link === 'string' ? req.body.report_link : undefined,
+    });
+    if (!task) {
+      sendError(res, 404, 'tech_task_not_found', 'tech task not found');
+      return;
+    }
+    res.json({ tech_task: task });
   });
 
   // == Cockpit Monitors =======================================================

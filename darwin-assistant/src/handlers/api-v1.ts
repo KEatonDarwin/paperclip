@@ -290,6 +290,16 @@ import { fullThrottleStatus } from '../throttle-status.js';
 // design so it still answers when jarvis.db is locked.
 import { LANE_KEYS, laneDef, resetAllLanes, resumeAll, setLane, stopAll } from '../work-switch.js';
 import { runWorkCli, workSwitchPayload } from '../work-switch-ops.js';
+
+// 🐎 Agent Stable — Kevin's recurring claude-CLI agents. A thin layer over the
+// `agent-stable` CLI so the registry/systemd/ledger logic has exactly one home
+// (src/agent-stable.ts).
+import {
+  agentStablePayload,
+  agentTail,
+  runAgentNow,
+  setAgentEnabled,
+} from '../agent-stable.js';
 // 🩺 COCKPIT HEALTH (docs/health/CONTRACT.md) — the box + workload monitor.
 import {
   noteApiRequest,
@@ -4272,6 +4282,59 @@ export function createApiV1Router(): Router {
     } catch (err) {
       sendError(res, 500, 'work_switch_failed', err instanceof Error ? err.message : String(err));
     }
+  });
+
+  // == 🐎 AGENT STABLE ========================================================
+  // The stable of recurring claude-CLI agents (/home/kevin/agent-stable). Every
+  // read and every mutation goes through the `agent-stable` CLI and the SHARED
+  // runner, so an API-triggered run is byte-for-byte the run a timer does:
+  // flock, API keys scrubbed from the env, post_step always, ledger row, ntfy on
+  // failure. Nothing here ever constructs a model call itself.
+  router.get('/agents', (_req: AuthedRequest, res) => {
+    res.json(agentStablePayload());
+  });
+
+  router.get('/agents/:key/tail', (req: AuthedRequest, res) => {
+    const key = String(req.params.key ?? '');
+    const which = req.query.which === 'log' ? 'log' : 'digest';
+    const lines = Number(req.query.lines ?? 40);
+    res.json({ key, ...agentTail(key, which, Number.isFinite(lines) ? lines : 40) });
+  });
+
+  router.post('/agents/:key/run', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Running an agent requires an admin-scoped key');
+      return;
+    }
+    const key = String(req.params.key ?? '');
+    const result = runAgentNow(key);
+    if (!result.ok) {
+      sendError(res, 400, 'agent_run_failed', result.detail);
+      return;
+    }
+    res.json({ ok: true, key, unit: result.unit, detail: result.detail });
+  });
+
+  router.post('/agents/:key/enabled', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Enabling/disabling an agent requires an admin-scoped key');
+      return;
+    }
+    const key = String(req.params.key ?? '');
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (typeof body.enabled !== 'boolean') {
+      sendError(res, 400, 'invalid_request', 'enabled (boolean) is required');
+      return;
+    }
+    const result = setAgentEnabled(key, body.enabled);
+    // The CLI exits non-zero when the timer unit is not installed (every
+    // adopted managed:false agent) even though the registry flag DID flip, so
+    // registry_written — not rc — decides whether this was a no-op.
+    if (!result.registry_written) {
+      sendError(res, 400, 'agent_enable_failed', result.output || 'the registry was not written');
+      return;
+    }
+    res.json({ ok: true, key, enabled: body.enabled, rc: result.rc, detail: result.output });
   });
 
   // Decision memory — real settled-node outcomes by model, for the planner to

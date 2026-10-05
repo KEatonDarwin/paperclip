@@ -3,17 +3,26 @@
 // (hopper node #1360: guestScopeGate, mounted right after bearerAuth; node
 // #1361: per-connection SSE scoping + thread write 403; node #1362:
 // deny/allow acceptance suite + guest support in GET /threads/:external_id
-// and POST /threads/:external_id/messages) end to end over real HTTP on a
-// throwaway port, against a scratch DB. No live data, no model calls, no
-// touch of the live jarvis.db.
+// and POST /threads/:external_id/messages; #271: markdown in-scope ALLOW +
+// the other ownership handlers guarded against the in-scope-500 gap) end to
+// end over real HTTP on a throwaway port, against a scratch DB. No live
+// data, no model calls, no touch of the live jarvis.db.
+//
+// This file only boots darwin-assistant's API router — it cannot exercise
+// jarvis-command-center's SSR page gate (a separate repo/process). That
+// proof — GET /flight-deck as a guest -> 302, plus the proxy forwarding her
+// own token upstream instead of the admin key — lives in
+// jarvis-command-center/scripts/guest-page-gate-test.ts, which boots this
+// same darwin-assistant router as its real backend.
 //
 //   npm run build
 //   npm run guest-enforce-route:test
 //
 // Proves:
 //   1. A guest hitting a thread outside her scope -> 403 JSON {error:{code:'forbidden'}}.
-//   2. A guest hitting a thread matching allowed_thread_prefixes -> passes
-//      the gate (reaches the real handler, not blocked at 403/404-by-gate).
+//   2. ALLOW: GET /threads/:external_id/markdown on her own thread -> a real
+//      200 with her markdown, not just "not 403" (#271: this used to crash
+//      on req.apiKey!.id for an in-scope guest — the in-scope-500 gap).
 //   2b. ALLOW: GET /threads/:external_id on her own thread -> 200 with the
 //      thread's turns (node #1362 guest branch).
 //   2c. ALLOW: POST /threads/:external_id/messages on her own thread -> 202,
@@ -25,8 +34,10 @@
 //      instead of a JSON 403.
 //   5c. DENY: a privileged/admin API (POST /work-switch) -> 403, never
 //      reaches the stop-all switch.
-//   5d. DENY: a non-shared page route (GET /workstreams, the Flight Deck
-//      data feed) -> 403.
+//   5d. DENY: a non-shared page-DATA route (GET /workstreams, the Flight
+//      Deck data feed) -> 403. This is an API-level denial, not the SSR
+//      page-route proof — see jarvis-command-center's
+//      guest-page-gate-test.ts for GET /flight-deck itself.
 //   6. GET /session/whoami always passes for a guest, regardless of scope_claim
 //      (identity bootstrap, not a protected resource).
 //   7. Admin/api_key bearer auth is completely unaffected by the gate,
@@ -144,20 +155,19 @@ try {
   }
   console.log('  ✓ guest denied on a thread outside her scope (403 forbidden)');
 
-  // 2. Thread matching allowed_thread_prefixes -> passes the gate (reaches
-  // the handler, not short-circuited at 403). Note: the handler itself then
-  // throws trying to read req.apiKey!.id, logging a stack trace below — this
-  // is the PRE-EXISTING gap ENFORCE-PLAN.md documents ("every existing
-  // handler assumes req.apiKey! is present... a crash, not a clean deny"),
-  // not a defect in this gate. Patching the ~60 ownership-checking handlers
-  // to branch on req.guestPrincipal is explicitly out of scope for #1360
-  // (the gate itself) — this assertion only proves the gate let the request
-  // through.
+  // 2. Thread matching allowed_thread_prefixes -> the gate lets it through
+  // AND the handler itself actually serves it: a real 200 with real markdown,
+  // not just "not 403". This used to crash (req.apiKey!.id on undefined for
+  // a guest) — the #271 fix branches GET /threads/:external_id/markdown on
+  // req.guestPrincipal the same way GET /threads/:external_id and
+  // POST .../messages already did (node #1362). getOrCreateConversation is
+  // idempotent — tests 2b/8/9 below reuse this same row.
   {
+    getOrCreateConversation('cockpit:companion-chat-1');
     const res = await req('GET', '/threads/cockpit:companion-chat-1/markdown', { token: guestToken });
-    assert.notEqual(res.status, 403, `gate should not block a matching thread prefix, got 403: ${JSON.stringify(res.json)}`);
+    assert.equal(res.status, 200, `expected 200 reading her own thread's markdown, got ${res.status}: ${JSON.stringify(res.json)}`);
   }
-  console.log('  ✓ guest passes the gate on a thread matching allowed_thread_prefixes (handler-side req.apiKey! crash is the pre-existing, documented, out-of-scope gap)');
+  console.log('  ✓ guest reads her own thread\'s markdown via GET /threads/:external_id/markdown -> 200 (in-scope ALLOW, not just "not 403")');
 
   // 2b. ALLOW: GET /threads/:external_id on her own thread -> a real 200,
   // not just "not 403" (node #1362 guest branch in the handler itself).

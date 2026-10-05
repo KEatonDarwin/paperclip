@@ -1385,6 +1385,23 @@ function findConversationForCaller(caller: ApiKeyRow, externalId: string): Conve
   return conv;
 }
 
+// #271 verifier gap (ENFORCE-PLAN.md "Thread write/post APIs"): guestScopeGate
+// only proves a guest's thread/goal/route is IN her scope_claim — for every
+// route below that is actually allowed through, the handler still assumed an
+// api_key caller and read `req.apiKey!.id`, which is undefined for a guest
+// and throws (500), not a clean deny. None of these routes (lock/unlock,
+// rename/delete/fork, todos/links/decisions/dispatches management, model
+// pin, …) are part of the guest's companion use case (read + post messages,
+// handled separately via req.guestPrincipal), so the correct behavior for a
+// guest here is a 403, not quiet access. Callers do `if (!caller) return;`.
+function requireApiKeyCaller(req: AuthedRequest, res: Response): ApiKeyRow | null {
+  if (req.guestPrincipal) {
+    sendError(res, 403, 'forbidden', 'Guest scope does not include this operation');
+    return null;
+  }
+  return req.apiKey!;
+}
+
 // Routes that carry their OWN authentication and must bypass the bearer gate.
 // The Guards webhook (CONTRACT §12.4 route 35) verifies X-Goals-Guard-Secret
 // itself (fails closed: 503 when the secret is unset) — see its handler.
@@ -5557,7 +5574,8 @@ export function createApiV1Router(): Router {
   // Pass adapter:null to clear the override (thread inherits the global default).
 
   router.patch('/threads/:external_id/model', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -5643,14 +5661,29 @@ export function createApiV1Router(): Router {
   // -- GET /threads/:external_id/markdown -----------------------------------
 
   router.get('/threads/:external_id/markdown', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
     const externalId = paramString(req.params.external_id);
-    const result = findConversationForCaller(caller, externalId);
-    if ('error' in result) {
-      sendError(res, result.error.status, result.error.code, result.error.message);
-      return;
+    // #271 verifier gap: same guest branch as GET /threads/:external_id (node
+    // #1362) and POST /threads/:external_id/messages — guestScopeGate already
+    // proved externalId is inside her scope_claim; findConversationForCaller
+    // needs an ApiKeyRow she doesn't have, so a guest read of an in-scope
+    // thread's markdown must not fall through to that branch.
+    let conv: ConversationRow;
+    if (req.guestPrincipal) {
+      const found = getConversation(externalId);
+      if (!found) {
+        sendError(res, 404, 'thread_not_found', `Thread ${externalId} not found`);
+        return;
+      }
+      conv = found;
+    } else {
+      const caller = req.apiKey!;
+      const result = findConversationForCaller(caller, externalId);
+      if ('error' in result) {
+        sendError(res, result.error.status, result.error.code, result.error.message);
+        return;
+      }
+      conv = result;
     }
-    const conv = result;
     const turns = getTurns(conv.id);
     const md = renderMarkdown(conv, turns);
     res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
@@ -5660,7 +5693,8 @@ export function createApiV1Router(): Router {
   // -- POST /threads/:external_id/session-clone ------------------------------
 
   router.post('/threads/:external_id/session-clone', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -5690,7 +5724,8 @@ export function createApiV1Router(): Router {
   // path first).
 
   router.patch('/threads/:external_id', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -5781,7 +5816,9 @@ export function createApiV1Router(): Router {
   // PUT /threads/:external_id/lock — set or change a password on the thread.
   router.put('/threads/:external_id/lock', (req: AuthedRequest, res) => {
     const externalId = paramString(req.params.external_id);
-    const result = findConversationForCaller(req.apiKey!, externalId);
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
+    const result = findConversationForCaller(caller, externalId);
     if ('error' in result) { sendError(res, result.error.status, result.error.code, result.error.message); return; }
     const { password } = (req.body ?? {}) as { password?: unknown };
     if (typeof password !== 'string' || password.length < 1) {
@@ -5796,7 +5833,9 @@ export function createApiV1Router(): Router {
   // DELETE /threads/:external_id/lock — remove the password from the thread.
   router.delete('/threads/:external_id/lock', (req: AuthedRequest, res) => {
     const externalId = paramString(req.params.external_id);
-    const result = findConversationForCaller(req.apiKey!, externalId);
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
+    const result = findConversationForCaller(caller, externalId);
     if ('error' in result) { sendError(res, result.error.status, result.error.code, result.error.message); return; }
     clearThreadPassword(result.id);
     const refreshed = getConversationById(result.id) ?? result;
@@ -5806,7 +5845,9 @@ export function createApiV1Router(): Router {
   // POST /threads/:external_id/unlock — verify a password to access the thread.
   router.post('/threads/:external_id/unlock', (req: AuthedRequest, res) => {
     const externalId = paramString(req.params.external_id);
-    const result = findConversationForCaller(req.apiKey!, externalId);
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
+    const result = findConversationForCaller(caller, externalId);
     if ('error' in result) { sendError(res, result.error.status, result.error.code, result.error.message); return; }
     const { password } = (req.body ?? {}) as { password?: unknown };
     if (typeof password !== 'string') {
@@ -5911,7 +5952,8 @@ export function createApiV1Router(): Router {
   // Fire-and-forget, like the send-time trigger — the title lands via the
   // existing `conversation_renamed` SSE event.
   router.post('/threads/:external_id/auto-title', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -5936,7 +5978,8 @@ export function createApiV1Router(): Router {
   // the `thread_summary` SSE event once it lands.
 
   router.post('/threads/:external_id/summarize', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -5953,7 +5996,8 @@ export function createApiV1Router(): Router {
   // -- GET /threads/:external_id/summaries: list persisted summaries ----------
 
   router.get('/threads/:external_id/summaries', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -5966,7 +6010,8 @@ export function createApiV1Router(): Router {
   // -- DELETE /threads/:external_id: delete thread + its turns/todos ----------
 
   router.delete('/threads/:external_id', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -5987,7 +6032,8 @@ export function createApiV1Router(): Router {
   // for branching, but concurrent runs on both could collide. Acceptable v1.
 
   router.post('/threads/:external_id/fork', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6027,7 +6073,8 @@ export function createApiV1Router(): Router {
   // normal turn SSE once it's ready.
 
   router.post('/threads/:external_id/smart-fork', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6115,7 +6162,8 @@ export function createApiV1Router(): Router {
   // user/assistant exchange, for pasting into a fresh chat.
 
   router.get('/threads/:external_id/context-markdown', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6131,7 +6179,8 @@ export function createApiV1Router(): Router {
   // -- POST /threads/:external_id/stop: abort the in-flight run --------------
 
   router.post('/threads/:external_id/stop', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6254,7 +6303,8 @@ export function createApiV1Router(): Router {
   // message (his explicit ask, 2026-10-05). Idempotent + safe: refuses unless the
   // last turn really is an unanswered user turn and nothing is in flight.
   router.post('/threads/:external_id/resume', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6297,7 +6347,8 @@ export function createApiV1Router(): Router {
   // uploads even though the physical path (image-store's UPLOADS_DIR) is keyed
   // by numeric conversation id rather than external_id.
   router.get('/threads/:external_id/images/:turn_index/:filename', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6326,7 +6377,8 @@ export function createApiV1Router(): Router {
   // -- DELETE /threads/:external_id/queue/:queue_id: cancel a queued message -
 
   router.delete('/threads/:external_id/queue/:queue_id', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6347,7 +6399,8 @@ export function createApiV1Router(): Router {
   // -- GET /threads/:external_id/messages/:message_id: poll status ----------
 
   router.get('/threads/:external_id/messages/:message_id', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const messageId = paramString(req.params.message_id);
 
@@ -6400,7 +6453,8 @@ export function createApiV1Router(): Router {
   // -- GET /threads/:external_id/autonomy-ledger ----------------------------
 
   router.get('/threads/:external_id/autonomy-ledger', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6435,7 +6489,8 @@ export function createApiV1Router(): Router {
   const toSqliteUtc = (d: Date): string => d.toISOString().slice(0, 19).replace('T', ' ');
 
   router.put('/threads/:external_id/reminder', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6489,7 +6544,8 @@ export function createApiV1Router(): Router {
 
   /** Dismiss the current alert. A repeating reminder stays armed. */
   router.post('/threads/:external_id/reminder/ack', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6507,7 +6563,8 @@ export function createApiV1Router(): Router {
 
   /** Turn the reminder off entirely. */
   router.delete('/threads/:external_id/reminder', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6588,7 +6645,8 @@ export function createApiV1Router(): Router {
   // -- GET /threads/:external_id/todos: list per-thread todos ---------------
 
   router.get('/threads/:external_id/todos', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6601,7 +6659,8 @@ export function createApiV1Router(): Router {
   // -- POST /threads/:external_id/todos: create a todo ----------------------
 
   router.post('/threads/:external_id/todos', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const body = (req.body ?? {}) as { content?: unknown; owner?: unknown };
     const content = typeof body.content === 'string' ? body.content.trim() : '';
@@ -6627,7 +6686,8 @@ export function createApiV1Router(): Router {
   // -- PATCH /threads/:external_id/todos/:todoId: flip status / edit --------
 
   router.patch('/threads/:external_id/todos/:todoId', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6664,7 +6724,8 @@ export function createApiV1Router(): Router {
   // -- DELETE /threads/:external_id/todos/:todoId: remove a todo -------------
 
   router.delete('/threads/:external_id/todos/:todoId', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6684,7 +6745,8 @@ export function createApiV1Router(): Router {
   // -- GET /threads/:external_id/links: list per-thread relevant links -------
 
   router.get('/threads/:external_id/links', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6698,7 +6760,8 @@ export function createApiV1Router(): Router {
   // kind:'preview' (default) upserts the single hero link; kind:'link' appends.
 
   router.post('/threads/:external_id/links', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const body = (req.body ?? {}) as { url?: unknown; label?: unknown; kind?: unknown };
     const url = typeof body.url === 'string' ? normalizeLinkTarget(body.url) : '';
@@ -6726,7 +6789,8 @@ export function createApiV1Router(): Router {
   // -- DELETE /threads/:external_id/links/:linkId: remove one link -----------
 
   router.delete('/threads/:external_id/links/:linkId', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6746,7 +6810,8 @@ export function createApiV1Router(): Router {
   // -- DELETE /threads/:external_id/links: clear all links -------------------
 
   router.delete('/threads/:external_id/links', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6761,7 +6826,8 @@ export function createApiV1Router(): Router {
 
   // -- POST /threads/:ext/dispatches: create a dispatch ----------------------
   router.post('/threads/:external_id/dispatches', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6811,7 +6877,8 @@ export function createApiV1Router(): Router {
 
   // -- GET /threads/:ext/dispatches: list outbound + inbound -----------------
   router.get('/threads/:external_id/dispatches', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6826,7 +6893,8 @@ export function createApiV1Router(): Router {
 
   // -- PATCH /threads/:ext/dispatches/:id: acknowledge -----------------------
   router.patch('/threads/:external_id/dispatches/:dispatchId', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6854,7 +6922,8 @@ export function createApiV1Router(): Router {
 
   // -- DELETE /threads/:ext/dispatches/:id: remove ---------------------------
   router.delete('/threads/:external_id/dispatches/:dispatchId', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6874,7 +6943,8 @@ export function createApiV1Router(): Router {
   // -- POST /threads/:external_id/todos/:todoId/promote-to-shim -------------
 
   router.post('/threads/:external_id/todos/:todoId/promote-to-shim', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6918,7 +6988,8 @@ export function createApiV1Router(): Router {
   // -- GET /threads/:external_id/decisions: per-thread Decision Ledger -------
 
   router.get('/threads/:external_id/decisions', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {
@@ -6933,7 +7004,8 @@ export function createApiV1Router(): Router {
   // -- POST /threads/:external_id/decisions: record a decision ---------------
 
   router.post('/threads/:external_id/decisions', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
+    const caller = requireApiKeyCaller(req, res);
+    if (!caller) return;
     const externalId = paramString(req.params.external_id);
     const result = findConversationForCaller(caller, externalId);
     if ('error' in result) {

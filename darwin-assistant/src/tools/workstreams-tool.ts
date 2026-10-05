@@ -1,3 +1,4 @@
+import { getConversation } from '../conversation-db.js';
 import type { ToolDef } from './index.js';
 import {
   attachWorkstreamLink,
@@ -15,6 +16,22 @@ import {
   type WorkstreamActor,
   type WorkstreamTurn,
 } from '../workstreams.js';
+
+// Flight Deck bug (Kevin, 2b0a7683): cards created from a chat had no link
+// back to it. Skip the Flight Deck page itself and a workstream's own
+// 💬 Discuss thread — neither is a meaningful "origin" to link back to.
+const SKIP_ORIGIN_EXT = /^cockpit:workstream-\d+$/;
+
+function originChatLabel(ext: string): string {
+  try {
+    const conversation = getConversation(ext);
+    const title = conversation?.title?.trim();
+    if (title) return `Origin chat · ${title.length > 48 ? `${title.slice(0, 48).trimEnd()}...` : title}`;
+  } catch {
+    /* fall through to generic label */
+  }
+  return 'Origin chat';
+}
 
 // FLIGHT DECK tool — keeps Kevin's cockpit surface true as work moves. A
 // workstream is one ball in the air; the important fields are `turn` (whose
@@ -64,7 +81,7 @@ export const workstreams: ToolDef = {
     },
     required: ['operation'],
   },
-  execute: async (args) => {
+  execute: async (args, context) => {
     const op = typeof args.operation === 'string' ? args.operation : '';
     const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null);
     const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
@@ -95,7 +112,23 @@ export const workstreams: ToolDef = {
         sort_order: num(args.sort_order),
         actor: actor(),
       });
-      return { ok: true, workstream };
+
+      const originExt = context && typeof context.externalId === 'string' ? context.externalId.trim() : '';
+      if (originExt && originExt !== 'cockpit:flight-deck' && !SKIP_ORIGIN_EXT.test(originExt)) {
+        try {
+          attachWorkstreamLink({
+            workstream_id: workstream.id,
+            kind: 'thread',
+            ref: originExt,
+            label: originChatLabel(originExt),
+          });
+        } catch {
+          /* a pre-existing link (or any attach failure) must never fail workstream creation */
+        }
+      }
+
+      const refreshed = getWorkstream(workstream.id);
+      return { ok: true, workstream: refreshed ?? workstream };
     }
 
     if (op === 'update') {

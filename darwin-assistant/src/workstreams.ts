@@ -108,6 +108,56 @@ for (const col of ['detail TEXT']) {
   }
 }
 
+// Flight Deck bug (Kevin, 2b0a7683): workstreams created before the
+// auto-attach-on-create fix (see tools/workstreams-tool.ts) have no origin
+// chat link. Recover one for each via its linked hopper tree's
+// origin_thread_ext. Idempotent (workstream_links has a UNIQUE constraint on
+// workstream_id/kind/ref) so it's safe to run on every startup.
+function backfillWorkstreamOriginChats(): void {
+  try {
+    const SKIP_ORIGIN_EXT = /^cockpit:workstream-\d+$/;
+    const candidates = sqliteDb
+      .prepare<[], { workstream_id: number; origin_thread_ext: string }>(
+        `
+        SELECT DISTINCT l.workstream_id AS workstream_id, t.origin_thread_ext AS origin_thread_ext
+        FROM workstream_links l
+        JOIN hopper_trees t ON t.id = l.ref
+        WHERE l.kind = 'tree' AND t.origin_thread_ext IS NOT NULL AND t.origin_thread_ext != ''
+          AND NOT EXISTS (
+            SELECT 1 FROM workstream_links tl
+            WHERE tl.workstream_id = l.workstream_id AND tl.kind = 'thread'
+          )
+          AND l.workstream_id IN (SELECT id FROM workstreams WHERE archived = 0)
+        `,
+      )
+      .all();
+
+    for (const row of candidates) {
+      const ext = row.origin_thread_ext.trim();
+      if (!ext || ext === 'cockpit:flight-deck' || SKIP_ORIGIN_EXT.test(ext)) continue;
+      let label = 'Origin chat';
+      try {
+        const conversation = sqliteDb
+          .prepare<[string], { title: string | null }>(`SELECT title FROM conversations WHERE external_id = ?`)
+          .get(ext);
+        const title = conversation?.title?.trim();
+        if (title) label = `Origin chat · ${title.length > 48 ? `${title.slice(0, 48).trimEnd()}...` : title}`;
+      } catch {
+        /* keep generic label */
+      }
+      try {
+        attachWorkstreamLink({ workstream_id: row.workstream_id, kind: 'thread', ref: ext, label });
+      } catch {
+        /* a pre-existing link for this ref must never block the rest of the backfill */
+      }
+    }
+  } catch {
+    /* missing hopper_trees table or a cold DB must never crash startup */
+  }
+}
+// NOTE: invoked at the bottom of this file, once attachWorkstreamLink (and
+// the statement objects it uses) are initialized — see call site below.
+
 const VALID_TURNS = new Set<WorkstreamTurn>(['jarvis', 'kevin', 'external', 'parked', 'done']);
 const VALID_LINK_KINDS = new Set<WorkstreamLinkKind>(['thread', 'tree', 'todo_root', 'commitment', 'url']);
 const VALID_ACTORS = new Set<WorkstreamActor>(['jarvis', 'kevin', 'system']);
@@ -488,6 +538,8 @@ export function attachWorkstreamLink(args: {
   emitById(args.workstream_id);
   return getExistingLinkStmt.get(args.workstream_id, kind, ref) ?? null;
 }
+
+backfillWorkstreamOriginChats();
 
 export function deleteWorkstreamLink(workstreamId: number, linkId: number): WorkstreamLinkRow | null {
   const row = getLinkByIdStmt.get(linkId) ?? null;

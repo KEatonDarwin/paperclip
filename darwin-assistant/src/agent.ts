@@ -781,7 +781,7 @@ export function buildContinuationPrompt(
   userMessage: string,
   adapterId: string = 'claude',
   model: string | null = null,
-  opts?: { aggressive?: boolean; memoryProfile?: MemoryProfile },
+  opts?: { aggressive?: boolean; memoryProfile?: MemoryProfile; externalId?: string | null },
 ): string {
   const priorTurns = turns.length && turns[turns.length - 1]?.role === 'user'
     ? turns.slice(0, -1)
@@ -791,7 +791,7 @@ export function buildContinuationPrompt(
   // Memory rides in the `## Current Memory` refresh block below, not in the
   // system prompt — passing omitMemory kills the historical double injection.
   const systemPrompt = buildSystemPrompt(memoryProfile, { omitMemory: true });
-  const toolsBlock = buildToolsBlock();
+  const toolsBlock = buildToolsBlock(opts?.externalId);
 
   const windowTokens = contextWindowTokensFor(adapterId, model);
   const aggressive = opts?.aggressive ?? false;
@@ -1586,7 +1586,7 @@ async function runConversationTurn(
   const memoryProfile = memoryProfileForThread(conv.external_id);
   let stdinContent = perTurnContextPrefix + (sessionId
     ? `<memory_refresh>\n${loadMemoryBlock(resumeMemoryMaxChars, memoryProfile)}\n</memory_refresh>\n\n${modelInput}`
-    : (turns.length > 1 ? buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { memoryProfile }) : buildInitialPrompt(modelInput, memoryProfile, conv.external_id)));
+    : (turns.length > 1 ? buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { memoryProfile, externalId: conv.external_id }) : buildInitialPrompt(modelInput, memoryProfile, conv.external_id)));
 
   // DAR-756: only one aggressive-compaction retry per turn — if the destination
   // model still overflows after that, stop retrying and degrade to a friendly
@@ -1639,7 +1639,7 @@ async function runConversationTurn(
       if (sessionId && !result.text && !result.sessionId) {
         console.log(`[agent] Session ${sessionId} expired, starting fresh`);
         sessionId = null;
-        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model);
+        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { memoryProfile, externalId: conv.external_id });
         accumulatedText = '';
         sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
         result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext);
@@ -1658,7 +1658,7 @@ async function runConversationTurn(
         contextOverflowRetried = true;
         console.log(`[agent] Conversation ${conv.id} overflowed ${adapter.id}'s context window; retrying with an aggressively compacted continuation prompt`);
         sessionId = null;
-        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { aggressive: true });
+        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { aggressive: true, memoryProfile, externalId: conv.external_id });
         accumulatedText = '';
         try {
           sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
@@ -1722,7 +1722,7 @@ async function runConversationTurn(
           activeClaudeAccount = rescueAccount;
           runClaudeRuntime.claudeAccount = rescueAccount;
           sessionId = null;
-          stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model);
+          stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { memoryProfile, externalId: conv.external_id });
           accumulatedText = '';
           try {
             sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);

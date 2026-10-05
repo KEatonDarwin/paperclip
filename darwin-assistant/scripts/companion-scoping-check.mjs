@@ -10,16 +10,20 @@
 //   (1) a companion thread's assembled system context carries the companion
 //       persona + goal-12 (wish-catalog) orientation, and NOT Kevin's JARVIS
 //       operator prompt.
-//   (2) a companion thread's resolved tool list is exactly the conversation
-//       path (plain text turns, which are never gated by tool name) plus the
-//       companion_send_to_kevin bridge seam — a representative set of ops
-//       tools (goals, hopper, throttle, work_switch, deploy_control, shim_*,
-//       create_issue, supabase_execute_sql) is absent.
+//   (2) a companion thread's ACTUAL PRODUCTION PROMPTS — buildToolsBlock(ext),
+//       buildInitialPrompt(...), and buildContinuationPrompt(...) in both its
+//       with-opts and no-opts call signatures (the real shapes every call
+//       site in agent.ts uses, including the session-expiry/overflow/
+//       account-swap retry paths that pass no opts at all) — never advertise
+//       an ops tool heading, and never leak the JARVIS persona. Asserts on
+//       the real prompt TEXT, not a re-derived allow-list, so an ungated call
+//       site (one that forgets to pass externalId/memoryProfile) fails this
+//       check the same way it would leak in production.
 //   (3) a non-companion thread is completely unaffected: full tool set,
 //       JARVIS persona.
 //
-// Imports the real prompt.js/companion-chat.js/tools/index.js modules so this
-// exercises production code, not a re-implementation of it.
+// Imports the real prompt.js/companion-chat.js/tools/index.js/agent.js
+// modules so this exercises production code, not a re-implementation of it.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -46,10 +50,13 @@ const distDir = path.join(__dirname, '..', 'dist');
 const { memoryProfileForThread, buildSystemPrompt, loadMemoryBlock } = await import(
   path.join(distDir, 'prompt.js')
 );
-const { allowedToolsForThread, companionThreadExt, COMPANION_BRIDGE_TOOL_NAME } = await import(
+const { companionThreadExt, COMPANION_BRIDGE_TOOL_NAME } = await import(
   path.join(distDir, 'companion-chat.js')
 );
 const { ALL_TOOLS } = await import(path.join(distDir, 'tools/index.js'));
+const { buildToolsBlock, buildInitialPrompt, buildContinuationPrompt } = await import(
+  path.join(distDir, 'agent.js')
+);
 
 let failures = 0;
 function check(label, cond) {
@@ -61,12 +68,62 @@ function check(label, cond) {
   }
 }
 
-// Mirrors agent.ts buildToolsBlock()'s exact filter, against the real
-// allowedToolsForThread + ALL_TOOLS this node is scoped to verify.
-function resolvedToolNames(externalId) {
-  const allowed = allowedToolsForThread(externalId);
-  const tools = allowed ? ALL_TOOLS.filter((t) => allowed.has(t.name)) : ALL_TOOLS;
-  return tools.map((t) => t.name);
+// A fake prior-turn transcript so buildContinuationPrompt has something to
+// replay (role/content/created_at are the only fields summarizeTurnForReplay
+// reads; the rest just need to exist on the row shape).
+function fakeTurn(role, content, idx) {
+  return {
+    id: idx, conversation_id: 1, turn_index: idx, role, content,
+    tool_name: null, tool_args: null, tool_result: null,
+    created_at: new Date().toISOString(), timing_ms: null,
+    input_tokens: null, output_tokens: null, cache_read_tokens: null, cache_write_tokens: null,
+    model: null, claude_input: null, claude_output: null, error_detail: null, images: null,
+  };
+}
+const FAKE_TURNS = [
+  fakeTurn('user', 'Hi there', 1),
+  fakeTurn('assistant', 'Hello! How can I help?', 2),
+  fakeTurn('user', 'How are you?', 3),
+];
+
+// The exact regex from this node's spec — matches the `### <tool_name>`
+// heading buildToolsBlock() emits for any of these ops tools. Asserted
+// against REAL buildToolsBlock/buildInitialPrompt/buildContinuationPrompt
+// output below, never a re-derived allow-list, so an ungated call site (one
+// that forgets to pass externalId/memoryProfile — exactly the #1390 gaps)
+// fails this check the same way it would leak in production.
+const OPS_HEADING_RE = /### (goals|hopper|throttle|work_switch|deploy_control|shim_|supabase_execute_sql)/;
+const OPS_TOOLS = [
+  'goals',
+  'hopper',
+  'throttle',
+  'work_switch',
+  'deploy_control',
+  'list_shim_tasks',
+  'create_shim_task',
+  'shim_deploy_status',
+  'shim_deploy_switch',
+  'create_issue',
+  'supabase_execute_sql',
+];
+
+function checkCompanionSafe(label, prompt) {
+  check(`${label}: no ops-tool heading (${OPS_HEADING_RE})`, !OPS_HEADING_RE.test(prompt));
+  check(`${label}: does NOT contain "You are JARVIS"`, !prompt.includes('You are JARVIS'));
+  check(`${label}: does NOT contain "Who Kevin Is"`, !prompt.includes('Who Kevin Is'));
+  check(`${label}: carries the companion_send_to_kevin tool heading`, prompt.includes(`### ${COMPANION_BRIDGE_TOOL_NAME}`));
+}
+
+// `includesPersona`: false for a bare buildToolsBlock() call, which never
+// carries the system prompt/persona at all — only the tools block itself.
+function checkNonCompanionUnaffected(label, prompt, includesPersona = true) {
+  check(`${label}: ops-tool headings present (unaffected)`, OPS_HEADING_RE.test(prompt));
+  if (includesPersona) {
+    check(`${label}: contains "You are JARVIS"`, prompt.includes('You are JARVIS'));
+  }
+  for (const name of OPS_TOOLS) {
+    check(`${label}: still advertises tool "${name}"`, prompt.includes(`### ${name}`));
+  }
 }
 
 const companionExternalId = companionThreadExt('kevin-wife');
@@ -97,55 +154,63 @@ check(
   loadMemoryBlock(undefined, companionProfile) === '',
 );
 
-// ── (2) resolved tool list ───────────────────────────────────────────────────
-const companionTools = resolvedToolNames(companionExternalId);
+// ── (2) real production prompts for a companion thread ──────────────────────
+// buildToolsBlock/buildInitialPrompt ("no-opts" signature: externalId is a
+// plain positional arg) and buildContinuationPrompt ("with-opts" signature:
+// externalId rides in the opts object) are each exercised with the companion
+// externalId, covering every shape agent.ts actually calls them with —
+// including the aggressive-retry opts variant (line ~1661) and the plain
+// opts variant used at the session-expiry/account-swap retry call sites
+// (lines ~1642/~1725) that GAP 1/2 found ungated.
+checkCompanionSafe('(2) buildToolsBlock(companionExternalId)', buildToolsBlock(companionExternalId));
 
-check(
-  '(2) resolved tool list is exactly {companion_send_to_kevin} (the conversation path itself carries no tool name, so is never gated by this allow-list)',
-  companionTools.length === 1 && companionTools[0] === COMPANION_BRIDGE_TOOL_NAME,
+checkCompanionSafe(
+  '(2) buildInitialPrompt(msg, companionProfile, companionExternalId)',
+  buildInitialPrompt('Hi', companionProfile, companionExternalId),
 );
 
-const OPS_TOOLS = [
-  'goals',
-  'hopper',
-  'throttle',
-  'work_switch',
-  'deploy_control',
-  'list_shim_tasks',
-  'create_shim_task',
-  'shim_deploy_status',
-  'shim_deploy_switch',
-  'create_issue',
-  'supabase_execute_sql',
-];
-for (const name of OPS_TOOLS) {
-  check(`(2) ops tool "${name}" is ABSENT from the companion allow-list`, !companionTools.includes(name));
-}
+checkCompanionSafe(
+  '(2) buildContinuationPrompt(..., { memoryProfile, externalId }) [with-opts]',
+  buildContinuationPrompt(FAKE_TURNS, 'Hi', 'claude', null, { memoryProfile: companionProfile, externalId: companionExternalId }),
+);
 
-// ── (3) a non-companion thread is unaffected ────────────────────────────────
+checkCompanionSafe(
+  '(2) buildContinuationPrompt(..., { aggressive: true, memoryProfile, externalId }) [with-opts, aggressive retry]',
+  buildContinuationPrompt(FAKE_TURNS, 'Hi', 'claude', null, {
+    aggressive: true,
+    memoryProfile: companionProfile,
+    externalId: companionExternalId,
+  }),
+);
+
+// ── (3) a non-companion thread is completely unaffected ─────────────────────
 const nonCompanionIds = ['cockpit:goal-12', 'cockpit:hopper-node-1382'];
 for (const externalId of nonCompanionIds) {
   const profile = memoryProfileForThread(externalId);
   check(`(3) ${externalId} does NOT resolve to the companion profile`, profile !== 'companion');
 
-  const systemPrompt = buildSystemPrompt(profile, { omitMemory: true });
-  check(
-    `(3) ${externalId} system context still carries the JARVIS persona`,
-    systemPrompt.includes("You are JARVIS — Kevin's personal AI life coach"),
+  checkNonCompanionUnaffected(`(3) ${externalId} buildToolsBlock(ext)`, buildToolsBlock(externalId), false);
+  checkNonCompanionUnaffected(
+    `(3) ${externalId} buildInitialPrompt(msg, profile, ext)`,
+    buildInitialPrompt('Hi', profile, externalId),
   );
+  checkNonCompanionUnaffected(
+    `(3) ${externalId} buildContinuationPrompt(..., { memoryProfile, externalId }) [with-opts]`,
+    buildContinuationPrompt(FAKE_TURNS, 'Hi', 'claude', null, { memoryProfile: profile, externalId }),
+  );
+
+  const systemPrompt = buildSystemPrompt(profile, { omitMemory: true });
   check(
     `(3) ${externalId} system context does NOT carry the companion persona`,
     !systemPrompt.includes("You're chatting with Kevin's wife"),
   );
 
-  const tools = resolvedToolNames(externalId);
+  const toolsBlock = buildToolsBlock(externalId);
+  const toolHeadingCount = (toolsBlock.match(/^### /gm) ?? []).length;
   check(
-    `(3) ${externalId} resolved tool list is the full, untouched ALL_TOOLS set (${ALL_TOOLS.length} tools)`,
-    tools.length === ALL_TOOLS.length,
+    `(3) ${externalId} buildToolsBlock(ext) advertises the full, untouched ALL_TOOLS set (${ALL_TOOLS.length} tools)`,
+    toolHeadingCount === ALL_TOOLS.length,
   );
-  for (const name of OPS_TOOLS) {
-    check(`(3) ${externalId} still has ops tool "${name}"`, tools.includes(name));
-  }
 }
 
 if (failures > 0) {

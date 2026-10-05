@@ -1301,18 +1301,19 @@ export async function processMessage(
   conversationId: string,
   messageId?: string,
   images?: SavedImage[],
+  opts?: { resumeLastUserTurn?: boolean },
 ): Promise<string> {
   if (refuseModelTurnInScratch(`processMessage(${conversationId})`)) {
     return '[sim-guard] model turn refused — scratch environment. No tokens were spent.';
   }
   if (!isAutomatedTurn(conversationId, messageId)) {
-    return await processMessageInner(input, conversationId, messageId, images);
+    return await processMessageInner(input, conversationId, messageId, images, opts);
   }
   if (!(await acquireAutomatedSlot(conversationId))) {
     return '[turn-admission] skipped — the automated-turn queue stayed full for 10 minutes.';
   }
   try {
-    return await processMessageInner(input, conversationId, messageId, images);
+    return await processMessageInner(input, conversationId, messageId, images, opts);
   } finally {
     releaseAutomatedSlot();
   }
@@ -1323,6 +1324,7 @@ async function processMessageInner(
   conversationId: string,
   messageId?: string,
   images?: SavedImage[],
+  opts?: { resumeLastUserTurn?: boolean },
 ): Promise<string> {
   // Sim guard (see src/sim-guard.ts). THE chokepoint: every ingress — Slack,
   // cockpit, webhook, check-in worker, goals/guards/tree cues, the autopilot
@@ -1356,7 +1358,7 @@ async function processMessageInner(
   } satisfies StatusEvent);
 
   try {
-    return await runConversationTurn(conv, input, abort.signal, images);
+    return await runConversationTurn(conv, input, abort.signal, images, opts?.resumeLastUserTurn === true);
   } finally {
     activeRuns.delete(conv.id);
     liveStreams.delete(conv.id);
@@ -1374,18 +1376,27 @@ async function runConversationTurn(
   input: string,
   signal?: AbortSignal,
   images?: SavedImage[],
+  resumeLastUserTurn = false,
 ): Promise<string> {
-  const userTurnIndex = addTurn(
-    conv.id,
-    'user',
-    input,
-    undefined,
-    undefined,
-    undefined,
-    images && images.length
-      ? { images: JSON.stringify(images.map(({ filename, mime, conversationId }) => ({ filename, mime, conversationId }))) }
-      : undefined,
-  );
+  // Normal path: this message is new, so record it as a `user` turn. Resume path
+  // (watchdog dead-turn recovery): the user turn ALREADY exists — the previous
+  // run died before replying — so re-running it must NOT insert a duplicate of
+  // Kevin's words. Reuse the existing last turn's index instead. (Kevin, 2026-10-05:
+  // a resumed dead turn appearing as a second copy of his message is "absolutely
+  // not the result I want.")
+  const userTurnIndex = resumeLastUserTurn
+    ? Math.max(0, countTurns(conv.id) - 1)
+    : addTurn(
+        conv.id,
+        'user',
+        input,
+        undefined,
+        undefined,
+        undefined,
+        images && images.length
+          ? { images: JSON.stringify(images.map(({ filename, mime, conversationId }) => ({ filename, mime, conversationId }))) }
+          : undefined,
+      );
   const runtime = resolveConversationRuntime(conv);
   const adapter = runtime.adapter;
   const turns = getTurnsLean(conv.id);

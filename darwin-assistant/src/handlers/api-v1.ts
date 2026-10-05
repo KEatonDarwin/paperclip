@@ -6018,6 +6018,48 @@ export function createApiV1Router(): Router {
     });
   });
 
+  // -- POST /threads/:external_id/resume: re-run a DEAD turn in place --------
+  // The watchdog's dead_turn sentinel calls this when a thread's last turn is
+  // Kevin's with no reply (the run died mid-turn, e.g. the model session reset).
+  // Unlike POST /messages, this does NOT insert a new user turn — it re-runs the
+  // EXISTING last user turn, so Kevin never sees a duplicate copy of his own
+  // message (his explicit ask, 2026-10-05). Idempotent + safe: refuses unless the
+  // last turn really is an unanswered user turn and nothing is in flight.
+  router.post('/threads/:external_id/resume', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const conv = result;
+
+    // Already running (or a queued message is pending)? Nothing to resume.
+    if (getInFlightMessageId(conv.id)) {
+      sendError(res, 409, 'turn_in_flight', 'a turn is already running on this thread');
+      return;
+    }
+
+    const turns = getTurns(conv.id);
+    const last = turns.length ? turns[turns.length - 1] : undefined;
+    if (!last || last.role !== 'user' || !(last.content ?? '').trim()) {
+      sendError(res, 409, 'nothing_to_resume', 'the last turn is not an unanswered user message');
+      return;
+    }
+
+    const messageId = `turn:${conv.id}:${last.turn_index}`;
+    errorByMessageId.delete(messageId);
+    processMessage(last.content ?? '', externalId, messageId, undefined, { resumeLastUserTurn: true })
+      .catch((err: unknown) => {
+        const code = err instanceof ConversationBusyError ? 'message_in_flight' : 'jarvis_error';
+        const message = err instanceof Error ? err.message : String(err);
+        errorByMessageId.set(messageId, { code, message });
+      });
+
+    res.status(202).json({ message_id: messageId, status: 'resuming' });
+  });
+
   // -- GET /threads/:external_id/images/:turn_index/:filename: serve an -----
   // -- attached image (DAR-744) ----------------------------------------------
   // The turn_index + filename must both match a real record on a turn the

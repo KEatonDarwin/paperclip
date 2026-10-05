@@ -294,8 +294,13 @@ def sentinel_dead_turn(c, now):
         if did_work == 0 and attempts < MAX_TURN_RECOVER and content:
             ok, err = True, ""
             try:
-                http("POST", COCKPIT + "/threads/" + urllib.parse.quote(ext, safe="") + "/messages",
-                     COCKPIT_KEY, {"text": content})
+                # Resume the EXISTING dead turn in place — do NOT re-post the
+                # message. /resume re-runs the last (unanswered) user turn without
+                # inserting a duplicate of Kevin's words into the thread, which is
+                # what the old POST /messages path did (Kevin, 2026-10-05: that's
+                # "absolutely not the result I want").
+                http("POST", COCKPIT + "/threads/" + urllib.parse.quote(ext, safe="") + "/resume",
+                     COCKPIT_KEY, {})
             except Exception as e:
                 ok, err = False, str(e)
             record_state(c, "dead_turn", key, "handled" if ok else "resume_failed",
@@ -304,7 +309,7 @@ def sentinel_dead_turn(c, now):
                    f"Dead turn auto-resumed: {label}" if ok else f"Dead turn — resume FAILED: {label}",
                    f"Your message got no reply for {int((now-ts).total_seconds()//60)}m "
                    f"(session died before doing anything). "
-                   f"{'Re-sent it; JARVIS is running it now.' if ok else 'Could not re-send: ' + err}"
+                   f"{'Re-running it now — no duplicate message.' if ok else 'Could not resume: ' + err}"
                    f"\n\n> {snippet}")
         else:
             record_state(c, "dead_turn", key, "handled", "error", snippet)

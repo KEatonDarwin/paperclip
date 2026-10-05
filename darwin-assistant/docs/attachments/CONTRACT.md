@@ -57,7 +57,7 @@ thread A is a **404** through thread B's URL — never a read.
 |---|---|---|---|
 | POST | `/threads/:external_id/attachments` | `{name, mime, data}` (base64, `data:` URL ok), optional `source:'settings'` | `201 {attachment}` |
 | GET | `/threads/:external_id/attachments` | — | `{attachments: [...]}` |
-| GET | `/threads/:external_id/attachments/:id/download` | — | the bytes, `Content-Type: <mime>`, `Content-Disposition: inline; filename="<original>"`, `X-Content-Type-Options: nosniff` |
+| GET | `/threads/:external_id/attachments/:id/download` | — | the bytes, `Content-Type: <mime>` (markup mimes — `text/html`, `text/css`, `*/xml`, svg — are deliberately served as `text/plain`, see below), `Content-Disposition: inline; filename="<original>"`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; sandbox` |
 | PUT | `/threads/:external_id/attachments/:id` | `{name?}` and/or `{data, mime?}` | `{attachment}` |
 | DELETE | `/threads/:external_id/attachments/:id` | — | `{status:'deleted', id}` |
 | GET | `/attachments` | `?external_id=` `?limit=` (default 500, max 2000) | `{attachments: [...]}` each **also** carrying `conversation_id`, `conversation_external_id`, `conversation_title` |
@@ -145,3 +145,18 @@ throwaway port, a scratch DB and a scratch uploads dir
 resolution and rejections, download headers, **cross-thread isolation**,
 rename/replace, delete-removes-bytes, the cross-thread list, the model block
 (inline/reference/truncate), and `attachment_ids` validation + turn stamping.
+
+## Why markup is served as `text/plain` (node #1395 review)
+
+`nosniff` only stops a browser *guessing* a type. A genuine `text/html` upload
+served with its own `Content-Type` would RENDER — and these bytes come back from
+the cockpit's own origin, where the SSR proxy attaches the bearer to every
+`/cockpit-api` call. A hostile `.html` opened at its download URL would then be
+stored XSS with full JARVIS API reach. So the download route sends a
+`default-src 'none'; sandbox` CSP on every attachment, and downgrades
+`text/html` / `text/css` / `text/xml` / `application/xml` / `image/svg+xml` to
+`text/plain; charset=utf-8`. Nothing in the UI regresses: `AttachmentViewer`
+reads the bytes with `fetch().text()` and renders them in a `<pre>` (markdown
+through `MarkdownText`, which has no raw-HTML pass), so Kevin still sees the
+file — just never executed. `image/svg+xml` is not on the upload allowlist at
+all; it is listed here as belt-and-braces.

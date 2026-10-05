@@ -6517,6 +6517,13 @@ export function createApiV1Router(): Router {
   // express.static, so an attachment id from thread A cannot be downloaded
   // through thread B's URL.
 
+  /** Mimes we refuse to hand back with their own Content-Type, because a browser
+   *  would RENDER them on the cockpit's origin rather than just display them.
+   *  Served as text/plain instead (the viewer shows source either way). */
+  const NEVER_RENDER_MIMES = new Set([
+    'text/html', 'text/xml', 'application/xml', 'text/css', 'image/svg+xml',
+  ]);
+
   /** Resolve :id to an attachment row that genuinely belongs to `conv`, or send the 404. */
   function attachmentForThread(conv: ConversationRow, rawId: string, res: Response): AttachmentRow | null {
     const id = Number(rawId);
@@ -6632,7 +6639,17 @@ export function createApiV1Router(): Router {
     // An attachment is user-supplied content served from the cockpit's own
     // origin — never let a browser sniff it into something scriptable.
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.type(row.mime).sendFile(absPath);
+    // ...and never let it BE scriptable even when it honestly declares itself as
+    // markup. nosniff only stops type *guessing*; a genuine text/html upload
+    // opened at this URL would otherwise execute on the cockpit's own origin,
+    // where the SSR proxy attaches the bearer to every /cockpit-api call — i.e.
+    // stored XSS with full JARVIS API reach. Two belts: a null/sandbox CSP, and
+    // markup types are served as text/plain (the in-cockpit viewer reads the
+    // bytes with fetch().text() and renders them in a <pre>, so nothing in the
+    // UI regresses — Kevin still sees the file, just never executed).
+    res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+    const servedMime = NEVER_RENDER_MIMES.has(row.mime) ? 'text/plain; charset=utf-8' : row.mime;
+    res.type(servedMime).sendFile(absPath);
   });
 
   // -- PUT /threads/:external_id/attachments/:id: rename and/or replace -----

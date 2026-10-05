@@ -161,9 +161,24 @@ try {
     assert.match(res.headers.get('content-type') ?? '', /text\/markdown/);
     assert.match(res.headers.get('content-disposition') ?? '', /filename="notes\.md"/);
     assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(res.headers.get('content-security-policy'), "default-src 'none'; sandbox");
     assert.equal(await res.text(), mdBody);
+
+    // An honest text/html upload must come back as text/plain: nosniff only
+    // stops type guessing, and a rendered upload would execute on the
+    // cockpit's own origin (where the SSR proxy holds the bearer).
+    const htmlBody = '<script>alert(1)</script>';
+    const up = await req('POST', `/threads/${A}/attachments`, {
+      body: { name: 'evil.html', mime: 'text/html', data: b64(htmlBody) },
+    });
+    assert.equal(up.status, 201);
+    const served = await req('GET', `/threads/${A}/attachments/${up.json.attachment.id}/download`, { rawResponse: true });
+    assert.match(served.headers.get('content-type') ?? '', /text\/plain/);
+    assert.doesNotMatch(served.headers.get('content-type') ?? '', /text\/html/);
+    assert.equal(await served.text(), htmlBody, 'the bytes are intact, only the Content-Type is defanged');
+    await req('DELETE', `/threads/${A}/attachments/${up.json.attachment.id}`);
   }
-  ok('GET lists the thread\'s files; download serves exact bytes + original name + nosniff');
+  ok('GET lists the thread\'s files; download serves exact bytes, nosniff + sandbox CSP, and defangs text/html');
 
   // 5. cross-thread isolation
   {

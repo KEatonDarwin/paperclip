@@ -1290,6 +1290,20 @@ export function clearConversation(externalId: string): void {
   dbCloseConversation(externalId);
 }
 
+export interface ProcessMessageOptions {
+  resumeLastUserTurn?: boolean;
+  /**
+   * Chat file attachments (tree-9b58ddb7). Extra text appended to the MODEL's
+   * copy of this turn's input only — never to the `input` that gets persisted
+   * as the user turn. Same split plan mode already uses (`modelInput` below):
+   * the transcript keeps showing what Kevin actually typed, while the model
+   * additionally sees the inlined contents of the files he attached. Without
+   * the split, a 200KB markdown upload would be pasted into the visible
+   * transcript and replayed in every subsequent continuation prompt.
+   */
+  modelInputSuffix?: string;
+}
+
 /**
  * Admission wrapper. Keeps two global protections in ONE place that every
  * ingress already funnels through, instead of at 16 call sites:
@@ -1302,7 +1316,7 @@ export async function processMessage(
   conversationId: string,
   messageId?: string,
   images?: SavedImage[],
-  opts?: { resumeLastUserTurn?: boolean },
+  opts?: ProcessMessageOptions,
 ): Promise<string> {
   if (refuseModelTurnInScratch(`processMessage(${conversationId})`)) {
     return '[sim-guard] model turn refused — scratch environment. No tokens were spent.';
@@ -1325,7 +1339,7 @@ async function processMessageInner(
   conversationId: string,
   messageId?: string,
   images?: SavedImage[],
-  opts?: { resumeLastUserTurn?: boolean },
+  opts?: ProcessMessageOptions,
 ): Promise<string> {
   // Sim guard (see src/sim-guard.ts). THE chokepoint: every ingress — Slack,
   // cockpit, webhook, check-in worker, goals/guards/tree cues, the autopilot
@@ -1359,7 +1373,14 @@ async function processMessageInner(
   } satisfies StatusEvent);
 
   try {
-    return await runConversationTurn(conv, input, abort.signal, images, opts?.resumeLastUserTurn === true);
+    return await runConversationTurn(
+      conv,
+      input,
+      abort.signal,
+      images,
+      opts?.resumeLastUserTurn === true,
+      opts?.modelInputSuffix,
+    );
   } finally {
     activeRuns.delete(conv.id);
     liveStreams.delete(conv.id);
@@ -1378,6 +1399,7 @@ async function runConversationTurn(
   signal?: AbortSignal,
   images?: SavedImage[],
   resumeLastUserTurn = false,
+  modelInputSuffix?: string,
 ): Promise<string> {
   // Normal path: this message is new, so record it as a `user` turn. Resume path
   // (watchdog dead-turn recovery): the user turn ALREADY exists — the previous
@@ -1493,7 +1515,9 @@ async function runConversationTurn(
   // prompt nudge — the ticket asks for a guarantee, not a suggestion the
   // model can ignore.
   const planModeActive = isPlanModeMessage(input);
-  const modelInput = applyPlanMode(input);
+  // tree-9b58ddb7: attachment contents ride on the model's copy only, exactly
+  // like the plan-mode rewrite above — `input` has already been persisted.
+  const modelInput = applyPlanMode(input) + (modelInputSuffix ?? '');
 
   // Native persona tools (mcp__jarvis__*) must honour the SAME hard plan-mode
   // gate the text-protocol path enforces below: in plan mode the model gets no

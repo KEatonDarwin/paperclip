@@ -2,6 +2,7 @@ import Database, { type Database as DatabaseType } from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { UPLOADS_DIR } from './image-store.js';
 import {
   sseBus,
   type TurnEvent,
@@ -62,6 +63,37 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  -- Chat file attachments (tree-9b58ddb7). One row per file Kevin uploaded to
+  -- a conversation; the bytes live on disk at
+  -- uploads/<conversation_id>/files/<stored_filename> (see attachment-store.ts).
+  -- Earmarked per CONVERSATION rather than per turn so a file can be uploaded
+  -- and managed (Settings > Files tab) without ever being sent: turn_index is
+  -- null until the attachment rides along on a sent message, and is stamped at
+  -- that point so the transcript can render which turn carried which file.
+  --   kind   — 'text' (inlined into the model's copy of the message)
+  --          | 'image' | 'binary' (referenced by name only)
+  --   source — 'chat' (composer) | 'settings' (Files tab upload)
+  -- Declared here, in conversation-db's eager block, for the same reason
+  -- conversation_groups is: the SELECT below that joins conversations is
+  -- prepared at module load and better-sqlite3 validates referenced tables at
+  -- prepare() time.
+  CREATE TABLE IF NOT EXISTS attachments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+    original_name   TEXT NOT NULL,
+    stored_filename TEXT NOT NULL,
+    mime            TEXT NOT NULL,
+    bytes           INTEGER NOT NULL,
+    kind            TEXT NOT NULL,
+    source          TEXT NOT NULL DEFAULT 'chat',
+    turn_index      INTEGER,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_attachments_conversation
+    ON attachments(conversation_id, id);
 `);
 
 // Migrate: add debug columns to turns table
@@ -849,7 +881,7 @@ export function deleteConversation(id: number): void {
   const txn = db.transaction(() => {
     db.prepare(`UPDATE conversations SET continued_to_id = NULL WHERE continued_to_id = ?`).run(id);
     db.prepare(`UPDATE conversations SET continued_from_id = NULL WHERE continued_from_id = ?`).run(id);
-    for (const table of ['thread_summaries', 'thread_reminders', 'thread_message_queue', 'jarvis_decisions', 'autonomy_ledger', 'thread_links', 'quick_chat_sessions']) {
+    for (const table of ['thread_summaries', 'thread_reminders', 'thread_message_queue', 'jarvis_decisions', 'autonomy_ledger', 'thread_links', 'quick_chat_sessions', 'attachments']) {
       try { db.prepare(`DELETE FROM ${table} WHERE conversation_id = ?`).run(id); } catch {}
     }
     db.prepare(`DELETE FROM thread_todos WHERE conversation_id = ?`).run(id);
@@ -857,6 +889,14 @@ export function deleteConversation(id: number): void {
     stmts.deleteConversationRow.run(id);
   });
   txn();
+  // Chat file attachments (tree-9b58ddb7): the rows went with the sweep above,
+  // so drop their bytes too rather than leaking up to 25MB per orphaned file.
+  // Only uploads/<id>/files/ — the flat uploads/<id>/ image files are
+  // deliberately left alone, because a forked thread's turns (copyTurns) still
+  // point at the ORIGINAL conversation's image directory.
+  try {
+    fs.rmSync(path.join(UPLOADS_DIR, String(id), 'files'), { recursive: true, force: true });
+  } catch { /* best effort */ }
   sseBus.emit('sse', {
     type: 'conversation_deleted',
     conversationId: id,
@@ -1240,4 +1280,150 @@ export function classifyRunOutcome(
   return 'completed';
 }
 
+// == Chat file attachments (tree-9b58ddb7) ====================================
+// Row-level CRUD over the `attachments` table declared at the top of this file.
+// The bytes themselves are owned by attachment-store.ts — nothing here touches
+// disk, so a caller that deletes a row is responsible for unlinking the file
+// (see the DELETE route in handlers/api-v1.ts).
+
+export type AttachmentKindValue = 'text' | 'binary' | 'image';
+export type AttachmentSource = 'chat' | 'settings';
+
+export interface AttachmentRow {
+  id: number;
+  conversation_id: number;
+  original_name: string;
+  stored_filename: string;
+  mime: string;
+  bytes: number;
+  kind: AttachmentKindValue;
+  source: AttachmentSource;
+  /** Null until the attachment rides along on a sent message. */
+  turn_index: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** An attachment plus the thread it belongs to — for the cross-thread Files tab. */
+export interface AttachmentWithThreadRow extends AttachmentRow {
+  conversation_external_id: string;
+  conversation_title: string | null;
+}
+
+const attachmentStmts = {
+  insert: db.prepare<[number, string, string, string, number, string, string, number | null]>(`
+    INSERT INTO attachments
+      (conversation_id, original_name, stored_filename, mime, bytes, kind, source, turn_index)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `),
+  getById: db.prepare<[number], AttachmentRow>(
+    `SELECT * FROM attachments WHERE id = ?`,
+  ),
+  listByConversation: db.prepare<[number], AttachmentRow>(`
+    SELECT * FROM attachments WHERE conversation_id = ? ORDER BY id ASC
+  `),
+  listByTurn: db.prepare<[number, number], AttachmentRow>(`
+    SELECT * FROM attachments WHERE conversation_id = ? AND turn_index = ? ORDER BY id ASC
+  `),
+  delete: db.prepare<[number]>(`DELETE FROM attachments WHERE id = ?`),
+  setTurnIndex: db.prepare<[number, number]>(`
+    UPDATE attachments SET turn_index = ?, updated_at = datetime('now') WHERE id = ?
+  `),
+  listAll: db.prepare<[number], AttachmentWithThreadRow>(`
+    SELECT a.*, c.external_id AS conversation_external_id, c.title AS conversation_title
+    FROM attachments a
+    JOIN conversations c ON c.id = a.conversation_id
+    ORDER BY a.id DESC
+    LIMIT ?
+  `),
+  listAllForThread: db.prepare<[string, number], AttachmentWithThreadRow>(`
+    SELECT a.*, c.external_id AS conversation_external_id, c.title AS conversation_title
+    FROM attachments a
+    JOIN conversations c ON c.id = a.conversation_id
+    WHERE c.external_id = ?
+    ORDER BY a.id DESC
+    LIMIT ?
+  `),
+};
+
+export function insertAttachment(input: {
+  conversationId: number;
+  originalName: string;
+  storedFilename: string;
+  mime: string;
+  bytes: number;
+  kind: AttachmentKindValue;
+  source?: AttachmentSource;
+  turnIndex?: number | null;
+}): AttachmentRow {
+  const info = attachmentStmts.insert.run(
+    input.conversationId,
+    input.originalName,
+    input.storedFilename,
+    input.mime,
+    input.bytes,
+    input.kind,
+    input.source ?? 'chat',
+    input.turnIndex ?? null,
+  );
+  const created = attachmentStmts.getById.get(Number(info.lastInsertRowid));
+  if (!created) throw new Error('Failed to load attachment after insert');
+  return created;
+}
+
+export function getAttachment(id: number): AttachmentRow | undefined {
+  return attachmentStmts.getById.get(id);
+}
+
+export function listAttachments(conversationId: number): AttachmentRow[] {
+  return attachmentStmts.listByConversation.all(conversationId);
+}
+
+export function listAttachmentsForTurn(conversationId: number, turnIndex: number): AttachmentRow[] {
+  return attachmentStmts.listByTurn.all(conversationId, turnIndex);
+}
+
+export function deleteAttachment(id: number): void {
+  attachmentStmts.delete.run(id);
+}
+
+/** Stamp the turn an attachment was sent with (inline-on-send). */
+export function setAttachmentTurnIndex(id: number, turnIndex: number): void {
+  attachmentStmts.setTurnIndex.run(turnIndex, id);
+}
+
+/**
+ * Rename and/or re-describe an attachment after a content replace. Only the
+ * fields passed are written; `updated_at` always moves. Returns the fresh row.
+ */
+export function updateAttachment(
+  id: number,
+  patch: { originalName?: string; mime?: string; bytes?: number; kind?: AttachmentKindValue },
+): AttachmentRow | undefined {
+  const sets: string[] = [];
+  const args: (string | number)[] = [];
+  if (patch.originalName !== undefined) { sets.push('original_name = ?'); args.push(patch.originalName); }
+  if (patch.mime !== undefined) { sets.push('mime = ?'); args.push(patch.mime); }
+  if (patch.bytes !== undefined) { sets.push('bytes = ?'); args.push(patch.bytes); }
+  if (patch.kind !== undefined) { sets.push('kind = ?'); args.push(patch.kind); }
+  if (sets.length) {
+    sets.push("updated_at = datetime('now')");
+    db.prepare(`UPDATE attachments SET ${sets.join(', ')} WHERE id = ?`).run(...args, id);
+  }
+  return attachmentStmts.getById.get(id);
+}
+
+/**
+ * Every attachment across every thread (newest first), each carrying its
+ * thread's external_id + title so the Settings Files tab can group by thread.
+ * Pass externalId to narrow to one thread.
+ */
+export function listAllAttachments(opts?: { externalId?: string; limit?: number }): AttachmentWithThreadRow[] {
+  const limit = Math.max(1, Math.min(2000, opts?.limit ?? 500));
+  return opts?.externalId
+    ? attachmentStmts.listAllForThread.all(opts.externalId, limit)
+    : attachmentStmts.listAll.all(limit);
+}
+
 export { db as sqliteDb };
+

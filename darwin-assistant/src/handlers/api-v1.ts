@@ -41,6 +41,15 @@ import {
   isThreadLocked,
   deleteConversation,
   copyTurns,
+  insertAttachment,
+  getAttachment,
+  listAttachments,
+  deleteAttachment,
+  updateAttachment,
+  setAttachmentTurnIndex,
+  listAllAttachments,
+  type AttachmentRow,
+  type AttachmentWithThreadRow,
   type ConversationRow,
   type TurnRow,
 } from '../conversation-db.js';
@@ -471,6 +480,15 @@ import {
   type IncomingImage,
   type SavedImage,
 } from '../image-store.js';
+import {
+  saveAttachment,
+  replaceAttachmentContent,
+  resolveAttachmentPath,
+  deleteAttachmentFile,
+  buildAttachmentModelBlock,
+  AttachmentValidationError,
+  type IncomingAttachment,
+} from '../attachment-store.js';
 import { createShimTask } from '../tools/shim.js';
 import { submitIntake, listIntakeOutcomes } from '../tools/paperclip.js';
 import {
@@ -1336,6 +1354,43 @@ function reconstructSavedImages(json: string | null): SavedImage[] {
   return out;
 }
 
+// tree-9b58ddb7: resolve a list of attachment row ids to rows that genuinely
+// belong to `conversationId`. Silently drops ids that don't exist or belong to
+// another thread — the caller validates separately on the send path; the queue
+// drain just wants whatever is still there.
+function resolveOwnedAttachments(conversationId: number, ids: number[]): AttachmentRow[] {
+  const out: AttachmentRow[] = [];
+  for (const id of ids) {
+    const row = getAttachment(id);
+    if (row && row.conversation_id === conversationId) out.push(row);
+  }
+  return out;
+}
+
+/** Turn attachment rows into the fenced-file suffix the model sees (see attachment-store). */
+function attachmentSuffix(rows: AttachmentRow[]): string | undefined {
+  if (!rows.length) return undefined;
+  const block = buildAttachmentModelBlock(rows.map((r) => ({
+    originalName: r.original_name,
+    storedFilename: r.stored_filename,
+    mime: r.mime,
+    bytes: r.bytes,
+    kind: r.kind,
+    conversationId: r.conversation_id,
+  })));
+  return block || undefined;
+}
+
+function parseAttachmentIdsJson(json: string | null): number[] {
+  if (!json) return [];
+  try {
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed.filter((n): n is number => Number.isInteger(n)) : [];
+  } catch {
+    return [];
+  }
+}
+
 function serializeTurnImages(turn: TurnRow, externalId?: string): { url: string; mime: string }[] | undefined {
   if (!turn.images || !externalId) return undefined;
   const stored = parseStoredImages(turn.images);
@@ -1507,11 +1562,17 @@ function installQueueDrain(): void {
       const messageId = `turn:${convId}:${nextIndex}`;
       errorByMessageId.delete(messageId);
       const drainedImages = reconstructSavedImages(next.images);
-      processMessage(next.content, conv.external_id, messageId, drainedImages.length ? drainedImages : undefined).catch((err: unknown) => {
+      // tree-9b58ddb7: an attachment that was deleted while the message waited
+      // is simply gone from the block — ids are re-resolved, never trusted.
+      const drainedAttachments = resolveOwnedAttachments(convId, parseAttachmentIdsJson(next.attachment_ids));
+      for (const a of drainedAttachments) setAttachmentTurnIndex(a.id, nextIndex);
+      processMessage(next.content, conv.external_id, messageId, drainedImages.length ? drainedImages : undefined, {
+        modelInputSuffix: attachmentSuffix(drainedAttachments),
+      }).catch((err: unknown) => {
         // Lost the per-conversation mutex to another ingress mid-drain — re-queue
         // so the message isn't dropped; the winning turn's completion drains it.
         if (err instanceof ConversationBusyError) {
-          enqueueMessage(convId, next.content, next.images);
+          enqueueMessage(convId, next.content, next.images, next.attachment_ids);
           return;
         }
         const message = err instanceof Error ? err.message : String(err);
@@ -6258,7 +6319,7 @@ export function createApiV1Router(): Router {
   router.post('/threads/:external_id/messages', (req: AuthedRequest, res) => {
     const caller = req.apiKey!;
     const externalId = paramString(req.params.external_id);
-    const body = (req.body ?? {}) as { text?: unknown; images?: unknown };
+    const body = (req.body ?? {}) as { text?: unknown; images?: unknown; attachment_ids?: unknown };
     const text = typeof body.text === 'string' ? body.text : '';
 
     if (!text.trim()) {
@@ -6295,13 +6356,34 @@ export function createApiV1Router(): Router {
       ? JSON.stringify(savedImages.map(({ filename, mime, conversationId }) => ({ filename, mime, conversationId })))
       : undefined;
 
+    // tree-9b58ddb7: files Kevin already uploaded to this thread and chose to
+    // send with this message. Resolved + ownership-checked here (NOT silently
+    // dropped) so a mistyped id is a 400 rather than a message that quietly
+    // reaches the model without the file it was about. The ids are only
+    // resolved — nothing is decoded or inlined until dispatch, below.
+    const requestedAttachmentIds = Array.isArray(body.attachment_ids)
+      ? body.attachment_ids.map((v) => Number(v))
+      : [];
+    if (requestedAttachmentIds.some((n) => !Number.isInteger(n) || n <= 0)) {
+      sendError(res, 400, 'invalid_request', 'attachment_ids must be an array of positive integers');
+      return;
+    }
+    const sendAttachments = resolveOwnedAttachments(conv.id, requestedAttachmentIds);
+    if (sendAttachments.length !== requestedAttachmentIds.length) {
+      sendError(res, 404, 'attachment_not_found', 'One or more attachment_ids are not attachments of this thread');
+      return;
+    }
+    const attachmentIdsJson = sendAttachments.length
+      ? JSON.stringify(sendAttachments.map((a) => a.id))
+      : undefined;
+
     // If a turn is already running, park this message on the server-owned queue
     // instead of bouncing. It's drained oldest-first when the current turn ends
     // (see the status listener below). The queue is exposed over API + SSE, so it
     // survives a refresh and stays in sync across every browser on this thread.
     const pending = getInFlightMessageId(conv.id);
     if (pending) {
-      const queued = enqueueMessage(conv.id, text, imagesJson);
+      const queued = enqueueMessage(conv.id, text, imagesJson, attachmentIdsJson);
       res.status(202).json({
         status: 'queued',
         queued_id: queued.id,
@@ -6322,7 +6404,13 @@ export function createApiV1Router(): Router {
       void autoGroupThreadFromFirstMessage(conv, text);
     }
 
-    processMessage(text, externalId, messageId, savedImages.length ? savedImages : undefined)
+    // Stamp the turn these files rode on, so the transcript (and the Files
+    // tab) can say which message carried which attachment.
+    for (const a of sendAttachments) setAttachmentTurnIndex(a.id, nextIndex);
+
+    processMessage(text, externalId, messageId, savedImages.length ? savedImages : undefined, {
+      modelInputSuffix: attachmentSuffix(sendAttachments),
+    })
       .catch((err: unknown) => {
         // A busy error here means another ingress won the mutex between the
         // pre-flight check and processMessage's synchronous registration.
@@ -6417,6 +6505,230 @@ export function createApiV1Router(): Router {
       return;
     }
     res.type(rec.mime).sendFile(absPath);
+  });
+
+  // == Chat file attachments (tree-9b58ddb7) ==================================
+  // Kevin's ask: "these should 'upload' to you and go into a folder ... that is
+  // earmarked with the chat in question, and I need to be able to see/view the
+  // files inside of the chat". Same transport and the same security posture as
+  // the image pipeline above — base64 in the JSON body, and bytes served ONLY
+  // through an authed route that re-derives the owning conversation from the
+  // row rather than trusting anything in the URL. Nothing is ever exposed via
+  // express.static, so an attachment id from thread A cannot be downloaded
+  // through thread B's URL.
+
+  /** Resolve :id to an attachment row that genuinely belongs to `conv`, or send the 404. */
+  function attachmentForThread(conv: ConversationRow, rawId: string, res: Response): AttachmentRow | null {
+    const id = Number(rawId);
+    if (!Number.isInteger(id) || id <= 0) {
+      sendError(res, 400, 'invalid_request', 'attachment id must be a positive integer');
+      return null;
+    }
+    const row = getAttachment(id);
+    // Ownership check, not just existence: a row whose conversation_id doesn't
+    // match the thread the caller authenticated against is a 404, never a read.
+    if (!row || row.conversation_id !== conv.id) {
+      sendError(res, 404, 'attachment_not_found', 'No such attachment on this thread');
+      return null;
+    }
+    return row;
+  }
+
+  function serializeAttachment(row: AttachmentRow, externalId: string): Record<string, unknown> {
+    return {
+      id: row.id,
+      name: row.original_name,
+      mime: row.mime,
+      bytes: row.bytes,
+      kind: row.kind,
+      source: row.source,
+      turn_index: row.turn_index,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      // Relative on purpose: the cockpit prefixes /cockpit-api (see
+      // turnImageSrc in routes/threads.tsx) so the browser never holds a bearer.
+      download_url: `/threads/${encodeURIComponent(externalId)}/attachments/${row.id}/download`,
+    };
+  }
+
+  // -- POST /threads/:external_id/attachments: upload one file ---------------
+  router.post('/threads/:external_id/attachments', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const conv = result;
+    const body = (req.body ?? {}) as { name?: unknown; mime?: unknown; data?: unknown; source?: unknown };
+    if (typeof body.data !== 'string' || !body.data) {
+      sendError(res, 400, 'invalid_request', 'data is required (base64, optionally a data: URL)');
+      return;
+    }
+    const source = body.source === 'settings' ? 'settings' : 'chat';
+
+    let saved;
+    try {
+      saved = saveAttachment(conv.id, {
+        name: typeof body.name === 'string' ? body.name : undefined,
+        mime: typeof body.mime === 'string' ? body.mime : undefined,
+        data: body.data,
+      } satisfies IncomingAttachment);
+    } catch (err) {
+      const message = err instanceof AttachmentValidationError ? err.message : 'failed to save attachment';
+      sendError(res, 400, 'invalid_attachment', message);
+      return;
+    }
+
+    const row = insertAttachment({
+      conversationId: conv.id,
+      originalName: saved.originalName,
+      storedFilename: saved.storedFilename,
+      mime: saved.mime,
+      bytes: saved.bytes,
+      kind: saved.kind,
+      source,
+    });
+    res.status(201).json({ attachment: serializeAttachment(row, externalId) });
+  });
+
+  // -- GET /threads/:external_id/attachments: this thread's files ------------
+  router.get('/threads/:external_id/attachments', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const conv = result;
+    res.json({ attachments: listAttachments(conv.id).map((a) => serializeAttachment(a, externalId)) });
+  });
+
+  // -- GET /threads/:external_id/attachments/:id/download -------------------
+  router.get('/threads/:external_id/attachments/:id/download', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const conv = result;
+    const row = attachmentForThread(conv, paramString(req.params.id), res);
+    if (!row) return;
+
+    const absPath = resolveAttachmentPath(row.conversation_id, row.stored_filename);
+    if (!absPath) {
+      sendError(res, 404, 'attachment_not_found', 'Attachment is no longer on disk');
+      return;
+    }
+    // `inline` so the cockpit can preview a markdown/pdf/image in place; the
+    // filename is the ORIGINAL name, quoted and stripped of anything that could
+    // break out of the header, never the uuid on disk.
+    const safeName = row.original_name.replace(/[^A-Za-z0-9 ._-]/g, '_');
+    res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
+    // An attachment is user-supplied content served from the cockpit's own
+    // origin — never let a browser sniff it into something scriptable.
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.type(row.mime).sendFile(absPath);
+  });
+
+  // -- PUT /threads/:external_id/attachments/:id: rename and/or replace -----
+  router.put('/threads/:external_id/attachments/:id', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const conv = result;
+    const row = attachmentForThread(conv, paramString(req.params.id), res);
+    if (!row) return;
+
+    const body = (req.body ?? {}) as { name?: unknown; mime?: unknown; data?: unknown };
+    const patch: { originalName?: string; mime?: string; bytes?: number; kind?: 'text' | 'binary' | 'image' } = {};
+
+    if (typeof body.data === 'string' && body.data) {
+      try {
+        const replaced = replaceAttachmentContent(row.conversation_id, row.stored_filename, {
+          name: typeof body.name === 'string' && body.name ? body.name : row.original_name,
+          mime: typeof body.mime === 'string' ? body.mime : row.mime,
+          data: body.data,
+        } satisfies IncomingAttachment);
+        patch.mime = replaced.mime;
+        patch.bytes = replaced.bytes;
+        patch.kind = replaced.kind;
+      } catch (err) {
+        const message = err instanceof AttachmentValidationError ? err.message : 'failed to replace attachment content';
+        sendError(res, 400, 'invalid_attachment', message);
+        return;
+      }
+    }
+
+    if (typeof body.name === 'string') {
+      const name = body.name.trim();
+      if (!name) {
+        sendError(res, 400, 'invalid_request', 'name must be a non-empty string when provided');
+        return;
+      }
+      if (name.length > 255) {
+        sendError(res, 400, 'invalid_request', 'name is too long');
+        return;
+      }
+      patch.originalName = name;
+    }
+
+    if (!Object.keys(patch).length) {
+      sendError(res, 400, 'invalid_request', 'nothing to update — pass name and/or data');
+      return;
+    }
+    const updated = updateAttachment(row.id, patch);
+    res.json({ attachment: serializeAttachment(updated ?? row, externalId) });
+  });
+
+  // -- DELETE /threads/:external_id/attachments/:id -------------------------
+  router.delete('/threads/:external_id/attachments/:id', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const conv = result;
+    const row = attachmentForThread(conv, paramString(req.params.id), res);
+    if (!row) return;
+
+    // Row first, then bytes: an orphaned file is recoverable noise, an
+    // orphaned row would 404 forever in the UI.
+    deleteAttachment(row.id);
+    deleteAttachmentFile(row.conversation_id, row.stored_filename);
+    res.json({ status: 'deleted', id: row.id });
+  });
+
+  // -- GET /attachments: every thread's files (Settings > Files tab) ---------
+  // Carries each row's thread external_id + title so the UI can group by chat
+  // without N follow-up requests. Scoped like /decisions: an admin-scope key
+  // sees everything, a narrower key only its own external_id prefix.
+  router.get('/attachments', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = typeof req.query.external_id === 'string' ? req.query.external_id : undefined;
+    const limit = Math.max(1, Math.min(2000, parseInt(String(req.query.limit ?? '500'), 10) || 500));
+    const rows = listAllAttachments({ externalId, limit });
+    const seesAll = isAdminScope(caller.scope);
+    const prefix = callerExternalIdPrefix(caller.id);
+    const visible = rows.filter((r) => seesAll || r.conversation_external_id.startsWith(prefix));
+    res.json({
+      attachments: visible.map((r: AttachmentWithThreadRow) => ({
+        ...serializeAttachment(r, r.conversation_external_id),
+        conversation_id: r.conversation_id,
+        conversation_external_id: r.conversation_external_id,
+        conversation_title: r.conversation_title,
+      })),
+    });
   });
 
   // -- DELETE /threads/:external_id/queue/:queue_id: cancel a queued message -

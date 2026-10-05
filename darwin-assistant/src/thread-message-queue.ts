@@ -13,6 +13,8 @@ export interface QueuedMessageRow {
   content: string;
   created_at: string;
   images: string | null;
+  /** tree-9b58ddb7: JSON array of attachment row ids attached to this message. */
+  attachment_ids: string | null;
 }
 
 sqliteDb.exec(`
@@ -32,9 +34,16 @@ sqliteDb.exec(`
 // SavedImage[] on drain (see reconstructSavedImages in handlers/api-v1.ts).
 try { sqliteDb.exec(`ALTER TABLE thread_message_queue ADD COLUMN images TEXT`); } catch {}
 
-const insertStmt = sqliteDb.prepare<[number, string, string | null]>(`
-  INSERT INTO thread_message_queue (conversation_id, content, images)
-  VALUES (?, ?, ?)
+// Chat file attachments (tree-9b58ddb7): the `attachments` row ids that were
+// sent with a message which got parked here. Ids (not content) because the
+// bytes already live on disk and in the attachments table — the drain just
+// re-resolves them, so a file deleted while the message waited is skipped
+// rather than resurrected.
+try { sqliteDb.exec(`ALTER TABLE thread_message_queue ADD COLUMN attachment_ids TEXT`); } catch {}
+
+const insertStmt = sqliteDb.prepare<[number, string, string | null, string | null]>(`
+  INSERT INTO thread_message_queue (conversation_id, content, images, attachment_ids)
+  VALUES (?, ?, ?, ?)
 `);
 
 const getByIdStmt = sqliteDb.prepare<[number], QueuedMessageRow>(
@@ -66,8 +75,13 @@ export function listQueuedMessages(conversationId: number): QueuedMessageRow[] {
   return listByConversationStmt.all(conversationId);
 }
 
-export function enqueueMessage(conversationId: number, content: string, images?: string | null): QueuedMessageRow {
-  const info = insertStmt.run(conversationId, content, images ?? null);
+export function enqueueMessage(
+  conversationId: number,
+  content: string,
+  images?: string | null,
+  attachmentIds?: string | null,
+): QueuedMessageRow {
+  const info = insertStmt.run(conversationId, content, images ?? null, attachmentIds ?? null);
   const created = getByIdStmt.get(Number(info.lastInsertRowid));
   if (!created) throw new Error('Failed to load queued message after insert');
   emit(conversationId, 'created', created);

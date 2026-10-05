@@ -348,7 +348,12 @@ async function publishNtfy(notification: NotificationRow): Promise<void> {
       console.error(`[ntfy] publish failed: HTTP ${res.status}`);
     }
   } catch (err) {
-    console.error(`[ntfy] publish error: ${err instanceof Error ? err.message : String(err)}`);
+    // Never log the thrown message: a custom fetch implementation or proxy
+    // could echo request data (including the topic carried in the JSON body).
+    // The error class is enough to distinguish a timeout from a transport
+    // failure without risking secret disclosure.
+    const kind = err instanceof Error && err.name ? err.name : 'transport failure';
+    console.error(`[ntfy] publish error: ${kind}`);
   } finally {
     clearTimeout(timer);
   }

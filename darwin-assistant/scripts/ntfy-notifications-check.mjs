@@ -292,7 +292,8 @@ errorLines.length = 0;
 fetchCalls.length = 0;
 M.createNotification({ severity: 'error', title: 'trigger a thrown-error log' });
 await waitFor(() => errorLines.length >= 1);
-t('even a thrown-error message path is not the sole source of the secret (request itself never carries it)', fetchCalls.every((c) => !c.url.includes(SECRET_TOPIC)));
+t('thrown-error request URL never contains the topic slug', fetchCalls.every((c) => !c.url.includes(SECRET_TOPIC)));
+t('thrown-error log never contains the topic slug', errorLines.every((l) => !l.includes(SECRET_TOPIC)));
 
 // ── 7. concurrency limiter ──────────────────────────────────────────────────
 realError('\nconcurrency limiter caps in-flight ntfy publishes');

@@ -41,6 +41,10 @@ const AUTOMATED_KEY_PREFIXES = [
   // TECH TASKS (2026-10-01): each new "Tech Task" email cues one JARVIS turn in
   // cockpit:tech-tasks, minting `tech-task:<id>` — gated like every other cue.
   'tech-task:',
+  // MIKE RADAR (tree-49d228a8, node #1342): the nightly report cue mints
+  // `mike-report:<date>` — one turn per day, but it fires at 23:40 CT while the
+  // night shift's lanes are typically live, so it waits for a slot like the rest.
+  'mike-report:',
 ];
 
 export function isAutomatedTurn(externalId: string, correlationKey?: string): boolean {

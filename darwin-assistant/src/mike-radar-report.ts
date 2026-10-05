@@ -40,6 +40,7 @@ import {
   type MikeActivity,
 } from './mike-radar.js';
 import { stripToolUses, riskFlagsFromChanges, type MikeChange } from './mike-radar-parse.js';
+import { fireMikeReportCue } from './mike-radar-cue.js';
 
 /** Sonnet, not haiku: haiku under-reads diffs and the report is the whole point.
  *  Not opus either — this is a daily log, not a design review. */
@@ -309,6 +310,15 @@ export async function runMikeReportPass(
       writeMikeDailyRollup(date);
     } catch (err) {
       console.error('[mike-report] rollup write failed:', err);
+    }
+    // DESIGN §6b — the day is written; wake the oversight thread ONCE with a
+    // digest of every project and raise the bell. Fire-and-forget and
+    // self-deduping (one cue per date), so the pass neither waits on a JARVIS
+    // turn nor double-posts if it runs twice for the same day.
+    try {
+      fireMikeReportCue(date);
+    } catch (err) {
+      console.error('[mike-report] cue failed:', err);
     }
   }
   console.log(`[mike-report] pass ${date}: ${queued.length} attempted, ${done} done, ${failed} failed`);

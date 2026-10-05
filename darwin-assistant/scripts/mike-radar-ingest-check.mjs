@@ -596,7 +596,14 @@ console.log('\nvalidators, thread bootstrap, retention');
   t('seed states the read-only rule', thread.seed_text.includes('READ-ONLY, HARD RULE'));
   t('seed names the forbidden write tools', thread.seed_text.includes('send_message'));
   t('seed names the allowed read tools', thread.seed_text.includes('read_file'));
-  t('seed carries the archive path on disk', thread.seed_text.includes(`${PA}.jsonl`));
+  // The archive/report paths and the live counts moved OUT of the seed and into
+  // the per-turn `<mike_project>` snapshot (node #1342): a seed is posted once
+  // and goes stale the next time Mike works, so the seed now carries only what
+  // never changes — identity, the hard rule, and a pointer to the snapshot.
+  // scripts/mike-radar-chat-check.mjs asserts the paths on the snapshot side.
+  t('seed points at the per-turn snapshot instead of inlining stale facts',
+    thread.seed_text.includes('<mike_project>'));
+  t('seed does not inline the archive path', !thread.seed_text.includes(`${PA}.jsonl`));
   eq('thread_ext linked back onto the project', M.getMikeProject(PA).thread_ext, 'cockpit:mike-816a7a7c');
   const again = M.getOrCreateMikeThread(M.getMikeProject(PA));
   eq('second call does not re-create', again.created, false);

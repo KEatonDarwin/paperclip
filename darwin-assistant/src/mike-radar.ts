@@ -33,6 +33,35 @@ export const MIKE_KNOWN_SUPABASE_REFS: Record<string, string> = {
   '816a7a7c': 'onxbfneqvjapberusidr',
 };
 
+/** The ONLY Lovable MCP tools a Mike-project chat may call — read-only by
+ *  construction. Shared by the one-time seed (below) and the per-turn snapshot
+ *  (mike-radar-chat.ts) so the rule can never drift between the two places a
+ *  chat learns it. */
+export const MIKE_READONLY_LOVABLE_TOOLS = [
+  'get_project', 'list_files', 'read_file', 'list_messages', 'list_edits',
+  'get_diff', 'get_project_knowledge', 'query_database',
+] as const;
+
+/** Tools that would WRITE to Mike's live work. A single one of these is visible
+ *  to Mike and can break a running app, so they are named explicitly rather
+ *  than left to "be careful". */
+export const MIKE_FORBIDDEN_LOVABLE_TOOLS = [
+  'send_message', 'create_project', 'deploy_project', 'remix_project',
+  'set_project_knowledge', 'enable_database', 'respond_to_approval',
+] as const;
+
+/** HOW those tools are actually called from a JARVIS turn: there is no native
+ *  `read_file` here — the Lovable MCP server is reached through the `mcp_call`
+ *  escape hatch. Spelled out because a chat told only "use read_file" will
+ *  report the tool as missing instead of reading Mike's code. The second
+ *  sentence is the important one: `lovable_send_message` is a first-class JARVIS
+ *  tool and it is EXACTLY the write path that must never fire at Mike. */
+export const MIKE_CHAT_CALL_CONVENTION =
+  'Call these as `mcp_call {server:"lovable", tool:"<name>", args:{project_id:"<uuid>", …}}` — ' +
+  'they are not native tools in this thread. The `lovable_send_message` and `supabase_execute_sql` ' +
+  'JARVIS tools are OFF LIMITS for this project: the first would message Mike\'s project agent and ' +
+  'start a real build, the second is a write-capable path to his database.';
+
 export const MIKE_ARCHIVE_DIR =
   process.env['MIKE_RADAR_ARCHIVE_DIR'] ?? '/home/kevin/perclickity-suite/lovable-watch/archive';
 
@@ -1066,16 +1095,22 @@ export function mikeThreadExt(short: string): string {
   return `cockpit:mike-${short}`;
 }
 
-/** Projects whose work is live enough that a read-only question is likely. */
+/** The one-time orientation post for a project chat. Mirrors the goal-chat
+ *  seed: it says what this thread IS and what the hard rule is, and it points
+ *  at the `<mike_project>` snapshot that prefixes every turn — live counts and
+ *  the latest report belong in that snapshot, NOT here, because a seed written
+ *  once goes stale the first time Mike touches the project. */
 export function composeMikeProjectSeed(project: MikeProject): string {
   const name = mikeDisplayName(project);
+  const allowed = MIKE_READONLY_LOVABLE_TOOLS.map((t) => `\`${t}\``).join(', ');
+  const forbidden = MIKE_FORBIDDEN_LOVABLE_TOOLS.map((t) => `\`${t}\``).join(', ');
   return `🛰 **MIKE RADAR — PROJECT CHAT.** This thread is about ONE Lovable project: *${name}* (\`${project.project_id}\`), owned and driven by Mike. You are Kevin's engineer looking over Mike's shoulder. Kevin will ask things like "how does X work" and "how do I debug Y" — answer from the real code, not from the archive text alone.
 
-Facts: Supabase \`${project.supabase_ref ?? 'none known'}\` · live URL \`${project.live_url ?? 'none known'}\` · ${project.msg_count} archived messages, ${project.change_count} with code changes · last activity ${project.last_activity_at ?? 'unknown'} · Lovable workspace \`${MIKE_WORKSPACE_ID}\`.
+**READ-ONLY, HARD RULE.** You may use the Lovable MCP tools ${allowed} *(SELECT only)*. You must NEVER call ${forbidden}, or any Supabase write tool against this project. This is Mike's live work; a single write would be visible to him and could break a running app. If a question can only be answered by changing something, say so and stop.
 
-**READ-ONLY, HARD RULE.** You may use the Lovable MCP tools \`get_project\`, \`list_files\`, \`read_file\`, \`list_messages\`, \`list_edits\`, \`get_diff\`, \`get_project_knowledge\`, \`query_database\` *(SELECT only)*. You must NEVER call \`send_message\`, \`create_project\`, \`deploy_project\`, \`remix_project\`, \`set_project_knowledge\`, \`enable_database\`, \`respond_to_approval\`, or any Supabase write tool against this project. This is Mike's live work; a single write would be visible to him and could break a running app. If a question can only be answered by changing something, say so and stop.
+${MIKE_CHAT_CALL_CONVENTION}
 
-The full archived history is in \`mike_activity\` and on disk at \`${MIKE_ARCHIVE_DIR}/${project.project_id}.jsonl\`; the day-by-day reports are in \`mike_reports\` and at \`${MIKE_OUTBOX_DIR}/<date>.md\`.`;
+Every turn of this thread is prefixed with a \`<mike_project>\` snapshot carrying the project's live facts — Supabase ref, archive path, the latest daily report, and the changes Mike shipped most recently. That snapshot is your memory of this project; never ask Kevin to restate any of it. Lovable workspace \`${MIKE_WORKSPACE_ID}\`.`;
 }
 
 /** Find-or-create the project's dedicated chat. Mirrors `getOrCreateGoalThread`

@@ -311,6 +311,12 @@ const stmts = {
   listAllConversations: db.prepare<[], ConversationRow>(
     `SELECT * FROM conversations ORDER BY pinned DESC, pinned_at DESC, updated_at DESC LIMIT 100`,
   ),
+  // Same ordering, no cap — literal search only (bug 2d4301d1). Everything else
+  // (sidebar listing, big-board, ephemeral sweep) must keep using the capped
+  // listAllConversations() above; this is not a general-purpose replacement.
+  listAllConversationsUncapped: db.prepare<[], ConversationRow>(
+    `SELECT * FROM conversations ORDER BY pinned DESC, pinned_at DESC, updated_at DESC`,
+  ),
   countTurns: db.prepare<[number], { cnt: number }>(
     `SELECT COUNT(*) as cnt FROM turns WHERE conversation_id = ?`,
   ),
@@ -628,6 +634,13 @@ export function listActiveConversations(): ConversationRow[] {
 
 export function listAllConversations(): ConversationRow[] {
   return stmts.listAllConversations.all();
+}
+
+/** listAllConversations() without the LIMIT 100 — literal search only
+ *  (bug 2d4301d1: "go back as far as I need to"). Do not reuse elsewhere;
+ *  every other caller wants the capped, model-context-sized list. */
+export function listAllConversationsUncapped(): ConversationRow[] {
+  return stmts.listAllConversationsUncapped.all();
 }
 
 export function countTurns(conversationId: number): number {

@@ -29,6 +29,7 @@ import {
   setThreadModelOverride,
   setThreadClaudeAccount,
   listAllConversations,
+  listAllConversationsUncapped,
   deriveSource,
   renameConversation,
   setConversationStatus,
@@ -5625,7 +5626,12 @@ export function createApiV1Router(): Router {
       return;
     }
 
-    const candidates = listAllConversations().filter((c) => {
+    // The AI path deliberately stays capped at 100 threads (listAllConversations)
+    // — that's all you can put in front of a model. Literal mode has no such
+    // ceiling ("go back as far as I need to" — bug 2d4301d1), so it scans the
+    // full, uncapped conversation list instead.
+    const sourceConversations = mode === 'literal' ? listAllConversationsUncapped() : listAllConversations();
+    const candidates = sourceConversations.filter((c) => {
       if (c.external_id.startsWith('ephemeral:')) return false;
       if (c.external_id.startsWith('checkin:')) return false;
       return seesAllThreads || c.external_id.startsWith(prefix);

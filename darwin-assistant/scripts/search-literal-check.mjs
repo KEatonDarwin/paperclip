@@ -33,7 +33,7 @@ for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) fs.rmSync(p, { fo
 console.log(`[search-literal-check] scratch DB: ${DB_PATH}`);
 
 const distDir = path.join(__dirname, '..', 'dist');
-const { getOrCreateConversation, getConversation, addTurn, renameConversation } = await import(path.join(distDir, 'conversation-db.js'));
+const { getOrCreateConversation, getConversation, addTurn, renameConversation, listAllConversations, listAllConversationsUncapped } = await import(path.join(distDir, 'conversation-db.js'));
 const { searchThreadsLiteral } = await import(path.join(distDir, 'thread-search.js'));
 const Database = (await import('better-sqlite3')).default;
 
@@ -163,6 +163,36 @@ console.log('\ncapped at a sane number of results');
   }
   const results = searchThreadsLiteral(MAGIC, many);
   t('capped at 50 results', results.length === 50, `got ${results.length}`);
+}
+
+console.log('\nliteral search scans the FULL history, not just the top-100-thread window (bug 2d4301d1)');
+{
+  const MAGIC2 = 'xyzzyburied77';
+  const buried = getOrCreateConversation('cockpit:search-literal-buried-deep');
+  addTurn(buried.id, 'user', `an old thread that mentions ${MAGIC2} once, long ago`);
+
+  // Push it far outside the 100-thread window by backdating it, then creating
+  // 120 fresh conversations that all sort ahead of it by updated_at DESC —
+  // mirroring the real jarvis.db shape where pinned threads + recent activity
+  // bury old ones past the cap.
+  const raw = new Database(DB_PATH);
+  raw.prepare('UPDATE conversations SET updated_at = ? WHERE id = ?').run('2000-01-01 00:00:00', buried.id);
+  raw.close();
+  for (let i = 0; i < 120; i++) {
+    const c = getOrCreateConversation(`cockpit:search-literal-crowd-${i}`);
+    addTurn(c.id, 'user', FILLER);
+  }
+
+  const capped = listAllConversations();
+  const uncapped = listAllConversationsUncapped();
+  t('sanity: capped list is actually capped at 100', capped.length === 100, `got ${capped.length}`);
+  t('capped list (the pre-fix candidate set) excludes the buried thread', !capped.some((c) => c.external_id === buried.external_id));
+  t('uncapped list includes the buried thread', uncapped.some((c) => c.external_id === buried.external_id));
+
+  const litOverCapped = searchThreadsLiteral(MAGIC2, capped);
+  const litOverUncapped = searchThreadsLiteral(MAGIC2, uncapped);
+  t('literal search over the capped candidate set misses it (the bug)', !litOverCapped.some((r) => r.thread_id === buried.external_id));
+  t('literal search over the uncapped candidate set finds it (the fix)', litOverUncapped.some((r) => r.thread_id === buried.external_id));
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} search-literal-check: ${pass}/${pass + fail}\n`);

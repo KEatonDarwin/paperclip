@@ -223,12 +223,15 @@ export interface AdapterConfig {
   // isCompanionThread (node #1441, gap 2; made required at node #1443 gap C):
   // only the `claude` adapter's buildArgs reads this — when true it strips
   // the CLI's own built-in tools (Bash/Read/Write/Edit/WebFetch/WebSearch/
-  // Glob/Grep/...) via `--tools ""`, leaving ONLY the --mcp-config persona
-  // tools reachable. Every other adapter (and every non-companion claude
-  // call) ignores it, so argv stays byte-identical there. Required (not
-  // optional) so tsc flags any future call site that forgets to pass it —
-  // an omitted field here fails OPEN (full CLI toolset for her), which is
-  // exactly the wrong default for a security gate.
+  // Glob/Grep/...) via `--tools ""` AND (node #1455) adds `--strict-mcp-config`
+  // so the CLI also ignores every account-level claude.ai remote connector
+  // (Smarty_Pants/Microsoft_365/Supabase/Lovable/Cloudflare/...), leaving ONLY
+  // the --mcp-config persona tools reachable. Every other adapter (and every
+  // non-companion claude call) ignores it, so argv stays byte-identical there.
+  // Required (not optional) so tsc flags any future call site that forgets to
+  // pass it — an omitted field here fails OPEN (full CLI toolset + every
+  // account connector for her), which is exactly the wrong default for a
+  // security gate.
   buildArgs: (opts: { sessionId?: string | null; model?: string | null; options?: Record<string, unknown>; imageDirs?: string[]; imagePaths?: string[]; isCompanionThread: boolean }) => string[];
   // Some CLIs (e.g. Devin) don't read the prompt from stdin — they take it via a
   // file flag. When set, runClaude writes the composed prompt to a temp file and
@@ -306,6 +309,18 @@ const ADAPTERS: Record<string, AdapterConfig> = {
       // explicitly refuses `--dangerously-skip-permissions`, which this
       // spawn always passes, so it would hard-fail every companion turn.
       if (isCompanionThread) args.push('--tools', '');
+      // Node #1455: `--tools ''` above only suppresses the CLI's own built-in
+      // tools (Bash/Read/Write/...) — it does nothing about account-level
+      // claude.ai remote connectors (Smarty_Pants, Microsoft_365, Supabase,
+      // Lovable, Cloudflare, ...), which still load whenever the turn routes
+      // to an account that has them configured (e.g. account B has all of
+      // them). Verified empirically: the SAME spawn + `--strict-mcp-config`
+      // collapses the init event's tool list from 174 down to 1 (the
+      // --mcp-config persona server only), 4 of 4 runs. `--strict-mcp-config`
+      // makes the CLI use ONLY the servers named in --mcp-config (added later
+      // in runClaude) and ignore every account-level connector — same
+      // fail-closed signal as `--tools ''`, so the two can never drift apart.
+      if (isCompanionThread) args.push('--strict-mcp-config');
       return args;
     },
     envOverrides(env) { delete env['ANTHROPIC_API_KEY']; },

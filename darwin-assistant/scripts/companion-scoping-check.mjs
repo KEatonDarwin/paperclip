@@ -32,9 +32,11 @@
 //   (5) the REAL CLI argv the claude adapter builds (getAdapters().claude.
 //       buildArgs) for a companion thread includes `--tools ''` (strips every
 //       CLI built-in — Bash/Read/Write/Edit/WebFetch/WebSearch/Glob/Grep —
-//       while leaving --mcp-config persona tools reachable), and a
-//       non-companion thread's argv is byte-identical to before (no --tools
-//       flag at all).
+//       while leaving --mcp-config persona tools reachable) AND (node #1455)
+//       `--strict-mcp-config` (strips every account-level claude.ai remote
+//       connector — Smarty_Pants/Microsoft_365/Supabase/Lovable/Cloudflare —
+//       so only the --mcp-config persona server remains), and a non-companion
+//       thread's argv is byte-identical to before (neither flag at all).
 //
 // Imports the real prompt.js/companion-chat.js/tools/index.js/agent.js
 // modules so this exercises production code, not a re-implementation of it.
@@ -265,9 +267,16 @@ const companionToolsIdx = companionArgs.indexOf('--tools');
 check('(5) companion argv includes the --tools flag', companionToolsIdx !== -1);
 check('(5) companion argv\'s --tools value is empty (strips every CLI built-in)', companionArgs[companionToolsIdx + 1] === '');
 check('(5) companion argv still carries --dangerously-skip-permissions (no conflict with --tools)', companionArgs.includes('--dangerously-skip-permissions'));
+// Node #1455: --tools '' alone doesn't block account-level claude.ai remote
+// connectors (Smarty_Pants/Microsoft_365/Supabase/Lovable/Cloudflare/...) —
+// --strict-mcp-config is what makes the CLI ignore them and use ONLY the
+// --mcp-config persona server. Must ride alongside --tools '' on every
+// companion spawn (fail-closed), and never appear on a non-companion one.
+check('(5) companion argv includes --strict-mcp-config (node #1455 fail-closed fix)', companionArgs.includes('--strict-mcp-config'));
 
 const nonCompanionArgs = claudeAdapter.buildArgs({ sessionId: null, model: null, isCompanionThread: false });
 check('(5) non-companion argv has NO --tools flag (byte-identical to before)', !nonCompanionArgs.includes('--tools'));
+check('(5) non-companion argv has NO --strict-mcp-config flag (connectors stay usable)', !nonCompanionArgs.includes('--strict-mcp-config'));
 
 const nonCompanionArgsNoFlag = claudeAdapter.buildArgs({ sessionId: null, model: null });
 check(
@@ -301,6 +310,7 @@ for (const [label, input] of [
   const argv = claudeAdapter.buildArgs({ sessionId: null, model: null, isCompanionThread: derivedIsCompanionThread });
   const toolsIdx = argv.indexOf('--tools');
   check(`${label}: resulting argv carries --tools '' (gap A)`, toolsIdx !== -1 && argv[toolsIdx + 1] === '');
+  check(`${label}: resulting argv carries --strict-mcp-config (node #1455, survives plan mode too)`, argv.includes('--strict-mcp-config'));
 }
 
 // Same drive, but for a NON-companion conversation — must NOT pick up the
@@ -321,6 +331,7 @@ for (const [label, input] of [
 
   const argv = claudeAdapter.buildArgs({ sessionId: null, model: null, isCompanionThread: derivedIsCompanionThread });
   check(`${label}: resulting argv has NO --tools flag`, !argv.includes('--tools'));
+  check(`${label}: resulting argv has NO --strict-mcp-config flag`, !argv.includes('--strict-mcp-config'));
 }
 
 if (failures > 0) {

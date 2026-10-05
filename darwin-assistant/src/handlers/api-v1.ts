@@ -3859,7 +3859,7 @@ export function createApiV1Router(): Router {
   });
 
   router.post('/hopper-trees', (req: AuthedRequest, res) => {
-    const body = (req.body ?? {}) as { topic?: unknown; origin_thread?: unknown; nodes?: unknown };
+    const body = (req.body ?? {}) as { topic?: unknown; origin_thread?: unknown; nodes?: unknown; draft?: unknown };
     const topic = typeof body.topic === 'string' ? body.topic.trim() : '';
     const nodes = Array.isArray(body.nodes) ? (body.nodes as NewNodeInput[]) : [];
     if (!topic || !nodes.length || nodes.some((n) => typeof n?.title !== 'string' || !n.title.trim())) {
@@ -3868,7 +3868,16 @@ export function createApiV1Router(): Router {
     }
     const origin = typeof body.origin_thread === 'string' && body.origin_thread.trim() ? body.origin_thread.trim() : null;
     const created = createHopperTree(topic, origin, nodes);
-    res.status(201).json(created);
+    // Kevin's directive (2026-10-05): trees skip the draft/approval gate — by the
+    // time something is a tree it is ready to go. Drafting/approval/steps live in
+    // the goal system now, not here. Auto-agree on plant so the tree goes live and
+    // dispatch starts immediately. (Pass draft:true to opt back into the old gate.)
+    if (body.draft === true) {
+      res.status(201).json(created);
+      return;
+    }
+    const live = agreeHopperTree(created.tree.id);
+    res.status(201).json({ tree: live ?? created.tree, nodes: listTreeNodes(created.tree.id) });
   });
 
   router.get('/hopper-trees/:treeId', (req: AuthedRequest, res) => {

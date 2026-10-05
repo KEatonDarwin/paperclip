@@ -16,6 +16,9 @@ import './tree-cue.js';
 // Side-effect import: registers the hopper paused-tree provider + the goals
 // autopilot stand-down probe and starts the Night Shift driver (NIGHT_SHIFT_DRIVER=0 disables).
 import './night-shift.js';
+// Side-effect import: creates the guest_identities table (scoped guest-login
+// principal, see src/guest-identities.ts). No login logic wired up yet.
+import './guest-identities.js';
 import { startFoundry } from './foundry.js';
 import { startNotepadDriver } from './notepad-driver.js';
 import { startMonitorScheduler } from './monitors.js';

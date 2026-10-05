@@ -210,6 +210,15 @@ export interface TechTaskEvent {
   task: import('./tech-tasks.js').TechTaskRow;
 }
 
+// BUG INTAKE (2026-10-05) — Ctrl+Shift+B modal rows. Global, same treatment as
+// TechTaskEvent: the modal's recent-submissions list re-renders on row
+// create/update (new submission, JARVIS flips triaging/tree_planted/done/needs_kevin).
+export interface BugfixEvent {
+  type: 'bugfix';
+  action: 'created' | 'updated';
+  bug: import('./bug-intake.js').BugIntakeRow;
+}
+
 // DAR-782 — dispatch signaling. Fired on dispatch lifecycle (create/complete/ack/delete)
 // and worker status updates. Keyed to the orchestrator's conversationId.
 export interface DispatchEvent {
@@ -389,7 +398,7 @@ export type SSEEvent =
   | GoalEvent | GoalNodeEvent | GoalFocusEvent | GoalGuardEvent
   | NightRunEvent | NightItemEvent
   | HealthSampleEvent | HealthEventEvent
-  | TechTaskEvent;
+  | TechTaskEvent | BugfixEvent;
 
 // ---------------------------------------------------------------------------
 // THE GLOBAL-STREAM EVENT CONTRACT — one list, server-owned.
@@ -429,6 +438,7 @@ export const GLOBAL_STREAM_EVENT_TYPES = [
   'night_run', 'night_item',   // Night Shift (node #679/#680): board + /night live updates
   'health_sample', 'health_event',   // Cockpit Health (node #858): live /health charts + spike markers
   'tech_task',   // Tech Tasks (2026-10-01): email-pipeline rows on the big board + dashboard
+  'bugfix',      // Bug Intake (2026-10-05): Ctrl+Shift+B modal rows + triage status
 ] as const satisfies readonly SSEEvent['type'][];
 
 export type GlobalStreamEventType = (typeof GLOBAL_STREAM_EVENT_TYPES)[number];

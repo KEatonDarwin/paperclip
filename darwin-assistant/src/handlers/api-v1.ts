@@ -102,6 +102,13 @@ import {
   type TechTaskSyncItem,
 } from '../tech-tasks.js';
 import {
+  listBugIntake,
+  createBugIntake,
+  updateBugIntake,
+  type BugIntakeStatus,
+  type BugIntakeJobType,
+} from '../bug-intake.js';
+import {
   listHopperItems,
   getHopperItem,
   createHopperItem,
@@ -5098,6 +5105,10 @@ export function createApiV1Router(): Router {
   });
 
   // == Foreman bug/task intake bridge (DAR-688 / DAR-711) =====================
+  // SUPERSEDED (2026-10-05) by /bug-intake below — this forwarded to Paperclip's
+  // Foreman intake API at http://localhost:3100, which is now mothballed and
+  // returns nothing. Left in place (dead but harmless) rather than ripped out;
+  // the Ctrl+Shift+B modal has been rewired to /bug-intake. See bug-intake.ts.
   // The Ctrl+Shift+B cockpit widget (BugIntakeWidget.tsx) POSTs here via the
   // /cockpit-api proxy. We forward server-to-server into Paperclip's intake API
   // (board key + Foreman worker project + run:true resolved in tools/paperclip.ts),
@@ -5128,6 +5139,50 @@ export function createApiV1Router(): Router {
     } catch (err) {
       sendError(res, 502, 'intake_submit_failed', err instanceof Error ? err.message : String(err));
     }
+  });
+
+  // == Bug Intake (2026-10-05) =================================================
+  // The modern Ctrl+Shift+B seam — replaces the dead Foreman /intake above.
+  // See src/bug-intake.ts. POST spawns a dedicated cockpit:bugfix-<id> thread
+  // and cues JARVIS to triage, plant its own hopper tree, and verify
+  // (skills/jarvis-bug-fixer/SKILL.md). JARVIS keeps the row honest via PATCH.
+
+  router.get('/bug-intake', (req: AuthedRequest, res) => {
+    const limit = Math.max(1, Math.min(200, parseInt(String(req.query.limit ?? '15'), 10) || 15));
+    res.json({ outcomes: listBugIntake(limit) });
+  });
+
+  router.post('/bug-intake', (req: AuthedRequest, res) => {
+    const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+    if (!text) {
+      sendError(res, 400, 'text_required', 'text is required');
+      return;
+    }
+    const jobType: BugIntakeJobType = req.body?.job_type === 'build' ? 'build' : 'bug_fix';
+    const repo = typeof req.body?.repo === 'string' && req.body.repo.trim() ? req.body.repo.trim() : 'darwin-assistant';
+    const pageUrl = typeof req.body?.page_url === 'string' ? req.body.page_url : null;
+    const bug = createBugIntake({ text, job_type: jobType, repo, page_url: pageUrl });
+    res.status(202).json({ bug_id: bug.id, thread_ext: bug.thread_ext, status: bug.status, running: true });
+  });
+
+  router.patch('/bug-intake/:id', (req: AuthedRequest, res) => {
+    const id = String(req.params.id);
+    const status = typeof req.body?.status === 'string' ? req.body.status as BugIntakeStatus : undefined;
+    const VALID_BUG_STATUSES: BugIntakeStatus[] = ['new', 'triaging', 'asked_question', 'tree_planted', 'done', 'needs_kevin'];
+    if (status !== undefined && !VALID_BUG_STATUSES.includes(status)) {
+      sendError(res, 400, 'invalid_status', `status must be one of ${VALID_BUG_STATUSES.join(', ')}`);
+      return;
+    }
+    const bug = updateBugIntake(id, {
+      status,
+      tree_id: typeof req.body?.tree_id === 'string' ? req.body.tree_id : undefined,
+      jarvis_note: typeof req.body?.jarvis_note === 'string' ? req.body.jarvis_note : undefined,
+    });
+    if (!bug) {
+      sendError(res, 404, 'bug_intake_not_found', 'bug intake row not found');
+      return;
+    }
+    res.json({ bug });
   });
 
   // == Quick Chat Profiles ====================================================

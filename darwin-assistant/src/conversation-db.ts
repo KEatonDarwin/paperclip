@@ -1240,4 +1240,34 @@ export function classifyRunOutcome(
   return 'completed';
 }
 
+// -- Thread bridges (node #1408, wish-catalog pilot tree-a9775da1) --
+// A symmetric link between two cockpit threads (e.g. the wife's companion
+// chat <-> the goal-12 thread it's attached to) so either side can resolve
+// its partner(s). Keyed by external_id strings rather than conversation_id
+// FKs — mirrors thread_links' table style but a bridge can be created before
+// both threads necessarily have a conversations row.
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS thread_bridges (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_a_ext  TEXT NOT NULL,
+    thread_b_ext  TEXT NOT NULL,
+    kind          TEXT NOT NULL DEFAULT 'companion-goal12',
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(thread_a_ext, thread_b_ext)
+  );
+`);
+
+const getBridgedThreadsStmt = db.prepare<[string, string], { partner: string }>(`
+  SELECT thread_b_ext AS partner FROM thread_bridges WHERE thread_a_ext = ?
+  UNION
+  SELECT thread_a_ext AS partner FROM thread_bridges WHERE thread_b_ext = ?
+`);
+
+/** Partner external_id(s) bridged to the given thread, symmetric in either
+ *  direction. Empty array when the thread has no bridge. */
+export function getBridgedThreads(threadExternalId: string): string[] {
+  return getBridgedThreadsStmt.all(threadExternalId, threadExternalId).map((r) => r.partner);
+}
+
 export { db as sqliteDb };

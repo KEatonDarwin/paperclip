@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // GUEST SCOPE ENFORCEMENT ROUTE TESTS — exercises the REAL Express router
-// (hopper node #1360: guestScopeGate, mounted right after bearerAuth) end
-// to end over real HTTP on a throwaway port, against a scratch DB. No live
-// data, no model calls, no touch of the live jarvis.db.
+// (hopper node #1360: guestScopeGate, mounted right after bearerAuth; node
+// #1361: per-connection SSE scoping + thread write 403) end to end over
+// real HTTP on a throwaway port, against a scratch DB. No live data, no
+// model calls, no touch of the live jarvis.db.
 //
 //   npm run build
 //   npm run guest-enforce-route:test
@@ -12,12 +13,18 @@
 //   2. A guest hitting a thread matching allowed_thread_prefixes -> passes
 //      the gate (reaches the real handler, not blocked at 403/404-by-gate).
 //   3. A guest hitting a goal route outside allowed_projects -> denied.
-//   4. A guest hitting a goal route matching allowed_projects -> passes.
+//   4. A goal route matching allowed_projects -> passes.
 //   5. A guest hitting any route with Accept: text/html -> 302 to /companion
 //      instead of a JSON 403.
 //   6. GET /session/whoami always passes for a guest, regardless of scope_claim
 //      (identity bootstrap, not a protected resource).
 //   7. Admin/api_key bearer auth is completely unaffected by the gate.
+//   8. GET /events (global SSE): a guest connection receives an event for
+//      her own thread but not one for a foreign thread (node #1361).
+//   9. GET /threads/:external_id/events (legacy per-thread SSE): a guest
+//      connects to her own thread without crashing and receives its events.
+//  10. POST /threads/:external_id/messages to a thread outside her scope
+//      -> 403, never reaching the handler.
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -43,6 +50,39 @@ const distDir = path.join(__dirname, '..', 'dist');
 const { createApiV1Router } = await import(path.join(distDir, 'handlers', 'api-v1.js'));
 const { mintApiKey } = await import(path.join(distDir, 'api-keys.js'));
 const { createGuestIdentity } = await import(path.join(distDir, 'guest-identities.js'));
+const { getOrCreateConversation } = await import(path.join(distDir, 'conversation-db.js'));
+const { sseBus } = await import(path.join(distDir, 'sse-bus.js'));
+
+// Opens an SSE connection, collects raw frames into `chunks` as they arrive,
+// and returns a closer. Used by tests 8/9 below to observe exactly what a
+// guest connection is forwarded, without a full EventSource client.
+async function openSSE(urlPath, token) {
+  const res = await fetch(`${base}${urlPath}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const chunks = [];
+  const reader = res.body.getReader();
+  let reading = true;
+  (async () => {
+    while (reading) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      chunks.push(Buffer.from(value).toString('utf8'));
+    }
+  })();
+  return {
+    status: res.status,
+    buffer: () => chunks.join(''),
+    close: () => {
+      reading = false;
+      reader.cancel().catch(() => {});
+    },
+  };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 const app = express();
 app.use(express.json());
@@ -155,7 +195,54 @@ try {
   }
   console.log('  ✓ admin/api_key bearer auth completely unaffected by the guest gate');
 
-  console.log('\n[guest-enforce-route-test] ALL 7 tests passed ✅');
+  // 8. GET /events (global SSE, node #1361): a guest connection receives an
+  // event tied to her own thread but not one tied to a foreign thread.
+  {
+    const herConv = getOrCreateConversation('cockpit:companion-chat-1');
+    const foreignConv = getOrCreateConversation('cockpit:someone-elses-thread');
+
+    const stream = await openSSE('/events', guestToken);
+    assert.equal(stream.status, 200, 'guest must be let onto the global stream (self-filtered downstream)');
+    await sleep(150); // let the stream_types frame + listener registration land
+
+    sseBus.emit('sse', { type: 'conversation_updated', conversationId: herConv.id, status: 'active', updatedAt: new Date().toISOString(), turnCount: 1 });
+    sseBus.emit('sse', { type: 'conversation_updated', conversationId: foreignConv.id, status: 'active', updatedAt: new Date().toISOString(), turnCount: 1 });
+    // Global, no-conversationId event (what the spec calls out by name) — must never reach a guest.
+    sseBus.emit('sse', { type: 'notification', action: 'created', notification: { id: 1, severity: 'info', title: 'x', body: null, source: null, link: null, created_at: new Date().toISOString(), read_at: null } });
+
+    await sleep(150);
+    stream.close();
+    const buf = stream.buffer();
+    assert.ok(buf.includes('cockpit:companion-chat-1'), 'guest must receive the event for her own thread');
+    assert.ok(!buf.includes('cockpit:someone-elses-thread'), 'guest must NOT receive the event for a foreign thread');
+    assert.ok(!buf.includes('"type":"notification"') && !buf.includes('event: notification'), 'guest must NOT receive global/no-thread events like notification');
+  }
+  console.log('  ✓ GET /events: guest sees her own thread\'s events, not a foreign thread\'s or global events');
+
+  // 9. GET /threads/:external_id/events (legacy per-thread SSE): a guest
+  // connects to her own thread without the pre-existing req.apiKey! crash,
+  // and receives that thread's events.
+  {
+    const herConv = getOrCreateConversation('cockpit:companion-chat-1');
+    const stream = await openSSE('/threads/cockpit:companion-chat-1/events', guestToken);
+    assert.equal(stream.status, 200, `guest must connect to her own thread's legacy SSE stream without crashing, got ${stream.status}`);
+    await sleep(150);
+    sseBus.emit('sse', { type: 'conversation_updated', conversationId: herConv.id, status: 'active', updatedAt: new Date().toISOString(), turnCount: 2 });
+    await sleep(150);
+    stream.close();
+    assert.ok(stream.buffer().includes('conversation_updated'), 'guest must receive her own thread\'s event on the legacy per-thread stream');
+  }
+  console.log('  ✓ GET /threads/:external_id/events: guest connects to her own thread and receives its events, no crash');
+
+  // 10. POST /threads/:external_id/messages to a thread outside her scope -> 403.
+  {
+    const res = await req('POST', '/threads/cockpit:someone-elses-thread/messages', { token: guestToken, body: { content: 'hi' } });
+    assert.equal(res.status, 403, `expected 403, got ${res.status}: ${JSON.stringify(res.json)}`);
+    assert.equal(res.json?.error?.code, 'forbidden', 'error code must be forbidden');
+  }
+  console.log('  ✓ POST /threads/:external_id/messages to a foreign thread -> 403, never reaches the handler');
+
+  console.log('\n[guest-enforce-route-test] ALL 10 tests passed ✅');
 } finally {
   server.close();
   for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) fs.rmSync(p, { force: true });

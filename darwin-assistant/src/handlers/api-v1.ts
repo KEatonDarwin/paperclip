@@ -498,6 +498,7 @@ import {
   loginGuest,
   resolveGuestSession,
   type GuestPrincipal,
+  type GuestScopeClaim,
 } from '../guest-identities.js';
 
 const MAX_TEXT_LENGTH = 50_000;
@@ -1483,10 +1484,33 @@ const SCOPED_HOME_PATH = '/companion';
 // just one step later. Covers no other route.
 const GUEST_ALWAYS_ALLOWED_PATHS = new Set(['/session/whoami']);
 
+// Node #1361: the global SSE stream has no single resource id in its own
+// path for the gate above to match against (that's the whole reason the
+// non-guest branch of GET /events filters per-event instead of gating the
+// connection). Unlike GUEST_ALWAYS_ALLOWED_PATHS (nothing to scope at all),
+// these two routes are let through here but then self-scope downstream: the
+// GET /events handler applies its own per-event guestScopeAllowsThread()
+// check (same helper as above) before writing anything to the wire, and
+// GET /events/types only ever answers with type NAMES, never event payloads.
+// Opening the connection is not itself a leak — the per-event filter is the
+// actual enforcement, same pattern ENFORCE-PLAN.md calls out for this family.
+const GUEST_SELF_FILTERED_STREAM_PATHS = new Set(['/events', '/events/types']);
+
 type GuestResourceKey =
   | { kind: 'thread'; id: string }
   | { kind: 'goal'; id: string }
   | { kind: 'route' };
+
+// Node #1360's single scope-match rule for "does this guest's claim cover
+// this thread" — exported-in-spirit by being the one place both the route
+// gate below AND the per-connection SSE filter (node #1361, GET /events)
+// call. Do not re-derive this union anywhere else.
+function guestScopeAllowsThread(scope: GuestScopeClaim, threadExternalId: string): boolean {
+  return (
+    scope.allowed_threads.includes(threadExternalId) ||
+    scope.allowed_thread_prefixes.some((prefix) => threadExternalId.startsWith(prefix))
+  );
+}
 
 // Resolution happens off `req.path` rather than `req.params`: this gate is
 // mounted via `router.use(...)` immediately after `bearerAuth` (also a
@@ -1548,7 +1572,7 @@ function guestScopeGate(req: AuthedRequest, res: Response, next: NextFunction): 
     next();
     return;
   }
-  if (GUEST_ALWAYS_ALLOWED_PATHS.has(req.path)) {
+  if (GUEST_ALWAYS_ALLOWED_PATHS.has(req.path) || GUEST_SELF_FILTERED_STREAM_PATHS.has(req.path)) {
     next();
     return;
   }
@@ -1556,9 +1580,7 @@ function guestScopeGate(req: AuthedRequest, res: Response, next: NextFunction): 
   const resource = extractGuestResourceKey(req.path);
   let allowed = false;
   if (resource.kind === 'thread') {
-    allowed =
-      scope.allowed_threads.includes(resource.id) ||
-      scope.allowed_thread_prefixes.some((prefix) => resource.id.startsWith(prefix));
+    allowed = guestScopeAllowsThread(scope, resource.id);
   } else if (resource.kind === 'goal') {
     allowed = scope.allowed_projects.includes(`goal-${resource.id}`);
   } else {
@@ -6924,14 +6946,28 @@ export function createApiV1Router(): Router {
   // -- GET /threads/:external_id/events: SSE stream --------------------------
 
   router.get('/threads/:external_id/events', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
     const externalId = paramString(req.params.external_id);
-    const result = findConversationForCaller(caller, externalId);
-    if ('error' in result) {
-      sendError(res, result.error.status, result.error.code, result.error.message);
-      return;
+    let conv: ConversationRow;
+    if (req.guestPrincipal) {
+      // guestScopeGate already proved externalId is inside her scope_claim
+      // before this handler could run (extractGuestResourceKey matches this
+      // exact path to the thread branch) — a plain lookup is all that's left,
+      // never findConversationForCaller, which requires req.apiKey.
+      const found = getConversation(externalId);
+      if (!found) {
+        sendError(res, 404, 'thread_not_found', `Thread ${externalId} not found`);
+        return;
+      }
+      conv = found;
+    } else {
+      const caller = req.apiKey!;
+      const result = findConversationForCaller(caller, externalId);
+      if ('error' in result) {
+        sendError(res, result.error.status, result.error.code, result.error.message);
+        return;
+      }
+      conv = result;
     }
-    const conv = result;
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -6991,9 +7027,13 @@ export function createApiV1Router(): Router {
   // stream — this is prep for that consolidation, additive and unused until
   // the frontend is updated to rely on it.
   router.get('/events', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
-    const seesAll = isAdminScope(caller.scope);
-    const prefix = callerExternalIdPrefix(caller.id);
+    // Node #1361: a guest connection never has req.apiKey — it carries
+    // req.guestPrincipal instead (mutually exclusive, see bearerAuth above).
+    // guestScope is non-null for exactly those connections.
+    const guestScope = req.guestPrincipal?.scope_claim;
+    const caller = req.apiKey;
+    const seesAll = !guestScope && isAdminScope(caller!.scope);
+    const prefix = guestScope ? null : callerExternalIdPrefix(caller!.id);
     // The forward set is NOT a literal here — it is sse-bus.ts's
     // GLOBAL_STREAM_EVENT_TYPES, the single server-owned list, announced to the
     // client below so nothing has to keep a second copy. See the contract block
@@ -7001,7 +7041,7 @@ export function createApiV1Router(): Router {
     const FORWARD: ReadonlySet<string> = new Set(GLOBAL_STREAM_EVENT_TYPES);
     // The Big Board kiosk credential only ever gets the board's own event
     // types — never turn/stream_delta transcript traffic (review fix #520).
-    const kiosk = caller === BIG_BOARD_KIOSK_API_KEY;
+    const kiosk = !guestScope && caller === BIG_BOARD_KIOSK_API_KEY;
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -7021,10 +7061,21 @@ export function createApiV1Router(): Router {
     const handler = (ev: SSEEvent) => {
       if (!FORWARD.has(ev.type)) return;
       if (kiosk && !BIG_BOARD_KIOSK_EVENT_TYPES.has(ev.type)) return;
-      // Scope non-admin callers to their own threads.
-      if (!seesAll && 'conversationId' in ev) {
+      if (guestScope) {
+        // Fail-closed, same as guestScopeAllowsThread's callers elsewhere: a
+        // guest only ever sees events tied to a thread inside her claim. Any
+        // event with no conversationId at all (notification, hopper_item,
+        // goal, workstream, monitor, health_sample, ...) has nothing to check
+        // her claim against and is dropped outright — those are exactly the
+        // "global-stream events" the spec calls out as never hers to see,
+        // not just the turn/notification examples.
+        if (!('conversationId' in ev)) return;
         const c = getConversationById(ev.conversationId);
-        if (!c || !c.external_id.startsWith(prefix)) return;
+        if (!c || !guestScopeAllowsThread(guestScope, c.external_id)) return;
+      } else if (!seesAll && 'conversationId' in ev) {
+        // Scope non-admin API-key callers to their own threads.
+        const c = getConversationById(ev.conversationId);
+        if (!c || !c.external_id.startsWith(prefix!)) return;
       }
       // Annotate with external_id so the client can key the sidebar without a
       // separate id→thread lookup.

@@ -1365,6 +1365,7 @@ function serializeTurn(turn: TurnRow, convSource?: string, externalId?: string):
     ? displayContentFromRawOutput(turn.content, turn.claude_output)
     : turn.content) ?? null;
   return {
+    id: turn.id,
     turn_index: turn.turn_index,
     role: turn.role,
     content: displayContent,
@@ -1393,6 +1394,11 @@ function serializeTurn(turn: TurnRow, convSource?: string, externalId?: string):
     plan_mode: turn.role === 'user' ? isPlanModeMessage(turn.content) : false,
     // DAR-744: paste/attach-chip images on this (user) turn — undefined when none.
     images: serializeTurnImages(turn, externalId),
+    // node #1451: a cross_chat_sidecar turn's accept state (#1447's accept
+    // handler persists these), so the card can render accepted→<target> and
+    // stay that way across reload instead of re-asking.
+    sidecar_accepted_at: turn.sidecar_accepted_at ?? null,
+    sidecar_accept_target: turn.sidecar_accept_target ?? null,
   };
 }
 

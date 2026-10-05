@@ -226,6 +226,11 @@ export interface TurnRow {
   claude_output: string | null;
   error_detail: string | null;
   images: string | null;
+  // cross-chat-sidecar.ts ALTER-TABLEs these in; absent from getTurnsLean's
+  // explicit column list, so optional here rather than widening that select.
+  sidecar_accepted_at?: string | null;
+  sidecar_accept_target?: string | null;
+  sidecar_accept_result_id?: string | null;
 }
 
 export interface TurnMetadata {

@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { companionIdFromThread } from './companion-chat.js';
 
 const MEMORY_FILE = '/home/kevin/obsidian/paperclip-wiki/agent-memory/jarvis/memory.md';
 
@@ -8,13 +9,16 @@ const MEMORY_FILE = '/home/kevin/obsidian/paperclip-wiki/agent-memory/jarvis/mem
 // worker turn for nothing.
 const WORKER_CORE_FILE = '/home/kevin/obsidian/paperclip-wiki/agent-memory/jarvis/worker-core.md';
 
-export type MemoryProfile = 'full' | 'worker';
+export type MemoryProfile = 'full' | 'worker' | 'companion';
 
 /** Ephemeral single-task worker threads that get worker-core.md instead of the
- *  full memory. Deliberately NARROW: goal/shift/checkin/quick threads are
+ *  full memory, and companion threads (node #1382) that get neither — Kevin's
+ *  wife's wish-catalog chat has no business carrying his memory.md/worker-core.md
+ *  at all. Deliberately NARROW otherwise: goal/shift/checkin/quick threads are
  *  JARVIS-persona surfaces Kevin talks to and keep the full (post-diet) memory. */
 export function memoryProfileForThread(externalId: string | null | undefined): MemoryProfile {
   if (!externalId) return 'full';
+  if (companionIdFromThread(externalId)) return 'companion';
   return externalId.startsWith('cockpit:hopper-node-') || externalId.startsWith('cockpit:unblocker-')
     ? 'worker'
     : 'full';
@@ -26,6 +30,10 @@ export function memoryProfileForThread(externalId: string | null | undefined): M
 // that block was the single biggest fixed cost in a replayed continuation
 // prompt. Full block (no arg) is unchanged for the common case.
 export function loadMemoryBlock(maxChars?: number, profile: MemoryProfile = 'full'): string {
+  // Companion threads (node #1382) never load memory.md or worker-core.md —
+  // neither is appropriate content for Kevin's wife's chat, on the initial
+  // prompt OR a resumed session's per-turn <memory_refresh>.
+  if (profile === 'companion') return '';
   if (profile === 'worker') {
     let core: string;
     try {
@@ -68,10 +76,55 @@ export function loadMemoryBlock(maxChars?: number, profile: MemoryProfile = 'ful
   ].join('\n');
 }
 
+/** Companion threads (node #1382, `cockpit:companion-*`) get a trimmed, warm
+ *  persona for Kevin's wife plus a compact goal-12 (wish-catalog) orientation —
+ *  never Kevin's JARVIS operator persona, his "Who Kevin Is" section, his
+ *  non-negotiables, or any engine-docs/ops internals. Intentionally has NO
+ *  memoryBlock splice: loadMemoryBlock() already returns '' for this profile,
+ *  so there's nothing to omit even on the omitMemory=false path. */
+function buildCompanionSystemPrompt(): string {
+  const now = new Date().toLocaleString('en-US', {
+    timeZone: 'America/Chicago',
+    dateStyle: 'full',
+    timeStyle: 'short',
+  });
+
+  return `You are a warm, friendly companion chat.
+
+## Current Time
+${now} (US Central)
+
+---
+
+## Who You're Talking To
+
+You're chatting with Kevin's wife. This is her own private space — not Kevin's assistant, not a work tool. Be warm, conversational, and easy to talk to, like a helpful friend she can bounce ideas off of.
+
+## What This Chat Is For — the Kids' Wish Catalog
+
+Kevin is building a small side project with her and the kids: a parent-curated, budget-capped printed catalog the kids can circle items in — like an old-school holiday wish book, but just for their family. Kids flip through it, circle what they want within a budget, and a QR code links back to the family's own site to turn the picks into something real (working name: Circle & Flip).
+
+Here's what you can help with:
+- Talk through ideas for the catalog — products, themes, budget rules, how the kids might use it
+- She can ask you about how the project is coming along
+- If she has an idea, a note, or feedback Kevin should see, help her get it to him — ask what she'd like passed along and relay it clearly
+
+## What You Are NOT
+
+- Not Kevin's operator or chief-of-staff assistant — you don't manage his calendar, his tasks, his companies, or any of his other systems
+- No access to his work tools, scheduling, or business systems, and nothing about how any of that works
+- Keep this space just about her, the kids, and this one project — no ops talk, no system internals, no secrets
+
+Be present, warm, and genuinely helpful. This is her chat.
+`;
+}
+
 export function buildSystemPrompt(
   profile: MemoryProfile = 'full',
   opts?: { omitMemory?: boolean },
 ): string {
+  if (profile === 'companion') return buildCompanionSystemPrompt();
+
   const now = new Date().toLocaleString('en-US', {
     timeZone: 'America/Chicago',
     dateStyle: 'full',

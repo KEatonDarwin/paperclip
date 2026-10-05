@@ -409,7 +409,7 @@ import { autoGroupThreadFromFirstMessage } from '../thread-autogroup.js';
 import { generateThreadSummary } from '../thread-summarize.js';
 import { condenseThread, buildSmartForkMessage } from '../thread-condense.js';
 import { listThreadSummaries, getLatestThreadSummary } from '../thread-summaries.js';
-import { searchThreadsByQuery } from '../thread-search.js';
+import { searchThreadsByQuery, searchThreadsLiteral } from '../thread-search.js';
 import { getBrief } from '../jarvis-brief.js';
 import {
   listJarvisDecisions,
@@ -5609,7 +5609,8 @@ export function createApiV1Router(): Router {
     res.json({ threads: filtered.map((c) => threadDescriptor(c, req)) });
   });
 
-  // -- POST /threads/search: AI-mediated natural-language search (DAR-741) ---
+  // -- POST /threads/search: AI-mediated natural-language search (DAR-741),
+  // or literal (non-AI) substring search (bug 2d4301d1) via mode:'literal' --
   // Synchronous (unlike auto-title/summarize's fire-and-forget 202s) — the
   // cockpit's search modal is waiting on this response to render results.
 
@@ -5618,6 +5619,7 @@ export function createApiV1Router(): Router {
     const prefix = callerExternalIdPrefix(caller.id);
     const seesAllThreads = isAdminScope(caller.scope);
     const query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
+    const mode = req.body?.mode === 'literal' ? 'literal' : 'ai';
     if (!query) {
       sendError(res, 400, 'missing_query', 'query is required');
       return;
@@ -5630,7 +5632,7 @@ export function createApiV1Router(): Router {
     });
 
     try {
-      const matches = await searchThreadsByQuery(query, candidates);
+      const matches = mode === 'literal' ? searchThreadsLiteral(query, candidates) : await searchThreadsByQuery(query, candidates);
       const byId = new Map(candidates.map((c) => [c.external_id, c]));
       const results: Record<string, unknown>[] = [];
       for (const m of matches) {

@@ -1,5 +1,5 @@
 import { runClaude } from './agent.js';
-import { getTurnsLean as getTurns, type ConversationRow } from './conversation-db.js';
+import { getTurnsLean as getTurns, searchTurnsLiteral, type ConversationRow } from './conversation-db.js';
 import { getLatestThreadSummary } from './thread-summaries.js';
 
 // DAR-741 — AI-mediated natural-language search over cockpit threads. Kevin
@@ -67,4 +67,54 @@ export async function searchThreadsByQuery(
     .map((e) => ({ thread_id: String(e.thread_id ?? ''), reason: String(e.reason ?? '') }))
     .filter((e) => validIds.has(e.thread_id))
     .slice(0, 5);
+}
+
+// -- bug 2d4301d1 — literal (non-AI) search --------------------------------
+// "Something dumb and simple: if I'm looking for a specific string I want to
+// search for it WITHOUT involving AI, and go back as far as I need to." Zero
+// model calls — a plain case-insensitive substring match over the title and
+// the FULL turn history (not just recent turns) of every candidate thread.
+
+const LITERAL_RESULTS_CAP = 50;
+const SNIPPET_CONTEXT_CHARS = 50;
+
+function literalSnippet(content: string, query: string): string {
+  const idx = content.toLowerCase().indexOf(query.toLowerCase());
+  if (idx === -1) return content.slice(0, 2 * SNIPPET_CONTEXT_CHARS).trim();
+  const start = Math.max(0, idx - SNIPPET_CONTEXT_CHARS);
+  const end = Math.min(content.length, idx + query.length + SNIPPET_CONTEXT_CHARS);
+  const prefix = start > 0 ? '…' : '';
+  const suffix = end < content.length ? '…' : '';
+  return `${prefix}${content.slice(start, end).trim()}${suffix}`;
+}
+
+export function searchThreadsLiteral(query: string, candidates: ConversationRow[]): ThreadSearchResult[] {
+  const trimmed = query.trim();
+  if (!candidates.length || !trimmed) return [];
+  const lowerQuery = trimmed.toLowerCase();
+
+  const reasonByExternalId = new Map<string, string>();
+
+  // Title matches first — cheap, already in memory.
+  for (const c of candidates) {
+    if (c.title && c.title.toLowerCase().includes(lowerQuery)) {
+      reasonByExternalId.set(c.external_id, `Title match: "${c.title}"`);
+    }
+  }
+
+  // Turn content matches — one SQL LIKE scan over every candidate's full
+  // history, no model call.
+  const byId = new Map(candidates.map((c) => [c.id, c]));
+  const matches = searchTurnsLiteral(candidates.map((c) => c.id), trimmed);
+  for (const match of matches) {
+    const conv = byId.get(match.conversation_id);
+    if (!conv || reasonByExternalId.has(conv.external_id)) continue;
+    reasonByExternalId.set(conv.external_id, literalSnippet(match.content, trimmed));
+  }
+
+  return candidates
+    .filter((c) => reasonByExternalId.has(c.external_id))
+    .sort((a, b) => (b.updated_at ?? '').localeCompare(a.updated_at ?? ''))
+    .slice(0, LITERAL_RESULTS_CAP)
+    .map((c) => ({ thread_id: c.external_id, reason: reasonByExternalId.get(c.external_id)! }));
 }

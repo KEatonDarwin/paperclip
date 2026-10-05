@@ -84,7 +84,8 @@
     "mike-radar:ingest-check": "npm run build && JARVIS_DB_PATH=/tmp/mike-radar-ingest-check.db JARVIS_SIM=1 node scripts/mike-radar-ingest-check.mjs",
     "mike-radar:report-check": "npm run build && JARVIS_DB_PATH=/tmp/mike-radar-report-check.db JARVIS_SIM=1 node scripts/mike-radar-report-check.mjs",
     "mike-radar:route-check": "npm run build && JARVIS_DB_PATH=/tmp/mike-radar-route-check.db JARVIS_SIM=1 node scripts/mike-radar-route-check.mjs",
-    "mike-radar:chat-check": "npm run build && JARVIS_DB_PATH=/tmp/mike-radar-chat-check.db JARVIS_SIM=1 node scripts/mike-radar-chat-check.mjs"
+    "mike-radar:chat-check": "npm run build && JARVIS_DB_PATH=/tmp/mike-radar-chat-check.db JARVIS_SIM=1 node scripts/mike-radar-chat-check.mjs",
+    "search-literal:check": "npm run build && JARVIS_DB_PATH=/tmp/search-literal-check.db JARVIS_SIM=1 node scripts/search-literal-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

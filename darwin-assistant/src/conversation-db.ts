@@ -586,6 +586,42 @@ export function getTurnsLean(conversationId: number): TurnRow[] {
   return stmts.getTurnsLean.all(conversationId);
 }
 
+export interface LiteralTurnMatch {
+  conversation_id: number;
+  turn_index: number;
+  role: string;
+  content: string;
+}
+
+/** Non-AI literal substring search over turn content, scoped to a given set of
+ *  conversation ids (bug 2d4301d1 — "go back as far as I need"). Scans the
+ *  FULL history of each conversation via a SQL LIKE, not just recent turns.
+ *  conversation_id IN (...) narrows the scan to idx_turns_conversation before
+ *  the LIKE runs, so this stays cheap even though a leading-wildcard LIKE
+ *  can't use a content index. Returns the first (earliest) matching turn per
+ *  conversation, ordered by turn_index so callers can rely on that. Zero
+ *  model calls. */
+export function searchTurnsLiteral(conversationIds: number[], query: string): LiteralTurnMatch[] {
+  const trimmed = query.trim();
+  if (!conversationIds.length || !trimmed) return [];
+  const likePattern = `%${trimmed.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+  const placeholders = conversationIds.map(() => '?').join(',');
+  const rows = db
+    .prepare<unknown[], LiteralTurnMatch>(
+      `SELECT conversation_id, turn_index, role, content
+       FROM turns
+       WHERE conversation_id IN (${placeholders})
+         AND content LIKE ? ESCAPE '\\'
+       ORDER BY conversation_id ASC, turn_index ASC`,
+    )
+    .all(...conversationIds, likePattern);
+  const firstPerConversation = new Map<number, LiteralTurnMatch>();
+  for (const row of rows) {
+    if (!firstPerConversation.has(row.conversation_id)) firstPerConversation.set(row.conversation_id, row);
+  }
+  return [...firstPerConversation.values()];
+}
+
 export function listActiveConversations(): ConversationRow[] {
   return stmts.listActiveConversations.all();
 }

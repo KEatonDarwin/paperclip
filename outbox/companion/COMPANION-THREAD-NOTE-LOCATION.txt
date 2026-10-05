@@ -1,0 +1,12 @@
+The companion thread documentation has been written to the shared wiki at:
+
+/home/kevin/obsidian/paperclip-wiki/outbox/companion/COMPANION-THREAD-NOTE.md
+
+This file documents:
+- Companion thread kind registration point (darwin-assistant/src/companion-chat.ts)
+- How the companion thread opts out of the 48h TTL (uses cockpit:companion- prefix, never inserted into quick_chat_sessions)
+- The Opus model pin and its resolution path (resolveConversationRuntime in agent.ts)
+- The exact command to create a real companion thread when ready
+- References to upcoming guards (#277 for model enforcement, #276 for persona/tool-scoping)
+
+Acceptance: File exists at the wiki path, names the registration point, and documents the create command.

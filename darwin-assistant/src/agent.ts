@@ -69,7 +69,14 @@ try {
 // actually reaches the model gets rewritten into an explicit instruction.
 export const PLAN_MODE_MARKER = '-- mode: planning --';
 
-export function isPlanModeMessage(rawContent: string | null | undefined): boolean {
+// Node #1443 gap B: a companion thread (Kevin's wife's persona chat) must
+// never be able to enter the operator plan-mode affordance — if she ever
+// typed text that happened to start with the marker, it must NOT be read as
+// the operator's plan-mode toggle. `isCompanionThread` defaults to false so
+// every existing caller (the cockpit bubble-coloring display in api-v1.ts,
+// which doesn't know about companion threads) keeps its current behavior.
+export function isPlanModeMessage(rawContent: string | null | undefined, isCompanionThread = false): boolean {
+  if (isCompanionThread) return false;
   return !!rawContent && rawContent.trimStart().startsWith(PLAN_MODE_MARKER);
 }
 
@@ -213,13 +220,16 @@ export interface AdapterConfig {
   // The `model`/`modelLabel` fields are placeholders here and filled in per-request
   // by getAdapterRuntimeDescriptor(); leave them null in the static config.
   runtime: Omit<AdapterRuntimeDescriptor, 'adapterType' | 'model' | 'modelLabel'>;
-  // isCompanionThread (node #1441, gap 2): only the `claude` adapter's
-  // buildArgs reads this — when true it strips the CLI's own built-in
-  // tools (Bash/Read/Write/Edit/WebFetch/WebSearch/Glob/Grep/...) via
-  // `--tools ""`, leaving ONLY the --mcp-config persona tools reachable.
-  // Every other adapter (and every non-companion claude call) ignores it,
-  // so argv stays byte-identical there.
-  buildArgs: (opts: { sessionId?: string | null; model?: string | null; options?: Record<string, unknown>; imageDirs?: string[]; imagePaths?: string[]; isCompanionThread?: boolean }) => string[];
+  // isCompanionThread (node #1441, gap 2; made required at node #1443 gap C):
+  // only the `claude` adapter's buildArgs reads this — when true it strips
+  // the CLI's own built-in tools (Bash/Read/Write/Edit/WebFetch/WebSearch/
+  // Glob/Grep/...) via `--tools ""`, leaving ONLY the --mcp-config persona
+  // tools reachable. Every other adapter (and every non-companion claude
+  // call) ignores it, so argv stays byte-identical there. Required (not
+  // optional) so tsc flags any future call site that forgets to pass it —
+  // an omitted field here fails OPEN (full CLI toolset for her), which is
+  // exactly the wrong default for a security gate.
+  buildArgs: (opts: { sessionId?: string | null; model?: string | null; options?: Record<string, unknown>; imageDirs?: string[]; imagePaths?: string[]; isCompanionThread: boolean }) => string[];
   // Some CLIs (e.g. Devin) don't read the prompt from stdin — they take it via a
   // file flag. When set, runClaude writes the composed prompt to a temp file and
   // appends `<promptFileArg> <path>` to the args instead of piping stdin. The
@@ -1095,6 +1105,14 @@ export async function runClaude(
   imageDirs?: string[],
   imagePaths?: string[],
   toolContext?: ToolExecutionContext,
+  // Node #1443: the companion signal MUST be its own explicit argument, not
+  // derived from `toolContext` here — plan mode nulls toolContext (see
+  // runConversationTurn's `mcpToolContext`), and deriving isCompanionThread
+  // from it meant a companion turn sent in plan mode silently lost
+  // `--tools ''` and got the full CLI built-in toolset. Callers that never
+  // touch a companion thread (one-shot briefings/summarizers/etc.) omit this
+  // and get `false`, i.e. byte-identical argv to before this parameter existed.
+  isCompanionThread = false,
 ): Promise<ClaudeResult> {
   // A resolved per-thread runtime (DAR-680 AC#4) wins; otherwise fall back to the
   // global adapter/model settings for callers that don't pass one.
@@ -1142,13 +1160,6 @@ export async function runClaude(
     }
   }
 
-  // Node #1441 gap 2: derive straight from the SAME toolContext.externalId
-  // the persona-tools-server already uses to fail-close its tool manifest
-  // (companion-chat.ts companionIdFromThread) — one source of truth, no new
-  // gate to drift out of sync. toolContext is undefined for one-shot callers
-  // (briefings, summarizers, etc.) that never touch a companion thread, so
-  // this is false (byte-identical argv) for every one of them.
-  const isCompanionThread = !!companionIdFromThread(toolContext?.externalId ?? '');
   const args = adapter.buildArgs({ sessionId, model, options, imageDirs, imagePaths, isCompanionThread });
 
   // Persona-tools MCP (native mcp__jarvis__<name> tools): only the `claude`
@@ -1560,6 +1571,14 @@ async function runConversationTurn(
     originalText: input,
   };
 
+  // Node #1443 gap A: the companion signal for THIS spawn comes from the
+  // conversation's own external_id, resolved here — before plan mode gets a
+  // chance to null `toolContext` below. It is threaded explicitly through to
+  // every runClaude() call this turn as its own argument (never recovered
+  // from toolContext), so a companion turn's argv ends `--tools ''`
+  // regardless of plan mode. Non-companion threads are unaffected (false).
+  const isCompanionThread = memoryProfileForThread(conv.external_id) === 'companion';
+
   let sessionId = conv.claude_session_id;
   const storedSessionAdapter = resolveSessionAdapter(conv, turns, adapter.id);
 
@@ -1643,7 +1662,9 @@ async function runConversationTurn(
   // the rewritten copy. `planModeActive` is a hard gate below, not just a
   // prompt nudge — the ticket asks for a guarantee, not a suggestion the
   // model can ignore.
-  const planModeActive = isPlanModeMessage(input);
+  // Node #1443 gap B: a companion thread never enters plan mode, even if her
+  // message happened to start with the operator marker.
+  const planModeActive = isPlanModeMessage(input, isCompanionThread);
   const modelInput = applyPlanMode(input);
 
   // Native persona tools (mcp__jarvis__*) must honour the SAME hard plan-mode
@@ -1724,7 +1745,7 @@ async function runConversationTurn(
     const claudeT0 = Date.now();
     let result: ClaudeResult;
     try {
-      result = await runClaude(stdinContent, sessionId, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext);
+      result = await runClaude(stdinContent, sessionId, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext, isCompanionThread);
       sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
 
       // Session expired or unknown — retry without resume
@@ -1734,7 +1755,7 @@ async function runConversationTurn(
         stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { memoryProfile, externalId: conv.external_id });
         accumulatedText = '';
         sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
-        result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext);
+        result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext, isCompanionThread);
         sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
       }
     } catch (err) {
@@ -1754,7 +1775,7 @@ async function runConversationTurn(
         accumulatedText = '';
         try {
           sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
-          result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext);
+          result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext, isCompanionThread);
           sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
         } catch (retryErr) {
           sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
@@ -1818,7 +1839,7 @@ async function runConversationTurn(
           accumulatedText = '';
           try {
             sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
-            result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext);
+            result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext, isCompanionThread);
             sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
           } catch (rescueErr) {
             // The rescue account also walled/failed → all headroom exhausted →

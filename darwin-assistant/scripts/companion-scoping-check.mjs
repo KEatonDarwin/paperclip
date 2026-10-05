@@ -68,7 +68,7 @@ const { companionThreadExt, COMPANION_BRIDGE_TOOL_NAME } = await import(
   path.join(distDir, 'companion-chat.js')
 );
 const { ALL_TOOLS } = await import(path.join(distDir, 'tools/index.js'));
-const { buildToolsBlock, buildInitialPrompt, buildContinuationPrompt, buildPerTurnContextPrefix, getAdapters } = await import(
+const { buildToolsBlock, buildInitialPrompt, buildContinuationPrompt, buildPerTurnContextPrefix, getAdapters, isPlanModeMessage, PLAN_MODE_MARKER } = await import(
   path.join(distDir, 'agent.js')
 );
 
@@ -125,7 +125,7 @@ function checkCompanionSafe(label, prompt) {
   check(`${label}: no ops-tool heading (${OPS_HEADING_RE})`, !OPS_HEADING_RE.test(prompt));
   check(`${label}: does NOT contain "You are JARVIS"`, !prompt.includes('You are JARVIS'));
   check(`${label}: does NOT contain "Who Kevin Is"`, !prompt.includes('Who Kevin Is'));
-  check(`${label}: carries the companion_send_to_kevin tool heading`, prompt.includes(`### ${COMPANION_BRIDGE_TOOL_NAME}`));
+  check(`${label}: carries the ${COMPANION_BRIDGE_TOOL_NAME} tool heading`, prompt.includes(`### ${COMPANION_BRIDGE_TOOL_NAME}`));
 }
 
 // `includesPersona`: false for a bare buildToolsBlock() call, which never
@@ -274,6 +274,54 @@ check(
   '(5) non-companion argv (isCompanionThread omitted) matches the explicit-false argv exactly',
   JSON.stringify(nonCompanionArgsNoFlag) === JSON.stringify(nonCompanionArgs),
 );
+
+// ── (6) node #1443 gap A/B regression: the companion signal must survive
+// plan mode. Drives the REAL decision runConversationTurn/runClaude now make
+// — derive isCompanionThread from the conversation's own external_id via
+// memoryProfileForThread (not from a toolContext plan mode can null), feed
+// it into isPlanModeMessage (gap B: must short-circuit false for a companion
+// thread) and independently into claudeAdapter.buildArgs (gap A: must still
+// carry `--tools ''` even though plan mode would have nulled the old
+// toolContext-derived signal). Before the fix, a companion turn sent with the
+// PLAN_MODE_MARKER prefix lost isCompanionThread (buildArgs got no flag at
+// all) because it was derived from toolContext, which plan mode zeroes out.
+const planModeInput = `${PLAN_MODE_MARKER} what should I get for dinner?`;
+const normalInput = 'what should I get for dinner?';
+
+for (const [label, input] of [
+  ['(6) companion conv + plan-mode input', planModeInput],
+  ['(6) companion conv + normal input', normalInput],
+]) {
+  const derivedIsCompanionThread = memoryProfileForThread(companionExternalId) === 'companion';
+  check(`${label}: derives isCompanionThread=true from the conversation`, derivedIsCompanionThread === true);
+
+  const derivedPlanModeActive = isPlanModeMessage(input, derivedIsCompanionThread);
+  check(`${label}: planModeActive is false for a companion thread (gap B)`, derivedPlanModeActive === false);
+
+  const argv = claudeAdapter.buildArgs({ sessionId: null, model: null, isCompanionThread: derivedIsCompanionThread });
+  const toolsIdx = argv.indexOf('--tools');
+  check(`${label}: resulting argv carries --tools '' (gap A)`, toolsIdx !== -1 && argv[toolsIdx + 1] === '');
+}
+
+// Same drive, but for a NON-companion conversation — must NOT pick up the
+// flag regardless of plan mode, and plan mode must still work normally.
+for (const [label, input] of [
+  ['(6) non-companion conv + plan-mode input', planModeInput],
+  ['(6) non-companion conv + normal input', normalInput],
+]) {
+  const nonCompanionExternalId = 'cockpit:goal-12';
+  const derivedIsCompanionThread = memoryProfileForThread(nonCompanionExternalId) === 'companion';
+  check(`${label}: derives isCompanionThread=false from the conversation`, derivedIsCompanionThread === false);
+
+  const derivedPlanModeActive = isPlanModeMessage(input, derivedIsCompanionThread);
+  check(
+    `${label}: planModeActive matches the raw marker (unaffected by gap B)`,
+    derivedPlanModeActive === (input === planModeInput),
+  );
+
+  const argv = claudeAdapter.buildArgs({ sessionId: null, model: null, isCompanionThread: derivedIsCompanionThread });
+  check(`${label}: resulting argv has NO --tools flag`, !argv.includes('--tools'));
+}
 
 if (failures > 0) {
   console.error(`\n${failures} check(s) failed`);

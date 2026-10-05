@@ -494,6 +494,11 @@ import {
   INTERNAL_MCP_KEY_SETTING,
   type ApiKeyRow,
 } from '../api-keys.js';
+import {
+  loginGuest,
+  resolveGuestSession,
+  type GuestPrincipal,
+} from '../guest-identities.js';
 
 const MAX_TEXT_LENGTH = 50_000;
 const UI_PORT = parseInt(process.env.JARVIS_UI_PORT ?? '3201', 10);
@@ -516,6 +521,10 @@ const GOVERNOR_SETTING_KEYS = Object.keys(GOVERNOR_SETTING_SPECS);
 
 interface AuthedRequest extends Request {
   apiKey?: ApiKeyRow;
+  // Set instead of `apiKey` when the bearer token is a guest session
+  // (`gst_` prefix) rather than an api_keys row. Node #1355: resolution
+  // only — downstream route enforcement on this is #271's scope.
+  guestPrincipal?: GuestPrincipal;
 }
 
 const errorByMessageId = new Map<string, { code: string; message: string }>();
@@ -1378,7 +1387,10 @@ function findConversationForCaller(caller: ApiKeyRow, externalId: string): Conve
 // Routes that carry their OWN authentication and must bypass the bearer gate.
 // The Guards webhook (CONTRACT §12.4 route 35) verifies X-Goals-Guard-Secret
 // itself (fails closed: 503 when the secret is unset) — see its handler.
-const AUTH_EXEMPT_PATHS = new Set(['/goals/guards/webhook']);
+// /guest/login (node #1355) carries its own auth too: username+password in
+// the body, verified by loginGuest() — there is no bearer token yet, that's
+// what this route mints.
+const AUTH_EXEMPT_PATHS = new Set(['/goals/guards/webhook', '/guest/login']);
 
 // Big Board kiosk auth (docs/big-board/CONTRACT.md Part 3). A dedicated,
 // narrow, revocable ?kiosk= token accepted on exactly these two GET routes —
@@ -1431,7 +1443,22 @@ function bearerAuth(req: AuthedRequest, res: Response, next: NextFunction): void
     sendError(res, 401, 'invalid_or_missing_bearer_token', 'Authorization: Bearer <key> header required');
     return;
   }
-  const key = authenticateBearer(match[1].trim());
+  const token = match[1].trim();
+  // Guest session resolution (node #1355): a `gst_`-prefixed bearer token
+  // is a session minted by POST /guest/login, not an api_keys row. Resolved
+  // separately onto req.guestPrincipal — req.apiKey stays unset for these,
+  // so admin/api_key auth below is completely untouched.
+  if (token.startsWith('gst_')) {
+    const principal = resolveGuestSession(token);
+    if (!principal) {
+      sendError(res, 401, 'invalid_or_missing_bearer_token', 'Unknown, revoked, or disabled guest session');
+      return;
+    }
+    req.guestPrincipal = principal;
+    next();
+    return;
+  }
+  const key = authenticateBearer(token);
   if (!key) {
     sendError(res, 401, 'invalid_or_missing_bearer_token', 'Unknown or revoked API key');
     return;
@@ -1508,6 +1535,46 @@ export function createApiV1Router(): Router {
 
   installQueueDrain();
   installDispatchGate();
+
+  // -- Guest login (node #1355, auth-exempt — see AUTH_EXEMPT_PATHS) ----------
+  // Resolves username+password into a bearer session token (`gst_...`),
+  // mirroring mintApiKey's plaintext-shown-once pattern. Route visibility /
+  // per-thread denials for guest sessions are NOT in scope here — that's
+  // #271; this is credential issuance + login resolution only.
+  router.post('/guest/login', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { username?: unknown; password?: unknown };
+    const username = typeof body.username === 'string' ? body.username.trim() : '';
+    const password = typeof body.password === 'string' ? body.password : '';
+    if (!username || !password) {
+      sendError(res, 400, 'invalid_request', 'username and password are required');
+      return;
+    }
+    const result = loginGuest(username, password);
+    if (!result) {
+      sendError(res, 401, 'invalid_credentials', 'Unknown username, wrong password, or disabled guest');
+      return;
+    }
+    res.json({
+      session_token: result.sessionToken,
+      guest_id: result.principal.guest_id,
+      scope_claim: result.principal.scope_claim,
+    });
+  });
+
+  // -- GET /session/whoami: resolved-principal introspection -------------------
+  // Proves the chokepoint resolution works for BOTH principal shapes without
+  // granting the guest session access to any real route (node #1355).
+  router.get('/session/whoami', (req: AuthedRequest, res) => {
+    if (req.guestPrincipal) {
+      res.json({ type: 'guest', guest_id: req.guestPrincipal.guest_id, scope_claim: req.guestPrincipal.scope_claim });
+      return;
+    }
+    if (req.apiKey) {
+      res.json({ type: 'api_key', id: req.apiKey.id, scope: req.apiKey.scope });
+      return;
+    }
+    sendError(res, 401, 'invalid_or_missing_bearer_token', 'No resolved principal');
+  });
 
   // -- GET /brief: JARVIS-authored cockpit landing view -----------------------
   // Not a fixed dashboard — JARVIS decides the content and shape fresh each

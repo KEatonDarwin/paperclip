@@ -17,6 +17,7 @@
 import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   addTurn,
   getOrCreateConversation,
@@ -25,6 +26,11 @@ import {
 } from './conversation-db.js';
 import { getInFlightMessageId, processMessage } from './agent.js';
 import { companionIdFromThread, companionThreadExt, getOrCreateCompanionThread } from './companion-chat.js';
+
+// Works identically from src/ (tsx) or dist/ (tsc) -- public/ sits one level
+// up from both, alongside package.json.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CLIENT_DIR = path.join(__dirname, '..', 'public', 'companion');
 
 const PORT = parseInt(process.env.COMPANION_THIN_PORT ?? '8099', 10);
 
@@ -90,13 +96,10 @@ export function startCompanionThinServer(): void {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
-  // GET / -- placeholder for the iPhone client; node 2 fills in the real HTML.
-  app.get('/', (_req, res) => {
-    res.type('html').send(
-      '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">' +
-        '<title>Companion</title></head><body><h1>💬 Companion</h1><p>Client coming soon.</p></body></html>',
-    );
-  });
+  // Serves the iPhone-first client (index.html at GET /, plus app.css/app.js)
+  // from public/companion -- plain static HTML+CSS+vanilla JS, no cockpit SPA
+  // bundled in. Unmatched paths fall through to the routes/404 below.
+  app.use(express.static(CLIENT_DIR, { extensions: ['html'] }));
 
   // GET /api/thread -- her thread's history ONLY. A client-supplied thread id
   // is impossible by construction: this handler never reads req.query at all.

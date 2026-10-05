@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Companion</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="app">
+  <header id="app-bar">
+    <button id="nav-btn" class="nav-btn" type="button" hidden></button>
+    <h1 id="nav-title">Chat</h1>
+    <button id="switch-btn" class="nav-btn" type="button">Reports</button>
+  </header>
+
+  <main id="chat-view" class="view">
+    <div id="chat-messages" class="chat-messages"></div>
+    <form id="chat-form" class="chat-form">
+      <textarea id="chat-input" rows="1" placeholder="Message…" autocomplete="off"></textarea>
+      <button id="chat-send" type="submit">Send</button>
+    </form>
+  </main>
+
+  <main id="reports-list-view" class="view" hidden>
+    <ul id="reports-list" class="reports-list"></ul>
+  </main>
+
+  <main id="report-detail-view" class="view" hidden>
+    <article id="report-content" class="report-content"></article>
+  </main>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

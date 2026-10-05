@@ -72,7 +72,7 @@ export { mcpCall, lovableSendMessage, supabaseExecuteSql } from './mcp.js';
 
 export { logDecision } from './decisions.js';
 
-export { companionSendToKevin } from './companion-bridge.js';
+export { bridgeSend } from './companion-bridge.js';
 
 import {
   createIssue,
@@ -130,7 +130,7 @@ import {
 } from './scheduled-tasks.js';
 import { mcpCall, lovableSendMessage, supabaseExecuteSql } from './mcp.js';
 import { logDecision } from './decisions.js';
-import { companionSendToKevin } from './companion-bridge.js';
+import { bridgeSend } from './companion-bridge.js';
 import { threadTodos } from './thread-todos-tool.js';
 import { threadLinks } from './thread-links-tool.js';
 import { hopper } from './hopper-tool.js';
@@ -208,7 +208,7 @@ export const ALL_TOOLS: ToolDef[] = [
   lovableSendMessage,
   supabaseExecuteSql,
   logDecision,
-  companionSendToKevin,
+  bridgeSend,
   threadTodos,
   threadLinks,
   hopper,

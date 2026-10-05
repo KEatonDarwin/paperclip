@@ -92,12 +92,12 @@ export function companionIdFromThread(externalId: string): string | null {
   return id.length > 0 ? id : null;
 }
 
-/** The one tool seam a companion thread is allowed to reach for sending
- *  something to Kevin. The real bridge (#266) isn't built yet — this name is
- *  reserved now so the allow-list below has something concrete to name; the
- *  stub tool registered under this name (tools/companion-bridge.ts) returns
- *  not-implemented until #266 lands. */
-export const COMPANION_BRIDGE_TOOL_NAME = 'companion_send_to_kevin';
+/** The one tool seam a companion thread is allowed to reach for relaying
+ *  something to its bridged partner thread (node #1430 — the real bridge;
+ *  the name was reserved by #1383 as a not-implemented stub under
+ *  'companion_send_to_kevin' before #1408's thread_bridges table existed to
+ *  resolve a partner). Implemented in tools/companion-bridge.ts. */
+export const COMPANION_BRIDGE_TOOL_NAME = 'bridge_send';
 
 /**
  * Fail-closed tool allow-list, keyed on thread kind (node #1383,

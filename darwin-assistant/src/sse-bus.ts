@@ -415,6 +415,25 @@ export interface MikeReportEvent {
   summary: string | null;
 }
 
+// Node #1430 (wish-catalog pilot, tree-3e526df9) — a cross_chat_sidecar turn
+// (bridge_send, tools/companion-bridge.ts) landing in a bridged partner
+// thread. conversationId is the RECIPIENT thread, so this rides the same
+// per-thread filter as everything else in the `/threads/:id/events` handler;
+// it also needs a slot in GLOBAL_STREAM_EVENT_TYPES below so the sidebar's
+// global stream (and any client subscribed from that announcement) doesn't
+// silently drop it the way `thread_group` once did.
+export interface CrossChatSidecarEvent {
+  type: 'cross_chat_sidecar';
+  conversationId: number;
+  sidecar: {
+    from_thread_ext: string;
+    to_thread_ext: string;
+    from_label: string;
+    summary: string;
+    origin_turn_ref: number | null;
+  };
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
@@ -431,7 +450,7 @@ export type SSEEvent =
   | NightRunEvent | NightItemEvent
   | HealthSampleEvent | HealthEventEvent
   | MikeProjectEvent | MikeActivityEvent | MikeReportEvent
-  | TechTaskEvent | BugfixEvent;
+  | TechTaskEvent | BugfixEvent | CrossChatSidecarEvent;
 
 // ---------------------------------------------------------------------------
 // THE GLOBAL-STREAM EVENT CONTRACT — one list, server-owned.
@@ -473,6 +492,7 @@ export const GLOBAL_STREAM_EVENT_TYPES = [
   'tech_task',   // Tech Tasks (2026-10-01): email-pipeline rows on the big board + dashboard
   'bugfix',      // Bug Intake (2026-10-05): Ctrl+Shift+B modal rows + triage status
   'mike_project', 'mike_activity', 'mike_report',   // Mike Radar (tree-49d228a8): live /mike-radar rail + feed + report pane
+  'cross_chat_sidecar',   // Companion bridge_send (node #1430): a relayed idea landing in the partner thread
 ] as const satisfies readonly SSEEvent['type'][];
 
 export type GlobalStreamEventType = (typeof GLOBAL_STREAM_EVENT_TYPES)[number];

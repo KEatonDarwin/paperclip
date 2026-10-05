@@ -338,7 +338,7 @@ async function main() {
   const turn1Prompt = turn1.stdinContent;
   check('step 2: assembled turn-1 prompt carries the companion persona', turn1Prompt.includes("You're chatting with Kevin's wife"));
   check('step 2: assembled turn-1 prompt carries the wish-catalog brief', turn1Prompt.toLowerCase().includes('wish catalog') || turn1Prompt.toLowerCase().includes('wish-catalog') || turn1Prompt.includes('Circle & Flip'));
-  check('step 2: assembled turn-1 prompt carries ONLY the companion tool allow-list', turn1Prompt.includes('companion_send_to_kevin'));
+  check('step 2: assembled turn-1 prompt carries ONLY the companion tool allow-list', turn1Prompt.includes('bridge_send'));
   check('step 2: assembled turn-1 prompt does NOT leak JARVIS operator persona', !turn1Prompt.includes("Kevin's personal AI life coach and chief of staff"));
   check('step 2: assembled turn-1 prompt carries no memory.md content (companion profile loads none)', !turn1Prompt.includes('Your Persistent Memory'));
 

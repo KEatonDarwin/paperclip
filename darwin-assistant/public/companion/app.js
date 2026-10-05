@@ -256,6 +256,11 @@
     out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
     out = out.replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?!\w)/g, '$1<em>$2</em>');
     out = out.replace(/(^|[^_\w])_([^_\s][^_]*?)_(?!\w)/g, '$1<em>$2</em>');
+    // images BEFORE links -- "![alt](url)" contains a "[alt](url)" the link
+    // regex below would otherwise also match, leaving a stray leading "!".
+    out = out.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) =>
+      `<img src="${url}" alt="${alt}" loading="lazy">`,
+    );
     out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_m, label, url) =>
       `<a href="${url}" target="_blank" rel="noreferrer">${label}</a>`,
     );

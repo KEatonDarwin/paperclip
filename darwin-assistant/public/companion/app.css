@@ -256,7 +256,7 @@ html, body {
   line-height: 1.5;
   max-width: 100%;
   word-wrap: break-word;
-  overflow-wrap: break-word;
+  overflow-wrap: anywhere;
 }
 
 .report-content h1 { font-size: 22px; margin: 4px 0 12px; }
@@ -305,6 +305,13 @@ html, body {
   border: 1px solid var(--border);
   padding: 6px 8px;
   text-align: left;
+}
+.report-content img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  margin: 4px 0 12px;
 }
 .report-content details {
   margin: 0 0 12px;

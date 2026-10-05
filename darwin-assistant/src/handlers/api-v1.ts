@@ -235,6 +235,29 @@ import {
   type IntelLane,
 } from '../intel-desk.js';
 import {
+  listMikeProjects,
+  getMikeProjectByRef,
+  updateMikeProject,
+  listMikeFeed,
+  getMikeActivity,
+  listMikeReports,
+  getMikeReport,
+  listMikeProjectReportStubs,
+  listMikeIngestRuns,
+  countMikeDayChanges,
+  listMikeDayActivity,
+  getOrCreateMikeThread,
+  emitMikeProject,
+  emitMikeReport,
+  requeueMikeReport,
+  mikeReportDate,
+  isMikeWatchState,
+  isMikeReportDate,
+  type MikeRole,
+} from '../mike-radar.js';
+import { runMikeIngest } from '../mike-radar-ingest.js';
+import { generateMikeReport, writeMikeDailyRollup } from '../mike-radar-report.js';
+import {
   listMonitors,
   getMonitor,
   createMonitor,
@@ -2527,6 +2550,252 @@ export function createApiV1Router(): Router {
     }
     res.json(promoted);
   });
+
+  // == Mike Radar ============================================================
+  // Oversight of Mike's Lovable work, read out of the Lovable Watcher archive.
+  // Every route here is a cheap SQLite read against our own jarvis.db; NOTHING
+  // in this block calls Lovable or any of Mike's Supabase projects, and nothing
+  // ever writes to them. The only mutations are our own rows: Kevin's is_key /
+  // watch_state knobs, an ingest sweep, and a report (re)generation.
+
+  /** Resolve a `:shortId` route param (8-char short id OR full uuid) or 404. */
+  const mikeProjectOr404 = (req: AuthedRequest, res: Response) => {
+    const ref = String(req.params.shortId ?? '').trim();
+    const project = ref ? getMikeProjectByRef(ref) : null;
+    if (!project) {
+      sendError(res, 404, 'mike_project_not_found', `no Mike Radar project for "${ref}"`);
+      return null;
+    }
+    return project;
+  };
+
+  router.get('/mike-radar/projects', (req: AuthedRequest, res) => {
+    const rawState = typeof req.query.watch_state === 'string' ? req.query.watch_state : 'watched';
+    if (rawState !== 'all' && !isMikeWatchState(rawState)) {
+      sendError(res, 400, 'invalid_request', 'watch_state must be watched, muted, archived, or all');
+      return;
+    }
+    const rawDay = typeof req.query.day === 'string' ? req.query.day : undefined;
+    if (rawDay !== undefined && !isMikeReportDate(rawDay)) {
+      sendError(res, 400, 'invalid_request', 'day must be YYYY-MM-DD');
+      return;
+    }
+    res.json(
+      listMikeProjects({
+        watch_state: rawState as 'all' | 'watched' | 'muted' | 'archived',
+        key_only: req.query.key_only === '1' || req.query.key_only === 'true',
+        since: typeof req.query.since === 'string' ? req.query.since : undefined,
+        limit: req.query.limit !== undefined ? parseInt(String(req.query.limit), 10) || undefined : undefined,
+        day: rawDay,
+      }),
+    );
+  });
+
+  router.get('/mike-radar/projects/:shortId', (req: AuthedRequest, res) => {
+    const project = mikeProjectOr404(req, res);
+    if (!project) return;
+    const days = req.query.days !== undefined ? parseInt(String(req.query.days), 10) : 14;
+    res.json({
+      project,
+      reports: listMikeProjectReportStubs(project.project_id, Number.isFinite(days) ? days : 14),
+    });
+  });
+
+  // Kevin-only knobs. `name` is accepted because a hand-typed name is the only
+  // fix for the ~11 projects Lovable reports as nameless, and name_source
+  // 'kevin' is the top of the precedence ladder so no later sweep clobbers it.
+  router.patch('/mike-radar/projects/:shortId', (req: AuthedRequest, res) => {
+    const project = mikeProjectOr404(req, res);
+    if (!project) return;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const patch: Parameters<typeof updateMikeProject>[1] = {};
+
+    if (body.is_key !== undefined) {
+      if (typeof body.is_key !== 'boolean' && body.is_key !== 0 && body.is_key !== 1) {
+        sendError(res, 400, 'invalid_request', 'is_key must be a boolean');
+        return;
+      }
+      patch.is_key = body.is_key === true || body.is_key === 1 ? 1 : 0;
+    }
+    if (body.watch_state !== undefined) {
+      if (!isMikeWatchState(body.watch_state)) {
+        sendError(res, 400, 'invalid_request', 'watch_state must be watched, muted, or archived');
+        return;
+      }
+      patch.watch_state = body.watch_state;
+    }
+    if (body.name !== undefined) {
+      if (body.name !== null && typeof body.name !== 'string') {
+        sendError(res, 400, 'invalid_request', 'name must be a string or null');
+        return;
+      }
+      const name = typeof body.name === 'string' ? body.name.trim().slice(0, 80) : null;
+      patch.name = name || null;
+      patch.name_source = name ? 'kevin' : 'short_id';
+    }
+    if (!Object.keys(patch).length) {
+      sendError(res, 400, 'invalid_request', 'nothing to update (is_key, watch_state, name)');
+      return;
+    }
+
+    const updated = updateMikeProject(project.project_id, patch);
+    if (!updated) {
+      sendError(res, 404, 'mike_project_not_found', 'project vanished mid-update');
+      return;
+    }
+    emitMikeProject('updated', updated);
+    res.json({ project: updated });
+  });
+
+  router.get('/mike-radar/projects/:shortId/feed', (req: AuthedRequest, res) => {
+    const project = mikeProjectOr404(req, res);
+    if (!project) return;
+    const rawRole = typeof req.query.role === 'string' ? req.query.role : 'all';
+    if (rawRole !== 'all' && rawRole !== 'user' && rawRole !== 'assistant') {
+      sendError(res, 400, 'invalid_request', 'role must be all, user, or assistant');
+      return;
+    }
+    const rawDay = typeof req.query.day === 'string' ? req.query.day : undefined;
+    if (rawDay !== undefined && !isMikeReportDate(rawDay)) {
+      sendError(res, 400, 'invalid_request', 'day must be YYYY-MM-DD');
+      return;
+    }
+    const before = req.query.before !== undefined ? parseInt(String(req.query.before), 10) : undefined;
+    res.json(
+      listMikeFeed({
+        project_id: project.project_id,
+        limit: req.query.limit !== undefined ? parseInt(String(req.query.limit), 10) || undefined : undefined,
+        before: Number.isFinite(before) ? before : undefined,
+        role: rawRole as MikeRole | 'all',
+        changes_only: req.query.changes_only === '1' || req.query.changes_only === 'true',
+        day: rawDay,
+      }),
+    );
+  });
+
+  // One row WITH its hunks — the expanded diff view. Separate from the feed on
+  // purpose: a single captured diff can be hundreds of KB.
+  router.get('/mike-radar/activity/:id', (req: AuthedRequest, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id) || id < 1) {
+      sendError(res, 400, 'invalid_request', 'activity id must be a positive integer');
+      return;
+    }
+    const detail = getMikeActivity(id);
+    if (!detail) {
+      sendError(res, 404, 'mike_activity_not_found', 'activity row not found');
+      return;
+    }
+    res.json(detail);
+  });
+
+  router.get('/mike-radar/reports', (req: AuthedRequest, res) => {
+    const rawDate = typeof req.query.date === 'string' ? req.query.date : undefined;
+    if (rawDate !== undefined && !isMikeReportDate(rawDate)) {
+      sendError(res, 400, 'invalid_request', 'date must be YYYY-MM-DD');
+      return;
+    }
+    let projectId: string | undefined;
+    if (typeof req.query.project === 'string' && req.query.project.trim()) {
+      const project = getMikeProjectByRef(req.query.project);
+      if (!project) {
+        sendError(res, 404, 'mike_project_not_found', `no Mike Radar project for "${req.query.project}"`);
+        return;
+      }
+      projectId = project.project_id;
+    }
+    res.json({
+      reports: listMikeReports({
+        date: rawDate,
+        project_id: projectId,
+        limit: req.query.limit !== undefined ? parseInt(String(req.query.limit), 10) || undefined : undefined,
+      }),
+    });
+  });
+
+  router.get('/mike-radar/reports/:shortId/:date', (req: AuthedRequest, res) => {
+    const project = mikeProjectOr404(req, res);
+    if (!project) return;
+    const date = String(req.params.date);
+    if (!isMikeReportDate(date)) {
+      sendError(res, 400, 'invalid_request', 'date must be YYYY-MM-DD');
+      return;
+    }
+    const report = getMikeReport(project.project_id, date);
+    if (!report) {
+      // A day Mike didn't touch is a legitimate answer, not an error — the UI
+      // renders "Mike didn't touch this project" rather than an empty report.
+      res.json({
+        report: null,
+        day_msg_count: listMikeDayActivity(project.project_id, date).length,
+      });
+      return;
+    }
+    res.json({ report });
+  });
+
+  // (Re)generate one project-day. Async: responds 202 with the queued row and
+  // the `mike_report` SSE delivers the result. Idempotent while running.
+  router.post('/mike-radar/reports/:shortId/:date/generate', (req: AuthedRequest, res) => {
+    const project = mikeProjectOr404(req, res);
+    if (!project) return;
+    const date = String(req.params.date);
+    if (!isMikeReportDate(date)) {
+      sendError(res, 400, 'invalid_request', 'date must be YYYY-MM-DD');
+      return;
+    }
+    const existing = getMikeReport(project.project_id, date);
+    if (existing?.status === 'running') {
+      res.status(202).json({ report: existing });
+      return;
+    }
+    const rows = listMikeDayActivity(project.project_id, date);
+    if (!rows.length) {
+      sendError(res, 409, 'mike_report_no_activity', `no archived activity for ${project.short_id} on ${date}`);
+      return;
+    }
+    const queued = requeueMikeReport(project.project_id, date, {
+      msg_count: rows.length,
+      change_count: countMikeDayChanges(project.project_id, date),
+    });
+    emitMikeReport('queued', queued);
+    // Fire-and-forget: generateMikeReport never throws and writes its own
+    // failure status, so an unhandled rejection here is impossible.
+    void generateMikeReport(project.project_id, date)
+      .then(() => { try { writeMikeDailyRollup(date); } catch { /* rollup is best-effort */ } })
+      .catch((err: unknown) => console.error('[mike-radar] generate failed:', err));
+    res.status(202).json({ report: queued });
+  });
+
+  // Run an ingest sweep now (what the in-process driver calls hourly at :20).
+  // Pure file -> SQLite, so it is safe to run synchronously: a full re-read of
+  // the whole 27 MB archive finishes in seconds.
+  router.post('/mike-radar/ingest', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const full = body.full === true || body.full === 1 || body.full === '1';
+    const result = runMikeIngest({ full, quiet: full });
+    if (result.run.status === 'failed') {
+      sendError(res, 500, 'mike_ingest_failed', result.run.error ?? 'ingest sweep failed', { run: result.run });
+      return;
+    }
+    res.json(result);
+  });
+
+  router.get('/mike-radar/ingest/runs', (req: AuthedRequest, res) => {
+    const limit = req.query.limit !== undefined ? parseInt(String(req.query.limit), 10) : 20;
+    res.json({ runs: listMikeIngestRuns(Number.isFinite(limit) ? limit : 20) });
+  });
+
+  // Find-or-create the per-project chat. Mirrors POST /goals/:id/thread exactly:
+  // when `created` is true the CLIENT posts `seed_text` to
+  // /threads/:ext/messages, so there is no second bootstrap mechanism.
+  const mikeThreadHandler = (req: AuthedRequest, res: Response) => {
+    const project = mikeProjectOr404(req, res);
+    if (!project) return;
+    res.json(getOrCreateMikeThread(project));
+  };
+  router.get('/mike-radar/projects/:shortId/thread', mikeThreadHandler);
+  router.post('/mike-radar/projects/:shortId/thread', mikeThreadHandler);
 
   // == Foundry ===============================================================
   // Universal module build system: prompt → blueprint → independently built

@@ -21,6 +21,7 @@ import type { GoalSummary, GoalNodeRow, FocusRow } from './goals.js';
 import type { GoalGuardRow } from './goals-guards.js';
 import type { NightRunRow, NightItemRow } from './night-shift.js';
 import type { HealthSample, HealthPoint, HealthEvent } from './health-monitor.js';
+import type { MikeProject } from './mike-radar.js';
 
 export interface TurnEvent {
   type: 'turn';
@@ -383,6 +384,37 @@ export interface HealthEventEvent {
   event: HealthEvent;
 }
 
+// MIKE RADAR — Mike's Lovable work, ingested from the watcher archive. Global
+// like GoalEvent (no conversationId); the /mike-radar page filters by project
+// client-side. `mike_activity` is emitted once per ingested row (~12 rows/hour);
+// a `full` re-ingest sets a quiet flag and emits one `mike_project` per project
+// instead of thousands of row events.
+export interface MikeProjectEvent {
+  type: 'mike_project';
+  action: 'created' | 'updated';
+  project: MikeProject;
+}
+export interface MikeActivityEvent {
+  type: 'mike_activity';
+  action: 'created';
+  project_id: string;
+  short_id: string;
+  activity_id: number;
+  role: 'user' | 'assistant';
+  ts: string;
+  headline: string | null;
+  change_count: number;
+}
+export interface MikeReportEvent {
+  type: 'mike_report';
+  action: 'queued' | 'updated' | 'done' | 'failed';
+  project_id: string;
+  short_id: string;
+  report_date: string;
+  status: string;
+  summary: string | null;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
@@ -398,6 +430,7 @@ export type SSEEvent =
   | GoalEvent | GoalNodeEvent | GoalFocusEvent | GoalGuardEvent
   | NightRunEvent | NightItemEvent
   | HealthSampleEvent | HealthEventEvent
+  | MikeProjectEvent | MikeActivityEvent | MikeReportEvent
   | TechTaskEvent | BugfixEvent;
 
 // ---------------------------------------------------------------------------
@@ -439,6 +472,7 @@ export const GLOBAL_STREAM_EVENT_TYPES = [
   'health_sample', 'health_event',   // Cockpit Health (node #858): live /health charts + spike markers
   'tech_task',   // Tech Tasks (2026-10-01): email-pipeline rows on the big board + dashboard
   'bugfix',      // Bug Intake (2026-10-05): Ctrl+Shift+B modal rows + triage status
+  'mike_project', 'mike_activity', 'mike_report',   // Mike Radar (tree-49d228a8): live /mike-radar rail + feed + report pane
 ] as const satisfies readonly SSEEvent['type'][];
 
 export type GlobalStreamEventType = (typeof GLOBAL_STREAM_EVENT_TYPES)[number];

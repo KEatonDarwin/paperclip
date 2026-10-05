@@ -58,6 +58,11 @@ export const LANES: LaneDef[] = [
   { key: 'bi',        label: 'BI sweep',          what: 'the overnight BI sweep',                      kind: 'timer', unit: 'bi-overnight-sweep.service' },
   { key: 'suppression', label: 'Suppression monitor', what: 'the suppression adherence checks',        kind: 'timer', unit: 'suppression-monitor.service' },
   { key: 'kpi',       label: 'Darwin KPI run',    what: 'the scheduled KPI run',                       kind: 'timer', unit: 'darwin-kpi-run.service' },
+  // Mike Radar (tree-49d228a8). In-process, NOT timers: the ingest is pure
+  // file->SQLite with no model call, so stopping it is cheap and fully
+  // recoverable (the next sweep catches up from the file high-water mark).
+  { key: 'mike_ingest', label: 'Mike Radar ingest', what: 'the hourly Lovable archive ingest',          kind: 'process' },
+  { key: 'mike_report', label: 'Mike Radar reports', what: 'the nightly per-project engineering reports', kind: 'process' },
 ];
 
 export const LANE_KEYS = LANES.map((l) => l.key);

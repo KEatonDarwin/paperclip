@@ -20,6 +20,7 @@ import { startFoundry } from './foundry.js';
 import { startNotepadDriver } from './notepad-driver.js';
 import { startMonitorScheduler } from './monitors.js';
 import { startHealthMonitor } from './health-monitor.js';
+import { startMikeRadarDriver } from './mike-radar-driver.js';
 
 const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT ?? '3200', 10);
 const SLACK_ENABLED = !!(process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN);
@@ -138,6 +139,11 @@ async function main() {
   // Cockpit Monitors — cheap scheduled prompt-check agents. Runs through the
   // same processMessage/local-CLI adapter seam as normal cockpit threads.
   startMonitorScheduler(processMessage, abortConversationRun);
+
+  // 🛰 Mike Radar — hourly ingest of the Lovable Watcher archive (:20, pure
+  // file->SQLite) plus the 23:40 CT per-project report pass. In-process on
+  // purpose: no new systemd units. MIKE_RADAR_DRIVER=0 disables.
+  startMikeRadarDriver();
 
   if (slackApp) {
     await slackApp.start();

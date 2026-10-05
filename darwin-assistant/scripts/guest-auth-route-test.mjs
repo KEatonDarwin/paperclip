@@ -15,6 +15,10 @@
 //   4. A disabled guest identity cannot log in even with the right password.
 //   5. Existing admin/api_key bearer auth is completely unaffected (still
 //      resolves to type 'api_key' on /session/whoami).
+//   6. (node #1370) Default-deny stopgap: a guest token gets 403 — not 200,
+//      not 500 — on /hopper-trees, /settings, /brief, /threads, while an
+//      in-scope route (a goal in her allowed_projects) returns 200,
+//      proving the gate isn't just a blanket block.
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -41,6 +45,7 @@ const distDir = path.join(__dirname, '..', 'dist');
 const { createApiV1Router } = await import(path.join(distDir, 'handlers', 'api-v1.js'));
 const { mintApiKey } = await import(path.join(distDir, 'api-keys.js'));
 const { createGuestIdentity } = await import(path.join(distDir, 'guest-identities.js'));
+const { createGoal } = await import(path.join(distDir, 'goals.js'));
 
 const app = express();
 app.use(express.json());
@@ -126,7 +131,40 @@ try {
   }
   console.log('  ✓ admin/api_key bearer auth unchanged');
 
-  console.log('\n[guest-auth-route-test] ALL 5 tests passed ✅');
+  // 6. Default-deny route gate (node #1370): out-of-scope routes 403, an
+  //    in-scope goal route 200, admin/api_key tokens unaffected.
+  {
+    const { goal } = createGoal({ title: 'companion test goal' });
+    const scopeClaim = {
+      allowed_thread_prefixes: ['cockpit:companion-'],
+      allowed_threads: [],
+      allowed_projects: [`goal-${goal.id}`],
+      allowed_routes: [],
+      deny_all_else: true,
+    };
+    createGuestIdentity('companion-gate-test', 'correct-horse-battery-2', scopeClaim);
+    const login = await req('POST', '/guest/login', { body: { username: 'companion-gate-test', password: 'correct-horse-battery-2' } });
+    assert.equal(login.status, 200, `expected 200, got ${login.status}: ${JSON.stringify(login.json)}`);
+    const token = login.json.session_token;
+
+    for (const outOfScopePath of ['/hopper-trees', '/settings', '/brief', '/threads']) {
+      const res = await req('GET', outOfScopePath, { token });
+      assert.equal(res.status, 403, `expected 403 for ${outOfScopePath}, got ${res.status}: ${JSON.stringify(res.json)}`);
+    }
+    console.log('  ✓ out-of-scope routes (/hopper-trees, /settings, /brief, /threads) -> 403, not 200/500');
+
+    const inScope = await req('GET', `/goals/${goal.id}`, { token });
+    assert.equal(inScope.status, 200, `expected 200 for in-scope goal route, got ${inScope.status}: ${JSON.stringify(inScope.json)}`);
+    console.log(`  ✓ in-scope goal route (/goals/${goal.id}, matches allowed_projects) -> 200`);
+
+    // Admin/api_key tokens: byte-identical behaviour, untouched by the gate.
+    const adminKey2 = mintApiKey('guest-auth-route-test-admin-2', 'admin').plaintext;
+    const adminHopperTrees = await req('GET', '/hopper-trees', { token: adminKey2 });
+    assert.notEqual(adminHopperTrees.status, 403, 'admin token must never be 403d by the guest gate');
+  }
+  console.log('  ✓ guest default-deny route gate: 403 out of scope, 200 in scope, admin unaffected');
+
+  console.log('\n[guest-auth-route-test] ALL 6 tests passed ✅');
 } finally {
   server.close();
   for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) fs.rmSync(p, { force: true });

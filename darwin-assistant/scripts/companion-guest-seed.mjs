@@ -4,11 +4,19 @@
 // existing 'companion' row by username instead of duplicating it.
 //
 // Usage:
-//   npm run seed-companion-guest   (JARVIS_DB_PATH must point at a scratch DB)
+//   JARVIS_DB_PATH=/tmp/scratch.db npm run seed-companion-guest   (any scratch DB)
 //
-// SAFETY: refuses to run against the live jarvis.db. The placeholder
-// password is randomly generated and printed ONCE to stdout — Kevin sets
-// the real one later. Never hardcode a real password here.
+//   To mint her REAL credential on the live cockpit DB, Kevin runs (node
+//   #1370):
+//     COMPANION_SEED_ALLOW_LIVE=1 JARVIS_DB_PATH=/home/kevin/paperclip/darwin-assistant/jarvis.db npm run seed-companion-guest
+//   (or pass --live instead of the env var.) That is the ONLY way through
+//   the live-DB guard below — any other unexpected path, or the live path
+//   WITHOUT the flag, still refuses to run.
+//
+// SAFETY: refuses to run against the live jarvis.db unless explicitly
+// opted in (see above). The placeholder password is randomly generated and
+// printed ONCE to stdout — Kevin sets the real one later. Never hardcode a
+// real password here.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -23,8 +31,14 @@ if (!raw || !raw.trim()) {
   process.exit(1);
 }
 const DB_PATH = path.resolve(raw);
-if (DB_PATH === path.resolve('/home/kevin/paperclip/darwin-assistant/jarvis.db')) {
-  console.error('FATAL: refusing to run against the live jarvis.db.');
+const LIVE_DB_PATH = path.resolve('/home/kevin/paperclip/darwin-assistant/jarvis.db');
+const allowLive = process.env.COMPANION_SEED_ALLOW_LIVE === '1' || process.argv.includes('--live');
+if (DB_PATH === LIVE_DB_PATH && !allowLive) {
+  console.error('FATAL: refusing to run against the live jarvis.db without COMPANION_SEED_ALLOW_LIVE=1 (or --live).');
+  process.exit(1);
+}
+if (DB_PATH !== LIVE_DB_PATH && allowLive) {
+  console.error('FATAL: COMPANION_SEED_ALLOW_LIVE/--live only permits the live jarvis.db path, not an arbitrary one.');
   process.exit(1);
 }
 

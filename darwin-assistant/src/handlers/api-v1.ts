@@ -497,6 +497,7 @@ import {
 import {
   loginGuest,
   resolveGuestSession,
+  isGuestRouteAllowed,
   type GuestPrincipal,
 } from '../guest-identities.js';
 
@@ -1452,6 +1453,17 @@ function bearerAuth(req: AuthedRequest, res: Response, next: NextFunction): void
     const principal = resolveGuestSession(token);
     if (!principal) {
       sendError(res, 401, 'invalid_or_missing_bearer_token', 'Unknown, revoked, or disabled guest session');
+      return;
+    }
+    // Default-deny stopgap (node #1370): a guest session only reaches a
+    // downstream handler for a route its scope_claim actually allows. This
+    // is also what keeps a guest off every `req.apiKey!`-assuming handler
+    // (e.g. GET /threads) — denied here, so it never gets the chance to
+    // crash on an undefined caller. Full per-thread/SSE enforcement is #271.
+    // /session/whoami is exempt: it's self-describing introspection of the
+    // caller's OWN principal (node #1355), not access to a real resource.
+    if (req.path !== '/session/whoami' && !isGuestRouteAllowed(principal.scope_claim, req.path)) {
+      sendError(res, 403, 'guest_route_not_allowed', 'This guest session is not permitted on this route');
       return;
     }
     req.guestPrincipal = principal;

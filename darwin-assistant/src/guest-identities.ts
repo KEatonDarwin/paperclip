@@ -151,3 +151,33 @@ export function resolveGuestSession(token: string): GuestPrincipal | null {
   if (!guest || guest.disabled) return null;
   return { type: 'guest', guest_id: guest.id, scope_claim: parseScopeClaim(guest.scope_claim) };
 }
+
+/**
+ * Minimal default-deny route gate for a guest principal (node #1370 — a
+ * stopgap closing the "blanket API reach" gap left by #1355's resolution-
+ * only scope; the real route/thread/SSE enforcement is #271's job).
+ *
+ * Checks, in order: (1) a literal match against `allowed_routes` (exact
+ * path, or a `*`-suffixed prefix); (2) for a `/threads/:external_id...`
+ * path, whether that external_id is in `allowed_threads` or starts with
+ * one of `allowed_thread_prefixes`; (3) for a `/goals/:id...` path,
+ * whether `goal-<id>` is in `allowed_projects`. Falls back to
+ * `!deny_all_else` so that flag (stored since #1355, unused until now)
+ * actually controls the unmatched-route default.
+ */
+export function isGuestRouteAllowed(claim: GuestScopeClaim, path: string): boolean {
+  if (claim.allowed_routes.some((r) => path === r || (r.endsWith('*') && path.startsWith(r.slice(0, -1))))) {
+    return true;
+  }
+  const threadMatch = path.match(/^\/threads\/([^/]+)/);
+  if (threadMatch) {
+    const externalId = decodeURIComponent(threadMatch[1]);
+    if (claim.allowed_threads.includes(externalId)) return true;
+    if (claim.allowed_thread_prefixes.some((p) => externalId.startsWith(p))) return true;
+  }
+  const goalMatch = path.match(/^\/goals\/(\d+)/);
+  if (goalMatch) {
+    if (claim.allowed_projects.includes(`goal-${goalMatch[1]}`)) return true;
+  }
+  return !claim.deny_all_else;
+}

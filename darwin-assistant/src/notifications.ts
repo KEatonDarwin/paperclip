@@ -163,6 +163,7 @@ export function createNotification(args: {
   const created = getNotification(Number(info.lastInsertRowid));
   if (!created) throw new Error('Failed to load notification after insert');
   emit('created', created);
+  scheduleNtfyDelivery(created);
   return created;
 }
 
@@ -190,4 +191,176 @@ export function deleteNotification(id: number): NotificationRow | null {
   if (!hydrated) return null;
   emit('deleted', hydrated);
   return hydrated;
+}
+
+// ── ntfy desktop-push bridge ─────────────────────────────────────────────────
+// Opt-in, env-only: set JARVIS_NTFY_TOPIC_URL (the full ntfy publish URL,
+// e.g. https://ntfy.sh/<topic>) to turn this on. No topic configured = no-op,
+// no hardcoded topic/secret anywhere in code. Delivery is async, time-bounded,
+// best-effort, and fully isolated from createNotification: every failure is
+// swallowed here so a flaky/unreachable ntfy server can never make a
+// notification write fail or delay the SQLite/SSE path.
+
+const NTFY_DEFAULT_SEVERITIES: readonly NotificationSeverity[] = ['success', 'warning', 'error'];
+const NTFY_TIMEOUT_MS = 5_000;
+const NTFY_MAX_CONCURRENT = 2;
+const NTFY_MAX_QUEUED = 50;
+
+function ntfyTopicUrl(): string | null {
+  const raw = process.env.JARVIS_NTFY_TOPIC_URL?.trim();
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    if (!u.pathname.replace(/^\//, '')) return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+function ntfyAllowedSeverities(): ReadonlySet<NotificationSeverity> {
+  const raw = process.env.JARVIS_NTFY_SEVERITIES?.trim();
+  if (!raw) return new Set(NTFY_DEFAULT_SEVERITIES);
+  const allowed = new Set<NotificationSeverity>();
+  for (const part of raw.split(',')) {
+    const sev = part.trim().toLowerCase();
+    if (sev === 'info' || sev === 'success' || sev === 'warning' || sev === 'error') {
+      allowed.add(sev);
+    }
+  }
+  return allowed.size > 0 ? allowed : new Set(NTFY_DEFAULT_SEVERITIES);
+}
+
+function ntfySeverityMeta(severity: NotificationSeverity): { priority: number; tags: string[] } {
+  switch (severity) {
+    case 'error':
+      return { priority: 5, tags: ['rotating_light'] };
+    case 'warning':
+      return { priority: 4, tags: ['warning'] };
+    case 'success':
+      return { priority: 3, tags: ['white_check_mark'] };
+    default:
+      return { priority: 3, tags: ['information_source'] };
+  }
+}
+
+/** http/https only — never file:, javascript:, etc. Returns null if it can't be made absolute. */
+function ntfyAbsoluteHttpUrl(candidate: string, base: string | null): string | null {
+  let resolved: URL;
+  try {
+    resolved = new URL(candidate);
+  } catch {
+    if (!base) return null;
+    try {
+      resolved = new URL(candidate, base);
+    } catch {
+      return null;
+    }
+  }
+  if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') return null;
+  return resolved.toString();
+}
+
+/** Resolves the notification's click target against JARVIS_COCKPIT_PUBLIC_URL, falling back to a deep link by id. */
+function resolveNtfyClickUrl(notification: NotificationRow): string | null {
+  const base = process.env.JARVIS_COCKPIT_PUBLIC_URL?.trim() || null;
+  const path = notification.link?.trim() || `/notifications?notification=${notification.id}`;
+  return ntfyAbsoluteHttpUrl(path, base);
+}
+
+interface NtfyQueueTask {
+  (): Promise<void>;
+}
+
+let ntfyInFlight = 0;
+const ntfyPending: NtfyQueueTask[] = [];
+
+function ntfyRunNext(): void {
+  const task = ntfyPending.shift();
+  if (!task) return;
+  ntfyInFlight++;
+  task()
+    .catch(() => {})
+    .finally(() => {
+      ntfyInFlight--;
+      ntfyRunNext();
+    });
+}
+
+/** Small in-process limiter so a burst of notifications can't hammer the ntfy server. */
+function ntfyEnqueue(task: NtfyQueueTask): void {
+  if (ntfyInFlight < NTFY_MAX_CONCURRENT) {
+    ntfyInFlight++;
+    task()
+      .catch(() => {})
+      .finally(() => {
+        ntfyInFlight--;
+        ntfyRunNext();
+      });
+    return;
+  }
+  if (ntfyPending.length >= NTFY_MAX_QUEUED) {
+    console.error('[ntfy] delivery queue full, dropping a notification');
+    return;
+  }
+  ntfyPending.push(task);
+}
+
+async function publishNtfy(notification: NotificationRow): Promise<void> {
+  const topicUrl = ntfyTopicUrl();
+  if (!topicUrl) return;
+
+  let origin: string;
+  let topic: string;
+  try {
+    const u = new URL(topicUrl);
+    origin = `${u.protocol}//${u.host}`;
+    topic = u.pathname.replace(/^\//, '');
+  } catch {
+    return;
+  }
+  if (!topic) return;
+
+  const { priority, tags } = ntfySeverityMeta(notification.severity);
+  const click = resolveNtfyClickUrl(notification);
+
+  const payload: Record<string, unknown> = {
+    topic,
+    title: notification.title,
+    message: notification.body?.trim() || notification.title,
+    priority,
+    tags,
+  };
+  if (click) payload.click = click;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NTFY_TIMEOUT_MS);
+  try {
+    const res = await fetch(origin, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      // Deliberately omit the topic URL/name from logs — it's the secret.
+      console.error(`[ntfy] publish failed: HTTP ${res.status}`);
+    }
+  } catch (err) {
+    console.error(`[ntfy] publish error: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Fire-and-forget: never throws, never awaited by callers. No-op unless JARVIS_NTFY_TOPIC_URL is set. */
+export function scheduleNtfyDelivery(notification: NotificationRow): void {
+  if (!ntfyTopicUrl()) return;
+  if (!ntfyAllowedSeverities().has(notification.severity)) return;
+  try {
+    ntfyEnqueue(() => publishNtfy(notification));
+  } catch {
+    // Scheduling itself must never throw into createNotification's caller.
+  }
 }

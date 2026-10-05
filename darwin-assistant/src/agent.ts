@@ -34,6 +34,7 @@ import { buildWorkbenchThreadContext } from './workbench.js';
 import { buildGoalThreadContext } from './goals.js';
 import { nightShiftContextBlock } from './night-shift.js';
 import { buildMikeThreadContext } from './mike-radar-chat.js';
+import { buildBridgedContext } from './bridged-context.js';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getOrCreateInternalMcpKey } from './api-keys.js';
@@ -1579,6 +1580,11 @@ async function runConversationTurn(
   // read-only hard rule, instead of relying on a one-time seed that goes stale
   // the moment Mike works again. '' for every other thread.
   const mikeContextBlock = buildMikeThreadContext(conv.external_id);
+  // TWO-WAY CONTEXT BRIDGE (tree-a9775da1 node #1413) — a thread linked via
+  // thread_bridges gets a fresh digest of its bridge partner's recent turns
+  // every turn, symmetric in either direction. '' for any thread with no
+  // bridge partner (see bridged-context.ts for the #276 safety note).
+  const bridgedContextBlock = await buildBridgedContext(conv.external_id);
 
   // DAR-744: hand the model an absolute file path per attached image, mirroring
   // the working vision-critique.ts pattern (local claude CLI reads an image when
@@ -1593,7 +1599,7 @@ async function runConversationTurn(
     ? `<attached_images>\nThe user attached ${images.length} image(s) to this message. Open and look at each one now before responding — absolute paths:\n${images.map((img) => `- ${img.absPath}`).join('\n')}\n</attached_images>\n\n`
     : '';
 
-  const perTurnContextPrefix = threadContextLine + autonomyDialLine + groupContextBlock + quickChatContextBlock + workbenchContextBlock + goalContextBlock + nightContextBlock + mikeContextBlock + imageBlock;
+  const perTurnContextPrefix = threadContextLine + autonomyDialLine + groupContextBlock + quickChatContextBlock + workbenchContextBlock + goalContextBlock + nightContextBlock + mikeContextBlock + bridgedContextBlock + imageBlock;
 
   // The resume path re-injects memory on EVERY turn that has a live sessionId
   // (the common case), so an uncapped loadMemoryBlock() here was the dominant

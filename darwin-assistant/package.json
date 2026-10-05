@@ -37,6 +37,7 @@
     "notepad:check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-check.db node scripts/notepad-check.mjs",
     "companion-thread:check": "npm run build && JARVIS_DB_PATH=/tmp/companion-thread-check.db node scripts/companion-thread-check.mjs",
     "companion-bridge:check": "npm run build && JARVIS_DB_PATH=/tmp/companion-bridge-check.db node scripts/companion-bridge-check.mjs",
+    "bridged-context:check": "npm run build && JARVIS_DB_PATH=/tmp/bridged-context-check.db node scripts/bridged-context-check.mjs",
     "companion-scoping:check": "npm run build && JARVIS_DB_PATH=/tmp/companion-scoping-check.db node scripts/companion-scoping-check.mjs",
     "companion-model-guard:check": "npm run build && JARVIS_DB_PATH=/tmp/companion-model-guard-check.db node scripts/companion-model-guard-check.mjs",
     "notepad:sim": "npm run build && JARVIS_DB_PATH=/tmp/notepad-sim.db node scripts/notepad-sim.mjs",

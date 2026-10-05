@@ -5523,14 +5523,27 @@ export function createApiV1Router(): Router {
   // -- GET /threads/:external_id ---------------------------------------------
 
   router.get('/threads/:external_id', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
     const externalId = paramString(req.params.external_id);
-    const result = findConversationForCaller(caller, externalId);
-    if ('error' in result) {
-      sendError(res, result.error.status, result.error.code, result.error.message);
-      return;
+    // Node #1362: same guest branch as POST /threads/:external_id/messages —
+    // guestScopeGate already proved externalId is inside her scope_claim;
+    // findConversationForCaller needs an ApiKeyRow she doesn't have.
+    let conv: ConversationRow;
+    if (req.guestPrincipal) {
+      const found = getConversation(externalId);
+      if (!found) {
+        sendError(res, 404, 'thread_not_found', `Thread ${externalId} not found`);
+        return;
+      }
+      conv = found;
+    } else {
+      const caller = req.apiKey!;
+      const result = findConversationForCaller(caller, externalId);
+      if ('error' in result) {
+        sendError(res, result.error.status, result.error.code, result.error.message);
+        return;
+      }
+      conv = result;
     }
-    const conv = result;
     const turns = getTurns(conv.id);
     const convSource = deriveSource(conv.external_id);
     res.json({
@@ -6132,7 +6145,6 @@ export function createApiV1Router(): Router {
   // -- POST /threads/:external_id/messages: send a message (async) -----------
 
   router.post('/threads/:external_id/messages', (req: AuthedRequest, res) => {
-    const caller = req.apiKey!;
     const externalId = paramString(req.params.external_id);
     const body = (req.body ?? {}) as { text?: unknown; images?: unknown };
     const text = typeof body.text === 'string' ? body.text : '';
@@ -6146,12 +6158,28 @@ export function createApiV1Router(): Router {
       return;
     }
 
-    const result = findConversationForCaller(caller, externalId);
-    if ('error' in result) {
-      sendError(res, result.error.status, result.error.code, result.error.message);
-      return;
+    // Node #1362: a guest never holds req.apiKey (see bearerAuth), and
+    // guestScopeGate already proved externalId is inside her scope_claim
+    // before this handler could run — same pattern as GET
+    // /threads/:external_id/events (node #1361). findConversationForCaller
+    // requires an ApiKeyRow for its ownership check, which doesn't apply here.
+    let conv: ConversationRow;
+    if (req.guestPrincipal) {
+      const found = getConversation(externalId);
+      if (!found) {
+        sendError(res, 404, 'thread_not_found', `Thread ${externalId} not found`);
+        return;
+      }
+      conv = found;
+    } else {
+      const caller = req.apiKey!;
+      const result = findConversationForCaller(caller, externalId);
+      if ('error' in result) {
+        sendError(res, result.error.status, result.error.code, result.error.message);
+        return;
+      }
+      conv = result;
     }
-    const conv = result;
 
     // DAR-744: decode + persist any attached images up front (before deciding
     // queued vs immediate below) so both dispatch paths see the same saved

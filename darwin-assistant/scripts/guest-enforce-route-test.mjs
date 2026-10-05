@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // GUEST SCOPE ENFORCEMENT ROUTE TESTS — exercises the REAL Express router
 // (hopper node #1360: guestScopeGate, mounted right after bearerAuth; node
-// #1361: per-connection SSE scoping + thread write 403) end to end over
-// real HTTP on a throwaway port, against a scratch DB. No live data, no
-// model calls, no touch of the live jarvis.db.
+// #1361: per-connection SSE scoping + thread write 403; node #1362:
+// deny/allow acceptance suite + guest support in GET /threads/:external_id
+// and POST /threads/:external_id/messages) end to end over real HTTP on a
+// throwaway port, against a scratch DB. No live data, no model calls, no
+// touch of the live jarvis.db.
 //
 //   npm run build
 //   npm run guest-enforce-route:test
@@ -12,13 +14,23 @@
 //   1. A guest hitting a thread outside her scope -> 403 JSON {error:{code:'forbidden'}}.
 //   2. A guest hitting a thread matching allowed_thread_prefixes -> passes
 //      the gate (reaches the real handler, not blocked at 403/404-by-gate).
+//   2b. ALLOW: GET /threads/:external_id on her own thread -> 200 with the
+//      thread's turns (node #1362 guest branch).
+//   2c. ALLOW: POST /threads/:external_id/messages on her own thread -> 202,
+//      a real turn gets queued (node #1362 guest branch).
 //   3. A guest hitting a goal route outside allowed_projects -> denied.
-//   4. A goal route matching allowed_projects -> passes.
+//   4. A goal route matching allowed_projects -> passes (the shared
+//      wish-catalog project page, goal-12).
 //   5. A guest hitting any route with Accept: text/html -> 302 to /companion
 //      instead of a JSON 403.
+//   5c. DENY: a privileged/admin API (POST /work-switch) -> 403, never
+//      reaches the stop-all switch.
+//   5d. DENY: a non-shared page route (GET /workstreams, the Flight Deck
+//      data feed) -> 403.
 //   6. GET /session/whoami always passes for a guest, regardless of scope_claim
 //      (identity bootstrap, not a protected resource).
-//   7. Admin/api_key bearer auth is completely unaffected by the gate.
+//   7. Admin/api_key bearer auth is completely unaffected by the gate,
+//      including a real 200 happy-path call.
 //   8. GET /events (global SSE): a guest connection receives an event for
 //      her own thread but not one for a foreign thread (node #1361).
 //   9. GET /threads/:external_id/events (legacy per-thread SSE): a guest
@@ -147,6 +159,29 @@ try {
   }
   console.log('  ✓ guest passes the gate on a thread matching allowed_thread_prefixes (handler-side req.apiKey! crash is the pre-existing, documented, out-of-scope gap)');
 
+  // 2b. ALLOW: GET /threads/:external_id on her own thread -> a real 200,
+  // not just "not 403" (node #1362 guest branch in the handler itself).
+  // getOrCreateConversation is idempotent — tests 8/9 below reuse this same
+  // row rather than creating a second one.
+  {
+    getOrCreateConversation('cockpit:companion-chat-1');
+    const res = await req('GET', '/threads/cockpit:companion-chat-1', { token: guestToken });
+    assert.equal(res.status, 200, `expected 200 reading her own thread, got ${res.status}: ${JSON.stringify(res.json)}`);
+    assert.equal(res.json?.thread_id, 'cockpit:companion-chat-1');
+    assert.ok(Array.isArray(res.json?.turns), 'response includes the turns array');
+  }
+  console.log('  ✓ guest reads her own thread via GET /threads/:external_id -> 200');
+
+  // 2c. ALLOW: POST /threads/:external_id/messages on her own thread -> 202,
+  // a real turn gets queued (node #1362 guest branch in the handler itself).
+  {
+    const res = await req('POST', '/threads/cockpit:companion-chat-1/messages', { token: guestToken, body: { text: 'hi from the companion' } });
+    assert.equal(res.status, 202, `expected 202 posting to her own thread, got ${res.status}: ${JSON.stringify(res.json)}`);
+    assert.equal(res.json?.status, 'processing');
+    assert.ok(typeof res.json?.message_id === 'string', 'response includes a message_id');
+  }
+  console.log('  ✓ guest posts to her own thread via POST /threads/:external_id/messages -> 202');
+
   // 3. Goal route outside allowed_projects -> denied.
   {
     const res = await req('GET', '/goals/99', { token: guestToken });
@@ -176,6 +211,23 @@ try {
   }
   console.log('  ✓ guest API request (no explicit html Accept) stays a JSON 403');
 
+  // 5c. DENY: a privileged/admin API (POST /work-switch, the stop-all switch)
+  // -> 403, never reaches the handler.
+  {
+    const res = await req('POST', '/work-switch', { token: guestToken, body: { operation: 'stop_all' } });
+    assert.equal(res.status, 403, `expected 403, got ${res.status}: ${JSON.stringify(res.json)}`);
+    assert.equal(res.json?.error?.code, 'forbidden', 'error code must be forbidden');
+  }
+  console.log('  ✓ guest denied on a privileged admin API (POST /work-switch)');
+
+  // 5d. DENY: a non-shared page route (GET /workstreams, the Flight Deck
+  // data feed) -> 403.
+  {
+    const res = await req('GET', '/workstreams', { token: guestToken });
+    assert.equal(res.status, 403, `expected 403, got ${res.status}: ${JSON.stringify(res.json)}`);
+  }
+  console.log('  ✓ guest denied on a non-shared page route (GET /workstreams)');
+
   // 6. /session/whoami always passes for a guest regardless of scope_claim
   // (allowed_routes is empty in SCOPE_CLAIM above).
   {
@@ -192,8 +244,15 @@ try {
     assert.notEqual(res.status, 403, `admin caller must never be blocked by the guest gate, got 403: ${JSON.stringify(res.json)}`);
     const goalRes = await req('GET', '/goals/99', { token: adminKey });
     assert.notEqual(goalRes.status, 403, `admin caller must never be blocked by the guest gate, got 403: ${JSON.stringify(goalRes.json)}`);
+
+    // Happy-path: a real 200, not just "not 403" — proves the gate's
+    // early-return for non-guest callers (req.guestPrincipal unset) doesn't
+    // somehow regress ordinary admin traffic.
+    const whoami = await req('GET', '/session/whoami', { token: adminKey });
+    assert.equal(whoami.status, 200, `admin whoami must return 200, got ${whoami.status}: ${JSON.stringify(whoami.json)}`);
+    assert.equal(whoami.json?.type, 'api_key');
   }
-  console.log('  ✓ admin/api_key bearer auth completely unaffected by the guest gate');
+  console.log('  ✓ admin/api_key bearer auth completely unaffected by the guest gate (incl. a real 200 happy path)');
 
   // 8. GET /events (global SSE, node #1361): a guest connection receives an
   // event tied to her own thread but not one tied to a foreign thread.
@@ -242,7 +301,7 @@ try {
   }
   console.log('  ✓ POST /threads/:external_id/messages to a foreign thread -> 403, never reaches the handler');
 
-  console.log('\n[guest-enforce-route-test] ALL 10 tests passed ✅');
+  console.log('\n[guest-enforce-route-test] ALL 15 tests passed ✅');
 } finally {
   server.close();
   for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) fs.rmSync(p, { force: true });

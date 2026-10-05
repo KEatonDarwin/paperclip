@@ -1467,6 +1467,116 @@ function bearerAuth(req: AuthedRequest, res: Response, next: NextFunction): void
   next();
 }
 
+// Node #1360: where a denied guest gets sent instead of the resource she
+// asked for. '/' is explicitly not acceptable here (plan: ENFORCE-PLAN.md
+// "Frontend dependency") — it has no scoped meaning for a guest. #272 owns
+// building the real route at this path; until then this is just the
+// redirect target, not a working page.
+const SCOPED_HOME_PATH = '/companion';
+
+// Identity bootstrap, not a protected resource: it echoes back the caller's
+// OWN principal and nothing else, so gating it behind the very scope_claim
+// it exists to reveal would be a chicken-and-egg lockout (a guest could
+// never confirm her own scope unless that scope already happened to list
+// this route). Exempt for every resolved guest regardless of scope_claim —
+// same tier as AUTH_EXEMPT_PATHS exempting /guest/login from auth itself,
+// just one step later. Covers no other route.
+const GUEST_ALWAYS_ALLOWED_PATHS = new Set(['/session/whoami']);
+
+type GuestResourceKey =
+  | { kind: 'thread'; id: string }
+  | { kind: 'goal'; id: string }
+  | { kind: 'route' };
+
+// Resolution happens off `req.path` rather than `req.params`: this gate is
+// mounted via `router.use(...)` immediately after `bearerAuth` (also a
+// path-less `.use()`), which runs before Express matches the specific route
+// pattern that would populate `:external_id`/`:id`. At this point in the
+// stack `req.params` is always `{}` — confirmed against this Express
+// version, not assumed from the route table.
+function extractGuestResourceKey(path: string): GuestResourceKey {
+  const threadMatch = path.match(/^\/threads\/([^/]+)(?:\/.*)?$/);
+  if (threadMatch) {
+    try {
+      return { kind: 'thread', id: decodeURIComponent(threadMatch[1]) };
+    } catch {
+      return { kind: 'route' }; // malformed %-escape — fail closed via the route branch
+    }
+  }
+  const goalMatch = path.match(/^\/goals\/([^/]+)(?:\/.*)?$/);
+  if (goalMatch) {
+    try {
+      return { kind: 'goal', id: decodeURIComponent(goalMatch[1]) };
+    } catch {
+      return { kind: 'route' };
+    }
+  }
+  return { kind: 'route' };
+}
+
+// Exact match, or a prefix match that only counts at a path boundary (so an
+// allowed route of "/companion" does not also cover "/companion-evil").
+function guestRouteMatches(path: string, allowedRoute: string): boolean {
+  if (path === allowedRoute) return true;
+  if (allowedRoute.endsWith('/')) return path.startsWith(allowedRoute);
+  return path.startsWith(allowedRoute) && path[allowedRoute.length] === '/';
+}
+
+// Ranks 'json' ahead of 'html' so an ambiguous/absent Accept header (the
+// common case for fetch() calls that never set one) resolves to the JSON
+// 403 rather than a redirect — only an explicit HTML preference (real page
+// navigation) gets the 302.
+function guestRequestWantsHtml(req: AuthedRequest): boolean {
+  return req.accepts(['json', 'html']) === 'html';
+}
+
+// Node #1360: the single authorization chokepoint for guest principals.
+// Mounted immediately after bearerAuth so it sees every request this
+// router serves. Non-guest callers (admin/api_key) fall through untouched —
+// req.guestPrincipal is only ever set for a resolved `gst_` session, so
+// their behavior is byte-identical to before this gate existed.
+//
+// Fail-closed: a guest is allowed only on the union of
+// allowed_thread_prefixes ∪ allowed_threads ∪ allowed_projects ∪
+// allowed_routes from her scope_claim. Everything else — including any
+// route added to this file later, with zero changes here — is denied by
+// construction (deny_all_else is always true; there is no code path that
+// mints a guest claim without it, per GuestScopeClaim).
+function guestScopeGate(req: AuthedRequest, res: Response, next: NextFunction): void {
+  const scope = req.guestPrincipal?.scope_claim;
+  if (!scope) {
+    next();
+    return;
+  }
+  if (GUEST_ALWAYS_ALLOWED_PATHS.has(req.path)) {
+    next();
+    return;
+  }
+
+  const resource = extractGuestResourceKey(req.path);
+  let allowed = false;
+  if (resource.kind === 'thread') {
+    allowed =
+      scope.allowed_threads.includes(resource.id) ||
+      scope.allowed_thread_prefixes.some((prefix) => resource.id.startsWith(prefix));
+  } else if (resource.kind === 'goal') {
+    allowed = scope.allowed_projects.includes(`goal-${resource.id}`);
+  } else {
+    allowed = scope.allowed_routes.some((allowedRoute) => guestRouteMatches(req.path, allowedRoute));
+  }
+
+  if (allowed) {
+    next();
+    return;
+  }
+
+  if (guestRequestWantsHtml(req)) {
+    res.redirect(302, SCOPED_HOME_PATH);
+    return;
+  }
+  sendError(res, 403, 'forbidden', 'Guest scope does not include this resource');
+}
+
 function parseMessageId(messageId: string): { conversationId: number; turnIndex: number } | null {
   const parts = messageId.split(':');
   if (parts.length !== 3 || parts[0] !== 'turn') return null;
@@ -1522,6 +1632,7 @@ export function createApiV1Router(): Router {
   const router: Router = Router();
 
   router.use(bearerAuth as (req: Request, res: Response, next: NextFunction) => void);
+  router.use(guestScopeGate as (req: Request, res: Response, next: NextFunction) => void);
 
   // 🩺 COCKPIT HEALTH — the "db reads" proxy. There is no cheap sqlite read
   // counter, so the honest number we CAN count is requests served here; the UI

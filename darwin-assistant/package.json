@@ -20,6 +20,7 @@
     "claude-account-pin:sim": "npm run build && JARVIS_DB_PATH=/tmp/claude-account-pin-sim.db node scripts/claude-account-pin-sim.mjs",
     "claude-accounts-route:test": "JARVIS_DB_PATH=/tmp/claude-accounts-route-test.db node scripts/claude-accounts-route-test.mjs",
     "guest-auth-route:test": "JARVIS_DB_PATH=/tmp/guest-auth-route-test.db node scripts/guest-auth-route-test.mjs",
+    "guest-enforce-route:test": "JARVIS_DB_PATH=/tmp/guest-enforce-route-test.db node scripts/guest-enforce-route-test.mjs",
     "companion-guest-seed": "JARVIS_DB_PATH=/tmp/companion-guest-seed.db node scripts/companion-guest-seed.mjs",
     "companion-guest-seed:test": "JARVIS_DB_PATH=/tmp/companion-guest-seed-test.db node scripts/companion-guest-seed-test.mjs",
     "multi-claude:e2e-sim": "JARVIS_DB_PATH=/tmp/multi-claude-e2e-sim.db node scripts/multi-claude-e2e-sim.mjs",

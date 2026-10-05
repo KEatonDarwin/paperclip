@@ -9,6 +9,8 @@
     "start": "tsx src/index.ts",
     "build": "tsc",
     "build:run": "tsc && node dist/index.js",
+    "companion-thin": "tsx src/companion-thin-server.ts",
+    "companion-thin:check": "npm run build && JARVIS_DB_PATH=/tmp/companion-thin-check.db node scripts/companion-thin-check.mjs",
     "foundry:sim": "node scripts/foundry-sim.mjs",
     "governor-v2:sim": "JARVIS_DB_PATH=/tmp/governor-v2-sim.db node scripts/governor-v2-sim.mjs",
     "governor-multiclaude:sim": "JARVIS_DB_PATH=/tmp/governor-multiclaude-sim.db node scripts/governor-multiclaude-sim.mjs",

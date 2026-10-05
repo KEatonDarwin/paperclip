@@ -22,6 +22,20 @@
 //   (3) a non-companion thread is completely unaffected: full tool set,
 //       JARVIS persona.
 //
+// Node #1441 (gap 3) added:
+//   (4) the REAL assembled per-turn PREFIX — buildPerTurnContextPrefix(conv,
+//       input, images), the exact string agent.ts prepends to stdin every
+//       turn — for a companion thread carries none of the operator
+//       thread-routing line or the autonomy dial / hard limiter (which names
+//       live Hub 2.0, merging to main, and Slack/email-to-Mike), while a
+//       non-companion thread's prefix still carries all of it (no regression).
+//   (5) the REAL CLI argv the claude adapter builds (getAdapters().claude.
+//       buildArgs) for a companion thread includes `--tools ''` (strips every
+//       CLI built-in — Bash/Read/Write/Edit/WebFetch/WebSearch/Glob/Grep —
+//       while leaving --mcp-config persona tools reachable), and a
+//       non-companion thread's argv is byte-identical to before (no --tools
+//       flag at all).
+//
 // Imports the real prompt.js/companion-chat.js/tools/index.js/agent.js
 // modules so this exercises production code, not a re-implementation of it.
 
@@ -54,7 +68,7 @@ const { companionThreadExt, COMPANION_BRIDGE_TOOL_NAME } = await import(
   path.join(distDir, 'companion-chat.js')
 );
 const { ALL_TOOLS } = await import(path.join(distDir, 'tools/index.js'));
-const { buildToolsBlock, buildInitialPrompt, buildContinuationPrompt } = await import(
+const { buildToolsBlock, buildInitialPrompt, buildContinuationPrompt, buildPerTurnContextPrefix, getAdapters } = await import(
   path.join(distDir, 'agent.js')
 );
 
@@ -212,6 +226,54 @@ for (const externalId of nonCompanionIds) {
     toolHeadingCount === ALL_TOOLS.length,
   );
 }
+
+// ── (4) the REAL assembled per-turn PREFIX (node #1441 gap 1/gap 3) ─────────
+// buildPerTurnContextPrefix is the exact function agent.ts's
+// runConversationTurn calls to build the string prepended to stdin every
+// turn — threadContextLine + autonomyDialLine + every other context block.
+// Only id/external_id/is_group_chat/group_id are read from the conv row.
+function fakeConv(externalId, id) {
+  return { id, external_id: externalId, is_group_chat: 0, group_id: null };
+}
+
+const OPERATOR_PREFIX_MARKERS = [
+  '<jarvis_autonomy_dial', // real tag carries a level="N" attribute, e.g. <jarvis_autonomy_dial level="5">
+  'Hard limiter (fixed', // the literal text autonomyDialLine renders, not the JS constant name
+  'kuojrvfdjjqhqyvkuiam', // live Hub 2.0 — named in AUTONOMY_HARD_LIMITER_SUMMARY
+  'merging to main',
+  'Slack/email to Mike',
+  '<jarvis_thread',
+];
+
+const companionPrefix = await buildPerTurnContextPrefix(fakeConv(companionExternalId, 999001), 'Hi there');
+for (const marker of OPERATOR_PREFIX_MARKERS) {
+  check(`(4) companion per-turn prefix does NOT contain "${marker}"`, !companionPrefix.includes(marker));
+}
+
+for (const externalId of nonCompanionIds) {
+  const prefix = await buildPerTurnContextPrefix(fakeConv(externalId, 999002), 'Hi there');
+  for (const marker of OPERATOR_PREFIX_MARKERS) {
+    check(`(4) ${externalId} per-turn prefix still contains "${marker}" (no regression)`, prefix.includes(marker));
+  }
+}
+
+// ── (5) the REAL CLI argv the claude adapter builds (node #1441 gap 2) ──────
+const claudeAdapter = getAdapters().claude;
+
+const companionArgs = claudeAdapter.buildArgs({ sessionId: null, model: null, isCompanionThread: true });
+const companionToolsIdx = companionArgs.indexOf('--tools');
+check('(5) companion argv includes the --tools flag', companionToolsIdx !== -1);
+check('(5) companion argv\'s --tools value is empty (strips every CLI built-in)', companionArgs[companionToolsIdx + 1] === '');
+check('(5) companion argv still carries --dangerously-skip-permissions (no conflict with --tools)', companionArgs.includes('--dangerously-skip-permissions'));
+
+const nonCompanionArgs = claudeAdapter.buildArgs({ sessionId: null, model: null, isCompanionThread: false });
+check('(5) non-companion argv has NO --tools flag (byte-identical to before)', !nonCompanionArgs.includes('--tools'));
+
+const nonCompanionArgsNoFlag = claudeAdapter.buildArgs({ sessionId: null, model: null });
+check(
+  '(5) non-companion argv (isCompanionThread omitted) matches the explicit-false argv exactly',
+  JSON.stringify(nonCompanionArgsNoFlag) === JSON.stringify(nonCompanionArgs),
+);
 
 if (failures > 0) {
   console.error(`\n${failures} check(s) failed`);

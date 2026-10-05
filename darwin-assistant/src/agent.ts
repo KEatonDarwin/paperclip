@@ -213,7 +213,13 @@ export interface AdapterConfig {
   // The `model`/`modelLabel` fields are placeholders here and filled in per-request
   // by getAdapterRuntimeDescriptor(); leave them null in the static config.
   runtime: Omit<AdapterRuntimeDescriptor, 'adapterType' | 'model' | 'modelLabel'>;
-  buildArgs: (opts: { sessionId?: string | null; model?: string | null; options?: Record<string, unknown>; imageDirs?: string[]; imagePaths?: string[] }) => string[];
+  // isCompanionThread (node #1441, gap 2): only the `claude` adapter's
+  // buildArgs reads this — when true it strips the CLI's own built-in
+  // tools (Bash/Read/Write/Edit/WebFetch/WebSearch/Glob/Grep/...) via
+  // `--tools ""`, leaving ONLY the --mcp-config persona tools reachable.
+  // Every other adapter (and every non-companion claude call) ignores it,
+  // so argv stays byte-identical there.
+  buildArgs: (opts: { sessionId?: string | null; model?: string | null; options?: Record<string, unknown>; imageDirs?: string[]; imagePaths?: string[]; isCompanionThread?: boolean }) => string[];
   // Some CLIs (e.g. Devin) don't read the prompt from stdin — they take it via a
   // file flag. When set, runClaude writes the composed prompt to a temp file and
   // appends `<promptFileArg> <path>` to the args instead of piping stdin. The
@@ -271,7 +277,7 @@ const ADAPTERS: Record<string, AdapterConfig> = {
       },
       capabilities: { tools: true, mcp: true, streamingText: true, structuredOutput: false, webSearch: true },
     },
-    buildArgs({ sessionId, model, options, imageDirs }) {
+    buildArgs({ sessionId, model, options, imageDirs, isCompanionThread }) {
       const args = ['--print', '-', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
       if (model) args.push('--model', model);
       if (sessionId) args.push('--resume', sessionId);
@@ -280,6 +286,16 @@ const ADAPTERS: Record<string, AdapterConfig> = {
       // dirs so it can open the absolute paths referenced in the prompt (see
       // vision-critique.ts for the same working pattern).
       for (const dir of imageDirs ?? []) args.push('--add-dir', dir);
+      // Node #1441 gap 2: a companion thread (Kevin's wife's chat) gets NONE
+      // of the CLI's built-in tools — no Bash, Read, Write, Edit, WebFetch,
+      // WebSearch, Glob, Grep, etc. `--tools ""` empties the built-in set
+      // while leaving --mcp-config's persona tools (bridge_send) reachable —
+      // verified empirically: with this flag the init event reports
+      // `"tools":[]` for the built-ins but an attached MCP tool still lists
+      // and calls successfully. `--restricted` was considered first but it
+      // explicitly refuses `--dangerously-skip-permissions`, which this
+      // spawn always passes, so it would hard-fail every companion turn.
+      if (isCompanionThread) args.push('--tools', '');
       return args;
     },
     envOverrides(env) { delete env['ANTHROPIC_API_KEY']; },
@@ -635,7 +651,11 @@ export function buildToolsBlock(externalId?: string | null): string {
   ].join('\n');
 }
 
-export function buildInitialPrompt(userMessage: string, memoryProfile: MemoryProfile = 'full', externalId?: string | null): string {
+// Node #1441 gap 3: memoryProfile + externalId are REQUIRED (no defaults) so
+// tsc fails the build on any future call site that forgets to resolve and
+// pass them — the exact shape of the leak this node patches (a call site
+// that silently fell back to 'full' for a companion thread).
+export function buildInitialPrompt(userMessage: string, memoryProfile: MemoryProfile, externalId: string | null): string {
   return [buildSystemPrompt(memoryProfile), buildToolsBlock(externalId), '---', `Human: ${userMessage}`, 'Assistant:'].join('\n\n');
 }
 
@@ -800,22 +820,26 @@ function selectTurnsForBudget(
 // error from the destination adapter (see the overflow-retry handling around
 // runClaude() below): shrinks the budget further and drops to a truncated
 // memory block, on top of whatever the normal per-model budget already trimmed.
+// Node #1441 gap 3: `opts` is REQUIRED (no default) and its memoryProfile +
+// externalId fields are REQUIRED (no `?`/defaults) — same rationale as
+// buildInitialPrompt above. `aggressive` stays optional; it's a genuine
+// per-call toggle, not a leak surface.
 export function buildContinuationPrompt(
   turns: TurnRow[],
   userMessage: string,
   adapterId: string = 'claude',
   model: string | null = null,
-  opts?: { aggressive?: boolean; memoryProfile?: MemoryProfile; externalId?: string | null },
+  opts: { aggressive?: boolean; memoryProfile: MemoryProfile; externalId: string | null },
 ): string {
   const priorTurns = turns.length && turns[turns.length - 1]?.role === 'user'
     ? turns.slice(0, -1)
     : turns;
 
-  const memoryProfile = opts?.memoryProfile ?? 'full';
+  const memoryProfile = opts.memoryProfile;
   // Memory rides in the `## Current Memory` refresh block below, not in the
   // system prompt — passing omitMemory kills the historical double injection.
   const systemPrompt = buildSystemPrompt(memoryProfile, { omitMemory: true });
-  const toolsBlock = buildToolsBlock(opts?.externalId);
+  const toolsBlock = buildToolsBlock(opts.externalId);
 
   const windowTokens = contextWindowTokensFor(adapterId, model);
   const aggressive = opts?.aggressive ?? false;
@@ -1118,7 +1142,14 @@ export async function runClaude(
     }
   }
 
-  const args = adapter.buildArgs({ sessionId, model, options, imageDirs, imagePaths });
+  // Node #1441 gap 2: derive straight from the SAME toolContext.externalId
+  // the persona-tools-server already uses to fail-close its tool manifest
+  // (companion-chat.ts companionIdFromThread) — one source of truth, no new
+  // gate to drift out of sync. toolContext is undefined for one-shot callers
+  // (briefings, summarizers, etc.) that never touch a companion thread, so
+  // this is false (byte-identical argv) for every one of them.
+  const isCompanionThread = !!companionIdFromThread(toolContext?.externalId ?? '');
+  const args = adapter.buildArgs({ sessionId, model, options, imageDirs, imagePaths, isCompanionThread });
 
   // Persona-tools MCP (native mcp__jarvis__<name> tools): only the `claude`
   // adapter supports a per-invocation --mcp-config file, and only calls with a
@@ -1399,6 +1430,99 @@ async function processMessageInner(
   }
 }
 
+// Node #1441 gap 1/gap 3: the full per-turn context prefix prepended ahead of
+// every message handed to the model, extracted out of runConversationTurn's
+// body so the fail-closed test (companion-scoping-check.mjs) can assemble
+// the REAL per-turn prefix for a companion thread and assert directly on it
+// — not a re-derived stand-in for it. Exported for that reason; every other
+// caller remains runConversationTurn itself.
+export async function buildPerTurnContextPrefix(
+  conv: ConversationRow,
+  input: string,
+  images?: SavedImage[],
+): Promise<string> {
+  // Companion threads (node #1382, #1383, #276/#1441) are Kevin's wife's
+  // persona chat, not an operator surface — they must never see the JARVIS
+  // operator thread-routing line or the autonomy dial / hard limiter (which
+  // by design names live production systems, merge-to-main, and
+  // Slack/email-to-Mike escalation rules that are none of her business).
+  // Same gate the prompt builders already use (prompt.ts buildSystemPrompt /
+  // loadMemoryBlock) so this stays in lockstep with that carve-out.
+  const isCompanionThread = memoryProfileForThread(conv.external_id) === 'companion';
+
+  // Tell the model which thread it's running in, so it never has to guess
+  // (this is what the cockpit todo-panel self-drive + thread routing rely on).
+  // '' for a companion thread — she has no business seeing her own internal
+  // external_id/conversation_id, which is operator plumbing, not persona content.
+  const threadContextLine = isCompanionThread
+    ? ''
+    : `<jarvis_thread external_id="${conv.external_id}" conversation_id="${conv.id}"/>\n`;
+
+  // kevin/jarvis-autonomy-dial.md — 0-10 dial controlling how autonomously
+  // JARVIS decides & executes work decisions this turn vs. deferring to
+  // Kevin. Read fresh every turn (Control Panel writes take effect on the
+  // very next message, same as the personality stats' write-then-read
+  // pattern). hard_limiter is fixed and never modulated by the dial value.
+  // '' for a companion thread — see isCompanionThread above.
+  const autonomyLevel = getAutonomyLevel();
+  const autonomyGuidance =
+    autonomyLevel <= 3
+      ? 'Low: highly questioning on work decisions — surface the fork, lay out options, prefer Kevin\'s input over your own judgment. Ask before acting on most non-trivial choices.'
+      : autonomyLevel <= 7
+        ? 'Mid (default): do a silent threat analysis; act on low/no-risk decisions you have a clear recommendation on (and note what you did so Kevin can override), surface the genuinely consequential or ambiguous ones.'
+        : 'High: execute every decision you run into, no matter what — no asking, just do it and report — up to the hard limiter below.';
+  const autonomyDialLine = isCompanionThread
+    ? ''
+    : `<jarvis_autonomy_dial level="${autonomyLevel}">\n` +
+      `${autonomyGuidance}\n` +
+      `Hard limiter (fixed, NOT modulated by this dial — ALWAYS escalate to Kevin instead of acting on these regardless of level): ${AUTONOMY_HARD_LIMITER_SUMMARY}\n` +
+      `</jarvis_autonomy_dial>\n`;
+
+  // DAR-742 — group chats get their member threads' summaries prepended every
+  // turn (bounded, lazily-refreshed context — see group-chat-context.ts).
+  // Ungrouped/normal threads are untouched (empty string).
+  const groupContextBlock = conv.is_group_chat && conv.group_id
+    ? await buildGroupChatContext(conv.group_id)
+    : '';
+  const quickChatContextBlock = buildQuickChatContext(conv.external_id);
+  // Workbench V2: a per-node "Open chat" deep-dive gets its branch scope every
+  // turn instead of a one-time seed post (nothing is posted on open anymore).
+  // '' for every non-workbench thread — see buildWorkbenchThreadContext.
+  const workbenchContextBlock = buildWorkbenchThreadContext(conv.external_id);
+  // GOALS (CONTRACT.md §6) — the goal-driven development surface. Every turn
+  // of a `cockpit:goal-<id>` thread gets a fresh <goal_focus/>+<goal_tree>
+  // snapshot instead of transcript memory. '' for every other thread.
+  // v0.4 §15.10: the turn input is passed so an autopilot cue turn gets its
+  // <autopilot_cue/> prefix line (matched on the fixed `[autopilot goal #g —` header).
+  const goalContextBlock = buildGoalThreadContext(conv.external_id, input);
+  // SHIFTS v1 §3.1/§3.2 — a shift's orchestrator thread (`cockpit:shift-<id>`,
+  // or the `cockpit:night-shift` lobby) gets its run, its frozen list, its
+  // lanes and Kevin's VERBATIM brief every turn, plus the cued goal's tree on a
+  // cue turn. '' for every other thread. Without this the function existed and
+  // was never called: the orchestrator ran the whole night on transcript memory
+  // with no brief and no list.
+  const nightContextBlock = nightShiftContextBlock(conv.external_id, input);
+  // MIKE RADAR (DESIGN §6a) — a `cockpit:mike-<short_id>` project chat gets its
+  // project's live facts every turn (Supabase ref, archive + report paths, the
+  // latest written report, the changes Mike shipped most recently) plus the
+  // read-only hard rule, instead of relying on a one-time seed that goes stale
+  // the moment Mike works again. '' for every other thread.
+  const mikeContextBlock = buildMikeThreadContext(conv.external_id);
+  // TWO-WAY CONTEXT BRIDGE (tree-a9775da1 node #1413) — a thread linked via
+  // thread_bridges gets a fresh digest of its bridge partner's recent turns
+  // every turn, symmetric in either direction. '' for any thread with no
+  // bridge partner (see bridged-context.ts for the #276 safety note). This is
+  // the "goal-12 orientation" a companion thread DOES keep — its bridge
+  // partner is the goal-12 engineering chat.
+  const bridgedContextBlock = await buildBridgedContext(conv.external_id);
+
+  const imageBlock = images && images.length
+    ? `<attached_images>\nThe user attached ${images.length} image(s) to this message. Open and look at each one now before responding — absolute paths:\n${images.map((img) => `- ${img.absPath}`).join('\n')}\n</attached_images>\n\n`
+    : '';
+
+  return threadContextLine + autonomyDialLine + groupContextBlock + quickChatContextBlock + workbenchContextBlock + goalContextBlock + nightContextBlock + mikeContextBlock + bridgedContextBlock + imageBlock;
+}
+
 async function runConversationTurn(
   conv: ConversationRow,
   input: string,
@@ -1528,64 +1652,6 @@ async function runConversationTurn(
   // loopback route executes for real and has no per-turn plan-mode signal).
   const mcpToolContext = planModeActive ? undefined : toolContext;
 
-  // Tell the model which thread it's running in, so it never has to guess
-  // (this is what the cockpit todo-panel self-drive + thread routing rely on).
-  const threadContextLine = `<jarvis_thread external_id="${conv.external_id}" conversation_id="${conv.id}"/>\n`;
-
-  // kevin/jarvis-autonomy-dial.md — 0-10 dial controlling how autonomously
-  // JARVIS decides & executes work decisions this turn vs. deferring to
-  // Kevin. Read fresh every turn (Control Panel writes take effect on the
-  // very next message, same as the personality stats' write-then-read
-  // pattern). hard_limiter is fixed and never modulated by the dial value.
-  const autonomyLevel = getAutonomyLevel();
-  const autonomyGuidance =
-    autonomyLevel <= 3
-      ? 'Low: highly questioning on work decisions — surface the fork, lay out options, prefer Kevin\'s input over your own judgment. Ask before acting on most non-trivial choices.'
-      : autonomyLevel <= 7
-        ? 'Mid (default): do a silent threat analysis; act on low/no-risk decisions you have a clear recommendation on (and note what you did so Kevin can override), surface the genuinely consequential or ambiguous ones.'
-        : 'High: execute every decision you run into, no matter what — no asking, just do it and report — up to the hard limiter below.';
-  const autonomyDialLine =
-    `<jarvis_autonomy_dial level="${autonomyLevel}">\n` +
-    `${autonomyGuidance}\n` +
-    `Hard limiter (fixed, NOT modulated by this dial — ALWAYS escalate to Kevin instead of acting on these regardless of level): ${AUTONOMY_HARD_LIMITER_SUMMARY}\n` +
-    `</jarvis_autonomy_dial>\n`;
-
-  // DAR-742 — group chats get their member threads' summaries prepended every
-  // turn (bounded, lazily-refreshed context — see group-chat-context.ts).
-  // Ungrouped/normal threads are untouched (empty string).
-  const groupContextBlock = conv.is_group_chat && conv.group_id
-    ? await buildGroupChatContext(conv.group_id)
-    : '';
-  const quickChatContextBlock = buildQuickChatContext(conv.external_id);
-  // Workbench V2: a per-node "Open chat" deep-dive gets its branch scope every
-  // turn instead of a one-time seed post (nothing is posted on open anymore).
-  // '' for every non-workbench thread — see buildWorkbenchThreadContext.
-  const workbenchContextBlock = buildWorkbenchThreadContext(conv.external_id);
-  // GOALS (CONTRACT.md §6) — the goal-driven development surface. Every turn
-  // of a `cockpit:goal-<id>` thread gets a fresh <goal_focus/>+<goal_tree>
-  // snapshot instead of transcript memory. '' for every other thread.
-  // v0.4 §15.10: the turn input is passed so an autopilot cue turn gets its
-  // <autopilot_cue/> prefix line (matched on the fixed `[autopilot goal #g —` header).
-  const goalContextBlock = buildGoalThreadContext(conv.external_id, input);
-  // SHIFTS v1 §3.1/§3.2 — a shift's orchestrator thread (`cockpit:shift-<id>`,
-  // or the `cockpit:night-shift` lobby) gets its run, its frozen list, its
-  // lanes and Kevin's VERBATIM brief every turn, plus the cued goal's tree on a
-  // cue turn. '' for every other thread. Without this the function existed and
-  // was never called: the orchestrator ran the whole night on transcript memory
-  // with no brief and no list.
-  const nightContextBlock = nightShiftContextBlock(conv.external_id, input);
-  // MIKE RADAR (DESIGN §6a) — a `cockpit:mike-<short_id>` project chat gets its
-  // project's live facts every turn (Supabase ref, archive + report paths, the
-  // latest written report, the changes Mike shipped most recently) plus the
-  // read-only hard rule, instead of relying on a one-time seed that goes stale
-  // the moment Mike works again. '' for every other thread.
-  const mikeContextBlock = buildMikeThreadContext(conv.external_id);
-  // TWO-WAY CONTEXT BRIDGE (tree-a9775da1 node #1413) — a thread linked via
-  // thread_bridges gets a fresh digest of its bridge partner's recent turns
-  // every turn, symmetric in either direction. '' for any thread with no
-  // bridge partner (see bridged-context.ts for the #276 safety note).
-  const bridgedContextBlock = await buildBridgedContext(conv.external_id);
-
   // DAR-744: hand the model an absolute file path per attached image, mirroring
   // the working vision-critique.ts pattern (local claude CLI reads an image when
   // its absolute path is in the prompt + the containing dir is on --add-dir).
@@ -1595,11 +1661,8 @@ async function runConversationTurn(
     ? Array.from(new Set(images.map((img) => dirname(img.absPath))))
     : undefined;
   const imagePaths = images && images.length ? images.map((img) => img.absPath) : undefined;
-  const imageBlock = images && images.length
-    ? `<attached_images>\nThe user attached ${images.length} image(s) to this message. Open and look at each one now before responding — absolute paths:\n${images.map((img) => `- ${img.absPath}`).join('\n')}\n</attached_images>\n\n`
-    : '';
 
-  const perTurnContextPrefix = threadContextLine + autonomyDialLine + groupContextBlock + quickChatContextBlock + workbenchContextBlock + goalContextBlock + nightContextBlock + mikeContextBlock + bridgedContextBlock + imageBlock;
+  const perTurnContextPrefix = await buildPerTurnContextPrefix(conv, input, images);
 
   // The resume path re-injects memory on EVERY turn that has a live sessionId
   // (the common case), so an uncapped loadMemoryBlock() here was the dominant

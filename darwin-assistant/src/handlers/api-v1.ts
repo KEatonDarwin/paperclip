@@ -1,4 +1,5 @@
 import { listCommitments } from '../commitments.js';
+import { allowedToolsForThread } from '../companion-chat.js';
 import { parseUnparkCondition } from '../unpark.js';
 import { gatherBigBoardSnapshot, BIG_BOARD_KIOSK_TOKEN_SETTING, BIG_BOARD_KIOSK_EVENT_TYPES, type BigBoardProviders } from '../big-board.js';
 import { Router, type Request, type Response, type NextFunction } from 'express';
@@ -6626,8 +6627,16 @@ export function createApiV1Router(): Router {
       sendError(res, 403, 'forbidden', 'internal tool manifest requires an admin-scoped key');
       return;
     }
+    // Fail-closed allow-list (node #1383): a companion thread's manifest is
+    // trimmed server-side so the model is never even advertised a tool it
+    // couldn't call — not just blocked at tool-exec. `externalId` absent (every
+    // non-internal caller, and every non-companion thread) = unrestricted,
+    // byte-identical to before this param existed.
+    const externalId = typeof req.query.externalId === 'string' ? req.query.externalId : undefined;
+    const allowed = allowedToolsForThread(externalId);
+    const tools = allowed ? ALL_TOOLS.filter((t) => allowed.has(t.name)) : ALL_TOOLS;
     res.json({
-      tools: ALL_TOOLS.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })),
+      tools: tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })),
     });
   });
 
@@ -6657,7 +6666,11 @@ export function createApiV1Router(): Router {
       sendError(res, 404, 'not_found', `No conversation with id ${context.conversationId}`);
       return;
     }
-    const tool = TOOL_MAP.get(name);
+    // Fail-closed allow-list (node #1383): a companion thread's dispatch is
+    // gated the same as its manifest — a disallowed tool simply doesn't exist
+    // from the caller's point of view, same shape as "tool not found" below.
+    const allowed = allowedToolsForThread(context.externalId);
+    const tool = (!allowed || allowed.has(name)) ? TOOL_MAP.get(name) : undefined;
     if (!tool) {
       // Shape matches the text-protocol "Unknown tool" branch (agent.ts) —
       // returned as a 200 tool result, not an HTTP error, so the MCP server

@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync, unlinkSync, readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSystemPrompt, loadMemoryBlock, memoryProfileForThread, type MemoryProfile } from './prompt.js';
+import { allowedToolsForThread } from './companion-chat.js';
 import { getAuggieModels } from './auggie-catalog.js';
 import { getDevinModels } from './devin-catalog.js';
 import { getCodexModels } from './codex-catalog.js';
@@ -590,8 +591,10 @@ export function getActiveRuns(): { conversationId: number; startedAt: number }[]
     .sort((a, b) => a.startedAt - b.startedAt);
 }
 
-export function buildToolsBlock(): string {
-  const defs = ALL_TOOLS.map(
+export function buildToolsBlock(externalId?: string | null): string {
+  const allowed = allowedToolsForThread(externalId);
+  const tools = allowed ? ALL_TOOLS.filter((t) => allowed.has(t.name)) : ALL_TOOLS;
+  const defs = tools.map(
     (t) =>
       `### ${t.name}\n${t.description}\nParameters: ${JSON.stringify(t.parameters, null, 2)}`,
   ).join('\n\n');
@@ -608,8 +611,8 @@ export function buildToolsBlock(): string {
   ].join('\n');
 }
 
-export function buildInitialPrompt(userMessage: string, memoryProfile: MemoryProfile = 'full'): string {
-  return [buildSystemPrompt(memoryProfile), buildToolsBlock(), '---', `Human: ${userMessage}`, 'Assistant:'].join('\n\n');
+export function buildInitialPrompt(userMessage: string, memoryProfile: MemoryProfile = 'full', externalId?: string | null): string {
+  return [buildSystemPrompt(memoryProfile), buildToolsBlock(externalId), '---', `Human: ${userMessage}`, 'Assistant:'].join('\n\n');
 }
 
 export function adapterFromModel(model: string | null | undefined): string | null {
@@ -1583,7 +1586,7 @@ async function runConversationTurn(
   const memoryProfile = memoryProfileForThread(conv.external_id);
   let stdinContent = perTurnContextPrefix + (sessionId
     ? `<memory_refresh>\n${loadMemoryBlock(resumeMemoryMaxChars, memoryProfile)}\n</memory_refresh>\n\n${modelInput}`
-    : (turns.length > 1 ? buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { memoryProfile }) : buildInitialPrompt(modelInput, memoryProfile)));
+    : (turns.length > 1 ? buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { memoryProfile }) : buildInitialPrompt(modelInput, memoryProfile, conv.external_id)));
 
   // DAR-756: only one aggressive-compaction retry per turn — if the destination
   // model still overflows after that, stop retrying and degrade to a friendly
@@ -1831,7 +1834,8 @@ async function runConversationTurn(
     );
     sseBus.emit('sse', { type: 'tool_call', conversationId: conv.id, toolName: toolCall.name } satisfies ToolCallEvent);
 
-    const tool = TOOL_MAP.get(toolCall.name);
+    const allowedTools = allowedToolsForThread(conv.external_id);
+    const tool = (!allowedTools || allowedTools.has(toolCall.name)) ? TOOL_MAP.get(toolCall.name) : undefined;
     const toolT0 = Date.now();
     let toolResult: unknown;
     if (planModeActive) {

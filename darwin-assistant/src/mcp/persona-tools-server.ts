@@ -51,7 +51,12 @@ const server = new Server({ name: 'jarvis', version: '0.0.1' }, { capabilities: 
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   try {
-    const resp = await loopback('/internal/tools', { method: 'GET', headers: authHeaders }, 15_000);
+    // Node #1383: forward the thread's externalId so the manifest comes back
+    // pre-filtered for a companion thread's fail-closed allow-list — the model
+    // is never even advertised a tool it couldn't call.
+    const externalId = (toolContext as { externalId?: string } | null)?.externalId;
+    const path = externalId ? `/internal/tools?externalId=${encodeURIComponent(externalId)}` : '/internal/tools';
+    const resp = await loopback(path, { method: 'GET', headers: authHeaders }, 15_000);
     const body = (await resp.json()) as { tools?: { name: string; description: string; parameters: Record<string, unknown> }[] };
     return {
       tools: (body.tools ?? []).map((t) => ({

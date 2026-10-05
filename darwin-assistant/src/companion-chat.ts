@@ -92,6 +92,27 @@ export function companionIdFromThread(externalId: string): string | null {
   return id.length > 0 ? id : null;
 }
 
+/** The one tool seam a companion thread is allowed to reach for sending
+ *  something to Kevin. The real bridge (#266) isn't built yet — this name is
+ *  reserved now so the allow-list below has something concrete to name; the
+ *  stub tool registered under this name (tools/companion-bridge.ts) returns
+ *  not-implemented until #266 lands. */
+export const COMPANION_BRIDGE_TOOL_NAME = 'companion_send_to_kevin';
+
+/**
+ * Fail-closed tool allow-list, keyed on thread kind (node #1383,
+ * COMPANION-PERSONA-RECON.md §b). `null` means "no restriction" — every
+ * non-companion thread, byte-identical to today. A companion thread gets the
+ * fixed allow-list below and NOTHING else: any tool not explicitly listed
+ * here is excluded, including every future tool nobody has thought to gate
+ * yet. The conversational turn path itself (plain assistant text, no tool
+ * call) is never gated by this — only tool NAMES are.
+ */
+export function allowedToolsForThread(externalId: string | null | undefined): Set<string> | null {
+  if (!externalId || !companionIdFromThread(externalId)) return null;
+  return new Set([COMPANION_BRIDGE_TOOL_NAME]);
+}
+
 /**
  * Find-or-create a companion thread, mirroring `getOrCreateMikeThread` /
  * `ensureNightThread` exactly: the Opus model override is applied ONCE, only

@@ -18,6 +18,11 @@
 //   (e) a traversal attempt against /api/reports/:name is rejected.
 //   (f) everything not in the five wired routes 404s: /threads,
 //       /hopper-trees, /goals/5, /work-switch.
+//   (g) catalog-only scoping: a sibling report sitting in the PARENT of the
+//       configured COMPANION_REPORTS_DIR never leaks into the listing.
+//   (h) fail-closed: a COMPANION_REPORTS_DIR that does not exist on disk
+//       yields an empty list with a clean 200 -- never a crash, never a
+//       fallback to any other directory.
 //
 //   npm run build && JARVIS_DB_PATH=/tmp/companion-thin-check.db node scripts/companion-thin-check.mjs
 
@@ -81,9 +86,15 @@ const sidecarResult = insertCrossChatSidecar({
 check('seed: cross_chat_sidecar landed in her thread', sidecarResult !== null);
 
 // ── fixture reports dir ──────────────────────────────────────────────────────
-const REPORTS_DIR = fs.mkdtempSync('/tmp/companion-thin-reports-');
+// REPORTS_DIR is a catalog-only subdir of a PARENT that also holds an
+// unrelated report -- proves (g) the parent's sibling file never leaks into
+// her listing just because it shares a parent with the configured dir.
+const REPORTS_PARENT = fs.mkdtempSync('/tmp/companion-thin-parent-');
+const REPORTS_DIR = path.join(REPORTS_PARENT, 'wish-catalog');
+fs.mkdirSync(REPORTS_DIR);
 fs.writeFileSync(path.join(REPORTS_DIR, 'wish-report-1.md'), '# Wish report 1\n\nSome content.\n');
 fs.writeFileSync(path.join(REPORTS_DIR, 'wish-report-2.md'), '# Wish report 2\n\nMore content.\n');
+fs.writeFileSync(path.join(REPORTS_PARENT, 'unrelated-accounting-report.md'), 'SHOULD NEVER APPEAR TO HER — outside the catalog dir');
 // a secret OUTSIDE the reports dir a traversal attempt must never reach
 const secretDir = fs.mkdtempSync('/tmp/companion-thin-secret-');
 fs.writeFileSync(path.join(secretDir, 'secret.md'), 'TOP SECRET — should never be served');
@@ -133,6 +144,7 @@ function countClaudeProcesses() {
   });
 }
 
+let missingDirServer;
 try {
   const up = await waitForServer();
   check('server came up', up);
@@ -201,6 +213,14 @@ try {
   check('(d) GET /api/reports/:name -> 200', oneRes.status === 200);
   check('(d) returns the raw markdown', oneText.includes('# Wish report 1'));
 
+  // -- (g) catalog-only scoping: the parent's sibling report never leaks ------
+  check(
+    '(g) sibling report in the PARENT of REPORTS_DIR is NOT listed',
+    !listBody.reports?.includes('unrelated-accounting-report.md'),
+  );
+  const siblingFetch = await fetch(`${BASE}/api/reports/unrelated-accounting-report.md`);
+  check('(g) fetching the sibling report by name -> 404 (not in the live listing)', siblingFetch.status === 404);
+
   // -- (e) traversal attempt is rejected ---------------------------------------
   const traversalRes = await fetch(`${BASE}/api/reports/${encodeURIComponent('../../etc/passwd')}`);
   check('(e) traversal via encoded ../../ -> 404', traversalRes.status === 404);
@@ -216,6 +236,39 @@ try {
     check(`(f) GET ${p} -> 404`, r.status === 404);
   }
 
+  // -- (h) fail-closed: a COMPANION_REPORTS_DIR that does not exist on disk ---
+  const MISSING_DIR = path.join(REPORTS_PARENT, 'does-not-exist-at-all');
+  const PORT2 = 8198;
+  const BASE2 = `http://127.0.0.1:${PORT2}`;
+  missingDirServer = spawn(process.execPath, [path.join(distDir, 'companion-thin-server.js')], {
+    env: {
+      ...process.env,
+      JARVIS_DB_PATH: DB_PATH,
+      COMPANION_THREAD_EXT: COMPANION_EXT,
+      COMPANION_REPORTS_DIR: MISSING_DIR,
+      COMPANION_THIN_PORT: String(PORT2),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let up2Actual = false;
+  {
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      try {
+        const r = await fetch(`${BASE2}/`);
+        if (r.status === 200) { up2Actual = true; break; }
+      } catch { /* not up yet */ }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+  check('(h) server with a nonexistent COMPANION_REPORTS_DIR still comes up', up2Actual);
+  if (up2Actual) {
+    const missingListRes = await fetch(`${BASE2}/api/reports`);
+    check('(h) GET /api/reports -> 200 even with a missing dir (no crash)', missingListRes.status === 200);
+    const missingListBody = await missingListRes.json();
+    check('(h) reports list is empty, not a crash and not the whole outbox', Array.isArray(missingListBody.reports) && missingListBody.reports.length === 0);
+  }
+
   console.log(failed ? '\nFAILED' : '\nALL PASS');
 } catch (err) {
   console.error(err);
@@ -224,7 +277,8 @@ try {
   failed = true;
 } finally {
   server.kill('SIGKILL');
-  fs.rmSync(REPORTS_DIR, { recursive: true, force: true });
+  if (missingDirServer) missingDirServer.kill('SIGKILL');
+  fs.rmSync(REPORTS_PARENT, { recursive: true, force: true });
   fs.rmSync(secretDir, { recursive: true, force: true });
 }
 

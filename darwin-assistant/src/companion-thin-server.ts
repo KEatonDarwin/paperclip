@@ -38,8 +38,13 @@ const PORT = parseInt(process.env.COMPANION_THIN_PORT ?? '8099', 10);
 // this service talks to (see allowlist test: ?ext=<anything> is never read).
 const COMPANION_THREAD_EXT = process.env.COMPANION_THREAD_EXT ?? companionThreadExt('kevin-wife');
 
+// Catalog-only by default -- NEVER the whole wiki outbox (that would also
+// surface accounting/perclickity/suppression/Mike reports to her). An
+// override may point anywhere, but listReportFiles() below still fails
+// closed (empty list, never a crash, never a fallback to the whole outbox)
+// if the resolved dir is missing or empty.
 const REPORTS_DIR = path.resolve(
-  process.env.COMPANION_REPORTS_DIR ?? '/home/kevin/obsidian/paperclip-wiki/outbox',
+  process.env.COMPANION_REPORTS_DIR ?? '/home/kevin/obsidian/paperclip-wiki/outbox/wish-catalog',
 );
 
 const MAX_TEXT_LENGTH = 50_000;

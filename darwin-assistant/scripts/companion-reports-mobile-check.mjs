@@ -112,6 +112,14 @@ const REPORT_MD = [
 ].join('\n');
 fs.writeFileSync(path.join(REPORTS_DIR, REPORT_NAME), REPORT_MD);
 
+// A second fixture: a COPY of a real vault wish-catalog report (node #1453,
+// gap-1 regression). It has 2 real markdown tables and several numbered
+// lists the synthetic fixture above doesn't exercise -- denser real content
+// is a better stress test for the view-isolation bug than a hand-written one.
+const REAL_CATALOG_SOURCE = '/home/kevin/obsidian/paperclip-wiki/outbox/kids-wish-catalog-idea-2026-10-05.md';
+const REAL_CATALOG_NAME = 'real-catalog-copy.md';
+fs.copyFileSync(REAL_CATALOG_SOURCE, path.join(REPORTS_DIR, REAL_CATALOG_NAME));
+
 // ── pick a free port, start the real server as a child process ────────────
 const PORT = 8199;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -156,18 +164,34 @@ try {
   await page.goto(`${BASE}/`, { waitUntil: 'load' });
   await page.waitForSelector('#reports-list-view', { state: 'attached' });
 
-  // navigate chat -> reports list -> the one report
+  // navigate chat -> reports list -> the synthetic fixture report. Two
+  // fixtures now live in REPORTS_DIR (sorted alphabetically), so target by
+  // button text rather than "the first button" to pick the right one.
   await page.click('#switch-btn');
   await page.waitForFunction(() => {
     const el = document.getElementById('reports-list');
-    return el && el.querySelectorAll('button').length > 0;
+    return el && el.querySelectorAll('button').length === 2;
   });
-  await page.click('#reports-list button');
+  await page.click(`#reports-list button:text("${REPORT_NAME}")`);
   await page.waitForFunction(() => {
     const el = document.getElementById('report-content');
     return el && el.querySelector('h1');
   });
   await sleep(200); // settle any layout/paint
+
+  // ---- GAP-1 regression: view isolation while a report is open ------------
+  // Before the fix, .view[hidden] had no display:none override, so app.js's
+  // el.hidden=true on chat-view/reports-list-view was beaten by the .view
+  // rule's own display:flex -- all three views stacked and an open report
+  // got squeezed into a sliver of the 844px screen.
+  const isolation = await page.evaluate(() => ({
+    chatViewVisible: document.getElementById('chat-view').getClientRects().length > 0,
+    reportsListViewVisible: document.getElementById('reports-list-view').getClientRects().length > 0,
+    reportContentHeight: document.getElementById('report-content').getBoundingClientRect().height,
+  }));
+  check('(GAP-1) chat-view is actually hidden (zero client rects) while a report is open', !isolation.chatViewVisible, isolation);
+  check('(GAP-1) reports-list-view is actually hidden (zero client rects) while a report is open', !isolation.reportsListViewVisible, isolation);
+  check('(GAP-1) #report-content gets >= 70% of the 844px viewport height', isolation.reportContentHeight >= 0.7 * 844, isolation.reportContentHeight);
 
   const contentHandle = page.locator('#report-content');
 
@@ -307,7 +331,42 @@ try {
   const detailsAfterClose = await page.evaluate(() => document.getElementById('report-content').querySelector('details')?.open);
   check('(3) <details> expander closes again on second tap', detailsAfterClose === false, detailsAfterClose);
 
-  await page.screenshot({ path: '/tmp/companion-reports-mobile-check.png', fullPage: true });
+  // ---- GAP-1 regression, second pass: a denser REAL catalog report --------
+  // Navigate back (nav-btn reads '‹ Reports' while a report is open) and open
+  // the real-vault-content fixture, which has more tables/lists than the
+  // hand-written one above -- a better stress test for the isolation bug.
+  await page.click('#nav-btn');
+  await page.waitForFunction(() => {
+    const el = document.getElementById('reports-list');
+    return el && el.querySelectorAll('button').length === 2;
+  });
+  await page.click(`#reports-list button:text("${REAL_CATALOG_NAME}")`);
+  await page.waitForFunction(() => {
+    const el = document.getElementById('report-content');
+    return el && el.querySelector('h1');
+  });
+  await sleep(200);
+
+  const realIsolation = await page.evaluate(() => ({
+    chatViewVisible: document.getElementById('chat-view').getClientRects().length > 0,
+    reportsListViewVisible: document.getElementById('reports-list-view').getClientRects().length > 0,
+    reportContentHeight: document.getElementById('report-content').getBoundingClientRect().height,
+  }));
+  check('(GAP-1, real catalog report) chat-view hidden', !realIsolation.chatViewVisible, realIsolation);
+  check('(GAP-1, real catalog report) reports-list-view hidden', !realIsolation.reportsListViewVisible, realIsolation);
+  check('(GAP-1, real catalog report) #report-content gets >= 70% of viewport height', realIsolation.reportContentHeight >= 0.7 * 844, realIsolation.reportContentHeight);
+
+  const realPresence = await page.evaluate(() => {
+    const root = document.getElementById('report-content');
+    return {
+      tableCount: root.querySelectorAll('table').length,
+      olCount: root.querySelectorAll('ol').length,
+    };
+  });
+  check('(real catalog report) both markdown tables rendered', realPresence.tableCount === 2, realPresence);
+  check('(real catalog report) ordered list(s) rendered', realPresence.olCount >= 1, realPresence);
+
+  await page.screenshot({ path: '/tmp/companion-reports-mobile-check.png' });
 
   console.log(failed ? '\nFAILED' : '\nALL PASS');
 } catch (err) {

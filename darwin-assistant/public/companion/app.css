@@ -95,6 +95,8 @@ html, body {
   overflow: hidden;
 }
 
+.view[hidden] { display: none; }
+
 /* ---- chat view ---- */
 
 .chat-messages {

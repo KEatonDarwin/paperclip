@@ -1,5 +1,6 @@
 import { listCommitments } from '../commitments.js';
 import { allowedToolsForThread } from '../companion-chat.js';
+import { acceptSidecar, AcceptError } from '../companion-accept.js';
 import { parseUnparkCondition } from '../unpark.js';
 import { gatherBigBoardSnapshot, BIG_BOARD_KIOSK_TOKEN_SETTING, BIG_BOARD_KIOSK_EVENT_TYPES, type BigBoardProviders } from '../big-board.js';
 import { Router, type Request, type Response, type NextFunction } from 'express';
@@ -7604,6 +7605,35 @@ export function createApiV1Router(): Router {
       .catch((err: unknown) => {
         sendError(res, 502, 'checkins_query_failed', err instanceof Error ? err.message : String(err));
       });
+  });
+
+  // == Companion sidecar accept (node #1447, tree-02951798) ===================
+  // Kevin-only (this whole router sits behind bearerAuth's JARVIS_COCKPIT_KEY)
+  // one-click action on a cross_chat_sidecar card: land it in a real goal-12
+  // ghost node or a (not-yet-sent) SHIM task request. Her scoped thin client
+  // has no route to this — it is not part of its allow-list by construction.
+
+  router.post('/companion/sidecars/:id/accept', (req: AuthedRequest, res) => {
+    const sidecarId = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(sidecarId)) {
+      sendError(res, 400, 'invalid_sidecar_id', 'sidecar id must be a number');
+      return;
+    }
+    const target = req.body?.target;
+    if (target !== 'shim_task' && target !== 'goal12_ghost') {
+      sendError(res, 400, 'invalid_target', "target must be 'shim_task' or 'goal12_ghost'");
+      return;
+    }
+    try {
+      const result = acceptSidecar(sidecarId, target);
+      res.json(result);
+    } catch (err) {
+      if (err instanceof AcceptError) {
+        sendError(res, err.status, err.code, err.message);
+        return;
+      }
+      sendError(res, 500, 'accept_failed', err instanceof Error ? err.message : String(err));
+    }
   });
 
   // == Memory Vault (DAR-676 — port of the 3201 /vault page) ==================

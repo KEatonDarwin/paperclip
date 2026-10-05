@@ -41,6 +41,7 @@
     "companion-scoping:check": "npm run build && JARVIS_DB_PATH=/tmp/companion-scoping-check.db node scripts/companion-scoping-check.mjs",
     "companion-allowlist:check": "npm run build && JARVIS_DB_PATH=/tmp/companion-allowlist-check.db node scripts/companion-tool-allowlist-check.mjs",
     "companion-model-guard:check": "npm run build && JARVIS_DB_PATH=/tmp/companion-model-guard-check.db node scripts/companion-model-guard-check.mjs",
+    "companion-accept:check": "npm run build && JARVIS_DB_PATH=/tmp/companion-accept-check.db node scripts/companion-accept-check.mjs",
     "notepad:sim": "npm run build && JARVIS_DB_PATH=/tmp/notepad-sim.db node scripts/notepad-sim.mjs",
     "throttle:check": "npm run build && JARVIS_DB_PATH=/tmp/throttle-check.db JARVIS_SIM=1 node scripts/throttle-check.mjs",
     "throttle:route-check": "npm run build && JARVIS_DB_PATH=/tmp/throttle-route-check.db JARVIS_SIM=1 node scripts/throttle-route-check.mjs",

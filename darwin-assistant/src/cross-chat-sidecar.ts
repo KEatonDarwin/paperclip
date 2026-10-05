@@ -1,4 +1,4 @@
-import { addTurn, getConversation } from './conversation-db.js';
+import { addTurn, getConversation, sqliteDb } from './conversation-db.js';
 import { sseBus, type CrossChatSidecarEvent } from './sse-bus.js';
 
 // CROSS-CHAT SIDECAR — node #1430, wish-catalog pilot (tree-3e526df9). A
@@ -57,4 +57,50 @@ export function insertCrossChatSidecar(payload: CrossChatSidecarPayload): { turn
   } satisfies CrossChatSidecarEvent);
 
   return { turnIndex };
+}
+
+// Accept handler support (node #1447, tree-02951798). The sidecar row is just
+// a `turns` row (role = CROSS_CHAT_SIDECAR_ROLE, tool_args = the JSON
+// payload) — these three columns record Kevin's accept decision on it so the
+// UI can later grey the card out, same ALTER-TABLE-ADD-COLUMN-in-a-try pattern
+// conversation-db.ts already uses for every other turns migration.
+for (const col of [
+  'sidecar_accepted_at TEXT',
+  'sidecar_accept_target TEXT',
+  'sidecar_accept_result_id TEXT',
+]) {
+  try { sqliteDb.exec(`ALTER TABLE turns ADD COLUMN ${col}`); } catch { /* already applied */ }
+}
+
+export interface SidecarTurnRow {
+  id: number;
+  conversation_id: number;
+  role: string;
+  content: string | null;
+  tool_args: string | null;
+  sidecar_accepted_at: string | null;
+  sidecar_accept_target: string | null;
+  sidecar_accept_result_id: string | null;
+}
+
+const getSidecarTurnStmt = sqliteDb.prepare(`
+  SELECT id, conversation_id, role, content, tool_args,
+         sidecar_accepted_at, sidecar_accept_target, sidecar_accept_result_id
+  FROM turns WHERE id = ?
+`);
+
+/** Loads a turn by its global id, but only if it's actually a cross_chat_sidecar row. */
+export function getSidecarTurnById(id: number): SidecarTurnRow | undefined {
+  const row = getSidecarTurnStmt.get(id) as SidecarTurnRow | undefined;
+  if (!row || row.role !== CROSS_CHAT_SIDECAR_ROLE) return undefined;
+  return row;
+}
+
+const markSidecarAcceptedStmt = sqliteDb.prepare(`
+  UPDATE turns SET sidecar_accepted_at = datetime('now'), sidecar_accept_target = ?, sidecar_accept_result_id = ?
+  WHERE id = ?
+`);
+
+export function markSidecarAccepted(id: number, target: string, resultId: string | null): void {
+  markSidecarAcceptedStmt.run(target, resultId, id);
 }

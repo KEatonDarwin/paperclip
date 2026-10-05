@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync, unlinkSync, readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSystemPrompt, loadMemoryBlock, memoryProfileForThread, type MemoryProfile } from './prompt.js';
-import { allowedToolsForThread } from './companion-chat.js';
+import { allowedToolsForThread, companionIdFromThread } from './companion-chat.js';
 import { getAuggieModels } from './auggie-catalog.js';
 import { getDevinModels } from './devin-catalog.js';
 import { getCodexModels } from './codex-catalog.js';
@@ -468,6 +468,26 @@ function getActiveOptions(): Record<string, unknown> {
   try { return JSON.parse(raw) as Record<string, unknown>; } catch { return {}; }
 }
 
+// Companion never-frontier guard (#277): a companion thread's EFFECTIVE model is
+// always claude-opus-* — never Fable, never a gpt-*/other-provider id, never
+// empty. This is the single chokepoint resolveConversationRuntime() funnels
+// through (its result is cached once per turn into runClaudeRuntime and reused
+// across every expiry/overflow/account-rescue retry, agent.ts ~1490-1729), so
+// applying it here covers every retry path without touching each one.
+function enforceCompanionModelGuard(
+  conv: ConversationRow,
+  result: { adapter: AdapterConfig; model: string | null; options: Record<string, unknown> },
+): { adapter: AdapterConfig; model: string | null; options: Record<string, unknown> } {
+  if (!companionIdFromThread(conv.external_id)) return result;
+  if (result.adapter.id === 'claude' && typeof result.model === 'string' && result.model.startsWith('claude-opus-')) {
+    return result;
+  }
+  console.warn(
+    `[agent] companion thread ${conv.external_id} resolved to ${result.adapter.id}/${result.model ?? '(empty)'}; coercing to claude/claude-opus-5 (never-frontier guard)`,
+  );
+  return { adapter: ADAPTERS.claude, model: 'claude-opus-5', options: result.options };
+}
+
 // Resolve the effective adapter+model+options for a specific conversation (DAR-680 AC#4).
 // A per-thread override (conv.thread_adapter/thread_model) wins over the global
 // setting. If the thread pins an adapter but no valid model for it, the adapter's
@@ -476,15 +496,18 @@ function getActiveOptions(): Record<string, unknown> {
 export function resolveConversationRuntime(
   conv: ConversationRow,
 ): { adapter: AdapterConfig; model: string | null; options: Record<string, unknown> } {
+  let result: { adapter: AdapterConfig; model: string | null; options: Record<string, unknown> };
   if (conv.thread_adapter && ADAPTERS[conv.thread_adapter]) {
     const adapter = ADAPTERS[conv.thread_adapter];
     const model =
       conv.thread_model && adapter.models.some((m) => m.id === conv.thread_model)
         ? conv.thread_model
         : null;
-    return { adapter, model, options: getActiveOptions() };
+    result = { adapter, model, options: getActiveOptions() };
+  } else {
+    result = { adapter: getActiveAdapter(), model: getSetting('model'), options: getActiveOptions() };
   }
-  return { adapter: getActiveAdapter(), model: getSetting('model'), options: getActiveOptions() };
+  return enforceCompanionModelGuard(conv, result);
 }
 
 // Resolve the full runtime descriptor for an adapter, filling in the concrete

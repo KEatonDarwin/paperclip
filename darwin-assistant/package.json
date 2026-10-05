@@ -35,6 +35,7 @@
     "night:sim": "npm run build && node scripts/night-shift-sim.mjs",
     "night:check": "npm run build && bash scripts/night-shift-check.sh",
     "notepad:check": "npm run build && JARVIS_DB_PATH=/tmp/notepad-check.db node scripts/notepad-check.mjs",
+    "companion-thread:check": "npm run build && JARVIS_DB_PATH=/tmp/companion-thread-check.db node scripts/companion-thread-check.mjs",
     "notepad:sim": "npm run build && JARVIS_DB_PATH=/tmp/notepad-sim.db node scripts/notepad-sim.mjs",
     "throttle:check": "npm run build && JARVIS_DB_PATH=/tmp/throttle-check.db JARVIS_SIM=1 node scripts/throttle-check.mjs",
     "throttle:route-check": "npm run build && JARVIS_DB_PATH=/tmp/throttle-route-check.db JARVIS_SIM=1 node scripts/throttle-route-check.mjs",

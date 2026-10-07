@@ -221,6 +221,12 @@ import {
   type WorkstreamTurn,
 } from '../workstreams.js';
 import {
+  listWorkBoardItems,
+  parseWorkBoardRef,
+  pinWorkBoardItem,
+  updateWorkBoardItem,
+} from '../work-board.js';
+import {
   INTEL_LANES,
   createIntelRun,
   getActiveIntelRun,
@@ -3197,6 +3203,57 @@ export function createApiV1Router(): Router {
       return;
     }
     res.json({ workstream });
+  });
+
+  // == Work Board (tree-afe07b31): chats Kevin is actively running ============
+  // Replaces his notepad list of thread links. Auto-populates from any
+  // cockpit:* conversation with a recent user turn (excluding ephemeral
+  // hopper-node/unblocker/shift/workstream chats); Kevin can also pin any
+  // thread explicitly via POST. See src/work-board.ts for the data rules.
+
+  router.get('/work-board', (req: AuthedRequest, res) => {
+    const includeDone = req.query.include_done === '1' || req.query.include_done === 'true';
+    res.json({ items: listWorkBoardItems(includeDone), generated_at: new Date().toISOString() });
+  });
+
+  router.post('/work-board/items', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const raw = typeof body.external_id === 'string' && body.external_id.trim()
+      ? body.external_id.trim()
+      : typeof body.url === 'string' && body.url.trim()
+        ? body.url.trim()
+        : '';
+    if (!raw) {
+      sendError(res, 400, 'invalid_request', 'external_id or url is required');
+      return;
+    }
+    const externalId = parseWorkBoardRef(raw);
+    if (!externalId) {
+      sendError(res, 400, 'invalid_request', 'could not parse a cockpit external id from the given external_id/url');
+      return;
+    }
+    const item = pinWorkBoardItem(externalId);
+    if (!item) {
+      sendError(res, 404, 'conversation_not_found', `no conversation found for ${externalId}`);
+      return;
+    }
+    res.status(201).json({ item });
+  });
+
+  router.patch('/work-board/items/:external_id', (req: AuthedRequest, res) => {
+    const externalId = paramString(req.params.external_id);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const done = typeof body.done === 'boolean' ? body.done : undefined;
+    const pinned = typeof body.pinned === 'boolean' ? body.pinned : undefined;
+    const titleOverride = body.title_override !== undefined
+      ? (body.title_override === null || body.title_override === '' ? null : String(body.title_override))
+      : undefined;
+    const item = updateWorkBoardItem(externalId, { done, pinned, title_override: titleOverride });
+    if (!item) {
+      sendError(res, 404, 'conversation_not_found', `no conversation found for ${externalId}`);
+      return;
+    }
+    res.json({ item });
   });
 
   // == Task Hopper (candidate tasks awaiting Kevin's yes/dismiss) ==============

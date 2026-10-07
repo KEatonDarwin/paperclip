@@ -38,8 +38,13 @@ console.log(`[work-board-test] scratch DB: ${DB_PATH}`);
 const distDir = path.join(__dirname, '..', 'dist');
 const convDb = await import(path.join(distDir, 'conversation-db.js'));
 const { getOrCreateConversation, addTurn, renameConversation, sqliteDb } = convDb;
-const { listWorkBoardItems, parseWorkBoardRef, pinWorkBoardItem, updateWorkBoardItem } =
+const { listWorkBoardItems, parseWorkBoardRef, pinWorkBoardItem, updateWorkBoardItem, getWorkBoardSince, resetWorkBoardSince } =
   await import(path.join(distDir, 'work-board.js'));
+
+// The board's start point is FIXED (set once at now−5h in prod). Fixtures below
+// use turns up to 10h old, so widen it for the suite; TEST 15 exercises the
+// fixed-point rule itself.
+resetWorkBoardSince({ hours: 24 });
 
 // ── fixture helpers ──────────────────────────────────────────────────────
 let seq = 0;
@@ -111,14 +116,14 @@ function ok(name) {
   ok('non-cockpit prefix excluded from auto-population');
 }
 
-// ── TEST 5: user turn older than 14 days → excluded; assistant-only recency doesn't count ──
+// ── TEST 5: user turn before the fixed start point (set once at now−5h) → excluded; assistant-only recency doesn't count ──
 {
   const conv = makeConv();
   addTurnAt(conv.id, 'user', 'old message', daysAgoStr(20));
   addTurnAt(conv.id, 'assistant', 'fresh reply', hoursAgoStr(1));
   const items = listWorkBoardItems(false);
   assert.ok(!items.some((i) => i.external_id === conv.external_id), 'stale user turn (20d) with only a fresh assistant turn is excluded');
-  ok('14-day window keys off the user role specifically, not any turn');
+  ok('fixed start point keys off the user role specifically, not any turn');
 }
 
 // ── TEST 6: ASC ordering — oldest last_activity first ───────────────────────
@@ -244,4 +249,24 @@ let doneConv;
 }
 
 for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) fs.rmSync(p, { force: true });
+// ── TEST 15: FIXED start point, not a rolling window ────────────────────────
+{
+  const convBefore = makeConv();
+  addTurnAt(convBefore.id, 'user', 'before the line', hoursAgoStr(8));
+  const convAfter = makeConv();
+  addTurnAt(convAfter.id, 'user', 'after the line', hoursAgoStr(1));
+  const s0 = getWorkBoardSince();
+  assert.ok(s0.since && typeof s0.since_turn_id === 'number', 'since is persisted and readable');
+  resetWorkBoardSince({ hours: 4 });
+  let items = listWorkBoardItems(false);
+  assert.ok(!items.some((i) => i.external_id === convBefore.external_id), 'user turn before the start point is excluded');
+  assert.ok(items.some((i) => i.external_id === convAfter.external_id), 'user turn after the start point is included');
+  const s1 = getWorkBoardSince();
+  assert.equal(getWorkBoardSince().since, s1.since, 'start point does not move between reads (not rolling)');
+  resetWorkBoardSince({ hours: 24 });
+  items = listWorkBoardItems(false);
+  assert.ok(items.some((i) => i.external_id === convBefore.external_id), 'moving the start point back brings the chat in');
+  ok('fixed start point: set once, stays put, movable only by reset');
+}
+
 console.log(`\n[work-board-test] ALL ${passed} tests passed ✅`);

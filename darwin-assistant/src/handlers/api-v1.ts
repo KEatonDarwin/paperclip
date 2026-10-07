@@ -225,6 +225,8 @@ import {
   parseWorkBoardRef,
   pinWorkBoardItem,
   updateWorkBoardItem,
+  getWorkBoardSince,
+  resetWorkBoardSince,
 } from '../work-board.js';
 import {
   INTEL_LANES,
@@ -3213,7 +3215,19 @@ export function createApiV1Router(): Router {
 
   router.get('/work-board', (req: AuthedRequest, res) => {
     const includeDone = req.query.include_done === '1' || req.query.include_done === 'true';
-    res.json({ items: listWorkBoardItems(includeDone), generated_at: new Date().toISOString() });
+    res.json({ items: listWorkBoardItems(includeDone), since: getWorkBoardSince(), generated_at: new Date().toISOString() });
+  });
+
+  // Move the fixed start point (Kevin 2026-10-07): {hours: N} → now − N h, or {at: 'YYYY-MM-DD HH:MM:SS'}.
+  router.post('/work-board/since', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { hours?: unknown; at?: unknown };
+    const hours = typeof body.hours === 'number' && Number.isFinite(body.hours) ? body.hours : undefined;
+    const at = typeof body.at === 'string' ? body.at : undefined;
+    if (hours === undefined && at === undefined) {
+      sendError(res, 400, 'invalid_request', 'hours (number) or at (YYYY-MM-DD HH:MM:SS) required');
+      return;
+    }
+    res.json({ since: resetWorkBoardSince({ hours, at }) });
   });
 
   router.post('/work-board/items', (req: AuthedRequest, res) => {

@@ -4,7 +4,7 @@
 // chats); Kevin can also pin any thread explicitly via POST. See the ORIGINAL
 // ASK captured on the hopper node for the full product spec.
 
-import { sqliteDb, getConversation, type ConversationRow } from './conversation-db.js';
+import { sqliteDb, getConversation, type ConversationRow, getSetting, setSetting} from './conversation-db.js';
 
 export interface WorkBoardItemRow {
   id: number;
@@ -46,7 +46,17 @@ function isEphemeralCockpitId(externalId: string): boolean {
   return EPHEMERAL_COCKPIT_PREFIXES.some((p) => externalId.startsWith(p));
 }
 
-const AUTO_POPULATE_WINDOW_DAYS = 14;
+/**
+ * FIXED START POINT (Kevin, 2026-10-07): the board auto-includes a chat only if
+ * Kevin typed in it AT OR AFTER a fixed watermark. The watermark is set ONCE on
+ * first use to "now minus WORK_BOARD_INITIAL_HOURS" and then never moves on its
+ * own (NOT a rolling window — old chats stay out, new activity comes in
+ * forever). It is persisted in settings-KV as an ISO-ish sqlite timestamp plus
+ * the first user turn id at/after it, and can be moved via resetWorkBoardSince().
+ */
+const WORK_BOARD_INITIAL_HOURS = 5;
+const SINCE_KEY = 'work_board_since';
+const SINCE_TURN_KEY = 'work_board_since_turn_id';
 
 sqliteDb.exec(`
   CREATE TABLE IF NOT EXISTS work_board_items (
@@ -93,15 +103,45 @@ const stmts = {
     `UPDATE work_board_items SET title_override = ?, updated_at = datetime('now') WHERE external_id = ?`,
   ),
   now: sqliteDb.prepare<[], { now: string }>(`SELECT datetime('now') AS now`),
+  firstUserTurnSince: sqliteDb.prepare<[string], { id: number | null }>(
+    `SELECT MIN(id) AS id FROM turns WHERE role = 'user' AND created_at >= ?`,
+  ),
+  maxTurnId: sqliteDb.prepare<[], { id: number | null }>(`SELECT MAX(id) AS id FROM turns`),
 };
 
 function sqliteNow(): string {
   return stmts.now.get()!.now;
 }
 
-function cutoffDaysAgo(days: number): string {
-  const d = new Date(Date.now() - days * 86_400_000);
+function hoursAgoStr(hours: number): string {
+  const d = new Date(Date.now() - hours * 3_600_000);
   return d.toISOString().replace('T', ' ').slice(0, 19);
+}
+
+export interface WorkBoardSince {
+  since: string;          // sqlite 'YYYY-MM-DD HH:MM:SS' (UTC) — user turns at/after this count
+  since_turn_id: number;  // first user turn id at/after `since` when it was set (informational)
+}
+
+/** The fixed start point; set once (now − 5h) on first use, then never moves on its own. */
+export function getWorkBoardSince(): WorkBoardSince {
+  const existing = getSetting(SINCE_KEY);
+  if (existing) {
+    return { since: existing, since_turn_id: Number(getSetting(SINCE_TURN_KEY) ?? 0) };
+  }
+  return resetWorkBoardSince({ hours: WORK_BOARD_INITIAL_HOURS });
+}
+
+/** Move the start point: to now − hours, or to an explicit sqlite timestamp. Persisted. */
+export function resetWorkBoardSince(opts: { hours?: number; at?: string }): WorkBoardSince {
+  const since = opts.at && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(opts.at)
+    ? opts.at
+    : hoursAgoStr(Math.max(0, Number(opts.hours ?? WORK_BOARD_INITIAL_HOURS)));
+  const first = stmts.firstUserTurnSince.get(since)?.id;
+  const sinceTurnId = first ?? (stmts.maxTurnId.get()?.id ?? 0) + 1;
+  setSetting(SINCE_KEY, since);
+  setSetting(SINCE_TURN_KEY, String(sinceTurnId));
+  return { since, since_turn_id: sinceTurnId };
 }
 
 function getItemRow(externalId: string): WorkBoardItemRow | undefined {
@@ -157,12 +197,12 @@ function buildItem(externalId: string): WorkBoardItem | null {
 
 /**
  * The board: every pinned external_id plus every non-ephemeral cockpit:*
- * conversation with a user turn in the last 14 days, sorted oldest-updated
+ * conversation with a user turn at/after the fixed start point (getWorkBoardSince), sorted oldest-updated
  * first (so Kevin works from the top). Done rows are dropped unless
  * includeDone is set.
  */
 export function listWorkBoardItems(includeDone: boolean): WorkBoardItem[] {
-  const cutoff = cutoffDaysAgo(AUTO_POPULATE_WINDOW_DAYS);
+  const cutoff = getWorkBoardSince().since;
   const candidateIds = new Set<string>();
 
   for (const conv of stmts.cockpitConversations.all()) {

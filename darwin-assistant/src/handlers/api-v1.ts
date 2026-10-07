@@ -228,6 +228,7 @@ import {
   getWorkBoardSince,
   resetWorkBoardSince,
 } from '../work-board.js';
+import { listTeamsRadarCatches, openTeamsRadarChat } from '../teams-radar.js';
 import {
   INTEL_LANES,
   createIntelRun,
@@ -3268,6 +3269,28 @@ export function createApiV1Router(): Router {
       return;
     }
     res.json({ item });
+  });
+
+  // == Teams Radar (tree-675acbd3): verified catches from the $300k Teams =====
+  // chat feed. File-backed (src/teams-radar.ts reads /home/kevin/teams-radar/
+  // catches/*.json written by the Python sweep pipeline) — this route never
+  // writes a catch, only reads them and opens each one's dedicated chat.
+  router.get('/teams-radar', (req: AuthedRequest, res) => {
+    const includeFine = req.query.include_fine === '1' || req.query.include_fine === 'true';
+    const daysRaw = typeof req.query.days === 'string' ? Number(req.query.days) : NaN;
+    const days = Number.isFinite(daysRaw) ? daysRaw : 7;
+    const { catches, counts, last_sweep_at } = listTeamsRadarCatches({ includeFine, days });
+    res.json({ catches, counts, last_sweep_at });
+  });
+
+  router.post('/teams-radar/:id/chat', (req: AuthedRequest, res) => {
+    const id = paramString(req.params.id);
+    const result = openTeamsRadarChat(id);
+    if (!result) {
+      sendError(res, 404, 'catch_not_found', `no teams-radar catch found for ${id}`);
+      return;
+    }
+    res.json(result);
   });
 
   // == Task Hopper (candidate tasks awaiting Kevin's yes/dismiss) ==============

@@ -1406,7 +1406,7 @@ function notifyWorkBoardWatchers(conv: ConversationRow): void {
       title: `Reply ready — ${conv.title ?? conv.external_id}`,
       body: 'JARVIS finished this turn. Your move.',
       source: 'chat-importance',
-      link: `/threads?open=${encodeURIComponent(conv.external_id)}`,
+      link: `/thread/${encodeURIComponent(conv.external_id)}`,
     });
   } catch {
     // best-effort

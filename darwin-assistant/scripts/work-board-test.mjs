@@ -38,7 +38,7 @@ console.log(`[work-board-test] scratch DB: ${DB_PATH}`);
 const distDir = path.join(__dirname, '..', 'dist');
 const convDb = await import(path.join(distDir, 'conversation-db.js'));
 const { getOrCreateConversation, addTurn, renameConversation, sqliteDb } = convDb;
-const { listWorkBoardItems, parseWorkBoardRef, pinWorkBoardItem, updateWorkBoardItem, getWorkBoardSince, resetWorkBoardSince, consumeWorkBoardWatch } =
+const { listWorkBoardItems, listRecentDoneItems, parseWorkBoardRef, pinWorkBoardItem, updateWorkBoardItem, getWorkBoardSince, resetWorkBoardSince, consumeWorkBoardWatch } =
   await import(path.join(distDir, 'work-board.js'));
 
 // The board's start point is FIXED (set once at now−5h in prod). Fixtures below
@@ -346,6 +346,47 @@ for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) fs.rmSync(p, { fo
   pinWorkBoardItem(pinned.external_id);
   assert.equal(consumeWorkBoardWatch(pinned.external_id), false, 'an automatically-hot chat never pings on its own');
   ok('watch: one-shot fires once, hand-set hot keeps firing, auto-hot stays quiet');
+}
+
+// ── TEST 20: listRecentDoneItems pages newest-first and skips reopened rows ──
+{
+  // Each row's done_at is backdated so pagination has a clean, deterministic
+  // order independent of what prior tests marked done.
+  function markDoneAt(externalId, when) {
+    updateWorkBoardItem(externalId, { done: true });
+    sqliteDb
+      .prepare(`UPDATE work_board_items SET done_at = ? WHERE external_id = ?`)
+      .run(when, externalId);
+  }
+
+  const a = makeConv('cockpit:wb-done-');
+  addTurnAt(a.id, 'user', 'first', hoursAgoStr(5));
+  markDoneAt(a.external_id, hoursAgoStr(4));
+
+  const b = makeConv('cockpit:wb-done-');
+  addTurnAt(b.id, 'user', 'second', hoursAgoStr(5));
+  markDoneAt(b.external_id, hoursAgoStr(3));
+
+  const c = makeConv('cockpit:wb-done-');
+  addTurnAt(c.id, 'user', 'third', hoursAgoStr(5));
+  markDoneAt(c.external_id, hoursAgoStr(2));
+
+  // A reopen (user turn after done_at) must drop the row from the done list.
+  const reopened = makeConv('cockpit:wb-done-');
+  addTurnAt(reopened.id, 'user', 'early', hoursAgoStr(5));
+  markDoneAt(reopened.external_id, hoursAgoStr(3.5));
+  addTurnAt(reopened.id, 'user', 'poke', hoursAgoStr(0.1));
+
+  const ours = (list) => list.filter((i) => i.external_id.startsWith('cockpit:wb-done-')).map((i) => i.external_id);
+  const first = ours(listRecentDoneItems(20, 0));
+  assert.deepEqual(first.slice(0, 3), [c.external_id, b.external_id, a.external_id], 'newest-completed first, oldest last');
+  assert.ok(!first.includes(reopened.external_id), 'a reopened row does not appear in the done list');
+
+  const page1 = ours(listRecentDoneItems(2, 0));
+  const page2 = ours(listRecentDoneItems(2, 2));
+  assert.ok(page1.includes(c.external_id) && page1.includes(b.external_id), 'page 1 (limit 2) covers the two newest');
+  assert.ok(page2.includes(a.external_id), 'page 2 (offset 2) reaches the oldest');
+  ok('listRecentDoneItems pages newest-first and skips auto-reopened rows');
 }
 
 console.log(`\n[work-board-test] ALL ${passed} tests passed ✅`);

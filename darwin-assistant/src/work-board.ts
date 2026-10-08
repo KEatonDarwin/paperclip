@@ -147,6 +147,12 @@ const stmts = {
     `SELECT MIN(id) AS id FROM turns WHERE role = 'user' AND created_at >= ?`,
   ),
   maxTurnId: sqliteDb.prepare<[], { id: number | null }>(`SELECT MAX(id) AS id FROM turns`),
+  recentDoneIds: sqliteDb.prepare<[number, number], { external_id: string }>(
+    `SELECT external_id FROM work_board_items
+      WHERE done_at IS NOT NULL
+      ORDER BY done_at DESC, external_id DESC
+      LIMIT ? OFFSET ?`,
+  ),
 };
 
 function sqliteNow(): string {
@@ -335,6 +341,23 @@ export function listWorkBoardItems(includeDone: boolean): WorkBoardItem[] {
   }
 
   items.sort((a, b) => (a.last_activity < b.last_activity ? -1 : a.last_activity > b.last_activity ? 1 : 0));
+  return items;
+}
+
+/**
+ * Recently-done items, newest-completed first, for the dashboard's history
+ * section. Pages via limit/offset over the raw done rows; buildItem's
+ * auto-reopen rule still applies, so a row Kevin replied to after checking it
+ * off drops out silently.
+ */
+export function listRecentDoneItems(limit: number, offset: number): WorkBoardItem[] {
+  const rows = stmts.recentDoneIds.all(limit, offset);
+  const items: WorkBoardItem[] = [];
+  for (const row of rows) {
+    const item = buildItem(row.external_id);
+    if (!item || !item.done_at) continue;
+    items.push(item);
+  }
   return items;
 }
 

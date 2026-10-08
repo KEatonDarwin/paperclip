@@ -222,6 +222,7 @@ import {
 } from '../workstreams.js';
 import {
   listWorkBoardItems,
+  listRecentDoneItems,
   parseWorkBoardRef,
   pinWorkBoardItem,
   updateWorkBoardItem,
@@ -3217,6 +3218,17 @@ export function createApiV1Router(): Router {
   router.get('/work-board', (req: AuthedRequest, res) => {
     const includeDone = req.query.include_done === '1' || req.query.include_done === 'true';
     res.json({ items: listWorkBoardItems(includeDone), since: getWorkBoardSince(), generated_at: new Date().toISOString() });
+  });
+
+  // Recently-checked-off items for the dashboard history section — newest first,
+  // paged by limit (default/cap 20) and offset so Kevin can scroll back through
+  // mistakes. Separate endpoint so the live board stays small and fast.
+  router.get('/work-board/done', (req: AuthedRequest, res) => {
+    const limitRaw = Number(req.query.limit);
+    const offsetRaw = Number(req.query.offset);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.trunc(limitRaw), 1), 20) : 20;
+    const offset = Number.isFinite(offsetRaw) ? Math.max(Math.trunc(offsetRaw), 0) : 0;
+    res.json({ items: listRecentDoneItems(limit, offset), limit, offset });
   });
 
   // Move the fixed start point (Kevin 2026-10-07): {hours: N} → now − N h, or {at: 'YYYY-MM-DD HH:MM:SS'}.

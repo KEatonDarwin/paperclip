@@ -38,7 +38,7 @@ console.log(`[work-board-test] scratch DB: ${DB_PATH}`);
 const distDir = path.join(__dirname, '..', 'dist');
 const convDb = await import(path.join(distDir, 'conversation-db.js'));
 const { getOrCreateConversation, addTurn, renameConversation, sqliteDb } = convDb;
-const { listWorkBoardItems, parseWorkBoardRef, pinWorkBoardItem, updateWorkBoardItem, getWorkBoardSince, resetWorkBoardSince } =
+const { listWorkBoardItems, parseWorkBoardRef, pinWorkBoardItem, updateWorkBoardItem, getWorkBoardSince, resetWorkBoardSince, consumeWorkBoardWatch } =
   await import(path.join(distDir, 'work-board.js'));
 
 // The board's start point is FIXED (set once at now−5h in prod). Fixtures below
@@ -267,6 +267,85 @@ for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) fs.rmSync(p, { fo
   items = listWorkBoardItems(false);
   assert.ok(items.some((i) => i.external_id === convBefore.external_id), 'moving the start point back brings the chat in');
   ok('fixed start point: set once, stays put, movable only by reset');
+}
+
+// ── TEST 16: auto importance — normal by default, hot when pinned, cool when cold ──
+{
+  const fresh = makeConv();
+  addTurnAt(fresh.id, 'user', 'go', hoursAgoStr(1));
+  let row = listWorkBoardItems(false).find((i) => i.external_id === fresh.external_id);
+  assert.equal(row.importance, 2, 'a live chat sits at normal');
+  assert.equal(row.importance_source, 'auto', 'and the level is automatic');
+
+  pinWorkBoardItem(fresh.external_id);
+  row = listWorkBoardItems(false).find((i) => i.external_id === fresh.external_id);
+  assert.equal(row.importance, 3, 'pinning a chat makes it hot');
+
+  const cold = makeConv();
+  addTurnAt(cold.id, 'user', 'ancient', hoursAgoStr(30));
+  resetWorkBoardSince({ hours: 48 }); // widen so a 30h-old chat is still listed
+  row = listWorkBoardItems(false).find((i) => i.external_id === cold.external_id);
+  assert.equal(row.importance, 1, 'a chat untouched for over a day goes cool');
+  resetWorkBoardSince({ hours: 24 });
+  ok('auto importance: normal by default, hot when pinned, cool after a day');
+}
+
+// ── TEST 17: a hand-set level wins, and null hands it back to automatic ────
+{
+  const conv = makeConv();
+  addTurnAt(conv.id, 'user', 'go', hoursAgoStr(1));
+  let row = updateWorkBoardItem(conv.external_id, { importance: 3 });
+  assert.equal(row.importance, 3, 'the level Kevin set is the level in force');
+  assert.equal(row.importance_source, 'manual', 'and it is reported as his, not the machine guess');
+  assert.equal(row.importance_auto, 2, 'the automatic level is still reported alongside');
+
+  row = updateWorkBoardItem(conv.external_id, { importance: null });
+  assert.equal(row.importance_source, 'auto', 'clearing hands the chat back to the automatic level');
+  assert.equal(row.importance, 2, 'and the automatic level takes over');
+  ok('manual importance overrides the auto level; null clears it');
+}
+
+// ── TEST 18: waiting_on follows the last real speaker, not tool rows ───────
+{
+  const empty = makeConv();
+  pinWorkBoardItem(empty.external_id);
+  let row = listWorkBoardItems(false).find((i) => i.external_id === empty.external_id);
+  assert.equal(row.waiting_on, null, 'a chat with no messages is waiting on nobody');
+
+  const conv = makeConv();
+  addTurnAt(conv.id, 'user', 'question', hoursAgoStr(1));
+  row = listWorkBoardItems(false).find((i) => i.external_id === conv.external_id);
+  assert.equal(row.waiting_on, 'jarvis', 'Kevin spoke last → it is JARVIS that owes a reply');
+
+  addTurnAt(conv.id, 'assistant', 'answer', hoursAgoStr(1));
+  addTurnAt(conv.id, 'tool', 'ran something', hoursAgoStr(1));
+  row = listWorkBoardItems(false).find((i) => i.external_id === conv.external_id);
+  assert.equal(row.waiting_on, 'kevin', 'a trailing tool row does not change whose move it is');
+  assert.equal(row.running, false, 'nothing is in flight in a test process');
+  ok('waiting_on follows the last user/assistant turn and ignores tool rows');
+}
+
+// ── TEST 19: the one-shot watch fires once; a hand-set hot level keeps firing ──
+{
+  const quiet = makeConv();
+  addTurnAt(quiet.id, 'user', 'go', hoursAgoStr(1));
+  assert.equal(consumeWorkBoardWatch(quiet.external_id), false, 'a normal chat does not ping');
+
+  updateWorkBoardItem(quiet.external_id, { watch: true });
+  assert.equal(consumeWorkBoardWatch(quiet.external_id), true, 'an armed watch pings');
+  assert.equal(consumeWorkBoardWatch(quiet.external_id), false, 'and disarms itself after one ping');
+
+  const hot = makeConv();
+  addTurnAt(hot.id, 'user', 'go', hoursAgoStr(1));
+  updateWorkBoardItem(hot.external_id, { importance: 3 });
+  assert.equal(consumeWorkBoardWatch(hot.external_id), true, 'a hand-set hot chat pings');
+  assert.equal(consumeWorkBoardWatch(hot.external_id), true, 'and keeps pinging — hot is standing, not one-shot');
+
+  const pinned = makeConv();
+  addTurnAt(pinned.id, 'user', 'go', hoursAgoStr(1));
+  pinWorkBoardItem(pinned.external_id);
+  assert.equal(consumeWorkBoardWatch(pinned.external_id), false, 'an automatically-hot chat never pings on its own');
+  ok('watch: one-shot fires once, hand-set hot keeps firing, auto-hot stays quiet');
 }
 
 console.log(`\n[work-board-test] ALL ${passed} tests passed ✅`);

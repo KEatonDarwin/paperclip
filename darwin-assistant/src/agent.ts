@@ -38,6 +38,8 @@ import { fileURLToPath } from 'node:url';
 import { getOrCreateInternalMcpKey } from './api-keys.js';
 import { refuseModelTurnInScratch } from './sim-guard.js';
 import { isAutomatedTurn, acquireAutomatedSlot, releaseAutomatedSlot } from './turn-admission.js';
+import { consumeWorkBoardWatch } from './work-board.js';
+import { createNotification } from './notifications.js';
 import type { SavedImage } from './image-store.js';
 
 const MAX_TOOL_TURNS = 50;
@@ -104,6 +106,14 @@ const INTERRUPTED_SUFFIX =
 const RUN_TIMEOUT_MS = (() => {
   const raw = Number(process.env.JARVIS_RUN_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : 10 * 60 * 1000; // 10 min per model call
+})();
+// Adapters whose CLI buffers everything and prints once at the end (auggie, devin)
+// emit no chunks while they work, so the idle timer below behaves as a hard cap on
+// total runtime for them. They get a much larger budget so a long agentic turn isn't
+// killed mid-work; the watchdog still catches a genuinely wedged child.
+const BUFFERED_RUN_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.JARVIS_BUFFERED_RUN_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 90 * 60 * 1000; // 90 min
 })();
 // Grace period between SIGTERM and SIGKILL when force-killing a subprocess.
 const CHILD_KILL_GRACE_MS = 5_000;
@@ -233,6 +243,10 @@ export interface AdapterConfig {
   // Optional adapter-specific pattern used to detect "unknown/expired session" stderr,
   // so runConversationTurn can retry without --resume.
   unknownSessionPattern?: RegExp;
+  // Optional override for the idle/hang watchdog (defaults to RUN_TIMEOUT_MS). Set on
+  // adapters that print nothing until the run finishes, where the idle timer is really
+  // a total-runtime cap.
+  idleTimeoutMs?: number;
 }
 
 const ADAPTERS: Record<string, AdapterConfig> = {
@@ -357,6 +371,9 @@ const ADAPTERS: Record<string, AdapterConfig> = {
       for (const p of imagePaths ?? []) args.push('--image', p);
       return args;
     },
+    // --output-format json prints one blob at the end, so nothing re-arms the idle
+    // watchdog while auggie works.
+    idleTimeoutMs: BUFFERED_RUN_TIMEOUT_MS,
   },
   devin: {
     id: 'devin',
@@ -411,6 +428,8 @@ const ADAPTERS: Record<string, AdapterConfig> = {
     // from the export file (captureSessionFromExport), not stdout.
     parseOutput: (stdout: string): ClaudeResult => ({ text: stdout.trim(), sessionId: null }),
     envOverrides(env) { delete env['ANTHROPIC_API_KEY']; delete env['OPENAI_API_KEY']; },
+    // Same buffered-output situation as auggie.
+    idleTimeoutMs: BUFFERED_RUN_TIMEOUT_MS,
   },
 };
 
@@ -1177,16 +1196,18 @@ export async function runClaude(
     }
     // IDLE timeout, not a total-runtime cap: the timer is re-armed on every chunk
     // of output, so a long-but-actively-working run (streaming text, tool calls)
-    // never trips it — only a run that goes SILENT for RUN_TIMEOUT_MS is treated
+    // never trips it — only a run that goes SILENT for idleTimeoutMs is treated
     // as hung and killed. This lets multi-minute agentic turns complete while
-    // still catching genuinely stuck subprocesses.
+    // still catching genuinely stuck subprocesses. Buffered-output adapters
+    // (auggie, devin) override the budget since nothing re-arms the timer for them.
+    const idleTimeoutMs = adapter.idleTimeoutMs ?? RUN_TIMEOUT_MS;
     let killTimer: ReturnType<typeof setTimeout>;
     const armIdleTimer = () => {
       clearTimeout(killTimer);
       killTimer = setTimeout(() => {
         timedOut = true;
         killChild(child);
-      }, RUN_TIMEOUT_MS);
+      }, idleTimeoutMs);
       killTimer.unref?.();
     };
     armIdleTimer();
@@ -1240,7 +1261,7 @@ export async function runClaude(
       // Fix C (DAR-676): killed by the run-timeout watchdog. Surface a distinct
       // error so the caller can persist whatever streamed and stop the thread.
       if (timedOut) {
-        reject(new RunTimeoutError(RUN_TIMEOUT_MS));
+        reject(new RunTimeoutError(idleTimeoutMs));
         return;
       }
 
@@ -1369,6 +1390,26 @@ async function processMessageInner(
       conversationId: conv.id,
       activeConversationId: null,
     } satisfies StatusEvent);
+    notifyWorkBoardWatchers(conv);
+  }
+}
+
+// Importance meter (2026-10-08): the reply just landed, so if Kevin marked
+// this chat hot or armed its one-shot watch, tell him now. consumeWorkBoardWatch
+// decides and disarms the one-shot; never let a notification failure take
+// down the turn that just succeeded.
+function notifyWorkBoardWatchers(conv: ConversationRow): void {
+  try {
+    if (!consumeWorkBoardWatch(conv.external_id)) return;
+    createNotification({
+      severity: 'info',
+      title: `Reply ready — ${conv.title ?? conv.external_id}`,
+      body: 'JARVIS finished this turn. Your move.',
+      source: 'chat-importance',
+      link: `/threads?open=${encodeURIComponent(conv.external_id)}`,
+    });
+  } catch {
+    // best-effort
   }
 }
 

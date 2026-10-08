@@ -3263,7 +3263,28 @@ export function createApiV1Router(): Router {
     const titleOverride = body.title_override !== undefined
       ? (body.title_override === null || body.title_override === '' ? null : String(body.title_override))
       : undefined;
-    const item = updateWorkBoardItem(externalId, { done, pinned, title_override: titleOverride });
+    // importance: 1|2|3 to override, explicit null to fall back to the auto level.
+    let importance: 1 | 2 | 3 | null | undefined;
+    if (body.importance !== undefined) {
+      if (body.importance === null) {
+        importance = null;
+      } else {
+        const n = Number(body.importance);
+        if (n !== 1 && n !== 2 && n !== 3) {
+          sendError(res, 400, 'invalid_request', 'importance must be 1, 2, 3, or null');
+          return;
+        }
+        importance = n as 1 | 2 | 3;
+      }
+    }
+    const watch = typeof body.watch === 'boolean' ? body.watch : undefined;
+    const item = updateWorkBoardItem(externalId, {
+      done,
+      pinned,
+      title_override: titleOverride,
+      importance,
+      watch,
+    });
     if (!item) {
       sendError(res, 404, 'conversation_not_found', `no conversation found for ${externalId}`);
       return;

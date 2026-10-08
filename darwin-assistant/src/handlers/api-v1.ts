@@ -7327,7 +7327,7 @@ export function createApiV1Router(): Router {
   }
 
   const DEFAULT_PRESETS: ModelPreset[] = [
-    { id: 'anthropic-opus', name: 'Anthropic / Opus', adapter: 'claude', model: 'claude-opus-4-8', options: { thinking: 'high' } },
+    { id: 'anthropic-opus', name: 'Anthropic / Opus', adapter: 'claude', model: 'claude-opus-4-8', options: { reasoning_effort: 'high' } },
     { id: 'codex', name: 'Codex', adapter: 'codex', model: 'gpt-5.1-codex', options: {} },
   ];
 

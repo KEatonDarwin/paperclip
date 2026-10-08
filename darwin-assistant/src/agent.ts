@@ -265,7 +265,10 @@ const ADAPTERS: Record<string, AdapterConfig> = {
       { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
     ],
     optionsSchema: [
-      { key: 'thinking', label: 'Thinking level', type: 'enum', values: ['low', 'medium', 'high', 'xhigh', 'max'], default: 'high' },
+      // Unified key across all adapters that expose a reasoning-effort control
+      // (claude, codex, auggie). Devin's CLI has no equivalent flag so it stays
+      // without an entry. The claude value set matches `claude --effort`.
+      { key: 'reasoning_effort', label: 'Reasoning effort', type: 'enum', values: ['low', 'medium', 'high', 'xhigh', 'max'], default: 'high' },
     ],
     runtime: {
       provider: 'anthropic',
@@ -287,7 +290,13 @@ const ADAPTERS: Record<string, AdapterConfig> = {
       const args = ['--print', '-', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
       if (model) args.push('--model', model);
       if (sessionId) args.push('--resume', sessionId);
-      if (options?.thinking && typeof options.thinking === 'string') args.push('--effort', options.thinking);
+      // Prefer the unified `reasoning_effort` key; fall back to the legacy
+      // `thinking` key so presets saved before the rename keep working.
+      const claudeEffort =
+        (typeof options?.reasoning_effort === 'string' && options.reasoning_effort) ||
+        (typeof options?.thinking === 'string' && options.thinking) ||
+        null;
+      if (claudeEffort) args.push('--effort', claudeEffort);
       // DAR-744: give the local claude CLI read access to attached-image temp
       // dirs so it can open the absolute paths referenced in the prompt (see
       // vision-critique.ts for the same working pattern).
@@ -306,6 +315,12 @@ const ADAPTERS: Record<string, AdapterConfig> = {
     models: [
       { id: 'gpt-5.5', label: 'GPT-5.5' },
     ],
+    optionsSchema: [
+      // Codex accepts the full OpenAI ladder via `-c model_reasoning_effort=…`.
+      // The underlying model clamps unsupported values server-side; we expose
+      // the superset so GPT-5-class and GPT-5.5-class models both work.
+      { key: 'reasoning_effort', label: 'Reasoning effort', type: 'enum', values: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'], default: 'medium' },
+    ],
     runtime: {
       provider: 'openai',
       providerLabel: 'OpenAI',
@@ -322,7 +337,7 @@ const ADAPTERS: Record<string, AdapterConfig> = {
       // incremental deltas (see codexMapStreamEvent), so streamingText is false.
       capabilities: { tools: true, mcp: true, streamingText: false, structuredOutput: false, webSearch: false },
     },
-    buildArgs({ sessionId, model, imagePaths }) {
+    buildArgs({ sessionId, model, options, imagePaths }) {
       const args: string[] = ['exec'];
       if (sessionId) args.push('resume', sessionId);
       args.push(
@@ -331,6 +346,11 @@ const ADAPTERS: Record<string, AdapterConfig> = {
         '--skip-git-repo-check',
       );
       if (model) args.push('-m', model);
+      // Reasoning effort rides on codex's generic config-override flag — there
+      // is no dedicated `--reasoning-effort` on `codex exec`.
+      if (typeof options?.reasoning_effort === 'string' && options.reasoning_effort) {
+        args.push('-c', `model_reasoning_effort=${options.reasoning_effort}`);
+      }
       // DAR-745: codex's own image flag, one per attached file (unlike claude's
       // --add-dir, codex wants the file paths themselves, not a containing dir).
       for (const p of imagePaths ?? []) args.push('-i', p);
@@ -349,6 +369,11 @@ const ADAPTERS: Record<string, AdapterConfig> = {
     models: [
       { id: 'default', label: 'Default' },
     ],
+    optionsSchema: [
+      // Auggie's `--reasoning-effort` is validated server-side with no local
+      // choice list — low/medium/high are the universally-supported rungs.
+      { key: 'reasoning_effort', label: 'Reasoning effort', type: 'enum', values: ['low', 'medium', 'high'], default: 'medium' },
+    ],
     runtime: {
       provider: 'augment',
       providerLabel: 'Augment',
@@ -363,10 +388,13 @@ const ADAPTERS: Record<string, AdapterConfig> = {
       },
       capabilities: { tools: true, mcp: false, streamingText: false, structuredOutput: false, webSearch: false },
     },
-    buildArgs({ sessionId, model, imagePaths }) {
+    buildArgs({ sessionId, model, options, imagePaths }) {
       const args = ['--print', '--output-format', 'json'];
       if (sessionId) args.push('--resume', sessionId);
       if (model && model !== 'default') args.push('--model', model);
+      if (typeof options?.reasoning_effort === 'string' && options.reasoning_effort) {
+        args.push('--reasoning-effort', options.reasoning_effort);
+      }
       // DAR-745: auggie's own image flag, one per attached file.
       for (const p of imagePaths ?? []) args.push('--image', p);
       return args;

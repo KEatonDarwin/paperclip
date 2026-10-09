@@ -119,11 +119,67 @@ Idempotent by construction — a second run adds nothing:
    auto rows appearing beneath it. Project name = the link's label, else the
    owning thread's title, else the page key.
 
+## The deny list (v0.2 — tree `tree-b0198a82`, node #1584)
+
+Hosts and endpoints the companion must **never** ask about. This table is the
+ONE source of truth for "may this page ever be looked up or registered", it
+gates every entry point *before* the registry or `thread_links` is consulted,
+and it is mirrored in three places that are proven identical by tests:
+
+| copy | where |
+|---|---|
+| server | `src/page-companion.ts` — `DENIED_HOSTS`, `DENIED_PATH_PREFIXES`, `DENY_ANY_QUERY_STRING`, `isDeniedPageUrl`, `isDeniedPagePattern` |
+| extension logic | `page-companion-extension/src/config.js` — same names, plus `shouldAskAboutUrl` |
+| content script | `page-companion-extension/src/content.js`, inline between `deny-mirror:begin/end` (MV3 content scripts cannot import) |
+
+The rules:
+
+- **(a) host** — exactly `thedarwinhub.com` and `www.thedarwinhub.com` (Hub 1.0),
+  any port, case-insensitive, trailing dot tolerated. 🔴 **An EXACT hostname
+  match, never a domain suffix.** `intake.thedarwinhub.com`,
+  `staging.intake.thedarwinhub.com` and `accounting.thedarwinhub.com` are
+  subdomains of it and are **in scope** — an `endsWith('thedarwinhub.com')`
+  check here kills the whole feature. Both halves are asserted in one test.
+- **(b) path, on every host** — `/track` and `/api`, matched on a path-segment
+  boundary (`/track/test` denied, `/tracking-dashboard` **not**). The live
+  lead/click machinery and the internal APIs.
+- **(c) query string** — any URL carrying one is denied, on every host.
+  Hub-family admin pages write on a bare `?param=` GET and the canonical key
+  drops the query anyway. **Known cost:** a dashboard reached as
+  `…/leaks?brand=x` has no companion button until Kevin lands on the
+  query-free URL. Narrowing this to a host list is a one-line change in each
+  of the three copies.
+- **(d)** non-http(s) and unparseable URLs stay refused, as before.
+
+Why Hub 1.0 is out permanently (Kevin, 2026-10-09): page-to-chat mapping has no
+value where the chats are about breakage and running numbers rather than editing
+the page, and ~51 Hub 1.0 pages write to the live DB on a bare `?param=` GET.
+
+How a deny behaves at each entry point:
+
+| entry point | denied behaviour |
+|---|---|
+| `POST /lookup` | **200** with the ordinary miss — `{ours:false, project:null, registry_id:null, threads:[], normalized_url:null}`. Never an error, never a distinct status: the extension asks about every page, so a deny that looked different from a miss would itself leak a signal about the page. A pre-existing registry row or thread link for a denied key **cannot** resurrect it — the gate runs first. |
+| `POST /registry` | **400 `denied_url_pattern`**. A loud refusal on purpose: this caller is Kevin or JARVIS registering on purpose, so a silent no-op would be worse. Wildcards are stripped before the check, so `…/track*` is denied. A denied page can never be registered by hand. |
+| `POST /new-chat` | **400**, the *same* `invalid_url` a bad URL gets, and no thread is created (a page chat writes a `thread_links` row, which is exactly how a page would otherwise auto-register on the next seed). |
+| seeding | denied manual seed rows and denied thread links are skipped — no auto row. |
+| extension | `shouldAskAboutUrl` in `background.js` (`lookup` *and* `newChat`, before any fetch) and the inline mirror in `content.js` `ask()`, before `chrome.runtime.sendMessage`. A denied page never even generates a request. |
+
 ## Tests
 
 Hermetic, no live DB, no network, no model calls:
 
 ```
-npm run page-companion:check        # 31 unit tests  (scripts/page-companion-check.mjs)
-npm run page-companion:route-check  # 55 route tests (the real Express router over HTTP)
+npm run page-companion:check        # 47 unit tests  (scripts/page-companion-check.mjs)
+npm run page-companion:route-check  # 86 route tests (the real Express router over HTTP)
 ```
+
+Extension side, from `page-companion-extension/`: `npm test` — 26 tests, of
+which 10 are the deny list (`test/deny.test.mjs`).
+
+The deny cases live in ONE shared table, `page-companion-extension/test/deny-cases.mjs`
+(50 URL cases + 16 pattern cases), read by all three suites — that is what keeps
+the three copies honest. Each deny test was proven to FAIL against the wrong
+implementation: suffix-match host deny, bare-`startsWith` path deny, the registry
+upsert refusal removed, the `lookupPage` gate removed, and the `content.js`
+`ask()` gate removed.

@@ -90,7 +90,11 @@ for (const [method, p, body] of [
 
 console.log('\nPOST /page-companion/lookup');
 {
-  const r = await call('POST', '/page-companion/lookup', { url: `${PAGE}/?tab=de#x` });
+  // NOTE (node #1584): was `${PAGE}/?tab=de#x`. Deny rule (c) refuses any query
+  // string, so the surface-form proof keeps the hash and the trailing slash
+  // (both still collapse into the canonical key) and drops the query; the
+  // denied `?tab=` form is asserted in the deny-list section below.
+  const r = await call('POST', '/page-companion/lookup', { url: `${PAGE}/#x` });
   eq('200', r.status, 200);
   t('ours:true from the thread_links reverse match', r.body.ours === true, JSON.stringify(r.body));
   eq('registry_id null (no registry row yet)', r.body.registry_id, null);
@@ -112,7 +116,9 @@ console.log('\nPOST /page-companion/lookup');
   eq('a non-page URL 200s (the extension asks about every page)', junk.status, 200);
   eq('…with ours:false', junk.body.ours, false);
 
-  const vault = await call('POST', '/page-companion/lookup', { url: 'http://192.168.1.25:8080/settings/vault?file=outbox/x.md' });
+  // Query-free on purpose (node #1584): with a query string the deny list would
+  // answer first and this would stop proving the vault-link exclusion.
+  const vault = await call('POST', '/page-companion/lookup', { url: 'http://192.168.1.25:8080/settings/vault' });
   eq('a vault-viewer link is never ours', vault.body.ours, false);
   eq('…and lists no threads', vault.body.threads.length, 0);
 
@@ -158,7 +164,10 @@ console.log('\nPOST /page-companion/registry');
 
 console.log('\nPOST /page-companion/new-chat');
 {
-  const r = await call('POST', '/page-companion/new-chat', { url: `${PAGE}/detail?x=1` });
+  // NOTE (node #1584): was `${PAGE}/detail?x=1`. Deny rule (c) refuses any query
+  // string, so new-chat is driven from the query-free URL; the denied form is
+  // asserted in the deny-list section below.
+  const r = await call('POST', '/page-companion/new-chat', { url: `${PAGE}/detail` });
   eq('201', r.status, 201);
   t('external_id is cockpit:page-<uuid>', /^cockpit:page-[0-9a-f-]{36}$/.test(r.body.external_id ?? ''), r.body.external_id);
   eq('project inherited from the registry row', r.body.project, 'Ad Review Board v2');
@@ -167,7 +176,7 @@ console.log('\nPOST /page-companion/new-chat');
   t('the conversation row exists', !!conv);
   const links = listThreadLinks(conv.id);
   eq('exactly one thread_links row', links.length, 1);
-  eq('…pointing at the page', links[0].url, `${PAGE}/detail?x=1`);
+  eq('…pointing at the page', links[0].url, `${PAGE}/detail`);
 
   const relookup = await call('POST', '/page-companion/lookup', { url: `${PAGE}/detail` });
   t('the new chat is listed on the very next lookup',
@@ -182,6 +191,68 @@ console.log('\nPOST /page-companion/new-chat');
     const bad = await call('POST', '/page-companion/new-chat', body);
     eq(`bad url → 400, no junk thread (${JSON.stringify(body)})`, bad.status, 400);
   }
+}
+
+console.log('\nthe deny list — over the real HTTP routes');
+{
+  // A denied page is an ordinary 200 miss on the lookup route — same status,
+  // same body shape a chrome:// page gets. Nothing on the wire distinguishes a
+  // deny from "not registered", by design.
+  for (const url of [
+    'https://thedarwinhub.com/wp-admin/admin.php?action=delete',
+    'https://www.thedarwinhub.com/',
+    'https://intake.thedarwinhub.com/track/test',
+    'http://192.168.1.25:8096/api/v1/x',
+    `${PAGE}/detail?x=1`,
+  ]) {
+    const d = await call('POST', '/page-companion/lookup', { url });
+    eq(`denied lookup 200s (${url})`, d.status, 200);
+    t(`…as the ordinary miss (${url})`,
+      d.body.ours === false && d.body.project === null && d.body.registry_id === null
+        && d.body.normalized_url === null && Array.isArray(d.body.threads) && d.body.threads.length === 0,
+      JSON.stringify(d.body));
+  }
+
+  // An in-scope subdomain of the denied host still works end to end — the
+  // regression a suffix-match deny would cause, caught at the route level.
+  const reg = await call('POST', '/page-companion/registry', {
+    url_pattern: 'intake.thedarwinhub.com/*', project: 'Intake Dashboards',
+  });
+  eq('an in-scope intake pattern registers (201)', reg.status, 201);
+  const inScope = await call('POST', '/page-companion/lookup', { url: 'https://intake.thedarwinhub.com/suppression-dashboard' });
+  eq('…and an intake dashboard is ours', inScope.body.ours, true);
+  eq('…with the project name', inScope.body.project, 'Intake Dashboards');
+
+  // The registry route refuses a denied pattern — a denied page can never be
+  // registered by hand later either.
+  for (const url_pattern of [
+    'thedarwinhub.com/*',
+    'www.thedarwinhub.com/wp-admin/*',
+    'intake.thedarwinhub.com/track*',
+    'intake.thedarwinhub.com/api/*',
+    'intake.thedarwinhub.com/dash?x=1',
+  ]) {
+    const bad = await call('POST', '/page-companion/registry', { url_pattern, project: 'Should Not Exist' });
+    eq(`registry refuses a denied pattern → 400 (${url_pattern})`, bad.status, 400);
+    eq('…with the denied code', bad.body.error?.code ?? bad.body.code, 'denied_url_pattern');
+  }
+  const stored = (await call('GET', '/page-companion/registry')).body.pages.map((x) => x.url_pattern);
+  t('nothing denied reached the table',
+    !stored.some((x) => x === 'thedarwinhub.com/*' || x.startsWith('www.thedarwinhub.com') || x.includes('/track') || x.includes('/api')),
+    JSON.stringify(stored));
+
+  // new-chat refuses a denied URL and creates no thread.
+  const convsBefore = (await call('GET', '/page-companion/registry')).status === 200;
+  for (const url of [
+    'https://thedarwinhub.com/wp-admin/admin.php',
+    'https://intake.thedarwinhub.com/track',
+    'https://intake.thedarwinhub.com/suppression-dashboard?brand=7',
+  ]) {
+    const bad = await call('POST', '/page-companion/new-chat', { url });
+    eq(`new-chat refuses a denied URL → 400 (${url})`, bad.status, 400);
+    t('…and returns no external_id', !bad.body.external_id, JSON.stringify(bad.body));
+  }
+  t('sanity: the registry route is still alive', convsBefore);
 }
 
 console.log('\nPOST /page-companion/seed');

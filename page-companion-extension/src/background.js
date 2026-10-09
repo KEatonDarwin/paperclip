@@ -5,7 +5,7 @@
 // would publish it to whatever page Kevin happens to be on. They ask, we fetch.
 
 import {
-  endpointFor, isAskableUrl, pageKey, badgeLabel, normalizeLookup, withDefaults, normalizeBase,
+  endpointFor, shouldAskAboutUrl, pageKey, badgeLabel, normalizeLookup, withDefaults, normalizeBase,
 } from './config.js';
 
 const MSG_LOOKUP = 'page-companion:lookup';
@@ -37,7 +37,14 @@ function cached(key) {
 }
 
 async function lookup(url) {
-  if (!isAskableUrl(url)) return { ours: false, project: null, registry_id: null, normalized_url: null, threads: [] };
+  // THE DENY GATE. A denied page (Hub 1.0, /track*, /api/*, anything with a
+  // query string — see config.js) gets the ordinary miss without a network call
+  // ever being made, so it is indistinguishable from a page that simply isn't
+  // registered. The content script refuses first; this is the backstop for any
+  // other caller of the worker.
+  if (!shouldAskAboutUrl(url)) {
+    return { ours: false, project: null, registry_id: null, normalized_url: null, threads: [] };
+  }
 
   const key = pageKey(url);
   const hit = key ? cached(key) : null;
@@ -74,6 +81,7 @@ async function lookup(url) {
 // Starts a page-scoped chat server-side (zero model calls — see CONTRACT.md)
 // and invalidates that page's lookup cache so the next lookup lists it.
 async function newChat(url, project) {
+  if (!shouldAskAboutUrl(url)) throw new Error('Page Companion does not operate on this page');
   const cfg = await settings();
   if (!cfg.enabled) throw new Error('Page Companion is switched off in options');
 

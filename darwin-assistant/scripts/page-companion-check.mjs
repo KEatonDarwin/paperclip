@@ -42,6 +42,14 @@ const { setPreviewLink, addThreadLink, listThreadLinks } =
   await import(path.join(distDir, 'thread-links.js'));
 const PC = await import(path.join(distDir, 'page-companion.js'));
 
+// The deny list lives in THREE copies (server TS, extension config.js, and an
+// inline mirror in content.js). This script is the only place that can import
+// the first two at once, so the TS↔JS drift check lives here; the
+// config.js↔content.js half lives in page-companion-extension/test/deny.test.mjs.
+const extRoot = path.join(__dirname, '..', '..', 'page-companion-extension');
+const EXT = await import(path.join(extRoot, 'src', 'config.js'));
+const { DENY_CASES, DENY_PATTERN_CASES } = await import(path.join(extRoot, 'test', 'deny-cases.mjs'));
+
 let passed = 0;
 function ok(name) {
   passed += 1;
@@ -183,7 +191,10 @@ console.log('\nlookupPage — thread_links reverse match');
   addThreadLink(unrelated.id, 'http://192.168.1.25:8096/other', 'other page');
   addTurnAt(unrelated.id, 'user', 'nope', hoursAgoStr(2));
 
-  const r = PC.lookupPage('http://192.168.1.25:8096/ad-review?from=extension');
+  // NOTE (node #1584): this used to be looked up as `…/ad-review?from=extension`.
+  // Deny rule (c) refuses ANY query string, so the query-free form is what the
+  // extension asks about now; the denied form is asserted below.
+  const r = PC.lookupPage('http://192.168.1.25:8096/ad-review');
   assert.equal(r.ours, true, 'a linked page is ours even with no registry row');
   assert.equal(r.registry_id, null);
   assert.equal(r.project, null);
@@ -196,6 +207,13 @@ console.log('\nlookupPage — thread_links reverse match');
   assert.equal(r.threads[0].title, 'Ad review follow-up');
   assert.ok(r.threads[0].last_active > r.threads[1].last_active);
   ok('reverse lookup matches across URL surface forms and orders by activity');
+
+  // …and the same page carrying a query string is now the ordinary miss — the
+  // known cost of deny rule (c), asserted here so it can never be a surprise.
+  assert.deepEqual(PC.lookupPage('http://192.168.1.25:8096/ad-review?from=extension'), {
+    ours: false, project: null, registry_id: null, threads: [], normalized_url: null,
+  }, 'deny rule (c): a query string makes even a linked page a miss');
+  ok('a linked page reached with a query string is denied (rule (c))');
 
   // Two links on one thread pointing at the same page must not list it twice.
   addThreadLink(newer.id, PAGE, 'again');
@@ -232,7 +250,9 @@ console.log('\nvault-viewer links');
   clearRegistry();
   const vaulty = getOrCreateConversation('cockpit:pc-vault');
   addThreadLink(vaulty.id, 'http://192.168.1.25:8080/settings/vault?file=outbox/report.md', 'report');
-  const r = PC.lookupPage('http://192.168.1.25:8080/settings/vault?file=outbox/report.md');
+  // Query-free on purpose (node #1584): with a query string the deny list would
+  // answer first and this test would stop proving the vault-link exclusion.
+  const r = PC.lookupPage('http://192.168.1.25:8080/settings/vault');
   assert.equal(r.ours, false, 'the vault viewer itself is never claimed as a built page');
   assert.deepEqual(r.threads, []);
   ok('a thread whose only link is a vault link never makes a page ours');
@@ -252,12 +272,17 @@ console.log('\nlookupPage — registry + primary thread');
     primary_thread_ext: 'cockpit:pc-heartbeat-owner',
   });
 
-  const r = PC.lookupPage('http://192.168.1.25:8100/anything/deep?x=1');
+  const r = PC.lookupPage('http://192.168.1.25:8100/anything/deep');
   assert.equal(r.ours, true);
   assert.equal(r.project, 'Hub 1.0 Heartbeat');
   assert.equal(r.registry_id, row.id);
   assert.deepEqual(r.threads.map((t) => t.external_id), ['cockpit:pc-heartbeat-owner']);
   ok('a registry prefix row claims the page and surfaces its owning chat');
+
+  // Same row, same page, a query string: denied (rule (c)) rather than matched.
+  assert.equal(PC.lookupPage('http://192.168.1.25:8100/anything/deep?x=1').ours, false,
+    'deny rule (c) outranks a matching registry row');
+  ok('a registry-covered page with a query string is still denied');
 
   // A registry row with a dangling owner must still be `ours`, just thread-less.
   PC.upsertPageRegistry({ url_pattern: 'http://192.168.1.25:8101/*', project: 'Orphan', primary_thread_ext: 'cockpit:does-not-exist' });
@@ -301,7 +326,10 @@ console.log('\ncreatePageChat');
   clearRegistry();
   PC.upsertPageRegistry({ url_pattern: 'http://192.168.1.25:8094/*', project: 'Circle & Flip' });
 
-  const made = PC.createPageChat('http://192.168.1.25:8094/flip?tab=a');
+  // NOTE (node #1584): this used to be `…/flip?tab=a`. Deny rule (c) refuses any
+  // URL carrying a query string, so the query-free form is what a page chat is
+  // created from now; the denied form is asserted below.
+  const made = PC.createPageChat('http://192.168.1.25:8094/flip');
   assert.match(made.external_id, /^cockpit:page-[0-9a-f-]{36}$/, 'external_id is cockpit:page-<uuid>');
   assert.equal(made.project, 'Circle & Flip', 'project inferred from the registry when not passed');
 
@@ -315,13 +343,13 @@ console.log('\ncreatePageChat');
     .all(conv.id);
   assert.equal(turns.length, 1, 'exactly one seeded turn — zero model calls');
   assert.equal(turns[0].role, 'assistant');
-  assert.ok(turns[0].content.includes('http://192.168.1.25:8094/flip?tab=a'), 'the page URL is pinned');
+  assert.ok(turns[0].content.includes('http://192.168.1.25:8094/flip'), 'the page URL is pinned');
   assert.ok(turns[0].content.includes('Circle & Flip'), 'the project name is pinned');
 
   const links = listThreadLinks(conv.id);
   assert.equal(links.length, 1);
   assert.equal(links[0].kind, 'preview');
-  assert.equal(links[0].url, 'http://192.168.1.25:8094/flip?tab=a');
+  assert.equal(links[0].url, 'http://192.168.1.25:8094/flip');
   ok('new-chat creates the conversation, pins the page, and writes the link row');
 
   // The whole point: the next lookup on that page lists the chat it created.
@@ -393,6 +421,159 @@ console.log('\nseedPageRegistry');
   assert.equal(bare.ours, true);
   assert.equal(bare.project, 'Engine Docs');
   ok('a seeded dashboard answers ours:true before any chat links it');
+}
+
+// ── 10. THE DENY LIST — the safety gate (tree-b0198a82, node #1584) ───────
+console.log('\nthe deny list');
+{
+  // 🔴 THE TEST THAT FAILS ON A SUFFIX-MATCH IMPLEMENTATION. The bare Hub 1.0
+  // host is denied AND its subdomains are allowed, asserted together — an
+  // `endsWith('thedarwinhub.com')` deny passes the first two lines and fails
+  // every line after, which is the whole feature.
+  assert.equal(PC.isDeniedPageUrl('https://thedarwinhub.com/anything'), true, 'Hub 1.0 is denied');
+  assert.equal(PC.isDeniedPageUrl('https://www.thedarwinhub.com/anything'), true, 'Hub 1.0 www is denied');
+  for (const host of [
+    'intake.thedarwinhub.com',
+    'staging.intake.thedarwinhub.com',
+    'accounting.thedarwinhub.com',
+    'perclickity.thedarwinhub.com',
+  ]) {
+    assert.equal(PC.isDeniedPageUrl(`https://${host}/dashboard`), false,
+      `${host} is IN SCOPE — a suffix-match deny would kill the whole feature`);
+  }
+  assert.equal(PC.isDeniedHost('thedarwinhub.com'), true);
+  assert.equal(PC.isDeniedHost('intake.thedarwinhub.com'), false);
+  ok('host deny is an EXACT match, not a domain suffix (subdomains stay in scope)');
+
+  assert.equal(PC.isDeniedPath('/track'), true);
+  assert.equal(PC.isDeniedPath('/track/test'), true);
+  assert.equal(PC.isDeniedPath('/api/v1/x'), true);
+  assert.equal(PC.isDeniedPath('/tracking-dashboard'), false, 'a bare startsWith() would wrongly deny this');
+  assert.equal(PC.isDeniedPath('/apiary'), false, 'a bare startsWith() would wrongly deny this');
+  assert.equal(PC.isDeniedPageUrl('http://192.168.1.25:8100/api/v1/x'), true, 'LAN hosts are not exempt');
+  ok('path deny is segment-bounded and applies on every host');
+
+  assert.equal(PC.isDeniedPageUrl('https://intake.thedarwinhub.com/dash?brand=7'), true);
+  assert.equal(PC.isDeniedPageUrl('https://intake.thedarwinhub.com/dash'), false);
+  assert.equal(PC.isDeniedPageUrl('https://intake.thedarwinhub.com/dash#tab'), false, 'a hash is not a query');
+  ok('any query string denies the URL (rule (c))');
+
+  for (const c of DENY_CASES) {
+    assert.equal(PC.isDeniedPageUrl(c.url), c.denied, `${JSON.stringify(c.url)} — ${c.why}`);
+  }
+  ok(`the server answers all ${DENY_CASES.length} shared deny cases`);
+
+  // ── the TS ↔ JS drift check: same lists, same answers.
+  assert.deepEqual([...PC.DENIED_HOSTS], [...EXT.DENIED_HOSTS], 'host lists must be identical');
+  assert.deepEqual([...PC.DENIED_PATH_PREFIXES], [...EXT.DENIED_PATH_PREFIXES], 'path lists must be identical');
+  assert.equal(PC.DENY_ANY_QUERY_STRING, EXT.DENY_ANY_QUERY_STRING, 'the query rule must be identical');
+  assert.deepEqual([...PC.DENIED_HOSTS], ['thedarwinhub.com', 'www.thedarwinhub.com']);
+  assert.deepEqual([...PC.DENIED_PATH_PREFIXES], ['/track', '/api']);
+  ok('the server and the extension carry byte-identical deny lists');
+
+  for (const c of DENY_CASES) {
+    assert.equal(PC.isDeniedPageUrl(c.url), EXT.isDeniedUrl(c.url),
+      `server and extension disagree on ${JSON.stringify(c.url)} — ${c.why}`);
+  }
+  ok('…and answer every shared case identically');
+
+  // ── patterns: the deny list is the one source of truth for "registerable".
+  for (const c of DENY_PATTERN_CASES) {
+    assert.equal(PC.isDeniedPagePattern(c.pattern), c.denied, `${JSON.stringify(c.pattern)} — ${c.why}`);
+  }
+  ok(`pattern deny answers all ${DENY_PATTERN_CASES.length} shared pattern cases`);
+}
+
+console.log('\nthe deny list — gates on the real entry points');
+{
+  clearRegistry();
+
+  // A denied URL is the ORDINARY miss: ours:false, no error, and deliberately
+  // the same `normalized_url:null` shape a chrome:// page gets, so nothing
+  // downstream can tell a deny from a miss.
+  for (const url of [
+    'https://thedarwinhub.com/wp-admin/admin.php?action=delete',
+    'https://intake.thedarwinhub.com/track/test',
+    'http://192.168.1.25:8100/api/v1/x',
+    'http://192.168.1.25:8095/leaks?brand=x',
+  ]) {
+    const r = PC.lookupPage(url);
+    assert.deepEqual(r, { ours: false, project: null, registry_id: null, threads: [], normalized_url: null },
+      `denied lookup must be the ordinary miss: ${url}`);
+  }
+  ok('lookupPage answers a denied URL with the ordinary ours:false miss');
+
+  // …even when a row and a linked chat exist for that key. The gate runs BEFORE
+  // the registry and before thread_links, so an older row can't resurrect a
+  // denied page. (The row is inserted straight through SQL precisely because
+  // upsertPageRegistry now refuses to create one.)
+  sqliteDb
+    .prepare(`INSERT INTO page_registry (url_pattern, project, source) VALUES (?, ?, 'manual')`)
+    .run('thedarwinhub.com/*', 'Legacy Hub 1.0 row');
+  const legacy = PC.lookupPage('https://thedarwinhub.com/anything');
+  assert.equal(legacy.ours, false, 'a pre-existing denied row must not make the page ours');
+  assert.equal(legacy.registry_id, null);
+  assert.equal(legacy.project, null);
+  assert.ok(PC.matchPageRegistry('thedarwinhub.com/anything'), 'the row really does match — the gate is what refuses');
+  ok('the gate runs before the registry, so a legacy denied row cannot resurrect a page');
+  sqliteDb.prepare(`DELETE FROM page_registry WHERE url_pattern = 'thedarwinhub.com/*'`).run();
+
+  // An in-scope page on the same domain still works — the regression this whole
+  // test file exists to prevent.
+  PC.upsertPageRegistry({ url_pattern: 'intake.thedarwinhub.com/*', project: 'Intake Dashboards' });
+  const inScope = PC.lookupPage('https://intake.thedarwinhub.com/suppression-dashboard');
+  assert.equal(inScope.ours, true, 'the intake host is in scope and must still match');
+  assert.equal(inScope.project, 'Intake Dashboards');
+  assert.equal(inScope.normalized_url, 'intake.thedarwinhub.com/suppression-dashboard');
+  ok('an in-scope subdomain of the denied host still registers and still matches');
+
+  // REGISTRY UPSERT REFUSAL — a denied page cannot be registered by hand later.
+  for (const c of DENY_PATTERN_CASES.filter((x) => x.denied)) {
+    assert.throws(
+      () => PC.upsertPageRegistry({ url_pattern: c.pattern, project: 'Should Not Exist' }),
+      (err) => err?.code === 'denied_url_pattern' && err?.status === 400,
+      `upsert must refuse ${JSON.stringify(c.pattern)} — ${c.why}`,
+    );
+  }
+  const stored = PC.listPageRegistry().map((r) => r.url_pattern);
+  for (const c of DENY_PATTERN_CASES.filter((x) => x.denied)) {
+    assert.ok(!stored.some((pat) => pat.includes('thedarwinhub.com/track') || pat.startsWith('thedarwinhub.com')),
+      `nothing denied reached the table (saw ${JSON.stringify(stored)})`);
+  }
+  ok('upsertPageRegistry refuses every denied pattern — a denied page can never be registered');
+
+  // …and an allowed pattern still stores, so the refusal isn't blanket.
+  const good = PC.upsertPageRegistry({ url_pattern: 'accounting.thedarwinhub.com/*', project: 'Accounting' });
+  assert.equal(good.url_pattern, 'accounting.thedarwinhub.com/*');
+  ok('an allowed pattern still registers normally');
+
+  // NEW-CHAT REFUSAL, with the same error a bad URL gets (no distinct signal).
+  const convsBefore = sqliteDb.prepare(`SELECT COUNT(*) AS n FROM conversations`).get().n;
+  for (const url of [
+    'https://thedarwinhub.com/wp-admin/admin.php',
+    'https://intake.thedarwinhub.com/track',
+    'https://intake.thedarwinhub.com/suppression-dashboard?brand=7',
+  ]) {
+    assert.throws(() => PC.createPageChat(url), /invalid_url|url must be/, `new-chat must refuse ${url}`);
+  }
+  assert.equal(sqliteDb.prepare(`SELECT COUNT(*) AS n FROM conversations`).get().n, convsBefore,
+    'not one junk conversation was created');
+  ok('createPageChat refuses a denied URL and creates no thread');
+
+  // SEEDING: a stray thread link to a denied page must not auto-register it.
+  clearRegistry();
+  const hubConv = getOrCreateConversation('cockpit:pc-deny-seed');
+  addThreadLink(hubConv.id, 'https://thedarwinhub.com/wp-admin/admin.php', 'Hub 1.0 admin');
+  addThreadLink(hubConv.id, 'https://intake.thedarwinhub.com/track/test', 'track test');
+  addThreadLink(hubConv.id, 'http://192.168.1.25:8077/dash?brand=1', 'a dashboard with a query');
+  addThreadLink(hubConv.id, 'http://192.168.1.25:8078/clean-dash', 'a clean dashboard');
+  PC.seedPageRegistry();
+  const patterns = PC.listPageRegistry().map((r) => r.url_pattern);
+  assert.ok(!patterns.some((x) => x.startsWith('thedarwinhub.com')), 'no Hub 1.0 auto row');
+  assert.ok(!patterns.some((x) => x.includes('/track')), 'no /track auto row');
+  assert.ok(!patterns.some((x) => x === '192.168.1.25:8077/dash'), 'no auto row from a query-string link');
+  assert.ok(patterns.includes('192.168.1.25:8078/clean-dash'), 'an allowed link still auto-registers');
+  ok('seeding skips denied thread links and still auto-registers the allowed ones');
 }
 
 console.log(`\n[page-companion-check] ALL ${passed} tests passed ✅`);

@@ -88,6 +88,84 @@ export function withDefaults(stored) {
   };
 }
 
+// ─── THE DENY LIST — the safety gate (tree-b0198a82, node #1584) ─────────────
+//
+// MIRROR of darwin-assistant/src/page-companion.ts. Same hosts, same path
+// prefixes, same query rule — proven identical (lists AND behaviour) by
+// darwin-assistant/scripts/page-companion-check.mjs, which imports both files.
+// content.js carries a third inline copy between `deny-mirror:begin/end`
+// sentinels because MV3 content scripts cannot import; test/deny.test.mjs
+// proves that copy matches this one. Do not edit one without the others.
+//
+// This is what makes a denied page never even generate a request.
+
+/**
+ * Hub 1.0 — permanently out of scope (Kevin, 2026-10-09).
+ *
+ * 🔴 EXACT HOSTNAME MATCHES, NOT A DOMAIN SUFFIX. `intake.thedarwinhub.com`,
+ * `staging.intake.thedarwinhub.com` and `accounting.thedarwinhub.com` are
+ * subdomains of `thedarwinhub.com` and are IN SCOPE — an
+ * `endsWith('thedarwinhub.com')` check here kills the feature.
+ */
+export const DENIED_HOSTS = Object.freeze(['thedarwinhub.com', 'www.thedarwinhub.com']);
+
+/** Denied on EVERY host, on a path-segment boundary: the live lead/click
+ *  machinery and the internal APIs. `/tracking-dashboard` is NOT denied. */
+export const DENIED_PATH_PREFIXES = Object.freeze(['/track', '/api']);
+
+/** Any query string denies the URL, on every host — Hub-family admin pages
+ *  write on a bare `?param=` GET and the page key drops the query anyway. */
+export const DENY_ANY_QUERY_STRING = true;
+
+/** Exact-host deny check (see the DENIED_HOSTS warning). Case-insensitive. */
+export function isDeniedHost(hostname) {
+  if (typeof hostname !== 'string') return false;
+  const h = hostname.trim().toLowerCase().replace(/\.$/, '');
+  return DENIED_HOSTS.includes(h);
+}
+
+/** Path-prefix deny check, on a segment boundary. */
+export function isDeniedPath(pathname) {
+  if (typeof pathname !== 'string') return false;
+  const p = pathname.toLowerCase();
+  return DENIED_PATH_PREFIXES.some((prefix) => p === prefix || p.startsWith(`${prefix}/`));
+}
+
+/**
+ * Is this URL denied? True for anything the companion must not touch, including
+ * anything that isn't a parseable http(s) page URL — so one call is a complete
+ * gate. Mirrors the server's isDeniedPageUrl exactly, including the bare
+ * `host:8100/path` convenience form.
+ */
+export function isDeniedUrl(raw) {
+  if (typeof raw !== 'string') return true;
+  const trimmed = raw.trim();
+  if (!trimmed) return true;
+  const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed);
+  if (hasScheme && !/^https?:\/\//i.test(trimmed)) return true;
+  if (!hasScheme && trimmed.startsWith('/')) return true;
+  let u;
+  try {
+    u = new URL(hasScheme ? trimmed : `http://${trimmed}`);
+  } catch {
+    return true;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return true;
+  if (!u.hostname) return true;
+  if (isDeniedHost(u.hostname)) return true;
+  if (isDeniedPath(u.pathname)) return true;
+  if (DENY_ANY_QUERY_STRING && u.search) return true;
+  return false;
+}
+
+/**
+ * The one question the worker and the content script ask: do we touch this page
+ * at all? An http(s) page that the deny list allows — nothing else.
+ */
+export function shouldAskAboutUrl(raw) {
+  return isAskableUrl(raw) && !isDeniedUrl(raw);
+}
+
 /**
  * Should we even ask about this URL? The extension asks about every page Kevin
  * opens, but there is no point burning a round trip on a scheme the registry

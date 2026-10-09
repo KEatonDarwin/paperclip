@@ -86,9 +86,21 @@ xvfb-run -a node test/e2e-browser.mjs # 22 real-browser assertions
 Server side, from `darwin-assistant/`:
 
 ```
-npm run page-companion:check        # 31 unit tests (registry, lookup, seeding)
-npm run page-companion:route-check  # 55 route checks against the real router
+npm run page-companion:check        # 47 unit tests (registry, lookup, seeding, deny list)
+npm run page-companion:route-check  # 86 route checks against the real router
 ```
+
+## The deny list
+
+`src/config.js` carries the hosts/endpoints the companion must never ask about —
+Hub 1.0 (`thedarwinhub.com`, `www.thedarwinhub.com`, **exact hosts**, so
+`intake.`/`staging.intake.`/`accounting.` subdomains stay in scope), `/track*`
+and `/api/*` on any host, and any URL with a query string. `content.js` carries
+an inline copy (MV3 forbids imports) between `deny-mirror:begin/end` sentinels;
+the server carries a third in `darwin-assistant/src/page-companion.ts`. All
+three are proven identical by `test/deny.test.mjs` and the server's
+`page-companion:check`, over the shared table in `test/deny-cases.mjs`. **Edit
+all three or none.** Full rationale: `darwin-assistant/docs/page-companion/CONTRACT.md`.
 
 `test/e2e-browser.mjs` is the real proof: it mounts the **real** Express
 `/page-companion` router on a scratch `/tmp` sqlite DB, serves a registered and

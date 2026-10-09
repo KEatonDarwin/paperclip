@@ -73,20 +73,17 @@ sqliteDb.exec(`
 // ─── URL normalization ────────────────────────────────────────────────────────
 
 /**
- * The ONE canonical form every comparison happens in: `host[:port]/path`, with
- *   - the scheme dropped (http vs https is never a different page here),
- *   - the host lowercased (hosts are case-insensitive; PATHS ARE NOT, and are
- *     deliberately left as-is so `/Goals` and `/goals` stay distinct),
- *   - default ports dropped (`:80`/`:443`),
- *   - query string and hash dropped,
- *   - any trailing slash stripped (`host/` → `host`, `host/a/` → `host/a`).
+ * Parse a page URL the lenient way every other function here needs it.
  *
  * Returns null for anything that isn't an http(s) URL with a host — relative
  * links (`/settings/vault?file=…`), `chrome://`, `file://`, junk. A relative
  * link can't be resolved to a page without guessing a host, and guessing is
  * exactly how a lookup would start claiming pages that aren't ours.
+ *
+ * Kept separate from normalizePageUrl because the deny list has to see the
+ * parts normalization throws away (the query string).
  */
-export function normalizePageUrl(raw: unknown): string | null {
+export function parsePageUrl(raw: unknown): URL | null {
   if (typeof raw !== 'string') return null;
   const trimmed = raw.trim();
   if (!trimmed) return null;
@@ -106,12 +103,118 @@ export function normalizePageUrl(raw: unknown): string | null {
   }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
   if (!u.hostname) return null;
+  return u;
+}
+
+/**
+ * The ONE canonical form every comparison happens in: `host[:port]/path`, with
+ *   - the scheme dropped (http vs https is never a different page here),
+ *   - the host lowercased (hosts are case-insensitive; PATHS ARE NOT, and are
+ *     deliberately left as-is so `/Goals` and `/goals` stay distinct),
+ *   - default ports dropped (`:80`/`:443`),
+ *   - query string and hash dropped,
+ *   - any trailing slash stripped (`host/` → `host`, `host/a/` → `host/a`).
+ *
+ * Null for anything parsePageUrl refuses.
+ */
+export function normalizePageUrl(raw: unknown): string | null {
+  const u = parsePageUrl(raw);
+  if (!u) return null;
 
   const host = u.host.toLowerCase(); // URL already drops :80/:443
   let path = u.pathname;
   while (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
   if (path === '/') path = '';
   return `${host}${path}`;
+}
+
+// ─── THE DENY LIST — the safety gate (tree-b0198a82, node #1584) ─────────────
+//
+// Hosts and endpoints the companion must NEVER ask about. This table is the ONE
+// source of truth for "may this page ever be looked up or registered", and it is
+// mirrored byte-for-byte in page-companion-extension/src/config.js (and, because
+// MV3 content scripts can't import, once more inline in content.js between
+// `deny-mirror:begin/end` sentinels). All three copies are proven identical by
+// scripts/page-companion-check.mjs and page-companion-extension/test/deny.test.mjs
+// — do not edit one without the others.
+//
+// A denied URL answers the ordinary `ours:false` miss. Never an error, never a
+// distinct status: the extension asks about every page Kevin opens, so a deny
+// that looked different from a miss would itself be a signal about the page.
+
+/**
+ * Hub 1.0 — permanently out of scope (Kevin, 2026-10-09). Page-to-chat mapping
+ * has no value where the chats are about breakage and running numbers rather
+ * than editing the page, AND ~51 Hub 1.0 pages WRITE TO THE LIVE DB on a bare
+ * `?param=` GET.
+ *
+ * 🔴 EXACT HOSTNAME MATCHES, NOT A DOMAIN SUFFIX. `intake.thedarwinhub.com`,
+ * `staging.intake.thedarwinhub.com` and `accounting.thedarwinhub.com` are
+ * subdomains of `thedarwinhub.com` and are the whole point of this tree — they
+ * are IN SCOPE. An `endsWith('thedarwinhub.com')` check here kills the feature.
+ * Port is irrelevant to the match (same origin, different listener).
+ */
+export const DENIED_HOSTS: readonly string[] = ['thedarwinhub.com', 'www.thedarwinhub.com'];
+
+/**
+ * Denied on EVERY host: the live lead/click machinery and the internal APIs.
+ * Matched on a path-segment boundary — `/track` and `/track/…` are denied,
+ * `/tracking-dashboard` is not.
+ */
+export const DENIED_PATH_PREFIXES: readonly string[] = ['/track', '/api'];
+
+/**
+ * Any URL carrying a query string is denied, on every host. Hub-family admin
+ * pages write on a bare `?param=` GET, and the canonical page key drops the
+ * query anyway — so the registry can never key off one, and refusing to ask is
+ * free. Cost worth knowing: a dashboard reached as `…/leaks?brand=x` loses its
+ * companion button until Kevin navigates to the query-free URL. Narrowing this
+ * to a host list later is a one-line change here plus the two mirrors.
+ */
+export const DENY_ANY_QUERY_STRING = true;
+
+/** Exact-host deny check (see the DENIED_HOSTS warning). Case-insensitive. */
+export function isDeniedHost(hostname: unknown): boolean {
+  if (typeof hostname !== 'string') return false;
+  const h = hostname.trim().toLowerCase().replace(/\.$/, '');
+  return DENIED_HOSTS.includes(h);
+}
+
+/** Path-prefix deny check, on a segment boundary. */
+export function isDeniedPath(pathname: unknown): boolean {
+  if (typeof pathname !== 'string') return false;
+  const p = pathname.toLowerCase();
+  return DENIED_PATH_PREFIXES.some((prefix) => p === prefix || p.startsWith(`${prefix}/`));
+}
+
+/**
+ * Is this URL denied? True for anything the companion must not touch, INCLUDING
+ * anything parsePageUrl refuses (rule (d): non-http(s) and unparseable URLs stay
+ * refused), so a single `isDeniedPageUrl` call is a complete gate.
+ */
+export function isDeniedPageUrl(raw: unknown): boolean {
+  const u = parsePageUrl(raw);
+  if (!u) return true;
+  if (isDeniedHost(u.hostname)) return true;
+  if (isDeniedPath(u.pathname)) return true;
+  if (DENY_ANY_QUERY_STRING && u.search) return true;
+  return false;
+}
+
+/**
+ * Same rules applied to a registry PATTERN (`host/x`, `host/x*`, `host/*`).
+ * The trailing wildcard is stripped before the check, so `…/track*` is denied
+ * by the `/track` rule. This is what makes the deny list the one source of
+ * truth for "may this ever be registered" — a denied page cannot be registered
+ * by hand later either.
+ */
+export function isDeniedPagePattern(raw: unknown): boolean {
+  if (typeof raw !== 'string') return true;
+  const trimmed = raw.trim();
+  const base = trimmed.endsWith('*') ? trimmed.slice(0, -1) : trimmed;
+  // `host/*` strips to `host/` — a bare host root, which is not itself denied.
+  const probe = base.length > 1 && base.endsWith('/') ? base.slice(0, -1) : base;
+  return isDeniedPageUrl(probe);
 }
 
 /** True when a thread_links row is the cockpit's vault-viewer link rather than
@@ -208,6 +311,19 @@ export function upsertPageRegistry(input: {
   if (!pattern) {
     throw new PageCompanionError(400, 'invalid_url_pattern', `not a usable page URL/pattern: ${input.url_pattern}`);
   }
+  // The deny list is the one source of truth for "may this ever be registered",
+  // so a denied host/path cannot be stored by hand either. Checked on the RAW
+  // input, not the canonical pattern, so a pattern typed with a query string is
+  // refused rather than silently stripped. A distinct code here (unlike the
+  // lookup) because this caller is Kevin or JARVIS registering a page on
+  // purpose — a silent no-op would be worse than a plain refusal.
+  if (isDeniedPagePattern(input.url_pattern)) {
+    throw new PageCompanionError(
+      400,
+      'denied_url_pattern',
+      `refused by the page-companion deny list: ${input.url_pattern}`,
+    );
+  }
   const project = (input.project ?? '').trim();
   if (!project) throw new PageCompanionError(400, 'invalid_project', 'project is required');
   const source = (input.source ?? 'manual').trim() || 'manual';
@@ -298,6 +414,13 @@ export function threadIdsLinkedToPage(normalizedUrl: string): number[] {
  * to about this page.
  */
 export function lookupPage(rawUrl: unknown): PageCompanionLookup {
+  // THE DENY GATE, before the registry or thread_links is consulted. A denied
+  // URL gets the same `ours:false` / `normalized_url:null` answer a chrome://
+  // page gets — indistinguishable from an ordinary miss, by design, and nothing
+  // downstream ever sees a canonical key for a page we refuse.
+  if (isDeniedPageUrl(rawUrl)) {
+    return { ours: false, project: null, registry_id: null, threads: [], normalized_url: null };
+  }
   const normalized = normalizePageUrl(rawUrl);
   if (!normalized) {
     return { ours: false, project: null, registry_id: null, threads: [], normalized_url: null };
@@ -372,7 +495,10 @@ export interface NewPageChatResult {
  * next lookup on that page lists this chat.
  */
 export function createPageChat(rawUrl: unknown, project?: unknown): NewPageChatResult {
-  const normalized = normalizePageUrl(rawUrl);
+  // Same deny gate as the lookup, and deliberately the SAME error a bad URL
+  // gets — a page chat writes a thread_links row, which is exactly how a page
+  // would otherwise auto-register itself on the next seed.
+  const normalized = isDeniedPageUrl(rawUrl) ? null : normalizePageUrl(rawUrl);
   if (!normalized) {
     throw new PageCompanionError(400, 'invalid_url', 'url must be an http(s) page URL');
   }
@@ -432,6 +558,7 @@ export interface PageRegistrySeedResult {
 export function seedPageRegistry(): PageRegistrySeedResult {
   let manualAdded = 0;
   for (const row of MANUAL_PAGE_REGISTRY_SEED) {
+    if (isDeniedPagePattern(row.url_pattern)) continue; // a denied seed row never boots
     const pattern = normalizePagePattern(row.url_pattern)!;
     if (getRegistryByPatternStmt.get(pattern)) continue;
     upsertPageRegistry({ ...row, source: 'manual' });
@@ -444,6 +571,9 @@ export function seedPageRegistry(): PageRegistrySeedResult {
   for (const link of linkLabelStmt.all()) {
     const key = pageKeyFromThreadLink(link.url);
     if (!key || handled.has(key)) continue;
+    // A denied page must not auto-register off a stray thread link. Checked on
+    // the raw link too, so a `?param=` link is skipped and not just its key.
+    if (isDeniedPageUrl(link.url) || isDeniedPageUrl(key)) continue;
     handled.add(key);
     if (matchPageRegistry(key)) {
       skippedCovered += 1;

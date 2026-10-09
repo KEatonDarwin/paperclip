@@ -47,6 +47,55 @@
     }
   }
 
+  // ─── THE DENY LIST — third copy, inline because MV3 forbids imports ────────
+  // Byte-for-byte mirror of src/config.js (which mirrors the server's
+  // page-companion.ts). The sentinels below are not decoration: test/deny.test.mjs
+  // extracts everything between them, evaluates it, and asserts it answers
+  // IDENTICALLY to config.js over the shared case table. Edit all three or none.
+  //
+  // This is the earliest chokepoint there is — a denied page never even sends a
+  // message to the background worker, let alone a request to the cockpit.
+  // deny-mirror:begin
+  const DENIED_HOSTS = ['thedarwinhub.com', 'www.thedarwinhub.com'];
+  const DENIED_PATH_PREFIXES = ['/track', '/api'];
+  const DENY_ANY_QUERY_STRING = true;
+
+  // 🔴 EXACT hostname match, NOT a domain suffix — intake./staging.intake./
+  // accounting.thedarwinhub.com are IN scope and must stay askable.
+  function isDeniedHost(hostname) {
+    if (typeof hostname !== 'string') return false;
+    const h = hostname.trim().toLowerCase().replace(/\.$/, '');
+    return DENIED_HOSTS.includes(h);
+  }
+
+  function isDeniedPath(pathname) {
+    if (typeof pathname !== 'string') return false;
+    const p = pathname.toLowerCase();
+    return DENIED_PATH_PREFIXES.some((prefix) => p === prefix || p.startsWith(`${prefix}/`));
+  }
+
+  function isDeniedUrl(raw) {
+    if (typeof raw !== 'string') return true;
+    const trimmed = raw.trim();
+    if (!trimmed) return true;
+    const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed);
+    if (hasScheme && !/^https?:\/\//i.test(trimmed)) return true;
+    if (!hasScheme && trimmed.startsWith('/')) return true;
+    let u;
+    try {
+      u = new URL(hasScheme ? trimmed : `http://${trimmed}`);
+    } catch {
+      return true;
+    }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return true;
+    if (!u.hostname) return true;
+    if (isDeniedHost(u.hostname)) return true;
+    if (isDeniedPath(u.pathname)) return true;
+    if (DENY_ANY_QUERY_STRING && u.search) return true;
+    return false;
+  }
+  // deny-mirror:end
+
   /** Kevin's HTML-signature idea (design doc): sent along for the server to use later. */
   function pageSignature() {
     const meta = document.querySelector('meta[name="jarvis-page"]');
@@ -55,6 +104,8 @@
   }
 
   function ask() {
+    // Deny gate first: no message, no request, nothing, on a denied page.
+    if (isDeniedUrl(location.href)) return;
     const key = pageKey(location.href);
     if (!key || key === askedKey) return;
     askedKey = key;

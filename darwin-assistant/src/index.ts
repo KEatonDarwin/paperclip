@@ -21,6 +21,7 @@ import { startNotepadDriver } from './notepad-driver.js';
 import { startMonitorScheduler } from './monitors.js';
 import { startHealthMonitor } from './health-monitor.js';
 import { startMikeRadarDriver } from './mike-radar-driver.js';
+import { seedPageRegistry } from './page-companion.js';
 
 const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT ?? '3200', 10);
 const SLACK_ENABLED = !!(process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN);
@@ -83,6 +84,17 @@ async function main() {
   // Fix B (DAR-676): heal any runs left mid-flight by the previous process.
   const healed = reconcileInterruptedRuns();
   if (healed > 0) console.log(`[startup] Reconciled ${healed} interrupted assistant turn(s)`);
+
+  // Page Companion (tree-e753d989): back-fill the page registry from thread
+  // links + the hand-listed dashboards. Idempotent, so it just runs each boot.
+  try {
+    const seeded = seedPageRegistry();
+    if (seeded.manual_added || seeded.auto_added) {
+      console.log(`[startup] page_registry seeded: ${seeded.manual_added} manual, ${seeded.auto_added} from thread links`);
+    }
+  } catch (err) {
+    console.error('[startup] page_registry seed failed:', err);
+  }
 
   // Fix C (DAR-676): on a service stop/restart, deterministically tear down any
   // live model subprocess instead of orphaning it. Empty assistant turns left

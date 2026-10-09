@@ -244,6 +244,14 @@ import {
 } from '../work-board.js';
 import { listTeamsRadarCatches, openTeamsRadarChat } from '../teams-radar.js';
 import {
+  lookupPage,
+  createPageChat,
+  listPageRegistry,
+  upsertPageRegistry,
+  seedPageRegistry,
+  PageCompanionError,
+} from '../page-companion.js';
+import {
   INTEL_LANES,
   createIntelRun,
   getActiveIntelRun,
@@ -3361,6 +3369,75 @@ export function createApiV1Router(): Router {
       return;
     }
     res.json(result);
+  });
+
+  // == Page Companion (tree-e753d989): "is this page one of ours?" ===========
+  // The Chrome extension content script POSTs every page it loads to /lookup.
+  // Answer shape is fixed by the extension contract (see src/page-companion.ts):
+  //   { ours, project, registry_id, threads: [{external_id,title,last_active}] }
+  // A non-page URL (chrome://, a file://, junk) is NOT an error — it's just
+  // `ours: false`, because the extension asks about every page Kevin opens.
+
+  router.post('/page-companion/lookup', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { url?: unknown };
+    if (typeof body.url !== 'string' || !body.url.trim()) {
+      sendError(res, 400, 'invalid_request', 'url is required and must be a non-empty string');
+      return;
+    }
+    res.json(lookupPage(body.url));
+  });
+
+  // Start a fresh chat scoped to one page. Costs zero model calls — the page
+  // pin goes in as an assistant turn and the thread_links row is written now,
+  // so the next lookup on that page already lists this chat.
+  router.post('/page-companion/new-chat', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { url?: unknown; project?: unknown };
+    try {
+      res.status(201).json(createPageChat(body.url, body.project));
+    } catch (err) {
+      if (err instanceof PageCompanionError) {
+        sendError(res, err.status, err.code, err.message);
+        return;
+      }
+      sendError(res, 500, 'new_chat_failed', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.get('/page-companion/registry', (_req: AuthedRequest, res) => {
+    res.json({ pages: listPageRegistry() });
+  });
+
+  // Register (or re-point) a page. Idempotent on the canonical pattern — this
+  // is the "any time I ship a page, add a registry row" path.
+  router.post('/page-companion/registry', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as {
+      url_pattern?: unknown; project?: unknown; primary_thread_ext?: unknown; source?: unknown;
+    };
+    if (typeof body.url_pattern !== 'string' || typeof body.project !== 'string') {
+      sendError(res, 400, 'invalid_request', 'url_pattern and project are required strings');
+      return;
+    }
+    try {
+      res.status(201).json({
+        page: upsertPageRegistry({
+          url_pattern: body.url_pattern,
+          project: body.project,
+          primary_thread_ext: typeof body.primary_thread_ext === 'string' ? body.primary_thread_ext : null,
+          source: typeof body.source === 'string' ? body.source : 'manual',
+        }),
+      });
+    } catch (err) {
+      if (err instanceof PageCompanionError) {
+        sendError(res, err.status, err.code, err.message);
+        return;
+      }
+      sendError(res, 500, 'registry_write_failed', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  // Re-run the back-fill on demand (it also runs once at boot). Idempotent.
+  router.post('/page-companion/seed', (_req: AuthedRequest, res) => {
+    res.json(seedPageRegistry());
   });
 
   // == Task Hopper (candidate tasks awaiting Kevin's yes/dismiss) ==============

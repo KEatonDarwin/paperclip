@@ -1,6 +1,7 @@
 import { runClaude } from './agent.js';
 import { getTurnsLean as getTurns, type ConversationRow } from './conversation-db.js';
 import { getLatestThreadSummary } from './thread-summaries.js';
+import { stripBrevityMarker } from './reply-brevity.js';
 
 // DAR-741 — AI-mediated natural-language search over cockpit threads. Kevin
 // describes what he's looking for in a free-form paragraph (not keywords);
@@ -12,15 +13,21 @@ export interface ThreadSearchResult {
   reason: string;
 }
 
-function threadSnippet(conv: ConversationRow): string {
+// Exported for scripts/reply-brevity-test.mjs — proves the both-halves
+// decision directly against a seeded conversation, without a real runClaude
+// call (searchThreadsByQuery is what actually calls runClaude).
+export function threadSnippet(conv: ConversationRow): string {
   const summary = getLatestThreadSummary(conv.id)?.content;
   if (summary) return summary.slice(0, 500);
   // No summary yet — fall back to the last couple of real messages so a
   // fresh/short thread is still searchable.
   const turns = getTurns(conv.id).filter((t) => t.role === 'user' || t.role === 'assistant');
+  // Matching must see text from BOTH halves — strip only the marker line,
+  // keep brief + full concatenated, so a query worded like the brief still
+  // matches a thread whose stored content is brief+marker+full.
   return turns
     .slice(-4)
-    .map((t) => `${t.role}: ${(t.content ?? '').slice(0, 300)}`)
+    .map((t) => `${t.role}: ${stripBrevityMarker(t.content ?? '').slice(0, 300)}`)
     .join('\n')
     .slice(0, 800);
 }

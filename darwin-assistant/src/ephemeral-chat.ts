@@ -9,6 +9,7 @@ import {
   countTurns,
   listAllConversations,
 } from './conversation-db.js';
+import { fullOnly } from './reply-brevity.js';
 
 // ---------------------------------------------------------------------------
 // Ephemeral chat = FULL JARVIS (same memory, same tools, same brain) running
@@ -84,7 +85,9 @@ function snapshot(id: string): EphemeralChatSession | null {
     .map((t) => ({
       id: `t${t.id}`,
       role: t.role as 'user' | 'assistant',
-      text: (t.content ?? '').trim(),
+      // This widget has no brief/full expand affordance — always the full
+      // reply, never a brief with no way to see what's hidden.
+      text: (t.role === 'assistant' ? fullOnly(t.content ?? '') : (t.content ?? '')).trim(),
       createdAt: t.created_at,
     }))
     // Drop empty assistant shells (mid-run / tool-only turns) — the widget shows

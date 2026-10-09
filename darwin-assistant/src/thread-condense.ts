@@ -1,13 +1,17 @@
 import { runClaude } from './agent.js';
 import { getTurns, type ConversationRow } from './conversation-db.js';
 import type { TurnRow } from './conversation-db.js';
+import { fullOnly } from './reply-brevity.js';
 
 const CHUNK_CHARS = 40_000;
 const ASSISTANT_CAP = 6_000;
 
-function renderTurn(t: TurnRow): string {
+// Exported for scripts/reply-brevity-test.mjs — proves the brief/full
+// decision directly, without a real runClaude call.
+export function renderTurn(t: TurnRow): string {
   const who = t.role === 'user' ? 'Kevin' : 'JARVIS';
-  let body = t.content ?? '';
+  // Condensing a condensed reply loses detail silently — read the full half.
+  let body = t.role === 'assistant' ? fullOnly(t.content ?? '') : (t.content ?? '');
   if (t.role === 'assistant' && body.length > ASSISTANT_CAP) {
     body = body.slice(0, ASSISTANT_CAP) + ' …[truncated]';
   }

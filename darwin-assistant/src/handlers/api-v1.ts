@@ -53,6 +53,7 @@ import {
   setGlobalBrevityView,
   isBrevityLevel,
   isBrevityView,
+  fullOnly,
 } from '../reply-brevity.js';
 import {
   listGroups,
@@ -6682,11 +6683,15 @@ export function createApiV1Router(): Router {
       return;
     }
 
+    // Generic polling API, not the cockpit chat bubble (that's the raw
+    // GET /threads/:external_id route) — callers here have no brief/full
+    // expand UI, so always hand back the full reply.
+    const fullText = fullOnly(assistantTurn.content ?? '');
     res.json({
       message_id: messageId,
       status: 'done',
-      text: assistantTurn.content,
-      turn: serializeTurn(assistantTurn, undefined, conv.external_id),
+      text: fullText,
+      turn: { ...serializeTurn(assistantTurn, undefined, conv.external_id), content: fullText },
       user_turn: serializeTurn(userTurn, undefined, conv.external_id),
       tool_calls: toolCalls.map((t) => serializeTurn(t, undefined, conv.external_id)),
     });
@@ -7695,6 +7700,9 @@ export function createApiV1Router(): Router {
     const errorCount = turns.filter((t) => t.error_detail != null).length;
     const lastErrorDetail = [...turns].reverse().find((t) => t.error_detail != null)?.error_detail ?? null;
     const running = getInFlightMessageId(id) != null;
+    // Control Panel admin drill-down, not the cockpit chat bubble — raw rows
+    // with no brief/full expand affordance, so always the full reply.
+    const displayTurns = turns.map((t) => (t.role === 'assistant' ? { ...t, content: fullOnly(t.content ?? '') } : t));
     res.json({
       conversation: {
         conversation_id: conversation.id,
@@ -7707,7 +7715,7 @@ export function createApiV1Router(): Router {
         outcome: classifyRunOutcome(running, conversation.status, errorCount, lastErrorDetail),
         running,
       },
-      turns,
+      turns: displayTurns,
     });
   });
 
@@ -7905,7 +7913,9 @@ function renderMarkdown(conv: ConversationRow, turns: TurnRow[]): string {
     } else if (t.role === 'assistant') {
       lines.push(`## JARVIS — ${ts}`);
       lines.push('');
-      lines.push(t.content ?? '');
+      // Markdown export is for human reference outside the cockpit's
+      // expand/collapse UI — always the full reply, never the brief.
+      lines.push(fullOnly(t.content ?? ''));
       lines.push('');
     } else if (t.role === 'tool_call') {
       lines.push(`### tool call: ${t.tool_name} — ${ts}`);
@@ -7936,7 +7946,9 @@ function renderContextDigest(conv: ConversationRow, turns: TurnRow[]): string {
   const convo = turns.filter((t) => t.role === 'user' || t.role === 'assistant');
   const render = (t: TurnRow): string => {
     const who = t.role === 'user' ? 'User' : 'JARVIS';
-    let body = t.content ?? '';
+    // This digest is pasted into a fresh chat (machine/model context, not a
+    // glance-and-expand UI) — always the full reply, never the brief.
+    let body = t.role === 'assistant' ? fullOnly(t.content ?? '') : (t.content ?? '');
     if (t.role === 'assistant' && body.length > ASSISTANT_CAP) {
       body = body.slice(0, ASSISTANT_CAP) + ' …[truncated]';
     }

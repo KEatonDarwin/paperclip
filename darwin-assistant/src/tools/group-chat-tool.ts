@@ -1,6 +1,7 @@
 import type { ToolDef } from './index.js';
 import { getConversationById, listConversationsByGroup, getTurnsLean as getTurns } from '../conversation-db.js';
 import { getLatestThreadSummary } from '../thread-summaries.js';
+import { fullOnly } from '../reply-brevity.js';
 
 // DAR-742 — group-chat-only tool. Only usable from inside a group's cover
 // chat (gated on the calling conversation's own is_group_chat/group_id), and
@@ -51,10 +52,12 @@ export const getMemberThread: ToolDef = {
     }
 
     const turns = getTurns(target.id).filter((t) => t.role === 'user' || t.role === 'assistant');
+    // Another JARVIS instance reading this transcript gets the full reply,
+    // never a brief it has no way to expand.
     return {
       thread_id: target.external_id,
       mode: 'full',
-      transcript: turns.map((t) => ({ role: t.role, content: t.content })),
+      transcript: turns.map((t) => ({ role: t.role, content: t.role === 'assistant' ? fullOnly(t.content ?? '') : t.content })),
     };
   },
 };

@@ -200,3 +200,11 @@ export function briefOnly(text: string): string {
   const { brief } = splitBrevityReply(text);
   return brief ?? text;
 }
+
+/** The full half, discarding the brief (and the marker). A no-op when there
+ *  is no marker. For consumers that must never see a partial/abbreviated
+ *  reply — summarizers, cross-thread reads, exports, anything that feeds
+ *  another model or is read without an expand affordance. */
+export function fullOnly(text: string): string {
+  return splitBrevityReply(text).full;
+}

@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync, unlinkSync, readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSystemPrompt, loadMemoryBlock, memoryProfileForThread, type MemoryProfile } from './prompt.js';
-import { resolveBrevity, brevityPromptBlock } from './reply-brevity.js';
+import { resolveBrevity, brevityPromptBlock, fullOnly } from './reply-brevity.js';
 import { getAuggieModels } from './auggie-catalog.js';
 import { getDevinModels } from './devin-catalog.js';
 import { getCodexModels } from './codex-catalog.js';
@@ -753,8 +753,15 @@ function contextWindowTokensFor(adapterId: string, model: string | null): number
 // field that replayed verbatim no matter how large a single agentic turn was.
 const ASSISTANT_REPLAY_TRUNCATE_CHARS = 4000;
 
-function summarizeTurnForReplay(turn: TurnRow, maxAssistantChars = ASSISTANT_REPLAY_TRUNCATE_CHARS): string | null {
-  const content = turn.content?.trim() ?? '';
+// Exported for scripts/reply-brevity-test.mjs — proves the full-only replay
+// decision directly, without exercising the rest of buildContinuationPrompt
+// (which reads live memory/tools state, out of scope for this proof).
+export function summarizeTurnForReplay(turn: TurnRow, maxAssistantChars = ASSISTANT_REPLAY_TRUNCATE_CHARS): string | null {
+  // This transcript is replayed back to the MODEL as its own prior context
+  // (provider switch / context-overflow retry) — it must see the full reply
+  // it actually gave, never a brief with the detail stripped out.
+  const rawContent = turn.content?.trim() ?? '';
+  const content = turn.role === 'assistant' ? fullOnly(rawContent) : rawContent;
   if (turn.role === 'user') return `Human (${turn.created_at} UTC): ${content}`;
   if (turn.role === 'assistant') {
     const body = content.length > maxAssistantChars

@@ -1,6 +1,7 @@
 import { runClaude } from './agent.js';
 import { getTurnsLean as getTurns, type ConversationRow, type TurnRow } from './conversation-db.js';
 import { createThreadSummary, type ThreadSummaryRow } from './thread-summaries.js';
+import { fullOnly } from './reply-brevity.js';
 
 // DAR-740 — generate a point-in-time "what's done / in progress / next"
 // summary of a thread, anchored to the last turn that existed when
@@ -10,12 +11,16 @@ import { createThreadSummary, type ThreadSummaryRow } from './thread-summaries.j
 
 const ASSISTANT_CAP = 4000;
 
-function renderTranscript(turns: TurnRow[]): string {
+// Exported for scripts/reply-brevity-test.mjs — the brief/full decision is
+// pure and worth proving directly, without a real runClaude call.
+export function renderTranscript(turns: TurnRow[]): string {
   const convo = turns.filter((t) => t.role === 'user' || t.role === 'assistant');
   return convo
     .map((t) => {
       const who = t.role === 'user' ? 'User' : 'JARVIS';
-      let body = t.content ?? '';
+      // Summarizing a summary loses detail silently — read the full half,
+      // never the brief, so a summary never skips what the brief omitted.
+      let body = t.role === 'assistant' ? fullOnly(t.content ?? '') : (t.content ?? '');
       if (t.role === 'assistant' && body.length > ASSISTANT_CAP) {
         body = body.slice(0, ASSISTANT_CAP) + ' …[truncated]';
       }

@@ -140,3 +140,47 @@ Prepending a brief would break that contract.
 - `PATCH /threads/:external_id/reply-brevity` — set/clear this thread's
   override. Accepts the literal string `"inherit"` for either field to clear
   that field's override back to NULL (go back to following global).
+
+## Consumers (node #1572 — the leak-proofing sweep)
+
+Every reader of a persisted assistant turn's `content` MUST make an explicit
+brief/full decision — nothing gets to silently inherit the raw two-half text
+by accident. The rule of thumb: anything a human glances at **with no
+expand/collapse affordance** gets the **full** reply (never the brief, which
+would hide information with no way to see what's hidden); anything that
+**feeds another model or another summary** gets the **full** reply (summarizing
+a summary loses detail silently); anything sent to a surface Kevin treats as
+**glanceable** (Slack) gets the **brief**; the **one** exception — the cockpit
+chat bubble itself — gets the **raw, unsplit** text (brief + marker + full)
+because its renderer (`BrevityReply.tsx` in jarvis-command-center) does its
+own client-side split and needs the marker to do it.
+
+All turn content, with no exception found in this codebase, flows through
+`conversation-db.ts`'s `getTurns` / `getTurnsLean`. The regression guard in
+`scripts/reply-brevity-test.mjs` (part D) scans `src/**/*.ts` for call sites
+of those two functions (tokenized — comments and string literals stripped
+first, so prose mentioning them can't trip it) and fails if a file calls
+them without appearing in this table's file list and the guard's `ALLOWLIST`.
+
+| File / route | What it is | Decision | How |
+|---|---|---|---|
+| `handlers/api-v1.ts` — `GET /threads/:external_id` (`serializeTurn`) | **The cockpit chat bubble.** The React thread view's live data source. | **RAW, unsplit** (brief + marker + full) | None — this is the one exception. `jarvis-command-center/src/components/BrevityReply.tsx` reads the marker and splits client-side. |
+| `handlers/api-v1.ts` — `GET /threads/:external_id/markdown` | "Download chat log" markdown export, for human reference outside the cockpit. | Full only | `fullOnly(t.content)` |
+| `handlers/api-v1.ts` — `GET /threads/:external_id/context-markdown` | Condensed digest for pasting a thread's gist into a fresh chat (model-context consumer). | Full only | `fullOnly(t.content)` |
+| `handlers/api-v1.ts` — `GET /threads/:external_id/messages/:message_id` | Generic async-polling API for external callers (not the cockpit — it has no brief/full expand UI). | Full only | `fullOnly(assistantTurn.content)`, applied to both the top-level `text` and the embedded `turn.content` |
+| `handlers/api-v1.ts` — `GET /control-panel/run-history/:id/turns` | Control Panel admin drill-down — raw turn rows, no expand UI. | Full only | per-turn `{ ...t, content: fullOnly(t.content) }` |
+| `handlers/api-v1.ts` — `POST /threads/:external_id/auto-title` | Reads the FIRST **user** turn only. | N/A | User turns never carry the marker (only assistant replies get the brevity treatment). |
+| `handlers/api-v1.ts` — `POST /threads/:external_id/resume` | Checks the last **user** turn. | N/A | Same — user turn. |
+| `handlers/api-v1.ts` — images route | Reads `turn.images`, not `.content`. | N/A | Different field entirely. |
+| `handlers/slack.ts` — outbound DM / `/darwin-clear` flow (`processMessage`/`buildMorningBriefing` response) | Live Slack reply to Kevin. | **Brief** (when there is one) | `response = briefOnly(response)` before `say`/`chat.update` |
+| `handlers/slack.ts` — `sendDailyBriefing` | Scheduled morning briefing post + its persisted turn. | Post: brief. Stored turn: full/raw. | `chat.postMessage({ text: briefOnly(briefing) })`; `addTurn(conv.id, 'assistant', briefing)` keeps the original text verbatim — "never want to lose that" applies to storage even though the Slack post is brief-only. |
+| `thread-summarize.ts` — `renderTranscript` (DAR-740 point-in-time summary) | Feeds a `runClaude` summarization prompt. | Full only | `fullOnly(t.content)` for assistant turns |
+| `thread-condense.ts` — `renderTurn`/`chunkTranscript` (long-thread condenser) | Feeds a `runClaude` condensing prompt. | Full only | `fullOnly(t.content)` for assistant turns |
+| `thread-search.ts` — `threadSnippet` (AI-mediated natural-language search corpus) | Fallback snippet (no summary yet) fed into the search-matching prompt. | **Both halves**, marker stripped | `stripBrevityMarker(t.content)` — Kevin may search using wording that only appears in the brief, so the match corpus must contain both. |
+| `agent.ts` — `summarizeTurnForReplay` (used by `buildContinuationPrompt`, the provider-switch / context-overflow transcript replay) | Feeds the transcript **back to the model itself** as its own prior context. | Full only | `fullOnly(turn.content)` for assistant turns |
+| `tools/group-chat-tool.ts` — `get_member_thread` tool, `mode:'full'` | Another JARVIS instance (in a group chat) reading a member thread's real transcript. | Full only | `fullOnly(t.content)` for assistant turns |
+| `ephemeral-chat.ts` — ephemeral chat widget snapshot | A second, throwaway chat surface in the cockpit with no expand/collapse UI of its own. | Full only | `fullOnly(t.content)` for assistant turns |
+| `ui-server.ts` — legacy pre-React debug server (`/conversations/:id` HTML view, `/api/conversations/:id` JSON dump, `/api/conversations/:id/markdown`, `/api/conversations/:id/session-clone`, `/api/conversations/:id/continue` primer generation, and the page's live SSE tail) | Admin/debug surface, still live on the same port (3201) as the real API, superseded by the React cockpit but not deleted. Five server-side `getTurns` call sites plus one client-side SSE render path — all found only by the regression guard's static scan, not the original file list for this node. | Full only, everywhere | `groupTurnsIntoExchanges` (shared by `renderExchange` the HTML view, and `buildSessionClone`) stores `{ ...t, content: fullOnly(t.content) }`; `buildTranscriptMarkdown` and `buildPrimerSourceTranscript` (feeds the `/continue` primer **model prompt**) apply `fullOnly` inline; the raw `GET /api/conversations/:id` JSON dump maps assistant turns through `fullOnly`; the inline client-side SSE live-tail script has its own minimal `fullOnlyClient` (line-split only, no fenced-code awareness — an accepted limitation on this debug-only page). |
+| `notifications.ts` — notification `body` | Could theoretically carry turn content. | N/A today | No current caller (`agent.ts`'s chat-importance ping, `tech-tasks.ts`, `mike-radar-report.ts`, `hopper-engine.ts`, etc.) passes raw turn content into a notification body — they all use static/templated strings or hopper-node `result` text (see below). The regression guard is what stops a *future* caller from doing so silently. |
+| `tree-cue.ts`, `hopper-engine.ts` (finish-contract parsing), `goals.ts` / `goals-autopilot*.ts` (verdict parsing), `night-shift.ts`, `shift-narrator.ts`, `result-summary.ts`, `layman-summary.ts`, `mike-radar-report.ts`, `tech-tasks.ts` | All read a hopper-node worker's `result` text, supplied directly in the finish-contract POST body (`parsed.result`) — never read back out of `turns.content`. | N/A | Doubly safe: (1) this text never round-trips through the DB turn-content column at all; (2) even if it did, every hopper-node/unblocker worker thread hard-excludes to level 0 (see above), so a worker's own reply never gets a brief or a marker in the first place. `mike-radar-report.ts`'s `row.text` is scraped Teams/Slack content from `mike_activity`, not a JARVIS turn at all. |
+| `notepad-dossier-sources.ts`, `group-chat-context.ts`, `big-board.ts`, `workbench.ts` (`read_up`), `briefing.ts`, `jarvis-brief.ts` | Read `thread_summaries.content` (a pre-generated summary) or `thread_todos.content` (a todo's own text). | N/A | Neither table ever stores raw turn content with a marker — summaries are freshly generated text, todos are authored separately. |

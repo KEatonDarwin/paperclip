@@ -3,6 +3,7 @@ import { processMessage, clearConversation } from '../agent.js';
 import { buildMorningBriefing } from '../briefing.js';
 import { getOrCreateConversation, addTurn } from '../conversation-db.js';
 import { sseBus, type SSEEvent } from '../sse-bus.js';
+import { briefOnly } from '../reply-brevity.js';
 
 const BRIEFING_TRIGGERS = /\b(morning briefing|good morning|briefing|morning|wake up|what's my day|what is my day|day look like)\b/i;
 
@@ -130,6 +131,9 @@ export function createSlackApp() {
       } else {
         response = await processMessage(text, conversationId);
       }
+      // Slack is the glanceable surface — the cockpit holds the full reply.
+      // Reply-brevity marker (tree-c8e32ef9) never reaches Slack either way.
+      response = briefOnly(response);
 
       if (statusTs) {
         try {
@@ -175,10 +179,12 @@ export async function sendDailyBriefing(app: App): Promise<void> {
   }
   try {
     const briefing = await buildMorningBriefing();
-    const postResult = await app.client.chat.postMessage({ channel: userId, text: briefing });
+    const postResult = await app.client.chat.postMessage({ channel: userId, text: briefOnly(briefing) });
     console.log('[briefing] Morning briefing sent to Kevin');
 
-    // Persist the briefing as an assistant turn so that Kevin's reply has context.
+    // Persist the briefing as an assistant turn so that Kevin's reply has
+    // context. Stores the FULL original text (marker included, if any) —
+    // only the outbound Slack post above is brief-only.
     const slackTs = typeof postResult.ts === 'string' ? postResult.ts : null;
     if (slackTs) {
       const conv = getOrCreateConversation(`slack:${userId}:${slackTs}`, userId);

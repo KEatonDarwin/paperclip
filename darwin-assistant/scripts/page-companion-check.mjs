@@ -384,7 +384,11 @@ console.log('\nseedPageRegistry');
   addThreadLink(linkedConv.id, 'http://192.168.1.25:8080/settings/vault?file=outbox/x.md', 'report');
 
   const first = PC.seedPageRegistry();
-  assert.equal(first.manual_added, 4, 'the four hand-listed dashboards land');
+  assert.equal(
+    first.manual_added,
+    PC.MANUAL_PAGE_REGISTRY_SEED.length,
+    'every hand-listed dashboard lands (count is derived, so adding a row never breaks this)',
+  );
   const rows = PC.listPageRegistry();
   const byPattern = new Map(rows.map((r) => [r.url_pattern, r]));
   for (const { url_pattern, project } of PC.MANUAL_PAGE_REGISTRY_SEED) {
@@ -421,6 +425,98 @@ console.log('\nseedPageRegistry');
   assert.equal(bare.ours, true);
   assert.equal(bare.project, 'Engine Docs');
   ok('a seeded dashboard answers ours:true before any chat links it');
+}
+
+// ── 9b. the public route map (tree-b0198a82, node #1585) ──────────────────
+// The seed is the whole deliverable of that node, so the three properties it
+// rests on are regression-locked here rather than left to a reading of the map.
+console.log('\nMANUAL_PAGE_REGISTRY_SEED — the public route map');
+{
+  const seed = PC.MANUAL_PAGE_REGISTRY_SEED;
+  const patterns = seed.map((r) => PC.normalizePagePattern(r.url_pattern));
+
+  // (1) every row canonicalizes, and no pattern is registered twice.
+  assert.ok(patterns.every((p) => typeof p === 'string' && p.length > 0), 'every seed row canonicalizes');
+  assert.equal(new Set(patterns).size, patterns.length, 'no duplicate pattern in the seed');
+  ok(`all ${seed.length} seed rows canonicalize and are unique`);
+
+  // (2) THE DENY CROSS-CHECK. Nothing in the seed may be denied — a denied row
+  // is silently skipped by seedPageRegistry, so without this assertion a typo
+  // would produce a dashboard that never gets a button and never complains.
+  const denied = seed.filter((r) => PC.isDeniedPagePattern(r.url_pattern));
+  assert.deepEqual(denied, [], `seed rows denied by the deny list: ${denied.map((r) => r.url_pattern).join(', ')}`);
+  ok('no seeded row is denied by the deny list (node #1584 cross-check)');
+
+  // The two traps the spec called out by name: dashboards whose paths merely
+  // START with "api" but are not under `/api/`. If anyone ever relaxes the path
+  // deny from a segment-boundary match to a bare startsWith, these two flip to
+  // denied and both dashboards go dark — this is the test that catches it.
+  for (const host of ['intake.thedarwinhub.com', 'staging.intake.thedarwinhub.com']) {
+    for (const path of ['/api-intake-monitor', '/api-audit-logs', '/api-audit-logs/42']) {
+      assert.equal(PC.isDeniedPageUrl(`https://${host}${path}`), false, `${host}${path} must NOT be denied`);
+    }
+    // ...while the real API under the same host still is.
+    assert.equal(PC.isDeniedPageUrl(`https://${host}/api/suppression/export`), true);
+    assert.equal(PC.isDeniedPageUrl(`https://${host}/track`), true);
+  }
+  ok('/api-intake-monitor and /api-audit-logs stay in scope; /api/* and /track stay denied');
+
+  // (3) THE SPECIFICITY PROPERTY — the whole basis of the route-keyed design.
+  // Two overlapping patterns on the same host: the specific dashboard row must
+  // win over a broader row covering the same URL. Without this, one catch-all
+  // would swallow all 23 intake dashboards into a single chat bucket.
+  clearRegistry();
+  PC.upsertPageRegistry({ url_pattern: 'https://intake.thedarwinhub.com/*', project: 'Intake (whole host)' });
+  PC.upsertPageRegistry({ url_pattern: 'https://intake.thedarwinhub.com/newsletter-ads/*', project: 'Intake · Newsletter Ads' });
+  PC.upsertPageRegistry({ url_pattern: 'https://intake.thedarwinhub.com/newsletter-ads/campaigns', project: 'Newsletter Ads · Campaigns tab' });
+
+  assert.equal(PC.matchPageRegistry('intake.thedarwinhub.com/suppression-dashboard').project, 'Intake (whole host)');
+  assert.equal(PC.matchPageRegistry('intake.thedarwinhub.com/newsletter-ads').project, 'Intake · Newsletter Ads');
+  assert.equal(PC.matchPageRegistry('intake.thedarwinhub.com/newsletter-ads/offers/7').project, 'Intake · Newsletter Ads');
+  assert.equal(
+    PC.matchPageRegistry('intake.thedarwinhub.com/newsletter-ads/campaigns').project,
+    'Newsletter Ads · Campaigns tab',
+    'an exact row beats the prefix row that also covers it',
+  );
+  // And the broader host row must not bleed onto the staging host.
+  assert.equal(PC.matchPageRegistry('staging.intake.thedarwinhub.com/newsletter-ads'), null);
+  ok('longest-pattern-wins: the specific dashboard row beats a broader row covering the same URL');
+
+  // (4) the seed itself resolves per-dashboard, not to one bucket.
+  clearRegistry();
+  PC.seedPageRegistry();
+  const expect = [
+    ['intake.thedarwinhub.com/suppression-dashboard', 'Intake · Suppression Dashboard'],
+    ['staging.intake.thedarwinhub.com/suppression-dashboard', 'Intake staging · Suppression Dashboard'],
+    ['intake.thedarwinhub.com/mediabuy-performance', 'Intake · Media Buy Performance'],
+    ['intake.thedarwinhub.com/api-intake-monitor', 'Intake · API Intake Monitor'],
+    ['intake.thedarwinhub.com/api-audit-logs/42', 'Intake · API Audit Logs'],
+    ['intake.thedarwinhub.com/auditlogs', 'Intake · Click Audit Logs'],
+    ['intake.thedarwinhub.com/lead-mapping-coverage/brand/9/gaps', 'Intake · Lead Mapping Coverage'],
+    ['intake.thedarwinhub.com/deploy', 'Intake · Deploy Dashboard'],
+    ['intake.thedarwinhub.com/deploy/history/3', 'Intake · Deploy History'],
+    ['intake.thedarwinhub.com/tools/campaign-board-clone/55/summary', 'Intake · Campaign Board Clone'],
+    ['accounting.thedarwinhub.com/ledger-reconciliation', 'Accounting · Ledger Reconciliation'],
+    ['accounting.thedarwinhub.com/fulfillment/month/2026/09', 'Accounting · Fulfillment Dashboard'],
+    ['accounting.thedarwinhub.com/transfers', 'Accounting · QuickBooks Transfer Dashboard'],
+    ['accounting.thedarwinhub.com/dashboard/quickbooks', 'Accounting · QuickBooks Transfer Dashboard'],
+    ['accounting.thedarwinhub.com/dashboard/quickbooks/customers', 'Accounting · QuickBooks Customers'],
+    ['192.168.1.25:8100/heartbeat', 'Hub 1.0 Heartbeat'],
+  ];
+  for (const [key, project] of expect) {
+    const row = PC.matchPageRegistry(key);
+    assert.equal(row?.project, project, `${key} → ${project} (got ${row?.project})`);
+  }
+  // `/dashboard/quickbooks` is an EXACT row and must not swallow its children.
+  assert.notEqual(
+    PC.matchPageRegistry('accounting.thedarwinhub.com/dashboard/quickbooks/validation').project,
+    'Accounting · QuickBooks Transfer Dashboard',
+  );
+  // `/deploy` is exact ON PURPOSE: the mutating `/deploy/{id}/execute` GET must
+  // stay unregistered.
+  assert.equal(PC.matchPageRegistry('intake.thedarwinhub.com/deploy/sandbox-intake/execute'), null,
+    'the mutating /deploy/{id}/execute GET is deliberately not covered');
+  ok('the seeded map resolves every spot-checked dashboard to its own row');
 }
 
 // ── 10. THE DENY LIST — the safety gate (tree-b0198a82, node #1584) ───────

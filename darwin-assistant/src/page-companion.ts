@@ -529,13 +529,161 @@ export function createPageChat(rawUrl: unknown, project?: unknown): NewPageChatR
 
 // ─── Seeding ──────────────────────────────────────────────────────────────────
 
-/** The dashboards Kevin named by hand (spec of node #1574). Patterns, so every
- *  page under each host counts as ours. */
-export const MANUAL_PAGE_REGISTRY_SEED: ReadonlyArray<{ url_pattern: string; project: string }> = [
+/** One hand-listed page: a canonical-able pattern plus the name Kevin sees. */
+export interface PageRegistrySeedRow {
+  url_pattern: string;
+  project: string;
+}
+
+/**
+ * The self-hosted LAN dashboards (tree-e753d989). One row per listener, because
+ * each of those ports IS one app.
+ */
+const LAN_DASHBOARD_SEED: ReadonlyArray<PageRegistrySeedRow> = [
   { url_pattern: 'http://192.168.1.25:8100/*', project: 'Hub 1.0 Heartbeat' },
   { url_pattern: 'http://192.168.1.25:8095/*', project: 'Restore Matrix + Leaks' },
   { url_pattern: 'http://192.168.1.25:8094/*', project: 'Circle & Flip' },
   { url_pattern: 'http://192.168.1.25:8090/*', project: 'Engine Docs' },
+];
+
+/**
+ * INTAKE — one row per dashboard, derived from DarwinIntakeSystem
+ * `routes/web.php` (tree-b0198a82, node #1585). 68 GET-reachable route
+ * definitions; these are the ones a human actually opens.
+ *
+ * Everything omitted is omitted on purpose, in four buckets:
+ *   - DENIED by the deny list above — `/track`, `/track/test`,
+ *     `/track/test/setRecaptchaScore`, `/api/suppression/*`.
+ *   - LIVE MACHINERY — the recaptcha gates (`/recaptcha`, `/recaptcha/v2`,
+ *     `/recaptcha/test`), the lead-flow interstitials (`/invalid`,
+ *     `/unavailable`, `/unavailable-offer`), `/` (a redirect), and two GETs
+ *     that WRITE: `/setRecaptchaScore` and `/perclickity-update`.
+ *   - DEBUG DUMPS — `/session`, `/botListCheck/{lead}`, `/intake-logs/{lead}`,
+ *     `/intake-log/{intake}` are bare `dd()`/`dump()` calls, not pages.
+ *   - JSON / TEST ENDPOINTS — `/campaigns/{campaign}` and `/offers/{offer}`
+ *     resolve to `Api\` controllers returning JSON; `/test-hub-message`,
+ *     `/test/perclickity-offer-api`, `/nathans-test`, `/intake-recaptcha-test`,
+ *     `/tools/cache-lead-tags-test` are test harnesses.
+ *
+ * 🔴 `/api-intake-monitor` and `/api-audit-logs` ARE dashboards. Their names
+ * start with "api" but they are NOT under `/api/`, and the deny rule matches on
+ * a path-SEGMENT boundary (`/api` or `/api/…`), so they pass. Asserted in
+ * scripts/page-companion-check.mjs — if someone ever "simplifies" the path deny
+ * to a bare startsWith, that test fails and two live dashboards go dark.
+ *
+ * 🔴 `/deploy` is registered EXACT, not as `/deploy/*`, because
+ * `/deploy/{identifier}/execute` RUNS A DEPLOY on a GET. `/deploy/history/*`
+ * is a separate row, so the dashboard and its history are covered and the
+ * mutating path is not.
+ */
+const INTAKE_DASHBOARD_ROUTES: ReadonlyArray<{ path: string; name: string }> = [
+  { path: '/suppression-dashboard', name: 'Suppression Dashboard' },
+  { path: '/mediabuy-performance', name: 'Media Buy Performance' },
+  { path: '/perclickity-dashboard', name: 'PerClickity Dashboard' },
+  { path: '/perclickity-requests-dashboard', name: 'PerClickity Requests Dashboard' },
+  { path: '/perclickity-live-monitor', name: 'PerClickity Live Monitor' },
+  { path: '/perclickity-live-table', name: 'PerClickity Live Table' },
+  { path: '/perclickity-interstitial-monitor', name: 'PerClickity Interstitial Monitor' },
+  { path: '/lead-profiling', name: 'Lead Profiling' },
+  // root + /brand/{brand} + /brand/{brand}/gaps are drill-downs of ONE board.
+  { path: '/lead-mapping-coverage/*', name: 'Lead Mapping Coverage' },
+  { path: '/lead-tagging', name: 'Lead Tagging' },
+  { path: '/creative-tagging', name: 'Creative Tagging' },
+  // root + /campaigns + /offers/{campaignId} are tabs of ONE dashboard.
+  { path: '/newsletter-ads/*', name: 'Newsletter Ads' },
+  { path: '/subscriber-intelligence', name: 'Subscriber Intelligence' },
+  { path: '/api-intake-monitor', name: 'API Intake Monitor' },
+  { path: '/api-audit-logs/*', name: 'API Audit Logs' },
+  { path: '/auditlogs/*', name: 'Click Audit Logs' },
+  { path: '/ignore-bot-dashboard', name: 'Ignore Bot Dashboard' },
+  { path: '/deploy', name: 'Deploy Dashboard' },
+  { path: '/deploy/history/*', name: 'Deploy History' },
+  { path: '/darwin-docs/*', name: 'Darwin Docs' },
+  { path: '/tools/lead-tag-cache', name: 'Lead Tag Cache tool' },
+  { path: '/tools/bulk-unsubscribe', name: 'Bulk Unsubscribe tool' },
+  { path: '/tools/campaign-board-clone/*', name: 'Campaign Board Clone' },
+];
+
+/**
+ * Both intake hosts, because they are separate deploy targets running
+ * (potentially) different branches — a chat about staging is legitimately a
+ * different thing from a chat about prod, and the whole point of the registry
+ * is to keep those apart.
+ */
+const INTAKE_HOSTS: ReadonlyArray<{ host: string; label: string }> = [
+  { host: 'intake.thedarwinhub.com', label: 'Intake' },
+  { host: 'staging.intake.thedarwinhub.com', label: 'Intake staging' },
+];
+
+/**
+ * ACCOUNTING — `accounting.thedarwinhub.com`, derived from the live app's
+ * `routes/web.php` + `routes/web-dashboard.php` (read read-only off the hub via
+ * the approved-roots `vhosts` reader; there is no checkout of this app on the
+ * pi). Every `/api/…` route in those files is denied by the deny list.
+ *
+ * ⚠️ KNOWN COST — THE ALIASES ARE REAL. `web-dashboard.php` points several
+ * URLs at the SAME blade view (`/quickbooks-dashboard`, `/dashboard/quickbooks`,
+ * `/qb-dashboard` and `/transfers` are one dashboard). Each alias is a distinct
+ * page key, so each needs its own row to get a button — but a chat opened on
+ * `/qb-dashboard` will NOT be listed on `/transfers`, because threads attach per
+ * key. The project NAME is shared so the panel reads right; de-duplicating the
+ * chat list across aliases would need a `canonical_of` column on page_registry
+ * and is deliberately NOT done here.
+ */
+const ACCOUNTING_DASHBOARD_ROUTES: ReadonlyArray<{ path: string; name: string }> = [
+  { path: '/fulfillment-dashboard', name: 'Fulfillment Dashboard' },
+  { path: '/fulfillment/month/*', name: 'Fulfillment Dashboard' },
+  { path: '/transfer/month/*', name: 'Transfer Month' },
+  { path: '/ledger-reconciliation', name: 'Ledger Reconciliation' },
+  // One view, four URLs.
+  { path: '/quickbooks-dashboard', name: 'QuickBooks Transfer Dashboard' },
+  { path: '/dashboard/quickbooks', name: 'QuickBooks Transfer Dashboard' },
+  { path: '/qb-dashboard', name: 'QuickBooks Transfer Dashboard' },
+  { path: '/transfers', name: 'QuickBooks Transfer Dashboard' },
+  { path: '/quickbooks-customer-dashboard', name: 'QuickBooks Customers' },
+  { path: '/dashboard/quickbooks/customers', name: 'QuickBooks Customers' },
+  { path: '/qb-customers', name: 'QuickBooks Customers' },
+  { path: '/quickbooks-query-executor', name: 'QuickBooks Query Executor' },
+  { path: '/qb-query', name: 'QuickBooks Query Executor' },
+  { path: '/dashboard/quickbooks/query', name: 'QuickBooks Query Executor' },
+  { path: '/local-accounts', name: 'Local Accounts' },
+  { path: '/qb-validation', name: 'QuickBooks Validation' },
+  { path: '/validation', name: 'QuickBooks Validation' },
+  { path: '/dashboard/quickbooks/validation', name: 'QuickBooks Validation' },
+  { path: '/quickbooks-prepared-entities', name: 'QuickBooks Prepared Entities' },
+  { path: '/qb-prepared-entities', name: 'QuickBooks Prepared Entities' },
+  { path: '/dashboard/quickbooks/prepared-entities', name: 'QuickBooks Prepared Entities' },
+  { path: '/quickbooks-webhook-dashboard', name: 'QuickBooks Webhooks' },
+  { path: '/dashboard/quickbooks/webhooks', name: 'QuickBooks Webhooks' },
+  { path: '/qb-webhooks', name: 'QuickBooks Webhooks' },
+  { path: '/bulk-deletion', name: 'QuickBooks Bulk Deletion' },
+  { path: '/qb-bulk-deletion', name: 'QuickBooks Bulk Deletion' },
+  { path: '/dashboard/quickbooks/bulk-deletion', name: 'QuickBooks Bulk Deletion' },
+  { path: '/darwin-accounts', name: 'Darwin Accounts' },
+  { path: '/dashboard/darwin/accounts', name: 'Darwin Accounts' },
+];
+
+/** `host` + a route table → seed rows named "<label> · <dashboard>". */
+function seedRowsForHost(
+  host: string,
+  label: string,
+  routes: ReadonlyArray<{ path: string; name: string }>,
+): PageRegistrySeedRow[] {
+  return routes.map(({ path, name }) => ({
+    url_pattern: `https://${host}${path}`,
+    project: `${label} · ${name}`,
+  }));
+}
+
+/**
+ * Every hand-listed page, in one array. Order is stable so the route-map report
+ * and the seed can't disagree. Re-running the seed adds nothing (see
+ * seedPageRegistry) and NEVER overwrites a project name Kevin has edited.
+ */
+export const MANUAL_PAGE_REGISTRY_SEED: ReadonlyArray<PageRegistrySeedRow> = [
+  ...LAN_DASHBOARD_SEED,
+  ...INTAKE_HOSTS.flatMap(({ host, label }) => seedRowsForHost(host, label, INTAKE_DASHBOARD_ROUTES)),
+  ...seedRowsForHost('accounting.thedarwinhub.com', 'Accounting', ACCOUNTING_DASHBOARD_ROUTES),
 ];
 
 const linkLabelStmt = sqliteDb.prepare<[], { conversation_id: number; url: string; label: string | null }>(

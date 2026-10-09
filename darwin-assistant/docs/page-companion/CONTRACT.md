@@ -110,10 +110,42 @@ Re-runs the back-fill. Also runs once at boot (`src/index.ts`).
 
 Idempotent by construction — a second run adds nothing:
 
-1. The four hand-listed dashboards (`MANUAL_PAGE_REGISTRY_SEED`), upserted by
-   pattern: `:8100/*` Hub 1.0 Heartbeat · `:8095/*` Restore Matrix + Leaks ·
-   `:8094/*` Circle & Flip · `:8090/*` Engine Docs (all on 192.168.1.25).
-   A project name Kevin later edits is **never** clobbered by a re-seed.
+1. The hand-listed dashboards (`MANUAL_PAGE_REGISTRY_SEED`, **79 rows**),
+   upserted by pattern. A project name Kevin later edits is **never** clobbered
+   by a re-seed. Three source tables, composed in that order:
+   - `LAN_DASHBOARD_SEED` (4) — the self-hosted listeners on 192.168.1.25:
+     `:8100/*` Hub 1.0 Heartbeat · `:8095/*` Restore Matrix + Leaks ·
+     `:8094/*` Circle & Flip · `:8090/*` Engine Docs.
+   - `INTAKE_DASHBOARD_ROUTES` (23) × `INTAKE_HOSTS` (2) = **46** — derived from
+     `DarwinIntakeSystem routes/web.php` (68 GET-reachable definitions; the other
+     45 are denied, live machinery, `dd()` debug dumps, or JSON/test endpoints).
+     Registered on `intake.thedarwinhub.com` *and*
+     `staging.intake.thedarwinhub.com` because they are separate deploy targets
+     on separate branches — a chat about staging is a different thing.
+   - `ACCOUNTING_DASHBOARD_ROUTES` (29) — `accounting.thedarwinhub.com`, derived
+     from the live app's `routes/web.php` + `routes/web-dashboard.php`, read
+     read-only off the hub (there is no checkout on the pi).
+
+   Two shapes worth not undoing:
+   - **`/deploy` is EXACT, not `/deploy/*`** — `/deploy/{identifier}/execute`
+     runs a deploy on a plain GET, so it must stay unregistered.
+     `/deploy/history/*` is its own row.
+   - **`/api-intake-monitor` and `/api-audit-logs` are dashboards**, not API
+     paths. Rule (b) matches on a path-segment boundary, so they pass; a test
+     asserts they are NOT denied, because loosening that rule to a bare
+     `startsWith` would dark two live dashboards silently.
+
+   Known cost, accounting only: `web-dashboard.php` aliases several URLs onto one
+   blade view (`/quickbooks-dashboard` = `/dashboard/quickbooks` = `/qb-dashboard`
+   = `/transfers`). Each alias is a distinct page key, so each gets a row and the
+   project *name* is shared — but the chat lists do not merge across aliases.
+   Fixing that needs a `canonical_of` column and is deliberately not done.
+
+   Route map for Kevin's approval: `outbox/page-companion/route-map.md`.
+   Out of the manual seed on purpose: `perclickity.thedarwinhub.com` (its live
+   interstitial is `/link`, which the deny list does not cover) and
+   `health.thedarwinhub.com` (`/overwatch` already self-registers via a thread
+   link).
 2. `thread_links_auto` rows for every distinct http(s) thread-link page **not
    already covered** by a row — so one `…:8100/*` row stops a hundred per-page
    auto rows appearing beneath it. Project name = the link's label, else the
@@ -170,12 +202,22 @@ How a deny behaves at each entry point:
 Hermetic, no live DB, no network, no model calls:
 
 ```
-npm run page-companion:check        # 47 unit tests  (scripts/page-companion-check.mjs)
+npm run page-companion:check        # 52 unit tests  (scripts/page-companion-check.mjs)
 npm run page-companion:route-check  # 86 route tests (the real Express router over HTTP)
 ```
 
 Extension side, from `page-companion-extension/`: `npm test` — 26 tests, of
 which 10 are the deny list (`test/deny.test.mjs`).
+
+The route-map seed adds 5 of those unit tests (`MANUAL_PAGE_REGISTRY_SEED — the
+public route map`): every row canonicalizes and is unique; **no seeded row is
+denied** (a denied row is silently skipped by the seeder, so without this a typo
+would produce a dashboard that never gets a button and never complains);
+`/api-intake-monitor` + `/api-audit-logs` are not denied while `/api/*` and
+`/track` still are; **longest-pattern-wins is regression-locked** with three
+overlapping patterns on one host (host prefix < path prefix < exact), which is
+the property the whole route-keyed design rests on; and the real seeded map
+resolves 16 spot-checked URLs to their own rows.
 
 The deny cases live in ONE shared table, `page-companion-extension/test/deny-cases.mjs`
 (50 URL cases + 16 pattern cases), read by all three suites — that is what keeps

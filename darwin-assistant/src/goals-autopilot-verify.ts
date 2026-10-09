@@ -94,6 +94,21 @@ export function renderVerifyTemplate(template: string, input: VerifyTemplateInpu
   return out;
 }
 
+/** Map an explicit autopilot model id to its worker adapter. Autopilot configs
+ *  carry real model ids (e.g. `claude-opus-5`, `gpt-5.6-sol`), not ambiguous
+ *  harness shelf names, so a direct substring map is safe here. Mirrors
+ *  agent.ts `adapterFromModel`, kept local to this leaf module to avoid a
+ *  goals↔agent import cycle (same reason throttle.ts keeps its own providerFor
+ *  copy). Returns null for an unrecognized id so callers can reject it. */
+export function workerAdapterForModel(model: string | null | undefined): string | null {
+  if (!model) return null;
+  const m = model.toLowerCase();
+  if (m.includes('claude')) return 'claude';
+  if (m.includes('gpt') || m.includes('codex') || m.includes('openai') || m.includes('o4')) return 'codex';
+  if (m.includes('augment') || m.includes('auggie')) return 'auggie';
+  return null;
+}
+
 /** The PlanJsonNode the server appends (§15.3 shape). */
 export function buildVerifyPlanNode(args: {
   goal: GoalRow;
@@ -105,7 +120,7 @@ export function buildVerifyPlanNode(args: {
   return {
     title: `VERIFY: ${args.node.title}`.slice(0, 300),
     spec,
-    adapter: 'claude',
+    adapter: workerAdapterForModel(args.verify_model) ?? 'claude',
     model: args.verify_model,
     depends_on_indexes: args.plan.nodes.map((_n, i) => i),
     priority: 0,

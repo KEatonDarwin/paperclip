@@ -27,7 +27,7 @@ import {
   type HopperTreeRow,
   type HopperNodeRow,
 } from './hopper-engine.js';
-import { buildVerifyPlanNode } from './goals-autopilot-verify.js';
+import { buildVerifyPlanNode, workerAdapterForModel } from './goals-autopilot-verify.js';
 import { generateAndStoreSummary } from './layman-summary.js';
 import { evaluateUnparks, type UnparkCondition, type UnparkTarget } from './unpark.js';
 import { createNotification } from './notifications.js';
@@ -859,8 +859,9 @@ export function normalizeAutopilotConfig(input: unknown, base?: AutopilotConfig 
     if (isFrontierModel(model)) {
       throw new GoalError(400, 'autopilot_config_invalid', `${key} must not be a frontier/planner model: ${model}`, { reason: `${key}_frontier` });
     }
-    if (!/^claude-/i.test(model)) {
-      throw new GoalError(400, 'autopilot_config_invalid', `${key} must be a claude model id (adapter 'claude'): ${model}`, { reason: `${key}_not_claude` });
+    const adapter = workerAdapterForModel(model);
+    if (adapter !== 'claude' && adapter !== 'codex') {
+      throw new GoalError(400, 'autopilot_config_invalid', `${key} must be a claude or codex model id: ${model}`, { reason: `${key}_unknown_adapter` });
     }
     out[key] = model;
   }

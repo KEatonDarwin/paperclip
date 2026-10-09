@@ -794,6 +794,14 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     claude_account: conv.pinned_claude_account ?? null,
     runtime: getAdapterRuntimeDescriptor(adapter.id, model),
     locked: !!conv.password_hash,
+    // Reply brevity dial (tree-c8e32ef9): this thread's explicit override
+    // (null fields = inherit global) plus the fully-resolved value actually
+    // in effect, so the per-chat header control and the brief/full renderer
+    // don't need a second round-trip to /reply-brevity.
+    reply_brevity: {
+      override: { level: conv.brevity_level ?? null, view: conv.brevity_view ?? null },
+      effective: resolveBrevity(conv.external_id),
+    },
   };
 }
 

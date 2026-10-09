@@ -360,6 +360,28 @@ await acheck('PATCH /threads/:ext/reply-brevity on a worker thread still accepts
   assert.equal(resolveBrevity(EXT).level, 0, 'resolution still hard-excludes the worker thread');
 });
 
+await acheck('GET /threads/:ext carries reply_brevity.override + .effective (node #1571 header control reads this)', async () => {
+  const EXT = 'cockpit:reply-brevity-descriptor-test';
+  convDb.getOrCreateConversation(EXT, null);
+  await patchGlobal({ level: 1, view: 'brief' });
+  await patchThread(EXT, { level: 3, view: 'full' });
+  const r = await fetch(`${base}/threads/${encodeURIComponent(EXT)}`, {
+    headers: { Authorization: `Bearer ${adminKey}` },
+  });
+  assert.equal(r.status, 200);
+  const json = await r.json();
+  assert.deepEqual(json.reply_brevity.override, { level: 3, view: 'full' });
+  assert.deepEqual(json.reply_brevity.effective, { level: 3, view: 'full' });
+
+  await patchThread(EXT, { level: 'inherit', view: 'inherit' });
+  const r2 = await fetch(`${base}/threads/${encodeURIComponent(EXT)}`, {
+    headers: { Authorization: `Bearer ${adminKey}` },
+  });
+  const json2 = await r2.json();
+  assert.deepEqual(json2.reply_brevity.override, { level: null, view: null });
+  assert.deepEqual(json2.reply_brevity.effective, { level: 1, view: 'brief' }, 'falls back to global once override cleared');
+});
+
 server.close();
 
 console.log(`\n${passed} passed, ${failures.length} failed`);

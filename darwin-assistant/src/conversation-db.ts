@@ -62,6 +62,33 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  -- Chat Topics (tree-c9800208 node #1578). Many-to-many: a conversation can
+  -- carry several topics over its life, and a pivot (new subject mid-thread)
+  -- ADDS a topic rather than replacing one — no code path ever deletes a
+  -- conversation_topics row (see chat-topics-store.ts).
+  CREATE TABLE IF NOT EXISTS topics (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    label          TEXT NOT NULL,
+    slug           TEXT NOT NULL UNIQUE,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at     TEXT,
+    last_active_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS conversation_topics (
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+    topic_id        INTEGER NOT NULL REFERENCES topics(id),
+    is_primary      INTEGER NOT NULL DEFAULT 0,
+    source          TEXT,
+    assigned_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(conversation_id, topic_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_conversation_topics_conversation
+    ON conversation_topics(conversation_id);
+  CREATE INDEX IF NOT EXISTS idx_conversation_topics_topic
+    ON conversation_topics(topic_id);
 `);
 
 // Migrate: add debug columns to turns table

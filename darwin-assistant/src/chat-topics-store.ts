@@ -166,3 +166,39 @@ export function listConversationsForTopic(topicId: number): { id: number; extern
 export function touchTopicActivity(topicId: number): void {
   touchActivityStmt.run(topicId);
 }
+
+const listConversationsForTopicDetailedStmt = sqliteDb.prepare<
+  [number],
+  { id: number; external_id: string; title: string | null; updated_at: string; is_primary: number }
+>(`
+  SELECT c.id, c.external_id, c.title, c.updated_at, ct.is_primary AS is_primary
+  FROM conversation_topics ct
+  JOIN conversations c ON c.id = ct.conversation_id
+  WHERE ct.topic_id = ?
+  ORDER BY c.updated_at DESC
+`);
+
+/** Like listConversationsForTopic, plus title + this pivot row's is_primary —
+ *  what the /chat-topics index and the overlap matcher both need. */
+export function listConversationsForTopicDetailed(
+  topicId: number,
+): { id: number; external_id: string; title: string | null; updated_at: string; is_primary: number }[] {
+  return listConversationsForTopicDetailedStmt.all(topicId);
+}
+
+const listPrimaryTopicAssignmentsStmt = sqliteDb.prepare<
+  [],
+  { conversation_id: number; topic_id: number; label: string; slug: string }
+>(`
+  SELECT ct.conversation_id, t.id AS topic_id, t.label, t.slug
+  FROM conversation_topics ct
+  JOIN topics t ON t.id = ct.topic_id
+  WHERE ct.is_primary = 1
+`);
+
+/** Every conversation's CURRENT primary topic, regardless of which topic
+ *  group it's being rendered under — backs the /chat-topics "now_about"
+ *  field for chats surfaced in a non-primary (secondary) topic group. */
+export function listPrimaryTopicAssignments(): { conversation_id: number; topic_id: number; label: string; slug: string }[] {
+  return listPrimaryTopicAssignmentsStmt.all();
+}

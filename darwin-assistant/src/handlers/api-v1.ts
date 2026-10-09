@@ -132,6 +132,15 @@ import {
   type HopperStatus,
 } from '../hopper.js';
 import {
+  isTopicEligible,
+  listTopics,
+  listTopicsForConversation,
+  listConversationsForTopicDetailed,
+  listPrimaryTopicAssignments,
+} from '../chat-topics-store.js';
+import { deriveTopicsForConversation } from '../chat-topics-derive.js';
+import { findOverlapCandidates } from '../chat-topics-overlap.js';
+import {
   GoalError,
   listGoals,
   createGoal,
@@ -3465,6 +3474,70 @@ export function createApiV1Router(): Router {
     }
     deleteHopperItem(id);
     res.status(204).end();
+  });
+
+  // == Chat Topics (tree-c9800208) =============================================
+  // Living topics over cockpit chats + the duplicate-open nudge. Node #1578
+  // built the store/schema, #1579 the derivation engine; this is the index +
+  // overlap-matcher API consumed by the cockpit UI.
+
+  // Grouped topic index: every topic that currently has at least one eligible
+  // cockpit chat, newest-active topic first, each chat carrying whether this
+  // topic is ITS primary plus (separately) its actual current primary label —
+  // the two differ when the chat is being listed under a secondary topic.
+  router.get('/chat-topics', (_req: AuthedRequest, res) => {
+    const primaryLabelByConversation = new Map<number, string>();
+    for (const row of listPrimaryTopicAssignments()) {
+      primaryLabelByConversation.set(row.conversation_id, row.label);
+    }
+    const topics = listTopics({ limit: 500 })
+      .map((topic) => {
+        const chats = listConversationsForTopicDetailed(topic.id)
+          .filter((c) => isTopicEligible(c.external_id))
+          .map((c) => ({
+            external_id: c.external_id,
+            title: c.title,
+            updated_at: c.updated_at,
+            is_primary: !!c.is_primary,
+            now_about: primaryLabelByConversation.get(c.id) ?? null,
+          }));
+        return {
+          topic_id: topic.id,
+          label: topic.label,
+          slug: topic.slug,
+          last_active_at: topic.last_active_at,
+          chats,
+        };
+      })
+      .filter((group) => group.chats.length > 0);
+    res.json({ topics });
+  });
+
+  // Duplicate-open nudge: given the text about to seed a NEW chat, returns up
+  // to 3 recent eligible chats that already cover the same topic. Must never
+  // block or 500 — findOverlapCandidates resolves to [] on any failure.
+  router.post('/chat-topics/overlap', async (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const text = typeof body.text === 'string' ? body.text : '';
+    const excludeExternalId = typeof body.exclude_external_id === 'string' ? body.exclude_external_id : null;
+    const candidates = await findOverlapCandidates(text, excludeExternalId);
+    res.json({ candidates });
+  });
+
+  // Manual re-derive: bypasses shouldRederive's debounce so Kevin (or the UI)
+  // can force a fresh topic pass on one conversation right now.
+  router.post('/chat-topics/derive/:convId', async (req: AuthedRequest, res) => {
+    const convId = parseInt(String(req.params.convId), 10);
+    if (!Number.isFinite(convId)) {
+      sendError(res, 400, 'invalid_request', 'convId must be a numeric conversation id');
+      return;
+    }
+    if (!getConversationById(convId)) {
+      sendError(res, 404, 'conversation_not_found', 'conversation not found');
+      return;
+    }
+    await deriveTopicsForConversation(convId);
+    res.json({ topics: listTopicsForConversation(convId) });
   });
 
   // == Goals ===================================================================

@@ -89,7 +89,8 @@
     "work-board:test": "npm run build && JARVIS_DB_PATH=/tmp/work-board-test.db node scripts/work-board-test.mjs",
     "teams-radar:check": "npm run build && JARVIS_DB_PATH=/tmp/teams-radar-check.db node scripts/teams-radar-check.mjs",
     "chat-topics:check": "npm run build && JARVIS_DB_PATH=/tmp/chat-topics-check.db node scripts/chat-topics-check.mjs",
-    "chat-topics-derive:check": "npm run build && JARVIS_DB_PATH=/tmp/chat-topics-derive-check.db node scripts/chat-topics-derive-check.mjs"
+    "chat-topics-derive:check": "npm run build && JARVIS_DB_PATH=/tmp/chat-topics-derive-check.db node scripts/chat-topics-derive-check.mjs",
+    "chat-topics-overlap:route-check": "npm run build && JARVIS_DB_PATH=/tmp/chat-topics-overlap-route-check.db node scripts/chat-topics-overlap-route-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

@@ -139,6 +139,11 @@ for (const col of [
   // to live; a pin is an explicit human instruction and outranks both the
   // selector and session stickiness (see agent.ts runConversationTurn).
   'pinned_claude_account TEXT',
+  // Reply brevity dial (tree-c8e32ef9, docs/reply-brevity/CONTRACT.md).
+  // Per-thread override of the global reply_brevity_level/reply_brevity_view
+  // settings. NULL on either column = inherit the global value for that axis.
+  'brevity_level INTEGER',
+  'brevity_view TEXT',
 ]) {
   try { db.exec(`ALTER TABLE conversations ADD COLUMN ${col}`); } catch {}
 }
@@ -181,6 +186,11 @@ export interface ConversationRow {
   // Per-thread Claude account pin (tree-b32ef869): a `claude_accounts` key
   // Kevin chose explicitly, or null for Auto (least-used selection).
   pinned_claude_account: string | null;
+  // Reply brevity dial per-thread override (tree-c8e32ef9). NULL = inherit
+  // the global reply_brevity_level/reply_brevity_view setting. See
+  // src/reply-brevity.ts resolveBrevity.
+  brevity_level: number | null;
+  brevity_view: string | null;
 }
 
 /**
@@ -280,6 +290,13 @@ const stmts = {
   setThreadClaudeAccount: db.prepare<[string | null, number]>(
     `UPDATE conversations
      SET pinned_claude_account = ?, updated_at = datetime('now')
+     WHERE id = ?`,
+  ),
+  // Reply brevity dial (tree-c8e32ef9). Either arg null clears that axis's
+  // override back to "inherit global" — see setThreadBrevityOverride below.
+  setThreadBrevity: db.prepare<[number | null, string | null, number]>(
+    `UPDATE conversations
+     SET brevity_level = ?, brevity_view = ?, updated_at = datetime('now')
      WHERE id = ?`,
   ),
   closeConversation: db.prepare<[string]>(
@@ -452,6 +469,23 @@ export function setThreadModelOverride(
  */
 export function setThreadClaudeAccount(conversationId: number, accountKey: string | null): void {
   stmts.setThreadClaudeAccount.run(accountKey, conversationId);
+}
+
+/**
+ * Set (or clear) this thread's reply-brevity override, per axis
+ * independently. Pass `null` for an axis to clear it back to "inherit
+ * global"; pass `undefined` to leave that axis exactly as it was (so a PATCH
+ * that only names one field never touches the other).
+ */
+export function setThreadBrevityOverride(
+  conversationId: number,
+  level: number | null | undefined,
+  view: string | null | undefined,
+): void {
+  const current = stmts.getConversationById.get(conversationId);
+  const nextLevel = level === undefined ? (current?.brevity_level ?? null) : level;
+  const nextView = view === undefined ? (current?.brevity_view ?? null) : view;
+  stmts.setThreadBrevity.run(nextLevel, nextView, conversationId);
 }
 
 export function closeConversation(externalId: string): void {

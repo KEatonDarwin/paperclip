@@ -28,6 +28,7 @@ import {
   addTurn,
   setThreadModelOverride,
   setThreadClaudeAccount,
+  setThreadBrevityOverride,
   listAllConversations,
   deriveSource,
   renameConversation,
@@ -44,6 +45,15 @@ import {
   type ConversationRow,
   type TurnRow,
 } from '../conversation-db.js';
+import {
+  resolveBrevity,
+  getGlobalBrevityLevel,
+  getGlobalBrevityView,
+  setGlobalBrevityLevel,
+  setGlobalBrevityView,
+  isBrevityLevel,
+  isBrevityView,
+} from '../reply-brevity.js';
 import {
   listGroups,
   getGroupById,
@@ -5878,6 +5888,60 @@ export function createApiV1Router(): Router {
     res.json(threadDescriptor(refreshed, req));
   });
 
+  // -- PATCH /threads/:external_id/reply-brevity -----------------------------
+  // tree-c8e32ef9. Body: { level?: 0|1|2|3|'inherit', view?: 'brief'|'full'|'inherit' }.
+  // 'inherit' clears that axis's override back to NULL (follow the global
+  // setting). Either field omitted entirely leaves that axis untouched.
+
+  router.patch('/threads/:external_id/reply-brevity', (req: AuthedRequest, res) => {
+    const caller = req.apiKey!;
+    const externalId = paramString(req.params.external_id);
+    const result = findConversationForCaller(caller, externalId);
+    if ('error' in result) {
+      sendError(res, result.error.status, result.error.code, result.error.message);
+      return;
+    }
+    const conv = result;
+
+    const body = (req.body ?? {}) as { level?: unknown; view?: unknown };
+    if (body.level === undefined && body.view === undefined) {
+      sendError(res, 400, 'invalid_request', "Provide at least one of: level, view (or 'inherit' to clear)");
+      return;
+    }
+
+    let level: number | null | undefined;
+    if (body.level !== undefined) {
+      if (body.level === 'inherit') {
+        level = null;
+      } else if (!isBrevityLevel(body.level)) {
+        sendError(res, 400, 'invalid_request', "level must be one of: 0, 1, 2, 3, 'inherit'");
+        return;
+      } else {
+        level = body.level;
+      }
+    }
+
+    let view: string | null | undefined;
+    if (body.view !== undefined) {
+      if (body.view === 'inherit') {
+        view = null;
+      } else if (!isBrevityView(body.view)) {
+        sendError(res, 400, 'invalid_request', "view must be one of: 'brief', 'full', 'inherit'");
+        return;
+      } else {
+        view = body.view;
+      }
+    }
+
+    setThreadBrevityOverride(conv.id, level, view);
+    const refreshed = getConversationById(conv.id) ?? conv;
+    res.json({
+      external_id: refreshed.external_id,
+      override: { level: refreshed.brevity_level, view: refreshed.brevity_view },
+      effective: resolveBrevity(refreshed.external_id),
+    });
+  });
+
   // -- GET /threads/:external_id/markdown -----------------------------------
 
   router.get('/threads/:external_id/markdown', (req: AuthedRequest, res) => {
@@ -7700,6 +7764,40 @@ export function createApiV1Router(): Router {
     const limitRaw = parseInt(String(req.query.limit ?? '100'), 10);
     const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, limitRaw)) : 100;
     res.json({ history: getAutonomyLevelHistory(limit) });
+  });
+
+  // Reply brevity dial (tree-c8e32ef9, docs/reply-brevity/CONTRACT.md) — the
+  // GLOBAL level (0-3)/view ('brief'|'full') settings. Per-thread overrides
+  // live on PATCH /threads/:external_id/reply-brevity below.
+  router.get('/reply-brevity', (_req: AuthedRequest, res) => {
+    res.json({ level: getGlobalBrevityLevel(), view: getGlobalBrevityView() });
+  });
+
+  router.patch('/reply-brevity', (req: AuthedRequest, res) => {
+    if (!isAdminScope(req.apiKey!.scope)) {
+      sendError(res, 403, 'admin_scope_required', 'Changing the reply brevity settings requires an admin-scoped key');
+      return;
+    }
+    const body = (req.body ?? {}) as { level?: unknown; view?: unknown };
+    if (body.level === undefined && body.view === undefined) {
+      sendError(res, 400, 'invalid_request', 'Provide at least one of: level, view');
+      return;
+    }
+    if (body.level !== undefined) {
+      if (!isBrevityLevel(body.level)) {
+        sendError(res, 400, 'invalid_request', 'level must be one of: 0, 1, 2, 3');
+        return;
+      }
+      setGlobalBrevityLevel(body.level);
+    }
+    if (body.view !== undefined) {
+      if (!isBrevityView(body.view)) {
+        sendError(res, 400, 'invalid_request', "view must be one of: 'brief', 'full'");
+        return;
+      }
+      setGlobalBrevityView(body.view);
+    }
+    res.json({ ok: true, level: getGlobalBrevityLevel(), view: getGlobalBrevityView() });
   });
 
   // == Check-ins (DAR-676 — port of the 3201 /checkins page) ==================

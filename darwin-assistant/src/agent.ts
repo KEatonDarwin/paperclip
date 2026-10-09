@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync, unlinkSync, readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSystemPrompt, loadMemoryBlock, memoryProfileForThread, type MemoryProfile } from './prompt.js';
+import { resolveBrevity, brevityPromptBlock } from './reply-brevity.js';
 import { getAuggieModels } from './auggie-catalog.js';
 import { getDevinModels } from './devin-catalog.js';
 import { getCodexModels } from './codex-catalog.js';
@@ -1592,6 +1593,15 @@ async function runConversationTurn(
     `Hard limiter (fixed, NOT modulated by this dial — ALWAYS escalate to Kevin instead of acting on these regardless of level): ${AUTONOMY_HARD_LIMITER_SUMMARY}\n` +
     `</jarvis_autonomy_dial>\n`;
 
+  // Reply brevity dial (tree-c8e32ef9, docs/reply-brevity/CONTRACT.md). Read
+  // fresh every turn so a dial change lands on the very next message, same as
+  // the autonomy dial above. '' at level 0 (off, the deploy default) — byte-
+  // identical to before this feature existed. resolveBrevity hard-excludes
+  // worker threads (hopper-node/unblocker) to level 0 regardless of settings,
+  // since their output is parsed by the finish contract and a VERDICT line
+  // must stay the first line of the reply.
+  const replyBrevityBlock = brevityPromptBlock(resolveBrevity(conv.external_id).level);
+
   // DAR-742 — group chats get their member threads' summaries prepended every
   // turn (bounded, lazily-refreshed context — see group-chat-context.ts).
   // Ungrouped/normal threads are untouched (empty string).
@@ -1636,7 +1646,7 @@ async function runConversationTurn(
     ? `<attached_images>\nThe user attached ${images.length} image(s) to this message. Open and look at each one now before responding — absolute paths:\n${images.map((img) => `- ${img.absPath}`).join('\n')}\n</attached_images>\n\n`
     : '';
 
-  const perTurnContextPrefix = threadContextLine + autonomyDialLine + groupContextBlock + quickChatContextBlock + workbenchContextBlock + goalContextBlock + nightContextBlock + mikeContextBlock + imageBlock;
+  const perTurnContextPrefix = threadContextLine + autonomyDialLine + replyBrevityBlock + groupContextBlock + quickChatContextBlock + workbenchContextBlock + goalContextBlock + nightContextBlock + mikeContextBlock + imageBlock;
 
   // The resume path re-injects memory on EVERY turn that has a live sessionId
   // (the common case), so an uncapped loadMemoryBlock() here was the dominant

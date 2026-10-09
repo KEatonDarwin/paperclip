@@ -230,3 +230,75 @@ export function normalizeLookup(data) {
     threads,
   };
 }
+
+// ─── Branch awareness (tree-b0198a82, node #1586) ────────────────────────────
+//
+// `GET /page-companion/deployment?registry_id=N` answers "which branch is
+// actually checked out on the host serving this page". It is a SEPARATE,
+// LAZY call made after the panel is already open — never part of the lookup —
+// so a slow or dead deploy source cannot delay the panel or change the
+// ours/not-ours answer. Anything other than a clean `known:true` answer means
+// the panel renders NO branch line at all (not the word "unknown", which would
+// be noise on every page that simply has no deploy target).
+
+/** Coerce a /page-companion/deployment response. Returns null for anything
+ *  we would not render — including `known:false`. */
+export function normalizeDeployment(data) {
+  const d = data && typeof data === 'object' ? data : {};
+  if (d.known !== true) return null;
+  const branch = typeof d.branch === 'string' && d.branch ? d.branch : null;
+  const commit = typeof d.commit === 'string' && d.commit ? d.commit : null;
+  const detached = d.detached === true;
+  // Nothing identifying the checkout = nothing worth a line.
+  if (!branch && !commit) return null;
+  return {
+    branch,
+    commit,
+    detached,
+    as_of: typeof d.as_of === 'string' && d.as_of ? d.as_of : null,
+    behind: typeof d.behind === 'number' ? d.behind : null,
+    stale: typeof d.stale === 'boolean' ? d.stale : null,
+    dirty: typeof d.dirty === 'boolean' ? d.dirty : null,
+    source: typeof d.source === 'string' && d.source ? d.source : null,
+  };
+}
+
+/**
+ * The one muted line the panel header shows. Built here (not in content.js) so
+ * it is unit-testable under plain node.
+ *
+ *   "main · ac3510d9d3 · 1d ago"
+ *   "detached @ 53739f343b"
+ *   "deploy/atomic-releases-hub2 · 53739f343b · 3 behind · 4h ago"
+ *
+ * `nowMs` is injectable so the relative-time cases are deterministic in tests.
+ */
+export function deploymentLine(dep, nowMs = Date.now()) {
+  if (!dep) return '';
+  const bits = [];
+  if (dep.detached) bits.push(dep.commit ? `detached @ ${dep.commit}` : 'detached');
+  else {
+    if (dep.branch) bits.push(dep.branch);
+    if (dep.commit) bits.push(dep.commit);
+  }
+  if (typeof dep.behind === 'number' && dep.behind > 0) bits.push(`${dep.behind} behind`);
+  if (dep.dirty === true) bits.push('dirty');
+  const rel = relativeAge(dep.as_of, nowMs);
+  if (rel) bits.push(rel);
+  return bits.join(' · ');
+}
+
+/** "4h ago" / "3d ago" / a date past a week. '' for anything unparseable. */
+export function relativeAge(raw, nowMs = Date.now()) {
+  if (typeof raw !== 'string' || !raw) return '';
+  const d = new Date(/[Tt]/.test(raw) ? raw : `${raw.replace(' ', 'T')}Z`);
+  if (Number.isNaN(d.getTime())) return '';
+  const mins = Math.round((nowMs - d.getTime()) / 60_000);
+  if (mins < 0) return '';
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return days < 7 ? `${days}d ago` : d.toISOString().slice(0, 10);
+}

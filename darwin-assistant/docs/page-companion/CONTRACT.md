@@ -37,6 +37,7 @@ convenience (that's how patterns get typed by hand).
 | `project` | human name shown on the page button ("Hub 1.0 Heartbeat") |
 | `primary_thread_ext` | optional owning chat's `external_id` |
 | `source` | `manual` · `thread_links_auto` · `signature` |
+| `deploy_target` | nullable. Key into `DEPLOY_TARGETS` (`src/page-companion-deploy.ts`) — which deployed checkout serves this page. NULL = no branch to report, which is the normal case. Added 2026-10-09 by an additive, re-runnable `ALTER`. |
 | `created_at` / `updated_at` | |
 
 Wildcards, both deliberate:
@@ -102,7 +103,104 @@ Body `{ url_pattern, project, primary_thread_ext?, source? }`. Idempotent on the
 canonical pattern — re-registering updates the row instead of duplicating it.
 This is the "any time I ship a page, add a registry row in the same turn" path.
 
-### `POST /page-companion/seed` → `{ manual_added, auto_added, skipped_covered }`
+### `GET /page-companion/deployment?registry_id=N` → 200
+
+**Which branch is actually live on the host serving this page.** The intake and
+accounting deploy model is checkout-switching, so the page Kevin is looking at
+is whatever branch happens to be checked out at that moment, and nothing on the
+page says which.
+
+```json
+{ "registry_id": 12, "deploy_target": "intake-prod", "known": true,
+  "source": "git_head", "branch": "main", "commit": "ac3510d9d3",
+  "detached": false, "as_of": "2026-10-08T02:33:49+00:00",
+  "behind": null, "stale": null, "dirty": null, "health": null, "reason": null }
+```
+
+🔴 **Deliberately NOT part of `/lookup`.** The panel calls this **lazily, after
+it has already opened** on the lookup's answer, so page-load latency and the
+ours/not-ours answer are completely untouched. Measured live, 2026-10-09:
+lookup 2ms, deployment read 450–1100ms. A deployment read must never be able to
+break or slow a lookup, and the split is **structural**, not a convention:
+
+- `lookupPage()` is **synchronous** and `src/page-companion.ts` does not import
+  `src/page-companion-deploy.ts`. A sync function cannot await a network read.
+- Both facts are asserted by tests, including a byte-identical `/lookup`
+  comparison with the deployment sources rigged to throw, to hang forever, and
+  to return garbage.
+
+`known: false` is a normal 200 — it is the answer on every page with no deploy
+target. **The panel renders the line only when `known` is true**; it renders
+*nothing* otherwise, because an "unknown" line would be noise on the majority
+of pages. `known:false` also covers an unknown `deploy_target`, a dead source,
+and a read that blew the budget; `reason` says which, for the log. It never
+returns a guess and never presents a cached value as current.
+
+Errors: missing/non-positive/non-integer `registry_id` → **400**; an id with no
+row → **404**. Both are caller mistakes, not page states.
+
+**Two read-only sources, in this order:**
+
+1. **the deploy-control API** — `GET <DEPLOY_API_BASE>/api/v1/deploy/environments?fetch=false`
+   (DarwinIntakeSystem `docs/deploy-control/CONTRACT.md` §8.2), for the targets
+   it manages. The good data: branch, commit, `drift.behind`/`stale`/`dirty`,
+   `doctor.health_http_status`. `fetch=false` on purpose — no `git fetch` on a
+   live host, and the branch name is exact either way.
+   ⚠️ **Not live as of 2026-10-09.** The control plane is on the unmerged
+   DarwinIntakeSystem branch `deploy/control-plane`; both intake hosts answer
+   `405 … Supported methods: POST` for this route today (it falls through to
+   `POST /api/v1/deploy/{identifier}`, which returns "Repository not found").
+   Verified, not assumed — which is exactly why (2) exists.
+2. **`.git/HEAD` through the hub file reader** — the already-live, read-only
+   smarty-pants `approved-roots-file-tool` (`vhosts` root = `/var/www/vhosts`).
+   `.git/HEAD` → `ref: refs/heads/<branch>` → the matching loose ref for the
+   sha, falling back to `.git/packed-refs` (a gc'd repo would otherwise read
+   "unknown" forever). A detached HEAD holds a raw sha: short sha +
+   `detached: true`, no branch. `as_of` = the ref file's mtime, i.e. **when
+   that checkout last moved** — the honest "how stale" for a checkout-switching
+   deploy model. `behind`/`stale` stay null here: there is no upstream
+   comparison without fetching, and a faked zero would be worse than a blank.
+   **This places nothing on any server and writes nothing anywhere.**
+
+**Cached ~60s per target** (`CACHE_TTL_MS`), unknowns included, with in-flight
+de-duplication — so toggling a panel cannot hammer the deploy API or the hub,
+and a source that is down is not re-asked on every click. The extension caches
+60s on its side too.
+
+### The deploy targets
+
+Named in `DEPLOY_TARGETS` (`src/page-companion-deploy.ts`); `page_registry.deploy_target`
+stores the key. Every target name was **read off the real config**, never guessed.
+
+| key | host | source |
+|---|---|---|
+| `intake-prod` | `intake.thedarwinhub.com` | git HEAD |
+| `intake-staging` | `staging.intake.thedarwinhub.com` | git HEAD |
+| `accounting` | `accounting.thedarwinhub.com` | git HEAD |
+| `sandbox-intake` | `sandbox.intake.thedarwinhub.com` | deploy API, git HEAD fallback |
+
+🔴 **`sandbox-intake` is `sandbox.intake.thedarwinhub.com`, NOT
+`staging.intake.thedarwinhub.com`.** They are two separate vhosts (both exist
+under `/var/www/vhosts/`) on two separate branches. The node #1586 spec said
+"the staging intake target is `sandbox-intake`"; that is wrong, and wiring it
+that way would have reported the sandbox's branch on every staging page. Staging
+intake is not a managed deploy-API target at all. `sandbox-intake` is kept in
+the table because it is a real managed target and it is what exercises source
+(1); no seeded page points at it (Kevin's scope named staging, not sandbox).
+
+Live, 2026-10-09, through the shipped code end-to-end:
+
+```
+intake-prod       main                        @ ac3510d9d3   (2026-10-08)
+intake-staging    deploy/atomic-releases-hub2 @ 53739f343b   (2026-10-05)
+accounting        jarvis/qb-sandbox-verify    @ 8f98257cc4   (2026-10-09)
+sandbox-intake    sandbox/door-parity         @ 32002eff1d   (2026-09-30)
+```
+
+All four came back `source: git_head` — i.e. the deploy API being unavailable
+and the fallback carrying it is not a hypothetical, it is the current live path.
+
+### `POST /page-companion/seed` → `{ manual_added, auto_added, skipped_covered, deploy_targets_set }`
 
 Re-runs the back-fill. Also runs once at boot (`src/index.ts`).
 
@@ -112,7 +210,13 @@ Idempotent by construction — a second run adds nothing:
 
 1. The hand-listed dashboards (`MANUAL_PAGE_REGISTRY_SEED`, **79 rows**),
    upserted by pattern. A project name Kevin later edits is **never** clobbered
-   by a re-seed. Three source tables, composed in that order:
+   by a re-seed. The 75 repo-driven rows carry a `deploy_target`; the 4 LAN rows
+   legitimately do not. **A row that already existed gets its `deploy_target`
+   back-filled only when it is still NULL** (`deploy_targets_set` counts those)
+   — without that, every row seeded before the column existed, i.e. all 79 in
+   the live DB, would stay branch-blind forever, because the manual loop skips
+   existing patterns. A target Kevin re-points by hand is never clobbered.
+   Three source tables, composed in that order:
    - `LAN_DASHBOARD_SEED` (4) — the self-hosted listeners on 192.168.1.25:
      `:8100/*` Hub 1.0 Heartbeat · `:8095/*` Restore Matrix + Leaks ·
      `:8094/*` Circle & Flip · `:8090/*` Engine Docs.
@@ -202,12 +306,32 @@ How a deny behaves at each entry point:
 Hermetic, no live DB, no network, no model calls:
 
 ```
-npm run page-companion:check        # 52 unit tests  (scripts/page-companion-check.mjs)
-npm run page-companion:route-check  # 86 route tests (the real Express router over HTTP)
+npm run page-companion:check         # 52 unit tests  (scripts/page-companion-check.mjs)
+npm run page-companion:route-check   # 108 route tests (the real Express router over HTTP)
+npm run page-companion:deploy-check  # 26 branch-awareness tests
 ```
 
-Extension side, from `page-companion-extension/`: `npm test` — 26 tests, of
+Extension side, from `page-companion-extension/`: `npm test` — 30 tests, of
 which 10 are the deny list (`test/deny.test.mjs`).
+
+`page-companion:deploy-check` is hermetic — scratch sqlite, both sources
+injected through `deploymentSources`, and the only network is a throwaway
+127.0.0.1 express fixture serving a verbatim CONTRACT §8.2 `TargetRollup`
+against the **shipped** `defaultFetchEnvironments` (not a re-creation of it).
+The git fixtures are the **real bytes** read off the three live checkouts on
+2026-10-09, so parsing is proven against real data: `main`, the slashed
+`deploy/atomic-releases-hub2`, `jarvis/qb-sandbox-verify`, plus a detached
+HEAD, a packed-refs repo, an unreadable checkout, a dead API falling through to
+git, both sources dead, an unknown target, no target, and a source that hangs
+forever (capped by the budget).
+
+The load-bearing tests are the last three: `lookupPage` is still synchronous,
+its response gained no deployment fields, `/lookup` is byte-identical with the
+sources throwing / hanging / returning garbage, and `src/page-companion.ts`
+does not import the deployment module. On the extension side, `content.js` is
+asserted to carry **no copy** of the line formatting — the worker formats it and
+the content script prints it, so unlike the deny list there is no fourth mirror
+to drift.
 
 The route-map seed adds 5 of those unit tests (`MANUAL_PAGE_REGISTRY_SEED — the
 public route map`): every row canonicalizes and is unique; **no seeded row is

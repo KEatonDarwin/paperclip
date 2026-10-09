@@ -13,6 +13,13 @@ embedded `/thread/<external_id>` iframe, with a pop-out to the cockpit's own
 thread window — plus **+ New** to start a fresh chat scoped to that page. The
 last tab open on a page is reopened the next time you land on it.
 
+On a **repo-driven page** (intake, staging intake, accounting) the panel header
+also shows ONE muted line saying what is actually deployed there —
+`main · ac3510d9d3 · 2d ago` — because those hosts deploy by switching
+checkouts, so the page you are looking at is whatever branch happens to be
+checked out right now. On a page with no deploy target, or when the answer
+can't be had, the line **isn't rendered at all** (never the word "unknown").
+
 ## Install
 
 No build step — plain JS/CSS on purpose.
@@ -57,9 +64,20 @@ background.js  (service worker — the ONLY place the key is read)
 content.js → Shadow DOM button + badge + panel (only when ours === true)
 ```
 
-The panel's **+ New** and the per-page last-tab memory take the same route: the
-content script messages the worker, which POSTs `/page-companion/new-chat` or
-reads/writes `chrome.storage.local` on its behalf.
+The panel's **+ New**, the per-page last-tab memory and the branch line take the
+same route: the content script messages the worker, which POSTs
+`/page-companion/new-chat`, reads/writes `chrome.storage.local`, or GETs
+`/page-companion/deployment?registry_id=N` on its behalf.
+
+- **The branch line is a SEPARATE, LAZY call** made only once the panel is open
+  — never part of the lookup. It has its own 8s timeout and its own 60s cache,
+  and every failure (no target, HTTP error, timeout, unknown answer) ends the
+  same way: the line stays hidden. Measured live: lookup 2ms, deployment read
+  450–1100ms. That gap is the whole reason it is not one call.
+- **The worker formats the line** (`deploymentLine` in `config.js`) and the
+  content script just prints what it is handed, so — unlike the deny list —
+  there is no fourth mirrored copy of the formatting to drift. A test asserts
+  `content.js` contains none of it.
 
 - **The key never reaches a page.** The content script has no `fetch`, no
   `chrome.storage` and no `Authorization` — it asks the worker and gets an
@@ -79,15 +97,16 @@ reads/writes `chrome.storage.local` on its behalf.
 ## Tests
 
 ```
-npm test                              # 16 unit tests, no deps, no network
+npm test                              # 30 unit tests, no deps, no network
 xvfb-run -a node test/e2e-browser.mjs # 22 real-browser assertions
 ```
 
 Server side, from `darwin-assistant/`:
 
 ```
-npm run page-companion:check        # 47 unit tests (registry, lookup, seeding, deny list)
-npm run page-companion:route-check  # 86 route checks against the real router
+npm run page-companion:check         # 52 unit tests (registry, lookup, seeding, deny list)
+npm run page-companion:route-check   # 108 route checks against the real router
+npm run page-companion:deploy-check  # 26 branch-awareness tests
 ```
 
 ## The deny list

@@ -5,21 +5,32 @@
 // would publish it to whatever page Kevin happens to be on. They ask, we fetch.
 
 import {
-  endpointFor, shouldAskAboutUrl, pageKey, badgeLabel, normalizeLookup, withDefaults, normalizeBase,
+  endpointFor, shouldAskAboutUrl, pageKey, badgeLabel, normalizeLookup, normalizeDeployment,
+  deploymentLine, withDefaults, normalizeBase,
 } from './config.js';
 
 const MSG_LOOKUP = 'page-companion:lookup';
 const MSG_NEW_CHAT = 'page-companion:new-chat';
 const MSG_GET_LAST_TAB = 'page-companion:get-last-tab';
 const MSG_SET_LAST_TAB = 'page-companion:set-last-tab';
+const MSG_DEPLOYMENT = 'page-companion:deployment';
 const CACHE_TTL_MS = 30_000;
 const LOOKUP_TIMEOUT_MS = 6_000;
+// Branch awareness is a nice-to-have on an already-open panel, so it gets its
+// own (shorter) budget and its own cache — it must never be able to slow or
+// break a lookup. The server caches per target for 60s too; this just stops a
+// panel being toggled from making a request per click.
+const DEPLOY_TIMEOUT_MS = 8_000;
+const DEPLOY_CACHE_TTL_MS = 60_000;
 // { [pageKey]: external_id } — which tab was open last, per page. Separate
 // storage key from the settings fields so withDefaults() never sees it.
 const LAST_TABS_KEY = 'lastTabs';
 
 /** pageKey -> { at, result } — collapses the reload/SPA storm into one call. */
 const cache = new Map();
+/** registry_id -> { at, result|null } — null is cached too, so a dead deploy
+ *  source is not re-asked on every panel toggle. */
+const deployCache = new Map();
 
 async function settings() {
   const stored = await chrome.storage.local.get(null);
@@ -129,6 +140,37 @@ async function setLastTab(url, externalId) {
   await chrome.storage.local.set({ [LAST_TABS_KEY]: map });
 }
 
+/**
+ * Which branch is live on the host serving this page. Returns null for every
+ * failure mode — no target, unknown answer, HTTP error, timeout, no config —
+ * because the panel's contract is "render the line or render nothing".
+ */
+async function deployment(registryId) {
+  if (!Number.isInteger(registryId) || registryId <= 0) return null;
+
+  const hit = deployCache.get(registryId);
+  if (hit && Date.now() - hit.at < DEPLOY_CACHE_TTL_MS) return hit.result;
+
+  let result = null;
+  try {
+    const cfg = await settings();
+    const endpoint = cfg.enabled ? endpointFor(cfg, 'deployment') : '';
+    if (endpoint) {
+      const headers = {};
+      if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
+      const res = await fetch(`${endpoint}?registry_id=${encodeURIComponent(registryId)}`, {
+        headers,
+        signal: AbortSignal.timeout(DEPLOY_TIMEOUT_MS),
+      });
+      if (res.ok) result = normalizeDeployment(await res.json());
+    }
+  } catch {
+    result = null; // a branch line is never worth surfacing an error for
+  }
+  deployCache.set(registryId, { at: Date.now(), result });
+  return result;
+}
+
 function paintBadge(tabId, result) {
   if (typeof tabId !== 'number') return;
   const text = result.ours ? badgeLabel(result.threads) || '•' : '';
@@ -172,6 +214,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  if (message?.type === MSG_DEPLOYMENT) {
+    // The worker formats the line too (it can import config.js; a content
+    // script cannot), so there is no fourth mirrored copy of this logic to keep
+    // honest — content.js just prints what it is handed, or nothing.
+    deployment(typeof message.registryId === 'number' ? message.registryId : NaN)
+      .then((result) => sendResponse({ ok: true, result, line: deploymentLine(result) }))
+      .catch(() => sendResponse({ ok: true, result: null, line: '' }));
+    return true; // async sendResponse
+  }
+
   if (message?.type === MSG_GET_LAST_TAB) {
     getLastTab(url)
       .then((externalId) => sendResponse({ ok: true, externalId }))
@@ -192,7 +244,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // A settings change invalidates the lookup cache (it was answered by the old
 // endpoint); a lastTabs-only write did not change what any endpoint returns.
 chrome.storage.onChanged.addListener((changes) => {
-  if (Object.keys(changes).some((k) => k !== LAST_TABS_KEY)) cache.clear();
+  if (Object.keys(changes).some((k) => k !== LAST_TABS_KEY)) { cache.clear(); deployCache.clear(); }
 });
 
 // Clicking the toolbar icon opens options; the in-page button is the real

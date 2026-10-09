@@ -1,7 +1,7 @@
 {
   "name": "darwin-assistant",
   "version": "0.1.0",
-  "description": "External Darwin AI assistant — voice intake, Slack bot, full Paperclip access",
+  "description": "External Darwin AI assistant \u2014 voice intake, Slack bot, full Paperclip access",
   "private": true,
   "type": "module",
   "scripts": {
@@ -89,7 +89,8 @@
     "work-board:test": "npm run build && JARVIS_DB_PATH=/tmp/work-board-test.db node scripts/work-board-test.mjs",
     "teams-radar:check": "npm run build && JARVIS_DB_PATH=/tmp/teams-radar-check.db node scripts/teams-radar-check.mjs",
     "page-companion:check": "npm run build && JARVIS_DB_PATH=/tmp/page-companion-check.db node scripts/page-companion-check.mjs",
-    "page-companion:route-check": "npm run build && JARVIS_DB_PATH=/tmp/page-companion-route-check.db node scripts/page-companion-route-check.mjs"
+    "page-companion:route-check": "npm run build && JARVIS_DB_PATH=/tmp/page-companion-route-check.db node scripts/page-companion-route-check.mjs",
+    "page-companion:deploy-check": "npm run build && JARVIS_DB_PATH=/tmp/page-companion-deploy-check.db node scripts/page-companion-deploy-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

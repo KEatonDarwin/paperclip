@@ -273,6 +273,67 @@ console.log('\nPOST /page-companion/seed');
   eq('…with its hand-given project name', heartbeat.body.project, 'Hub 1.0 Heartbeat');
 }
 
+// ── GET /page-companion/deployment (node #1586) ───────────────────────────
+// A SEPARATE endpoint on purpose: the panel calls it lazily after it is already
+// open, so a slow or dead deploy source can never touch page-load latency or
+// the ours/not-ours answer.
+console.log('\nGET /page-companion/deployment');
+{
+  const PCD = await import(path.join(distDir, 'page-companion-deploy.js'));
+  // Hermetic: both sources replaced, no Darwin host contacted by this suite.
+  PCD.deploymentSources.fetchEnvironments = async () => { throw new Error('deploy API down'); };
+  PCD.deploymentSources.readHubFile = async (_h, _r, p) =>
+    p === 'intake.thedarwinhub.com/.git/HEAD'
+      ? { content: 'ref: refs/heads/main\n', mtime: '2026-10-08T02:33:41+00:00' }
+      : p === 'intake.thedarwinhub.com/.git/refs/heads/main'
+        ? { content: 'ac3510d9d3574b1bc34ccb799c92191a19ee36d5\n', mtime: '2026-10-08T02:33:49+00:00' }
+        : null;
+  PCD.clearDeploymentCache();
+
+  const noAuth = await call('GET', '/page-companion/deployment?registry_id=1', undefined, { noAuth: true });
+  eq('auth is enforced', noAuth.status, 401);
+
+  for (const q of ['', '?registry_id=', '?registry_id=abc', '?registry_id=0', '?registry_id=-3', '?registry_id=1.5']) {
+    const bad = await call('GET', `/page-companion/deployment${q}`);
+    eq(`bad registry_id → 400 (${q || 'missing'})`, bad.status, 400);
+  }
+
+  const missing = await call('GET', '/page-companion/deployment?registry_id=999999');
+  eq('an unknown registry_id → 404', missing.status, 404);
+
+  // A page with no deploy target: 200, known:false, nothing rendered.
+  const lan = (await call('POST', '/page-companion/lookup', { url: 'http://192.168.1.25:8100/heartbeat' })).body;
+  const lanDep = await call('GET', `/page-companion/deployment?registry_id=${lan.registry_id}`);
+  eq('a page with no deploy target → 200', lanDep.status, 200);
+  eq('…known:false', lanDep.body.known, false);
+  eq('…and no branch', lanDep.body.branch, null);
+
+  // A repo-driven page: the git fallback answers after the deploy API fails.
+  const intake = (await call('POST', '/page-companion/lookup',
+    { url: 'https://intake.thedarwinhub.com/suppression-dashboard' })).body;
+  t('the intake dashboard is ours', intake.ours === true, JSON.stringify(intake));
+  const dep = await call('GET', `/page-companion/deployment?registry_id=${intake.registry_id}`);
+  eq('200', dep.status, 200);
+  eq('known', dep.body.known, true);
+  eq('source fell back to the git read', dep.body.source, 'git_head');
+  eq('branch', dep.body.branch, 'main');
+  eq('short commit', dep.body.commit, 'ac3510d9d3');
+  eq('deploy_target', dep.body.deploy_target, 'intake-prod');
+  eq('registry_id echoes the caller', dep.body.registry_id, intake.registry_id);
+
+  // THE LOAD-BEARING CHECK: with BOTH sources dead, /lookup is byte-identical.
+  PCD.deploymentSources.fetchEnvironments = async () => { throw new Error('down'); };
+  PCD.deploymentSources.readHubFile = async () => { throw new Error('down'); };
+  PCD.clearDeploymentCache();
+  const again = (await call('POST', '/page-companion/lookup',
+    { url: 'https://intake.thedarwinhub.com/suppression-dashboard' })).body;
+  t('the lookup is unchanged with the deployment source dead',
+    JSON.stringify(again) === JSON.stringify(intake), `${JSON.stringify(again)} vs ${JSON.stringify(intake)}`);
+  const dead = await call('GET', `/page-companion/deployment?registry_id=${intake.registry_id}`);
+  eq('…and the deployment endpoint still answers 200', dead.status, 200);
+  eq('…with known:false', dead.body.known, false);
+}
+
 server.close();
 console.log(`\n${fail === 0 ? `ALL ${pass} route checks passed ✅` : `${fail} FAILED (${pass} passed) ❌`}\n`);
 process.exit(fail === 0 ? 0 : 1);

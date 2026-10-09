@@ -16,6 +16,7 @@
   const MSG_NEW_CHAT = 'page-companion:new-chat';
   const MSG_GET_LAST_TAB = 'page-companion:get-last-tab';
   const MSG_SET_LAST_TAB = 'page-companion:set-last-tab';
+  const MSG_DEPLOYMENT = 'page-companion:deployment';
   const HOST_ID = 'jarvis-page-companion-host';
   const RECHECK_DEBOUNCE_MS = 600;
   // Identical to the cockpit's own openThreadWindow() (thread-window.ts) — same
@@ -194,7 +195,16 @@
       display: flex; align-items: center; gap: 8px; padding: 10px 8px 10px 14px;
       border-bottom: 1px solid rgba(255,255,255,.1); flex: none;
     }
-    .panel-title { font-weight: 700; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .panel-head-text { flex: 1; min-width: 0; }
+    .panel-title { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* Branch awareness (node #1586): ONE muted line, and only when the server
+       actually knows. Hidden by default and left hidden on every page that has
+       no deploy target — an "unknown" line would be noise. */
+    .panel-deploy {
+      font-size: 11px; opacity: .55; margin-top: 2px; font-variant-numeric: tabular-nums;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .panel-deploy[hidden] { display: none; }
     .panel-actions { display: flex; gap: 2px; flex: none; }
     .icon-btn {
       border: 0; background: transparent; color: #eaf0ff; opacity: .72; cursor: pointer;
@@ -245,7 +255,10 @@
       wrap.innerHTML = `
         <div class="panel" hidden>
           <div class="panel-head">
-            <span class="panel-title"></span>
+            <div class="panel-head-text">
+              <div class="panel-title"></div>
+              <div class="panel-deploy" hidden></div>
+            </div>
             <div class="panel-actions">
               <button class="icon-btn popout-btn" type="button" title="Pop out this chat" hidden>↗</button>
               <button class="icon-btn close-btn" type="button" aria-label="Close panel">×</button>
@@ -327,12 +340,53 @@
   function refreshPanel(root) {
     if (!current) return;
     root.querySelector('.panel-title').textContent = current.project || 'JARVIS chats';
+    askDeployment(root);
     const threads = Array.isArray(current.threads) ? current.threads : [];
     if (!activeExternalId || !threads.some((th) => th.external_id === activeExternalId)) {
       activeExternalId = threads[0]?.external_id ?? null;
     }
     renderTabs(root);
     renderFrame(root);
+  }
+
+  /**
+   * "Which branch is live here?" — asked LAZILY, only once the panel is open,
+   * and never as part of the lookup. Every failure mode (no deploy target, a
+   * dead deploy API, an unreachable hub, a timeout) ends the same way: the line
+   * stays hidden. The worker hands us the formatted string so this file carries
+   * no copy of the formatting rules.
+   */
+  function askDeployment(root) {
+    const el = root.querySelector('.panel-deploy');
+    const registryId = current?.registry_id;
+    if (typeof registryId !== 'number' || registryId <= 0) {
+      el.hidden = true;
+      el.textContent = '';
+      return;
+    }
+    if (el.dataset.forId === String(registryId) && el.dataset.done === '1') return; // already answered
+    if (el.dataset.forId !== String(registryId)) {
+      // Different page (SPA nav within the same host). Drop the previous
+      // page's branch line immediately — showing one host's branch under
+      // another page's title would be worse than showing nothing.
+      el.hidden = true;
+      el.textContent = '';
+      delete el.dataset.done;
+    }
+    el.dataset.forId = String(registryId);
+    try {
+      chrome.runtime.sendMessage({ type: MSG_DEPLOYMENT, url: location.href, registryId }, (response) => {
+        if (chrome.runtime.lastError) return;
+        if (el.dataset.forId !== String(registryId)) return; // panel moved on
+        const line = response?.ok && typeof response.line === 'string' ? response.line : '';
+        el.dataset.done = '1';
+        el.textContent = line;
+        el.hidden = !line;
+        if (line) el.title = `Deployed on this host — ${line}`;
+      });
+    } catch {
+      // extension context invalidated mid-reload — the line just stays hidden
+    }
   }
 
   function parseServerDate(raw) {

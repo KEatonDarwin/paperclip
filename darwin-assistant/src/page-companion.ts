@@ -37,6 +37,11 @@ export interface PageRegistryRow {
   project: string;
   primary_thread_ext: string | null;
   source: string;
+  /** Which deployed checkout serves this page, as a key into
+   *  `DEPLOY_TARGETS` (src/page-companion-deploy.ts). NULL = this page has no
+   *  branch to report (every LAN dashboard, every auto-registered page), which
+   *  is the common case and is never an error. */
+  deploy_target: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -69,6 +74,16 @@ sqliteDb.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_page_registry_source ON page_registry(source);
 `);
+
+// Added 2026-10-09 with branch awareness (tree-b0198a82, node #1586). Additive
+// and re-runnable: the only failure ALTER can throw here is "duplicate column
+// name" on a table that already has it, and existing rows keep NULL, which
+// means "no deploy target" — the same answer they gave before the column
+// existed. Nothing reads page_registry positionally, so adding a column is safe
+// on a table that already has rows.
+for (const col of ['deploy_target TEXT']) {
+  try { sqliteDb.exec(`ALTER TABLE page_registry ADD COLUMN ${col}`); } catch { /* already present */ }
+}
 
 // ─── URL normalization ────────────────────────────────────────────────────────
 
@@ -270,21 +285,27 @@ export function pagePatternMatches(pattern: string, normalizedUrl: string): bool
 
 // ─── Registry CRUD ────────────────────────────────────────────────────────────
 
+const REGISTRY_COLS = `id, url_pattern, project, primary_thread_ext, source, deploy_target, created_at, updated_at`;
+
 const listRegistryStmt = sqliteDb.prepare<[], PageRegistryRow>(
-  `SELECT id, url_pattern, project, primary_thread_ext, source, created_at, updated_at
-     FROM page_registry ORDER BY url_pattern ASC`,
+  `SELECT ${REGISTRY_COLS} FROM page_registry ORDER BY url_pattern ASC`,
 );
 const getRegistryByPatternStmt = sqliteDb.prepare<[string], PageRegistryRow>(
-  `SELECT id, url_pattern, project, primary_thread_ext, source, created_at, updated_at
-     FROM page_registry WHERE url_pattern = ?`,
+  `SELECT ${REGISTRY_COLS} FROM page_registry WHERE url_pattern = ?`,
 );
-const insertRegistryStmt = sqliteDb.prepare<[string, string, string | null, string]>(
-  `INSERT INTO page_registry (url_pattern, project, primary_thread_ext, source)
-   VALUES (?, ?, ?, ?)`,
+const setRegistryDeployTargetStmt = sqliteDb.prepare<[string, number]>(
+  `UPDATE page_registry SET deploy_target = ?, updated_at = datetime('now') WHERE id = ?`,
 );
-const updateRegistryStmt = sqliteDb.prepare<[string, string | null, string, number]>(
+const getRegistryByIdStmt = sqliteDb.prepare<[number], PageRegistryRow>(
+  `SELECT ${REGISTRY_COLS} FROM page_registry WHERE id = ?`,
+);
+const insertRegistryStmt = sqliteDb.prepare<[string, string, string | null, string, string | null]>(
+  `INSERT INTO page_registry (url_pattern, project, primary_thread_ext, source, deploy_target)
+   VALUES (?, ?, ?, ?, ?)`,
+);
+const updateRegistryStmt = sqliteDb.prepare<[string, string | null, string, string | null, number]>(
   `UPDATE page_registry
-      SET project = ?, primary_thread_ext = ?, source = ?, updated_at = datetime('now')
+      SET project = ?, primary_thread_ext = ?, source = ?, deploy_target = ?, updated_at = datetime('now')
     WHERE id = ?`,
 );
 
@@ -306,6 +327,10 @@ export function upsertPageRegistry(input: {
   project: string;
   primary_thread_ext?: string | null;
   source?: PageRegistrySource | string;
+  /** Omit to leave an existing row's target alone (same rule as the owning
+   *  thread) — a caller that doesn't know about deploy targets must never
+   *  blank one that is already set. */
+  deploy_target?: string | null;
 }): PageRegistryRow {
   const pattern = normalizePagePattern(input.url_pattern);
   if (!pattern) {
@@ -329,13 +354,28 @@ export function upsertPageRegistry(input: {
   const source = (input.source ?? 'manual').trim() || 'manual';
   const owner = input.primary_thread_ext?.trim() || null;
 
+  const target = input.deploy_target?.trim() || null;
+
   const existing = getRegistryByPatternStmt.get(pattern);
   if (existing) {
-    updateRegistryStmt.run(project, owner ?? existing.primary_thread_ext, source, existing.id);
+    updateRegistryStmt.run(
+      project,
+      owner ?? existing.primary_thread_ext,
+      source,
+      target ?? existing.deploy_target,
+      existing.id,
+    );
     return getRegistryByPatternStmt.get(pattern)!;
   }
-  insertRegistryStmt.run(pattern, project, owner, source);
+  insertRegistryStmt.run(pattern, project, owner, source, target);
   return getRegistryByPatternStmt.get(pattern)!;
+}
+
+/** One registry row by id — the key the extension already has from a lookup,
+ *  and the only input the deployment endpoint takes. */
+export function getPageRegistryById(id: number): PageRegistryRow | null {
+  if (!Number.isInteger(id) || id <= 0) return null;
+  return getRegistryByIdStmt.get(id) ?? null;
 }
 
 /** Most specific registry row covering this normalized URL: longest pattern
@@ -533,6 +573,9 @@ export function createPageChat(rawUrl: unknown, project?: unknown): NewPageChatR
 export interface PageRegistrySeedRow {
   url_pattern: string;
   project: string;
+  /** Key into DEPLOY_TARGETS (src/page-companion-deploy.ts). Only the
+   *  repo-driven hosts have one; the LAN dashboards legitimately do not. */
+  deploy_target?: string;
 }
 
 /**
@@ -610,9 +653,9 @@ const INTAKE_DASHBOARD_ROUTES: ReadonlyArray<{ path: string; name: string }> = [
  * different thing from a chat about prod, and the whole point of the registry
  * is to keep those apart.
  */
-const INTAKE_HOSTS: ReadonlyArray<{ host: string; label: string }> = [
-  { host: 'intake.thedarwinhub.com', label: 'Intake' },
-  { host: 'staging.intake.thedarwinhub.com', label: 'Intake staging' },
+const INTAKE_HOSTS: ReadonlyArray<{ host: string; label: string; deployTarget: string }> = [
+  { host: 'intake.thedarwinhub.com', label: 'Intake', deployTarget: 'intake-prod' },
+  { host: 'staging.intake.thedarwinhub.com', label: 'Intake staging', deployTarget: 'intake-staging' },
 ];
 
 /**
@@ -663,15 +706,19 @@ const ACCOUNTING_DASHBOARD_ROUTES: ReadonlyArray<{ path: string; name: string }>
   { path: '/dashboard/darwin/accounts', name: 'Darwin Accounts' },
 ];
 
-/** `host` + a route table → seed rows named "<label> · <dashboard>". */
+/** `host` + a route table → seed rows named "<label> · <dashboard>", all
+ *  carrying that host's deploy target so the panel can say which branch is
+ *  actually checked out there. */
 function seedRowsForHost(
   host: string,
   label: string,
   routes: ReadonlyArray<{ path: string; name: string }>,
+  deployTarget?: string,
 ): PageRegistrySeedRow[] {
   return routes.map(({ path, name }) => ({
     url_pattern: `https://${host}${path}`,
     project: `${label} · ${name}`,
+    ...(deployTarget ? { deploy_target: deployTarget } : {}),
   }));
 }
 
@@ -682,8 +729,10 @@ function seedRowsForHost(
  */
 export const MANUAL_PAGE_REGISTRY_SEED: ReadonlyArray<PageRegistrySeedRow> = [
   ...LAN_DASHBOARD_SEED,
-  ...INTAKE_HOSTS.flatMap(({ host, label }) => seedRowsForHost(host, label, INTAKE_DASHBOARD_ROUTES)),
-  ...seedRowsForHost('accounting.thedarwinhub.com', 'Accounting', ACCOUNTING_DASHBOARD_ROUTES),
+  ...INTAKE_HOSTS.flatMap(({ host, label, deployTarget }) =>
+    seedRowsForHost(host, label, INTAKE_DASHBOARD_ROUTES, deployTarget),
+  ),
+  ...seedRowsForHost('accounting.thedarwinhub.com', 'Accounting', ACCOUNTING_DASHBOARD_ROUTES, 'accounting'),
 ];
 
 const linkLabelStmt = sqliteDb.prepare<[], { conversation_id: number; url: string; label: string | null }>(
@@ -694,6 +743,10 @@ export interface PageRegistrySeedResult {
   manual_added: number;
   auto_added: number;
   skipped_covered: number;
+  /** Rows that already existed from an earlier boot and had no deploy_target
+   *  yet. Without this, every row seeded before the column existed would stay
+   *  branch-blind forever, because the manual loop skips existing patterns. */
+  deploy_targets_set: number;
 }
 
 /**
@@ -705,10 +758,20 @@ export interface PageRegistrySeedResult {
  */
 export function seedPageRegistry(): PageRegistrySeedResult {
   let manualAdded = 0;
+  let deployTargetsSet = 0;
   for (const row of MANUAL_PAGE_REGISTRY_SEED) {
     if (isDeniedPagePattern(row.url_pattern)) continue; // a denied seed row never boots
     const pattern = normalizePagePattern(row.url_pattern)!;
-    if (getRegistryByPatternStmt.get(pattern)) continue;
+    const existing = getRegistryByPatternStmt.get(pattern);
+    if (existing) {
+      // Back-fill ONLY a target that isn't set. Everything else about the row
+      // (above all a project name Kevin edited) is left exactly as it is.
+      if (row.deploy_target && !existing.deploy_target) {
+        setRegistryDeployTargetStmt.run(row.deploy_target, existing.id);
+        deployTargetsSet += 1;
+      }
+      continue;
+    }
     upsertPageRegistry({ ...row, source: 'manual' });
     manualAdded += 1;
   }
@@ -738,5 +801,10 @@ export function seedPageRegistry(): PageRegistrySeedResult {
     autoAdded += 1;
   }
 
-  return { manual_added: manualAdded, auto_added: autoAdded, skipped_covered: skippedCovered };
+  return {
+    manual_added: manualAdded,
+    auto_added: autoAdded,
+    skipped_covered: skippedCovered,
+    deploy_targets_set: deployTargetsSet,
+  };
 }

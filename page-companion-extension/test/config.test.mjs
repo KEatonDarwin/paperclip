@@ -3,12 +3,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   DEFAULTS, normalizeBase, resolveApiBase, endpointFor, apiKeyRequired,
   withDefaults, isAskableUrl, pageKey, badgeLabel, normalizeLookup,
+  normalizeDeployment, deploymentLine, relativeAge,
 } from '../src/config.js';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -149,4 +151,95 @@ test('the content script never imports (MV3 forbids it) and never reads the key'
     'the key must stay in the background worker — the content script runs next to the page');
   assert.ok(!/\bfetch\s*\(/.test(src), 'all network goes through the background worker');
   assert.ok(/attachShadow/.test(src), 'the button lives in a Shadow DOM');
+});
+
+// ─── Branch awareness (tree-b0198a82, node #1586) ────────────────────────────
+// The panel's contract is "render the line, or render nothing" — so every
+// not-known / not-identifying answer must normalize to null, and the line
+// formatter must never emit a bare separator or the word "unknown".
+
+test('normalizeDeployment: only a known, identifying answer survives', () => {
+  // known:false is the answer on every page with no deploy target.
+  assert.equal(normalizeDeployment({ known: false, branch: 'main' }), null);
+  assert.equal(normalizeDeployment(null), null);
+  assert.equal(normalizeDeployment('nope'), null);
+  assert.equal(normalizeDeployment({}), null);
+  // known but with nothing identifying it = nothing worth a line.
+  assert.equal(normalizeDeployment({ known: true, branch: null, commit: null }), null);
+
+  const d = normalizeDeployment({
+    known: true, branch: 'main', commit: 'ac3510d9d3', detached: false,
+    as_of: '2026-10-08T02:33:49+00:00', behind: 3, stale: true, dirty: false, source: 'git_head',
+  });
+  assert.deepEqual(d, {
+    branch: 'main', commit: 'ac3510d9d3', detached: false,
+    as_of: '2026-10-08T02:33:49+00:00', behind: 3, stale: true, dirty: false, source: 'git_head',
+  });
+
+  // Wrong types are dropped, not passed through to the formatter.
+  const loose = normalizeDeployment({ known: true, branch: 'main', commit: 5, behind: '3', as_of: 7 });
+  assert.equal(loose.commit, null);
+  assert.equal(loose.behind, null);
+  assert.equal(loose.as_of, null);
+});
+
+test('deploymentLine: the one muted header line', () => {
+  const NOW = Date.parse('2026-10-09T19:00:00Z');
+  const line = (d) => deploymentLine(normalizeDeployment(d), NOW);
+
+  // The three real in-scope hosts, 2026-10-09.
+  assert.equal(
+    line({ known: true, branch: 'main', commit: 'ac3510d9d3', as_of: '2026-10-08T02:33:49+00:00' }),
+    'main · ac3510d9d3 · 2d ago',
+  );
+  assert.equal(
+    line({ known: true, branch: 'deploy/atomic-releases-hub2', commit: '53739f343b', as_of: '2026-10-05T21:29:19+00:00' }),
+    'deploy/atomic-releases-hub2 · 53739f343b · 4d ago',
+  );
+  assert.equal(
+    line({ known: true, branch: 'jarvis/qb-sandbox-verify', commit: '8f98257cc4', as_of: '2026-10-09T17:45:04+00:00' }),
+    'jarvis/qb-sandbox-verify · 8f98257cc4 · 1h ago',
+  );
+
+  // The deploy-API extras.
+  assert.equal(
+    line({ known: true, branch: 'hub2/x', commit: 'abc1234567', behind: 3, dirty: true, as_of: '2026-10-09T18:00:00+00:00' }),
+    'hub2/x · abc1234567 · 3 behind · dirty · 1h ago',
+  );
+  // behind:0 is not news; dirty:false is not news.
+  assert.equal(
+    line({ known: true, branch: 'main', commit: 'abc1234567', behind: 0, dirty: false }),
+    'main · abc1234567',
+  );
+
+  // Detached HEAD says so and shows no branch.
+  assert.equal(line({ known: true, detached: true, commit: 'ac3510d9d3' }), 'detached @ ac3510d9d3');
+
+  // Nothing to render = the empty string, which is what hides the element.
+  assert.equal(deploymentLine(null), '');
+  assert.equal(line({ known: false }), '');
+});
+
+test('relativeAge: the staleness half of the line', () => {
+  const NOW = Date.parse('2026-10-09T19:00:00Z');
+  assert.equal(relativeAge('2026-10-09T18:59:40+00:00', NOW), 'just now');
+  assert.equal(relativeAge('2026-10-09T18:30:00+00:00', NOW), '30m ago');
+  assert.equal(relativeAge('2026-10-09T15:00:00+00:00', NOW), '4h ago');
+  assert.equal(relativeAge('2026-10-06T19:00:00+00:00', NOW), '3d ago');
+  // Past a week it becomes a date, not "47d ago".
+  assert.equal(relativeAge('2026-08-20T17:39:14+00:00', NOW), '2026-08-20');
+  // A server clock ahead of ours must not render "-3m ago".
+  assert.equal(relativeAge('2026-10-09T20:00:00+00:00', NOW), '');
+  assert.equal(relativeAge('not a date', NOW), '');
+  assert.equal(relativeAge('', NOW), '');
+  assert.equal(relativeAge(null, NOW), '');
+});
+
+test('content.js carries no copy of the deployment formatting', () => {
+  // The worker formats the line and the content script prints it, so unlike the
+  // deny list there is NO fourth mirror here to drift. Locked in by assertion.
+  const content = readFileSync(new URL('../src/content.js', import.meta.url), 'utf8');
+  assert.ok(/MSG_DEPLOYMENT/.test(content), 'content.js does ask for the deployment');
+  assert.ok(!/deploymentLine|relativeAge|behind/.test(content),
+    'content.js must not re-implement the line formatting — it prints response.line');
 });

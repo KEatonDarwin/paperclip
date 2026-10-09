@@ -249,8 +249,10 @@ import {
   listPageRegistry,
   upsertPageRegistry,
   seedPageRegistry,
+  getPageRegistryById,
   PageCompanionError,
 } from '../page-companion.js';
+import { getPageDeployment } from '../page-companion-deploy.js';
 import {
   INTEL_LANES,
   createIntelRun,
@@ -3438,6 +3440,33 @@ export function createApiV1Router(): Router {
   // Re-run the back-fill on demand (it also runs once at boot). Idempotent.
   router.post('/page-companion/seed', (_req: AuthedRequest, res) => {
     res.json(seedPageRegistry());
+  });
+
+  // BRANCH AWARENESS (node #1586). Deliberately NOT part of /lookup: the panel
+  // calls this lazily after it has already opened, so page-load latency and the
+  // ours/not-ours answer are completely untouched by a slow or dead deploy
+  // source. Always 200 with `known:false` when there is nothing to say — the
+  // panel renders the branch line only when known is true.
+  router.get('/page-companion/deployment', async (req: AuthedRequest, res) => {
+    const raw = typeof req.query.registry_id === 'string' ? req.query.registry_id : '';
+    const id = Number(raw);
+    if (!raw || !Number.isInteger(id) || id <= 0) {
+      sendError(res, 400, 'invalid_request', 'registry_id is required and must be a positive integer');
+      return;
+    }
+    const page = getPageRegistryById(id);
+    if (!page) {
+      sendError(res, 404, 'page_not_found', `no page_registry row with id ${id}`);
+      return;
+    }
+    try {
+      res.json(await getPageDeployment(page.id, page.deploy_target));
+    } catch (err) {
+      // getPageDeployment folds every data-shaped failure into known:false, so
+      // this is a programmer error — still answer 200-shaped rather than
+      // handing the panel a 500 it would have to special-case.
+      sendError(res, 500, 'deployment_read_failed', err instanceof Error ? err.message : String(err));
+    }
   });
 
   // == Task Hopper (candidate tasks awaiting Kevin's yes/dismiss) ==============

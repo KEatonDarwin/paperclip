@@ -782,6 +782,12 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     // (least-used selection). Independent of model_override so switching models
     // inside the claude adapter keeps the pin.
     claude_account: conv.pinned_claude_account ?? null,
+    // The Claude account THIS thread's last turn actually ran on ('a'/'b'/…),
+    // or null before its first claude turn. Lets the cockpit show a live A/B
+    // badge even while the pin is Auto, so Kevin never has to guess which
+    // subscription a chat is on. Sticky: it only changes when the account is
+    // re-picked (new session / the held account ran out), never per message.
+    session_account: conv.session_account ?? null,
     runtime: getAdapterRuntimeDescriptor(adapter.id, model),
     locked: !!conv.password_hash,
   };

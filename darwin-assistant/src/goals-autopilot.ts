@@ -49,7 +49,7 @@ import {
   type GoalTree,
   type PlanJson,
 } from './goals.js';
-import { VAULT_ROOT } from './goals-autopilot-verify.js';
+import { VAULT_ROOT, workerAdapterForModel } from './goals-autopilot-verify.js';
 import { laneStopped } from './work-switch.js';
 import { summarizeForLayman } from './layman-summary.js';
 
@@ -570,8 +570,10 @@ export function composeCueText(goal: GoalRow, tree: GoalTree, d: Decision, secon
       break;
     case 'plan':
     case 'replan': {
+      const buildAdapter = workerAdapterForModel(cfg.build_model) ?? 'claude';
+      const lightAdapter = workerAdapterForModel(cfg.light_model) ?? 'claude';
       lines.push(
-        `Write the plan for #${node!.id} and dispatch it: \`propose_plan\` {node_id:${node!.id}, plan:{what, deliverable, model, estimate, nodes:[…]}}. ≤6 flat build nodes, dependency-ordered via depends_on_indexes, every spec self-contained (a worker on ${cfg.build_model} with no chat context must succeed: repo, branch/worktree, files, commands, acceptance). adapter "claude" on every node; builds on ${cfg.build_model}, mechanical steps on ${cfg.light_model}; never fable / gpt-6-astra. Do NOT add a VERIFY or review node — the server appends the verifier on ${cfg.verify_model} and plants the tree in the same call. This is attempt ${attempt} of ${cfg.max_attempts}.`,
+        `Write the plan for #${node!.id} and dispatch it: \`propose_plan\` {node_id:${node!.id}, plan:{what, deliverable, model, estimate, nodes:[…]}}. ≤6 flat build nodes, dependency-ordered via depends_on_indexes, every spec self-contained (a worker on ${cfg.build_model} with no chat context must succeed: repo, branch/worktree, files, commands, acceptance). Set each node's \`adapter\` to match its model: \`${buildAdapter}\` for ${cfg.build_model} builds, \`${lightAdapter}\` for ${cfg.light_model} mechanical steps; never fable / gpt-6-astra. Do NOT add a VERIFY or review node — the server appends the verifier on ${cfg.verify_model} and plants the tree in the same call. This is attempt ${attempt} of ${cfg.max_attempts}.`,
       );
       if (gapsBlock) lines.push(gapsBlock);
       if (d.action === 'replan') {

@@ -28,7 +28,7 @@ import type { Statement } from 'better-sqlite3';
 import { sqliteDb, getSetting, setSetting } from './conversation-db.js';
 import { activeAutomatedTurns } from './turn-admission.js';
 import { createNotification } from './notifications.js';
-import type { AccountUsageEntry, ClaudeAccount } from './claude-accounts.js';
+import type { AccountUsage, AccountUsageEntry, ClaudeAccount } from './claude-accounts.js';
 import type { GovernorProvider, GovernorVerdict } from './hopper-governor.js';
 
 // ─── §1.1 the dials ───────────────────────────────────────────────────────────
@@ -632,6 +632,85 @@ function pickLeastUsed(pool: AccountUsageEntry[]): ClaudeAccount | null {
   return best?.account ?? (pool.length ? pool[0].account : null);
 }
 
+/** Minutes floor (as hours) on time-to-reset, so an about-to-reset window reads
+ *  as max urgency without dividing by zero or going negative when the poll clock
+ *  drifts a hair past the stored reset instant. */
+const BURN_RESET_FLOOR_HOURS = 5 / 60;
+
+function hoursUntil(iso: string | null, now: number): number | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return null;
+  return (t - now) / 3_600_000;
+}
+
+/**
+ * CONTRACT §4.7 — the burn-rate account score (2026-10-08, Kevin's formula; it
+ * replaces the old "lowest 5h" auto ranking). For each window the AFFORDABLE
+ * BURN RATE = headroom ÷ hours-until-reset: a window about to reset is cheap to
+ * spend (it refills in minutes), a window locked in for days is expensive. The
+ * account's score is the MIN across its two windows, because it must stay under
+ * BOTH ceilings — its tightest window governs. Highest score = most burnable
+ * right now = the auto pick.
+ *
+ * Why this fixes the old bug: an account at 0% on its 5h window but 98% on its
+ * weekly (resetting in >1 day) used to win on raw 5h; here its weekly term is
+ * ~zero, so its min is ~zero and the other account wins — for the right reason.
+ *
+ * A window with unknown usage or no reset timestamp is treated as non-binding
+ * (it can't be scored, so it never drags the min down). If NEITHER window is
+ * scorable the account is unscorable and the caller falls back to least-used.
+ * Headroom/ceiling are in utilization PERCENT POINTS, so the score is pct-pts/hr
+ * and is only ever compared between accounts — the unit itself never matters.
+ */
+export function claudeBurnScore(
+  usage: AccountUsage,
+  ceiling5h: number,
+  ceilingWeek: number,
+  now: number = Date.now(),
+): number | null {
+  const windowRate = (used: number | null, ceiling: number, resetIso: string | null): number | null => {
+    if (used == null) return null;
+    const t = hoursUntil(resetIso, now);
+    if (t == null) return null;
+    const headroom = Math.max(0, ceiling - used);
+    const hours = Math.max(t, BURN_RESET_FLOOR_HOURS);
+    return headroom / hours;
+  };
+  const r5 = windowRate(usage.five_hour, ceiling5h, usage.five_hour_resets_at);
+  const rw = windowRate(usage.weekly, ceilingWeek, usage.weekly_resets_at);
+  if (r5 == null && rw == null) return null;
+  if (r5 == null) return rw;
+  if (rw == null) return r5;
+  return Math.min(r5, rw);
+}
+
+/** AUTO ranking: the account that can sustain the highest burn rate until its
+ *  next reset. Falls back to least-used only when no account has scorable reset
+ *  timestamps (e.g. a usage file that predates the resets_at fields). */
+function pickHighestBurnScore(
+  ceiling5h: number,
+  ceilingWeek: number,
+): (pool: AccountUsageEntry[]) => ClaudeAccount | null {
+  return (pool) => {
+    const now = Date.now();
+    let best: AccountUsageEntry | null = null;
+    let bestScore = -Infinity;
+    let anyScored = false;
+    for (const e of pool) {
+      const s = claudeBurnScore(e.usage, ceiling5h, ceilingWeek, now);
+      if (s == null) continue;
+      anyScored = true;
+      if (s > bestScore) {
+        bestScore = s;
+        best = e; // strict > keeps the earlier (registry-order) entry on ties
+      }
+    }
+    if (!anyScored) return pickLeastUsed(pool);
+    return best?.account ?? (pool.length ? pool[0].account : null);
+  };
+}
+
 export function splitCursor(): string | null {
   return getSetting('throttle_split_cursor')?.trim() || null;
 }
@@ -714,7 +793,11 @@ export function throttleClaudeCandidates(
       return other?.account ?? (pool.length ? pool[0].account : null);
     };
   } else {
-    rank = pickLeastUsed; // auto, and split on interactive turns
+    // auto, and split on interactive turns: burn-rate ranking (CONTRACT §4.7).
+    const sl = readStopLoss();
+    const ceiling5h = sl.gov_5h_ceiling;
+    const ceilingWeek = sl.gov_weekly_mode === 'hard' ? sl.gov_weekly_ceiling : 100;
+    rank = pickHighestBurnScore(ceiling5h, ceilingWeek);
   }
 
   return { mode, focusKey, narrow, rank, eligible: narrow(entries).filter((e) => e.eligible) };

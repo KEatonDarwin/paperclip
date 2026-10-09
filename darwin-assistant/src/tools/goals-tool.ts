@@ -183,7 +183,7 @@ export const goals: ToolDef = {
       ow_group: { type: 'string', description: "Overwatch group (leads/email/queue/billing/revenue/system/custom/general); default custom." },
       // v0.4 autopilot:
       on: { type: 'boolean', description: 'For autopilot: true = turn it on, false = stop it. Only when Kevin said so in words.' },
-      config: { type: 'object', description: 'For autopilot {on:true}: partial AutopilotConfig — build_model/light_model/verify_model (claude ids, never fable/frontier), max_depth 1-8, parallel 1-3, tick_minutes 1-120, max_attempts 1-5. Merged over defaults (or the stored config).' },
+      config: { type: 'object', description: 'For autopilot {on:true}: partial AutopilotConfig — build_model/light_model/verify_model (claude or codex ids, never fable/gpt-6-astra), max_depth 1-8, parallel 1-3, tick_minutes 1-120, max_attempts 1-5. Merged over defaults (or the stored config).' },
       date: { type: 'string', description: 'For night_report: YYYY-MM-DD (default = the current run/today).' },
     },
     required: ['operation'],

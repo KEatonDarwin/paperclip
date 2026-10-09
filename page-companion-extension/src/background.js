@@ -4,9 +4,12 @@
 // read. Content scripts run in the page's world; handing them a cockpit key
 // would publish it to whatever page Kevin happens to be on. They ask, we fetch.
 
-import { endpointFor, isAskableUrl, pageKey, badgeLabel, normalizeLookup, withDefaults } from './config.js';
+import {
+  endpointFor, isAskableUrl, pageKey, badgeLabel, normalizeLookup, withDefaults, normalizeBase,
+} from './config.js';
 
 const MSG_LOOKUP = 'page-companion:lookup';
+const MSG_NEW_CHAT = 'page-companion:new-chat';
 const CACHE_TTL_MS = 30_000;
 const LOOKUP_TIMEOUT_MS = 6_000;
 
@@ -63,6 +66,36 @@ async function lookup(url) {
   return result;
 }
 
+// Starts a page-scoped chat server-side (zero model calls — see CONTRACT.md)
+// and invalidates that page's lookup cache so the next lookup lists it.
+async function newChat(url, project) {
+  const cfg = await settings();
+  if (!cfg.enabled) throw new Error('Page Companion is switched off in options');
+
+  const endpoint = endpointFor(cfg, 'new-chat');
+  if (!endpoint) throw new Error('No cockpit base URL configured — open the extension options');
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
+
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ url, project: typeof project === 'string' && project ? project : undefined }),
+    signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS),
+  });
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new Error(`new-chat ${res.status}${detail ? `: ${detail.slice(0, 200)}` : ''}`);
+  }
+
+  const data = await res.json();
+  const key = pageKey(url);
+  if (key) cache.delete(key);
+  return data;
+}
+
 function paintBadge(tabId, result) {
   if (typeof tabId !== 'number') return;
   const text = result.ours ? badgeLabel(result.threads) || '•' : '';
@@ -79,22 +112,34 @@ function paintBadge(tabId, result) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message?.type !== MSG_LOOKUP) return false;
-
   // Trust the sender's own URL over anything in the message body — a page can
   // talk to a content script, and a content script can be coaxed into lying.
   const url = sender?.tab?.url || sender?.url || (typeof message.url === 'string' ? message.url : '');
 
-  lookup(url)
-    .then((result) => {
-      paintBadge(sender?.tab?.id, result);
-      sendResponse({ ok: true, result });
-    })
-    .catch((err) => {
-      sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
-    });
+  if (message?.type === MSG_LOOKUP) {
+    Promise.all([lookup(url), settings()])
+      .then(([result, cfg]) => {
+        paintBadge(sender?.tab?.id, result);
+        // The panel needs the public base URL (never the key) to build
+        // /thread/<external_id> links for the embedded iframe and pop-out.
+        sendResponse({ ok: true, result, cockpitBase: normalizeBase(cfg.cockpitBase) });
+      })
+      .catch((err) => {
+        sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      });
+    return true; // async sendResponse
+  }
 
-  return true; // async sendResponse
+  if (message?.type === MSG_NEW_CHAT) {
+    newChat(url, message?.project)
+      .then((result) => sendResponse({ ok: true, result }))
+      .catch((err) => {
+        sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      });
+    return true; // async sendResponse
+  }
+
+  return false;
 });
 
 // Settings changed → everything we cached was answered by the old endpoint.

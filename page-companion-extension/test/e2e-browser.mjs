@@ -204,13 +204,54 @@ if (injected) {
   t('injection is one shadow host and nothing else',
     leak.children === 2 && leak.light === 0 && leak.shadow === true, JSON.stringify(leak));
 
-  // The panel stub (the real panel is the next node).
+  // The real panel: a tab per related chat, an embedded iframe for the active
+  // one (both the page and the API mock are plain http here, so embedding is
+  // always legal), a manual pop-out, and "+ New" creating a chat server-side.
   await btn.click();
-  await good.waitForTimeout(250);
-  const note = await good.locator('#jarvis-page-companion-host .note').textContent();
-  t('clicking opens the placeholder with the chat titles',
-    /E2E Test Dashboard/.test(note ?? '') && /First chat about the page/.test(note ?? ''), String(note).trim());
-  t('clicking logs the lookup result', logs.some((l) => l.includes('[JARVIS Page Companion]')), logs.join(' | '));
+  await good.waitForSelector('#jarvis-page-companion-host .panel:not([hidden])', { timeout: 5_000 });
+  const panelTitle = (await good.locator('#jarvis-page-companion-host .panel-title').textContent())?.trim();
+  t('panel title shows the project name', panelTitle === 'E2E Test Dashboard', panelTitle ?? '');
+
+  const tabs = good.locator('#jarvis-page-companion-host .tab');
+  t('one tab per related chat plus "+ New"', (await tabs.count()) === 3, String(await tabs.count()));
+
+  const GROUP_Q = `?group=${encodeURIComponent('E2E Test Dashboard')}`;
+  const expectedSrcs = [
+    `${API_BASE}/thread/${encodeURIComponent('cockpit:e2e-one')}${GROUP_Q}`,
+    `${API_BASE}/thread/${encodeURIComponent('cockpit:e2e-two')}${GROUP_Q}`,
+  ];
+  const frameSrc1 = await good.locator('#jarvis-page-companion-host .frame-wrap iframe').getAttribute('src');
+  t('the active tab embeds an iframe at /thread/<external_id>', expectedSrcs.includes(frameSrc1 ?? ''), String(frameSrc1));
+
+  // Switch to whichever thread tab isn't already active.
+  const firstIsActive = (await tabs.nth(0).getAttribute('class'))?.includes('active');
+  await tabs.nth(firstIsActive ? 1 : 0).click();
+  await good.waitForTimeout(150);
+  const frameSrc2 = await good.locator('#jarvis-page-companion-host .frame-wrap iframe').getAttribute('src');
+  t('switching tabs swaps the iframe src',
+    expectedSrcs.includes(frameSrc2 ?? '') && frameSrc2 !== frameSrc1, String(frameSrc2));
+
+  // The manual pop-out always works, even on an already-embedded tab.
+  const [popup] = await Promise.all([
+    context.waitForEvent('page', { timeout: 5_000 }),
+    good.locator('#jarvis-page-companion-host .popout-btn').click(),
+  ]);
+  t('the pop-out button opens the thread in its own window',
+    popup.url().startsWith(`${API_BASE}/thread/cockpit%3A`), popup.url());
+  await popup.close();
+
+  // "+ New" creates a chat server-side and opens it as a fourth, embedded tab.
+  await tabs.last().click();
+  await good.waitForFunction(
+    () => document.getElementById('jarvis-page-companion-host').shadowRoot.querySelectorAll('.tab').length === 4,
+    null, { timeout: 10_000 },
+  );
+  t('"+ New" adds a fourth tab', true);
+  const newFrameSrc = await good.locator('#jarvis-page-companion-host .frame-wrap iframe').getAttribute('src');
+  t('the new chat becomes the active, embedded tab',
+    (newFrameSrc ?? '').startsWith(`${API_BASE}/thread/cockpit%3A`) && !expectedSrcs.includes(newFrameSrc),
+    String(newFrameSrc));
+  t('console carries no stray errors from the panel build', !logs.some((l) => /error/i.test(l)), logs.join(' | '));
 
   if (process.env.E2E_SHOT) {
     await good.screenshot({ path: process.env.E2E_SHOT });

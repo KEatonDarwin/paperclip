@@ -13,8 +13,13 @@
 
 (() => {
   const MSG_LOOKUP = 'page-companion:lookup';
+  const MSG_NEW_CHAT = 'page-companion:new-chat';
   const HOST_ID = 'jarvis-page-companion-host';
   const RECHECK_DEBOUNCE_MS = 600;
+  // Identical to the cockpit's own openThreadWindow() (thread-window.ts) — same
+  // dimensions and the same per-thread window name, so popping a thread out here
+  // focuses the exact window the cockpit itself would reuse.
+  const POPUP_FEATURES = 'width=480,height=760,menubar=no,toolbar=no,location=no,status=no';
 
   if (window.__jarvisPageCompanionLoaded) return; // double-inject guard
   window.__jarvisPageCompanionLoaded = true;
@@ -22,6 +27,9 @@
   let askedKey = null; // the page key we last asked about — once per page
   let recheckTimer = null;
   let current = null; // last positive lookup result
+  let cockpitBase = null; // public base URL (no key) from the background worker
+  let panelOpen = false;
+  let activeExternalId = null; // which tab is selected
 
   function pageKey(raw) {
     try {
@@ -59,7 +67,7 @@
           if (chrome.runtime.lastError) return;
           if (!response?.ok) return;
           if (pageKey(location.href) !== key) return; // navigated while we waited
-          if (response.result?.ours) mount(response.result);
+          if (response.result?.ours) mount(response.result, response.cockpitBase);
           else unmount();
         },
       );
@@ -117,20 +125,54 @@
       font-size: 11px; font-weight: 700; display: grid; place-items: center;
       box-shadow: 0 0 0 2px #1f2a44;
     }
-    .note {
-      /* The wrap shrink-to-fits to the 48px button, so an absolutely positioned
-         child needs an explicit width or it wraps one word per line. */
-      position: absolute; right: 0; bottom: 60px; width: 250px;
-      background: #1f2a44; color: #eaf0ff; border: 1px solid rgba(255,255,255,.14);
-      border-radius: 10px; padding: 10px 12px; box-shadow: 0 10px 28px rgba(8,13,28,.44);
+    .panel {
+      position: absolute; right: 0; bottom: 60px; width: 380px; height: 520px;
+      max-height: calc(100vh - 100px);
+      background: #161e35; color: #eaf0ff; border: 1px solid rgba(255,255,255,.14);
+      border-radius: 12px; box-shadow: 0 14px 36px rgba(8,13,28,.5);
+      display: flex; flex-direction: column; overflow: hidden;
     }
-    .note .project { font-weight: 700; margin-bottom: 4px; }
-    .note .muted { opacity: .72; font-weight: 400; }
-    .note[hidden] { display: none; }
+    .panel[hidden] { display: none; }
+    .panel-head {
+      display: flex; align-items: center; gap: 8px; padding: 10px 8px 10px 14px;
+      border-bottom: 1px solid rgba(255,255,255,.1); flex: none;
+    }
+    .panel-title { font-weight: 700; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .panel-actions { display: flex; gap: 2px; flex: none; }
+    .icon-btn {
+      border: 0; background: transparent; color: #eaf0ff; opacity: .72; cursor: pointer;
+      width: 26px; height: 26px; border-radius: 6px; font-size: 14px; line-height: 1;
+      display: grid; place-items: center; padding: 0;
+    }
+    .icon-btn:hover { opacity: 1; background: rgba(255,255,255,.08); }
+    .icon-btn[hidden] { display: none; }
+    .tabs {
+      display: flex; gap: 4px; padding: 8px; overflow-x: auto; flex: none;
+      border-bottom: 1px solid rgba(255,255,255,.1);
+    }
+    .tab {
+      border: 1px solid rgba(255,255,255,.14); background: #1f2a44; color: #cdd8f5;
+      border-radius: 999px; padding: 5px 11px; font: inherit; font-size: 12px;
+      cursor: pointer; white-space: nowrap; flex: none;
+    }
+    .tab.active { background: #2f6df6; border-color: #2f6df6; color: #fff; }
+    .tab.new { opacity: .8; }
+    .tab:disabled { cursor: default; opacity: .5; }
+    .frame-wrap { flex: 1; min-height: 0; position: relative; }
+    .thread-frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #fff; }
+    .empty, .error, .mixed-note {
+      padding: 16px 14px; font-size: 12.5px; line-height: 1.5; opacity: .82;
+    }
+    .error { color: #ff9b9b; }
+    .mixed-note .open-popout {
+      display: block; margin-top: 10px; border: 0; border-radius: 7px; padding: 7px 12px;
+      background: #2f6df6; color: #fff; font: 600 12.5px/1 inherit; cursor: pointer;
+    }
   `;
 
-  function mount(result) {
+  function mount(result, base) {
     current = result;
+    if (base) cockpitBase = base;
     let host = document.getElementById(HOST_ID);
     if (!host) {
       host = document.createElement('div');
@@ -141,16 +183,160 @@
       const wrap = document.createElement('div');
       wrap.className = 'wrap';
       wrap.innerHTML = `
-        <div class="note" hidden></div>
+        <div class="panel" hidden>
+          <div class="panel-head">
+            <span class="panel-title"></span>
+            <div class="panel-actions">
+              <button class="icon-btn popout-btn" type="button" title="Pop out this chat" hidden>↗</button>
+              <button class="icon-btn close-btn" type="button" aria-label="Close panel">×</button>
+            </div>
+          </div>
+          <div class="tabs"></div>
+          <div class="frame-wrap"></div>
+        </div>
         <button class="btn" type="button" part="button">
           <span aria-hidden="true">🤖</span>
           <span class="badge" hidden></span>
         </button>`;
       root.append(style, wrap);
       (document.body ?? document.documentElement).appendChild(host);
-      root.querySelector('.btn').addEventListener('click', onClick);
+      wireEvents(root);
     }
     paint(host.shadowRoot, result);
+    if (panelOpen) refreshPanel(host.shadowRoot);
+  }
+
+  function wireEvents(root) {
+    root.querySelector('.btn').addEventListener('click', () => togglePanel(root));
+    root.querySelector('.close-btn').addEventListener('click', () => {
+      panelOpen = false;
+      root.querySelector('.panel').hidden = true;
+    });
+    root.querySelector('.popout-btn').addEventListener('click', () => popOut(activeExternalId));
+    // Delegated: the tab list is rebuilt wholesale on every render.
+    root.querySelector('.tabs').addEventListener('click', (e) => {
+      const btn = e.target.closest('button');
+      if (!btn) return;
+      if (btn.dataset.new) { startNewChat(root); return; }
+      const id = btn.dataset.id;
+      if (id && id !== activeExternalId) {
+        activeExternalId = id;
+        renderTabs(root);
+        renderFrame(root);
+      }
+    });
+  }
+
+  function togglePanel(root) {
+    panelOpen = !panelOpen;
+    root.querySelector('.panel').hidden = !panelOpen;
+    if (panelOpen) refreshPanel(root);
+  }
+
+  /** Tab bar + content area reflect current.threads and activeExternalId. */
+  function refreshPanel(root) {
+    if (!current) return;
+    root.querySelector('.panel-title').textContent = current.project || 'JARVIS chats';
+    const threads = Array.isArray(current.threads) ? current.threads : [];
+    if (!activeExternalId || !threads.some((th) => th.external_id === activeExternalId)) {
+      activeExternalId = threads[0]?.external_id ?? null;
+    }
+    renderTabs(root);
+    renderFrame(root);
+  }
+
+  /** "derive a display name client-side when [title is] null" — CONTRACT.md. */
+  function deriveTitle(thread) {
+    if (thread.title) return thread.title;
+    const raw = thread.last_active;
+    const d = raw ? new Date(/[Tt]/.test(raw) ? raw : `${raw.replace(' ', 'T')}Z`) : null;
+    if (d && !Number.isNaN(d.getTime())) return `Chat — ${d.toLocaleDateString()}`;
+    return 'Untitled chat';
+  }
+
+  function renderTabs(root) {
+    const threads = Array.isArray(current?.threads) ? current.threads : [];
+    root.querySelector('.tabs').innerHTML =
+      threads
+        .map(
+          (th) => `<button class="tab${th.external_id === activeExternalId ? ' active' : ''}" type="button"
+            data-id="${escapeHtml(th.external_id)}">${escapeHtml(deriveTitle(th))}</button>`,
+        )
+        .join('') + `<button class="tab new" type="button" data-new="1">+ New</button>`;
+  }
+
+  /** host[:port]/thread/<id> — the cockpit's own pop-out route, verbatim. */
+  function threadUrl(base, externalId, project) {
+    const q = project ? `?group=${encodeURIComponent(project)}` : '';
+    return `${base}/thread/${encodeURIComponent(externalId)}${q}`;
+  }
+
+  /** An https page can't iframe a plain-http cockpit — the browser blocks it as
+   *  mixed content. An https cockpit, or an http page, is always fine. */
+  function canEmbed(base) {
+    if (!base) return false;
+    try {
+      return !(location.protocol === 'https:' && new URL(base).protocol !== 'https:');
+    } catch {
+      return false;
+    }
+  }
+
+  function popOut(externalId) {
+    if (!cockpitBase || !externalId) return;
+    window.open(threadUrl(cockpitBase, externalId, current?.project), `jarvis-thread-${externalId}`, POPUP_FEATURES);
+  }
+
+  function renderFrame(root) {
+    const wrap = root.querySelector('.frame-wrap');
+    const popoutBtn = root.querySelector('.popout-btn');
+    if (!activeExternalId || !cockpitBase) {
+      popoutBtn.hidden = true;
+      wrap.innerHTML = '<div class="empty">No chat selected yet — start one with “+ New”.</div>';
+      return;
+    }
+    popoutBtn.hidden = false;
+    if (canEmbed(cockpitBase)) {
+      wrap.innerHTML =
+        `<iframe class="thread-frame" src="${escapeHtml(threadUrl(cockpitBase, activeExternalId, current.project))}"></iframe>`;
+      return;
+    }
+    // Mixed content: this page is https, the cockpit isn't, so the iframe would
+    // be blocked outright. Pop it out instead — still inside the click's user
+    // gesture, so the browser won't treat it as an unsolicited popup.
+    wrap.innerHTML = `
+      <div class="mixed-note">
+        This page is secure (https); the cockpit chat isn't, so it can't load inside this panel.
+        Opening it in its own window instead.
+        <button class="open-popout" type="button">Open chat ↗</button>
+      </div>`;
+    wrap.querySelector('.open-popout').addEventListener('click', () => popOut(activeExternalId));
+    popOut(activeExternalId);
+  }
+
+  function startNewChat(root) {
+    const newBtn = root.querySelector('.tab.new');
+    if (newBtn) { newBtn.disabled = true; newBtn.textContent = 'Starting…'; }
+    chrome.runtime.sendMessage(
+      { type: MSG_NEW_CHAT, url: location.href, project: current?.project },
+      (response) => {
+        if (chrome.runtime.lastError || !response?.ok) {
+          if (newBtn) { newBtn.disabled = false; newBtn.textContent = '+ New'; }
+          root.querySelector('.frame-wrap').innerHTML =
+            `<div class="error">Couldn't start a new chat${response?.error ? `: ${escapeHtml(response.error)}` : ''}.</div>`;
+          return;
+        }
+        const t = response.result;
+        current.threads = [
+          { external_id: t.external_id, title: null, last_active: new Date().toISOString() },
+          ...(Array.isArray(current.threads) ? current.threads : []),
+        ];
+        activeExternalId = t.external_id;
+        paint(root, current);
+        renderTabs(root);
+        renderFrame(root);
+      },
+    );
   }
 
   function paint(root, result) {
@@ -169,26 +355,9 @@
 
   function unmount() {
     current = null;
+    panelOpen = false;
+    activeExternalId = null;
     document.getElementById(HOST_ID)?.remove();
-  }
-
-  // Panel stub — the real panel (tabbed iframes of /thread/<external_id>) is the
-  // next node. For now: say what we found and prove the data arrived.
-  function onClick() {
-    const root = document.getElementById(HOST_ID)?.shadowRoot;
-    if (!root || !current) return;
-    const note = root.querySelector('.note');
-    const names = current.threads
-      .slice(0, 4)
-      .map((t) => `• ${escapeHtml(t.title ?? t.external_id)}`)
-      .join('<br>');
-    note.innerHTML = `
-      <div class="project">${escapeHtml(current.project ?? 'A JARVIS page')}</div>
-      <div class="muted">${current.threads.length} related chat${current.threads.length === 1 ? '' : 's'}</div>
-      ${names ? `<div class="muted" style="margin-top:6px">${names}</div>` : ''}
-      <div class="muted" style="margin-top:6px">Chat panel lands in the next build.</div>`;
-    note.hidden = !note.hidden;
-    console.log('[JARVIS Page Companion]', current);
   }
 
   function escapeHtml(s) {

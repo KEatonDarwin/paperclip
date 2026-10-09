@@ -10,8 +10,13 @@ import {
 
 const MSG_LOOKUP = 'page-companion:lookup';
 const MSG_NEW_CHAT = 'page-companion:new-chat';
+const MSG_GET_LAST_TAB = 'page-companion:get-last-tab';
+const MSG_SET_LAST_TAB = 'page-companion:set-last-tab';
 const CACHE_TTL_MS = 30_000;
 const LOOKUP_TIMEOUT_MS = 6_000;
+// { [pageKey]: external_id } — which tab was open last, per page. Separate
+// storage key from the settings fields so withDefaults() never sees it.
+const LAST_TABS_KEY = 'lastTabs';
 
 /** pageKey -> { at, result } — collapses the reload/SPA storm into one call. */
 const cache = new Map();
@@ -96,6 +101,26 @@ async function newChat(url, project) {
   return data;
 }
 
+// "Remember last-selected tab per normalized URL in chrome.storage.local"
+// (design doc) — the content script never touches chrome.storage itself
+// (see test/config.test.mjs), so it round-trips through us like everything else.
+async function getLastTab(url) {
+  const key = pageKey(url);
+  if (!key) return null;
+  const stored = await chrome.storage.local.get(LAST_TABS_KEY);
+  const map = stored?.[LAST_TABS_KEY];
+  return map && typeof map === 'object' && typeof map[key] === 'string' ? map[key] : null;
+}
+
+async function setLastTab(url, externalId) {
+  const key = pageKey(url);
+  if (!key || typeof externalId !== 'string' || !externalId) return;
+  const stored = await chrome.storage.local.get(LAST_TABS_KEY);
+  const map = stored?.[LAST_TABS_KEY] && typeof stored[LAST_TABS_KEY] === 'object' ? stored[LAST_TABS_KEY] : {};
+  map[key] = externalId;
+  await chrome.storage.local.set({ [LAST_TABS_KEY]: map });
+}
+
 function paintBadge(tabId, result) {
   if (typeof tabId !== 'number') return;
   const text = result.ours ? badgeLabel(result.threads) || '•' : '';
@@ -139,11 +164,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  if (message?.type === MSG_GET_LAST_TAB) {
+    getLastTab(url)
+      .then((externalId) => sendResponse({ ok: true, externalId }))
+      .catch(() => sendResponse({ ok: true, externalId: null }));
+    return true; // async sendResponse
+  }
+
+  if (message?.type === MSG_SET_LAST_TAB) {
+    setLastTab(url, message?.externalId)
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+    return true; // async sendResponse
+  }
+
   return false;
 });
 
-// Settings changed → everything we cached was answered by the old endpoint.
-chrome.storage.onChanged.addListener(() => cache.clear());
+// A settings change invalidates the lookup cache (it was answered by the old
+// endpoint); a lastTabs-only write did not change what any endpoint returns.
+chrome.storage.onChanged.addListener((changes) => {
+  if (Object.keys(changes).some((k) => k !== LAST_TABS_KEY)) cache.clear();
+});
 
 // Clicking the toolbar icon opens options; the in-page button is the real
 // surface, and this is the escape hatch when it hasn't appeared.

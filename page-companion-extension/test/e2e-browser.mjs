@@ -253,6 +253,19 @@ if (injected) {
     String(newFrameSrc));
   t('console carries no stray errors from the panel build', !logs.some((l) => /error/i.test(l)), logs.join(' | '));
 
+  // "Remember last-selected tab per normalized URL in chrome.storage.local"
+  // (design doc) — a fresh page load of the same URL should reopen on the
+  // same thread the new-chat flow just landed on.
+  const good2 = await context.newPage();
+  await good2.goto(REGISTERED_URL);
+  await good2.waitForSelector('#jarvis-page-companion-host', { state: 'attached', timeout: 15_000 });
+  await good2.locator('#jarvis-page-companion-host .btn').click();
+  await good2.waitForSelector('#jarvis-page-companion-host .panel:not([hidden])', { timeout: 5_000 });
+  const restoredFrameSrc = await good2.locator('#jarvis-page-companion-host .frame-wrap iframe').getAttribute('src');
+  t('reopening the page restores the last-selected tab',
+    restoredFrameSrc === newFrameSrc, `expected ${newFrameSrc}, got ${restoredFrameSrc}`);
+  await good2.close();
+
   if (process.env.E2E_SHOT) {
     await good.screenshot({ path: process.env.E2E_SHOT });
     console.log(`  · screenshot → ${process.env.E2E_SHOT}`);

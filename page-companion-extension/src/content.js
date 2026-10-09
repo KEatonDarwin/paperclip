@@ -14,6 +14,8 @@
 (() => {
   const MSG_LOOKUP = 'page-companion:lookup';
   const MSG_NEW_CHAT = 'page-companion:new-chat';
+  const MSG_GET_LAST_TAB = 'page-companion:get-last-tab';
+  const MSG_SET_LAST_TAB = 'page-companion:set-last-tab';
   const HOST_ID = 'jarvis-page-companion-host';
   const RECHECK_DEBOUNCE_MS = 600;
   // Identical to the cockpit's own openThreadWindow() (thread-window.ts) — same
@@ -67,8 +69,12 @@
           if (chrome.runtime.lastError) return;
           if (!response?.ok) return;
           if (pageKey(location.href) !== key) return; // navigated while we waited
-          if (response.result?.ours) mount(response.result, response.cockpitBase);
-          else unmount();
+          if (response.result?.ours) {
+            mount(response.result, response.cockpitBase);
+            restoreLastTab();
+          } else {
+            unmount();
+          }
         },
       );
     } catch {
@@ -126,7 +132,7 @@
       box-shadow: 0 0 0 2px #1f2a44;
     }
     .panel {
-      position: absolute; right: 0; bottom: 60px; width: 380px; height: 520px;
+      position: absolute; right: 0; bottom: 60px; width: 420px; height: 520px;
       max-height: calc(100vh - 100px);
       background: #161e35; color: #eaf0ff; border: 1px solid rgba(255,255,255,.14);
       border-radius: 12px; box-shadow: 0 14px 36px rgba(8,13,28,.5);
@@ -153,8 +159,11 @@
     .tab {
       border: 1px solid rgba(255,255,255,.14); background: #1f2a44; color: #cdd8f5;
       border-radius: 999px; padding: 5px 11px; font: inherit; font-size: 12px;
-      cursor: pointer; white-space: nowrap; flex: none;
+      cursor: pointer; white-space: nowrap; flex: none; max-width: 170px;
+      display: inline-flex; align-items: baseline; gap: 3px;
     }
+    .tab-label { overflow: hidden; text-overflow: ellipsis; max-width: 120px; }
+    .tab-rel { opacity: .65; font-size: 10.5px; flex: none; }
     .tab.active { background: #2f6df6; border-color: #2f6df6; color: #fff; }
     .tab.new { opacity: .8; }
     .tab:disabled { cursor: default; opacity: .5; }
@@ -223,8 +232,38 @@
         activeExternalId = id;
         renderTabs(root);
         renderFrame(root);
+        saveLastTab(id);
       }
     });
+  }
+
+  /** Round-trips through the background worker — see note in background.js. */
+  function saveLastTab(externalId) {
+    try {
+      chrome.runtime.sendMessage({ type: MSG_SET_LAST_TAB, url: location.href, externalId }, () => {
+        void chrome.runtime.lastError; // best-effort; nothing actionable on failure
+      });
+    } catch {
+      // extension context invalidated mid-reload — not worth retrying for this
+    }
+  }
+
+  /** Re-selects whatever tab was last open on this exact page, if it still exists. */
+  function restoreLastTab() {
+    if (activeExternalId) return; // user (or this call, on a re-paint) already picked one
+    try {
+      chrome.runtime.sendMessage({ type: MSG_GET_LAST_TAB, url: location.href }, (response) => {
+        if (chrome.runtime.lastError || !response?.ok || !response.externalId) return;
+        if (activeExternalId) return; // raced with a user click while we waited
+        const threads = Array.isArray(current?.threads) ? current.threads : [];
+        if (!threads.some((th) => th.external_id === response.externalId)) return;
+        activeExternalId = response.externalId;
+        const root = document.getElementById(HOST_ID)?.shadowRoot;
+        if (root && panelOpen) { renderTabs(root); renderFrame(root); }
+      });
+    } catch {
+      // extension context invalidated mid-reload — fine, next page load retries
+    }
   }
 
   function togglePanel(root) {
@@ -245,23 +284,44 @@
     renderFrame(root);
   }
 
+  function parseServerDate(raw) {
+    if (!raw) return null;
+    const d = new Date(/[Tt]/.test(raw) ? raw : `${raw.replace(' ', 'T')}Z`);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
   /** "derive a display name client-side when [title is] null" — CONTRACT.md. */
   function deriveTitle(thread) {
     if (thread.title) return thread.title;
-    const raw = thread.last_active;
-    const d = raw ? new Date(/[Tt]/.test(raw) ? raw : `${raw.replace(' ', 'T')}Z`) : null;
-    if (d && !Number.isNaN(d.getTime())) return `Chat — ${d.toLocaleDateString()}`;
-    return 'Untitled chat';
+    const d = parseServerDate(thread.last_active);
+    return d ? `Chat — ${d.toLocaleDateString()}` : 'Untitled chat';
+  }
+
+  /** Compact relative time for the tab strip ("title + relative last-active"). */
+  function relativeTime(raw) {
+    const d = parseServerDate(raw);
+    if (!d) return '';
+    const mins = Math.round((Date.now() - d.getTime()) / 60_000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.round(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.round(hours / 24);
+    return days < 7 ? `${days}d ago` : d.toLocaleDateString();
   }
 
   function renderTabs(root) {
     const threads = Array.isArray(current?.threads) ? current.threads : [];
     root.querySelector('.tabs').innerHTML =
       threads
-        .map(
-          (th) => `<button class="tab${th.external_id === activeExternalId ? ' active' : ''}" type="button"
-            data-id="${escapeHtml(th.external_id)}">${escapeHtml(deriveTitle(th))}</button>`,
-        )
+        .map((th) => {
+          const title = deriveTitle(th);
+          const rel = relativeTime(th.last_active);
+          return `<button class="tab${th.external_id === activeExternalId ? ' active' : ''}" type="button"
+            data-id="${escapeHtml(th.external_id)}" title="${escapeHtml(title)}${rel ? ` · ${rel}` : ''}">
+            <span class="tab-label">${escapeHtml(title)}</span>${rel ? `<span class="tab-rel">${escapeHtml(rel)}</span>` : ''}
+          </button>`;
+        })
         .join('') + `<button class="tab new" type="button" data-new="1">+ New</button>`;
   }
 
@@ -335,6 +395,7 @@
         paint(root, current);
         renderTabs(root);
         renderFrame(root);
+        saveLastTab(t.external_id);
       },
     );
   }

@@ -47,6 +47,7 @@ import {
 } from '../conversation-db.js';
 import {
   resolveBrevity,
+  getBrevityGlobals,
   getGlobalBrevityLevel,
   getGlobalBrevityView,
   setGlobalBrevityLevel,
@@ -54,6 +55,7 @@ import {
   isBrevityLevel,
   isBrevityView,
   fullOnly,
+  type ResolvedBrevity,
 } from '../reply-brevity.js';
 import {
   listGroups,
@@ -721,7 +723,15 @@ function spawnIntelRunner(runId: number, lanes: IntelLane[]): void {
   child.unref();
 }
 
-function threadDescriptor(conv: ConversationRow, req: Request): Record<string, unknown> {
+/** `brevityGlobals` is an optional read-once hoist for callers that build MANY
+ *  descriptors in one response (LIST /threads maps up to 200, search up to the
+ *  match count). Single-thread callers omit it and each read the two settings
+ *  themselves, which is the same cost as before. */
+function threadDescriptor(
+  conv: ConversationRow,
+  req: Request,
+  brevityGlobals?: ResolvedBrevity,
+): Record<string, unknown> {
   const host = headerString(req.headers.host) ?? `localhost:${UI_PORT}`;
   const proto = req.protocol ?? 'http';
   // Effective provider/model for this thread (per-thread override, else global).
@@ -801,7 +811,9 @@ function threadDescriptor(conv: ConversationRow, req: Request): Record<string, u
     // don't need a second round-trip to /reply-brevity.
     reply_brevity: {
       override: { level: conv.brevity_level ?? null, view: conv.brevity_view ?? null },
-      effective: resolveBrevity(conv.external_id),
+      // Hand resolveBrevity the row we already have (and, on list/search, the
+      // globals read once for the whole page) — see ResolveBrevityOpts.
+      effective: resolveBrevity(conv.external_id, { conv, globals: brevityGlobals }),
     },
   };
 }
@@ -5752,7 +5764,10 @@ export function createApiV1Router(): Router {
       return true;
     }).slice(0, limit);
 
-    res.json({ threads: filtered.map((c) => threadDescriptor(c, req)) });
+    // Read the two global brevity settings ONCE for the whole page instead of
+    // per thread (up to 200 descriptors here).
+    const listBrevityGlobals = getBrevityGlobals();
+    res.json({ threads: filtered.map((c) => threadDescriptor(c, req, listBrevityGlobals)) });
   });
 
   // -- POST /threads/search: AI-mediated natural-language search (DAR-741) ---
@@ -5779,9 +5794,12 @@ export function createApiV1Router(): Router {
       const matches = await searchThreadsByQuery(query, candidates);
       const byId = new Map(candidates.map((c) => [c.external_id, c]));
       const results: Record<string, unknown>[] = [];
+      const searchBrevityGlobals = getBrevityGlobals();
       for (const m of matches) {
         const conv = byId.get(m.thread_id);
-        if (conv) results.push({ ...threadDescriptor(conv, req), search_reason: m.reason });
+        if (conv) {
+          results.push({ ...threadDescriptor(conv, req, searchBrevityGlobals), search_reason: m.reason });
+        }
       }
       res.json({ results });
     } catch (err) {

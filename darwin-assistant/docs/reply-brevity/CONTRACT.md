@@ -155,12 +155,36 @@ chat bubble itself — gets the **raw, unsplit** text (brief + marker + full)
 because its renderer (`BrevityReply.tsx` in jarvis-command-center) does its
 own client-side split and needs the marker to do it.
 
-All turn content, with no exception found in this codebase, flows through
-`conversation-db.ts`'s `getTurns` / `getTurnsLean`. The regression guard in
-`scripts/reply-brevity-test.mjs` (part D) scans `src/**/*.ts` for call sites
-of those two functions (tokenized — comments and string literals stripped
-first, so prose mentioning them can't trip it) and fails if a file calls
-them without appearing in this table's file list and the guard's `ALLOWLIST`.
+There are **two** classes of consumer, and the original sweep for this node
+only knew about one of them. That mistake is worth recording, because it is
+the reason three real leaks shipped past a green test suite.
+
+**Class 1 — reads a persisted turn** via `conversation-db.ts`'s `getTurns` /
+`getTurnsLean`. Guarded by part **D** of `scripts/reply-brevity-test.mjs`,
+which scans `src/**/*.ts` for call sites of those two functions (tokenized —
+comments and string literals stripped first, so prose mentioning them can't
+trip it) and fails if a file calls them without appearing in this table and
+the guard's `ALLOWLIST`.
+
+**Class 2 — consumes `processMessage()`'s RETURN VALUE.** `processMessage`
+hands the reply text straight back to its caller and never passes through the
+turns table, so *no* amount of `getTurns` scanning can see these. This
+document previously asserted "all turn content, with no exception found in
+this codebase, flows through `getTurns`/`getTurnsLean`" — that was **false**,
+and the review of this branch (tree-c8e32ef9 node #1573) found three live
+leaks hiding behind it: `checkin-worker.ts` posting the raw brief+marker+full
+to Kevin's Slack DM (where Slack renders no HTML, so the marker was *visible
+text* — precisely the failure the HTML-comment marker was chosen to prevent)
+and into the notification bell, plus both `handlers/webhook.ts` JSON
+responses. Guarded by part **D2**, which allowlists **every** file calling
+`processMessage` — including the fire-and-forget callers that discard the
+return value. It deliberately does *not* try to detect "is the return value
+used?" statically: a shape heuristic is the same species of guess that
+produced the blind spot in the first place.
+
+**The lesson, stated plainly:** a guard is only as good as its premise about
+where the data flows. When adding a guard, write down the premise — then go
+looking for a path that violates it.
 
 | File / route | What it is | Decision | How |
 |---|---|---|---|
@@ -181,6 +205,8 @@ them without appearing in this table's file list and the guard's `ALLOWLIST`.
 | `tools/group-chat-tool.ts` — `get_member_thread` tool, `mode:'full'` | Another JARVIS instance (in a group chat) reading a member thread's real transcript. | Full only | `fullOnly(t.content)` for assistant turns |
 | `ephemeral-chat.ts` — ephemeral chat widget snapshot | A second, throwaway chat surface in the cockpit with no expand/collapse UI of its own. | Full only | `fullOnly(t.content)` for assistant turns |
 | `ui-server.ts` — legacy pre-React debug server (`/conversations/:id` HTML view, `/api/conversations/:id` JSON dump, `/api/conversations/:id/markdown`, `/api/conversations/:id/session-clone`, `/api/conversations/:id/continue` primer generation, and the page's live SSE tail) | Admin/debug surface, still live on the same port (3201) as the real API, superseded by the React cockpit but not deleted. Five server-side `getTurns` call sites plus one client-side SSE render path — all found only by the regression guard's static scan, not the original file list for this node. | Full only, everywhere | `groupTurnsIntoExchanges` (shared by `renderExchange` the HTML view, and `buildSessionClone`) stores `{ ...t, content: fullOnly(t.content) }`; `buildTranscriptMarkdown` and `buildPrimerSourceTranscript` (feeds the `/continue` primer **model prompt**) apply `fullOnly` inline; the raw `GET /api/conversations/:id` JSON dump maps assistant turns through `fullOnly`; the inline client-side SSE live-tail script has its own minimal `fullOnlyClient` (line-split only, no fenced-code awareness — an accepted limitation on this debug-only page). |
-| `notifications.ts` — notification `body` | Could theoretically carry turn content. | N/A today | No current caller (`agent.ts`'s chat-importance ping, `tech-tasks.ts`, `mike-radar-report.ts`, `hopper-engine.ts`, etc.) passes raw turn content into a notification body — they all use static/templated strings or hopper-node `result` text (see below). The regression guard is what stops a *future* caller from doing so silently. |
+| `checkin-worker.ts` — the fired check-in nudge (**class 2**) | `processMessage`'s return value, posted to Kevin's Slack DM, put in the notification bell body, *and* persisted as an assistant turn. | Slack post: **brief**. Bell body: **brief**. Persisted turn: **RAW**. | `const nudgeText = briefOnly(response)` feeds both `chat.postMessage` and `createNotification({ body })`; `addTurn(…, 'assistant', response)` keeps the original both-halves text so the cockpit's Notifications thread still renders the expander, and the notification links straight to it. Deviates from the review's suggestion of `fullOnly` for the bell body on purpose: the bell is the definition of a glance surface, and its `link` is the expand affordance. |
+| `handlers/webhook.ts` — `POST /intake`, `POST /intake/reply` (**class 2**) | `processMessage`'s return value returned as `{response}` JSON to a programmatic caller. | Full only | `fullOnly(await processMessage(…))` on both routes — an API client has no expander, so it must never get the abbreviated half. |
+| `notifications.ts` — notification `body` | Carries turn/reply content when a caller passes it. | Per-caller (see `checkin-worker.ts` above) | `checkin-worker.ts` is the one caller that passes reply text, and it passes the brief. Every other caller (`agent.ts`'s chat-importance ping, `tech-tasks.ts`, `mike-radar-report.ts`, `hopper-engine.ts`, …) uses static/templated strings or hopper-node `result` text (see below). An earlier draft of this table claimed *no* caller did — the class-2 guard is what makes that claim checkable instead of assumed. |
 | `tree-cue.ts`, `hopper-engine.ts` (finish-contract parsing), `goals.ts` / `goals-autopilot*.ts` (verdict parsing), `night-shift.ts`, `shift-narrator.ts`, `result-summary.ts`, `layman-summary.ts`, `mike-radar-report.ts`, `tech-tasks.ts` | All read a hopper-node worker's `result` text, supplied directly in the finish-contract POST body (`parsed.result`) — never read back out of `turns.content`. | N/A | Doubly safe: (1) this text never round-trips through the DB turn-content column at all; (2) even if it did, every hopper-node/unblocker worker thread hard-excludes to level 0 (see above), so a worker's own reply never gets a brief or a marker in the first place. `mike-radar-report.ts`'s `row.text` is scraped Teams/Slack content from `mike_activity`, not a JARVIS turn at all. |
 | `notepad-dossier-sources.ts`, `group-chat-context.ts`, `big-board.ts`, `workbench.ts` (`read_up`), `briefing.ts`, `jarvis-brief.ts` | Read `thread_summaries.content` (a pre-generated summary) or `thread_todos.content` (a todo's own text). | N/A | Neither table ever stores raw turn content with a marker — summaries are freshly generated text, todos are authored separately. |

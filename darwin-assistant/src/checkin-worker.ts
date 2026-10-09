@@ -5,6 +5,7 @@ import { isMuted } from './mute-check.js';
 import { createNotification, type NotificationAction } from './notifications.js';
 import { getConversation, getOrCreateConversation, addTurn, updateSessionState, renameConversation } from './conversation-db.js';
 import { laneStopped } from './work-switch.js';
+import { briefOnly } from './reply-brevity.js';
 
 const POLL_INTERVAL_MS = 60_000;
 const CHECKIN_CONV_PREFIX = 'ephemeral:checkin:';
@@ -179,14 +180,21 @@ async function processDueCheckins(slackApp: App): Promise<void> {
         continue;
       }
 
-      const postResult = await slackApp.client.chat.postMessage({ channel: userId, text: response });
+      // Reply-brevity dial (tree-c8e32ef9): processMessage RETURNS the reply
+      // text, so this path never passes through the turns table and the #1572
+      // sweep (which scanned getTurns call sites) could not see it. Slack and
+      // the notification bell are both glance surfaces — they get the brief;
+      // the persisted turn below stays RAW so the cockpit still renders both
+      // halves with its expander, and the notification links to that thread.
+      const nudgeText = briefOnly(response);
+      const postResult = await slackApp.client.chat.postMessage({ channel: userId, text: nudgeText });
       const notificationsConversationId = ensureCheckinNotificationsConversationId();
       addTurn(notificationsConversationId, 'assistant', response);
       const link = linkForCheckin(checkin);
       createNotification({
         severity: 'info',
         title: titleForCheckin(checkin),
-        body: response,
+        body: nudgeText,
         source: sourceLabelForCheckin(checkin),
         link: `/thread/${encodeURIComponent(CHECKIN_NOTIFICATIONS_THREAD_ID)}`,
         actions: actionsForCheckin(checkin, link),

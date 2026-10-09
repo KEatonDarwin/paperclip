@@ -47,6 +47,7 @@ const {
   briefOnly,
   fullOnly,
   resolveBrevity,
+  getBrevityGlobals,
   brevityPromptBlock,
   getGlobalBrevityLevel,
   getGlobalBrevityView,
@@ -171,6 +172,28 @@ check('briefOnly returns the whole text when there is no usable brief', () => {
   assert.equal(briefOnly(firstLineMarker), firstLineMarker);
 });
 
+check('fullOnly returns the full half, and is a no-op without a marker', () => {
+  assert.equal(fullOnly(`Short bit.\n\n${FULL_MARKER}\n\nFull bit.`), 'Full bit.');
+  assert.equal(fullOnly('plain text, no marker'), 'plain text, no marker');
+});
+
+// Review finding (#1573): a run that died right after emitting the marker left
+// fullOnly() returning '' — handing every full-only consumer (export, context
+// digest, polling API, admin drill-down, cross-thread read, and the model's own
+// transcript replay) a BLANK assistant turn, losing the one half that survived.
+check('fullOnly degrades to the brief when the full half never arrived', () => {
+  assert.equal(fullOnly(`Short version here.\n\n${FULL_MARKER}\n`), 'Short version here.');
+  assert.equal(fullOnly(`Short version here.\n\n${FULL_MARKER}\n   \n\n`), 'Short version here.');
+});
+
+check('fullOnly only ever returns empty for genuinely empty input', () => {
+  assert.equal(fullOnly(''), '');
+  // Marker alone, nothing either side: no brief and no full — return the input
+  // untouched rather than inventing a value.
+  const markerOnly = `${FULL_MARKER}\n`;
+  assert.equal(fullOnly(markerOnly), markerOnly);
+});
+
 // ═════════ B. brevityPromptBlock + resolveBrevity (DB-backed) ═══════════════
 console.log('\nB. brevityPromptBlock(0) + resolveBrevity precedence (scratch DB)');
 
@@ -260,6 +283,59 @@ check('a non-worker thread with the same number suffix is NOT excluded (prefix m
   const r = resolveBrevity(EXT);
   assert.equal(r.level, 2, 'only a true external_id PREFIX match is a worker thread');
   setGlobalBrevityLevel(0);
+});
+
+// Review finding (#1573): threadDescriptor re-fetched the row it was already
+// handed, and LIST /threads maps it over up to 200 threads — ~600 extra
+// synchronous sqlite reads on the one surface whose event-loop stalls have
+// already bitten once. The opts form must give the SAME answer as the
+// fetching form, or the hot path and the cold path would disagree.
+check('resolveBrevity(ext, {conv}) matches the self-fetching form exactly', () => {
+  const EXT = 'cockpit:reply-brevity-opts-test';
+  const conv = convDb.getOrCreateConversation(EXT, null);
+  setGlobalBrevityLevel(1);
+  setGlobalBrevityView('full');
+  const fresh = convDb.getConversation(EXT);
+  assert.deepEqual(resolveBrevity(EXT, { conv: fresh }), resolveBrevity(EXT));
+  convDb.setThreadBrevityOverride(conv.id, 3, 'brief');
+  const afterOverride = convDb.getConversation(EXT);
+  assert.deepEqual(resolveBrevity(EXT, { conv: afterOverride }), { level: 3, view: 'brief' });
+  assert.deepEqual(resolveBrevity(EXT, { conv: afterOverride }), resolveBrevity(EXT));
+  convDb.setThreadBrevityOverride(conv.id, null, null);
+  setGlobalBrevityLevel(0);
+  setGlobalBrevityView('brief');
+});
+
+check('resolveBrevity honours a caller-supplied globals pair and an explicit conv:null', () => {
+  const EXT = 'cockpit:reply-brevity-globals-test';
+  convDb.getOrCreateConversation(EXT, null);
+  // Global setting says 0/brief; the passed-in pair must win for a thread with
+  // no override — this is what the read-once list hoist relies on.
+  assert.deepEqual(
+    resolveBrevity(EXT, { conv: convDb.getConversation(EXT), globals: { level: 2, view: 'full' } }),
+    { level: 2, view: 'full' },
+  );
+  // conv:null = "there is no such conversation" — no lookup, globals apply.
+  assert.deepEqual(resolveBrevity('cockpit:does-not-exist', { conv: null, globals: { level: 1, view: 'brief' } }), {
+    level: 1,
+    view: 'brief',
+  });
+  // A worker thread still wins over everything, including supplied globals.
+  assert.deepEqual(
+    resolveBrevity('cockpit:hopper-node-999', { conv: null, globals: { level: 3, view: 'full' } }).level,
+    0,
+  );
+});
+
+check('getBrevityGlobals returns the same pair resolveBrevity would read', () => {
+  setGlobalBrevityLevel(2);
+  setGlobalBrevityView('full');
+  assert.deepEqual(getBrevityGlobals(), { level: 2, view: 'full' });
+  const EXT = 'cockpit:reply-brevity-globals-parity';
+  convDb.getOrCreateConversation(EXT, null);
+  assert.deepEqual(resolveBrevity(EXT), getBrevityGlobals());
+  setGlobalBrevityLevel(0);
+  setGlobalBrevityView('brief');
 });
 
 // ═════════ B2. Consumer brief/full decisions (seeded two-half turns, no model calls) ═
@@ -697,6 +773,86 @@ check('every turn-content reader found in src/ is on the documented allowlist', 
 check('every allowlisted file still actually reads turn content (allowlist is not stale)', () => {
   const stale = [...ALLOWLIST].filter((f) => !foundFiles.has(f));
   assert.deepEqual(stale, [], `Allowlist entries with no real call site anymore (remove from ALLOWLIST and CONTRACT.md): ${stale.join(', ')}`);
+});
+
+// -- D2: the SECOND consumer class ------------------------------------------
+// The class-1 guard above scans getTurns/getTurnsLean call sites, and its
+// stated premise — "all turn content flows through getTurns" — was FALSE:
+// processMessage() RETURNS the reply text straight to its caller, never
+// touching the turns table. That blind spot shipped three real leaks
+// (checkin-worker's Slack DM + notification body, and both webhook JSON
+// responses) past a green class-1 guard. So processMessage call sites get
+// their own allowlist.
+//
+// Deliberately NOT trying to detect "is the return value used?" statically —
+// a shape heuristic (`= await`, `return`, …) is exactly the kind of guess
+// that produced the first blind spot. EVERY file that calls processMessage
+// must carry a recorded decision, even "fire-and-forget, return value
+// discarded". A new caller fails this test until someone decides.
+console.log('\nD2. Regression guard: processMessage callers (the class the #1572 sweep could not see)');
+
+// Defines processMessage; its own internal references are not consumers.
+const PM_DEFINITION_FILE = 'agent.ts';
+
+const PM_ALLOWLIST = new Set([
+  // Return value CONSUMED — must apply briefOnly/fullOnly.
+  'checkin-worker.ts', // -> briefOnly for the Slack DM + the bell body; persisted turn stays raw
+  'handlers/slack.ts', // -> briefOnly (Slack is the glance surface)
+  'handlers/webhook.ts', // -> fullOnly (programmatic caller, no expander)
+  // Return value DISCARDED (fire-and-forget cue/seed posts) — nothing to strip.
+  'ephemeral-chat.ts',
+  'tools/goals-tool.ts',
+  'health-monitor.ts',
+  'tree-cue.ts',
+  'goals-guards.ts',
+  'mike-radar-cue.ts',
+  'dispatch-gate.ts',
+  'goals.ts',
+  'handlers/api-v1.ts',
+]);
+
+const pmCallSiteRe = /\bprocessMessage\s*\(/;
+const pmFoundFiles = new Set();
+for (const file of walkTsFiles(SRC_DIR)) {
+  const rel = path.relative(SRC_DIR, file).split(path.sep).join('/');
+  if (rel === PM_DEFINITION_FILE) continue;
+  const cleaned = stripCommentsAndStrings(fs.readFileSync(file, 'utf8'));
+  if (pmCallSiteRe.test(cleaned)) pmFoundFiles.add(rel);
+}
+
+check('every processMessage caller in src/ is on the documented allowlist', () => {
+  const undocumented = [...pmFoundFiles].filter((f) => !PM_ALLOWLIST.has(f));
+  assert.deepEqual(
+    undocumented,
+    [],
+    `New processMessage caller(s) with no CONTRACT.md decision: ${undocumented.join(', ')}. ` +
+      'processMessage returns the reply text and bypasses the turns table — decide whether this caller ' +
+      'needs briefOnly/fullOnly (or genuinely discards the value), document it in "## Consumers", then add it here.',
+  );
+});
+
+check('processMessage allowlist is not stale', () => {
+  const stale = [...PM_ALLOWLIST].filter((f) => !pmFoundFiles.has(f));
+  assert.deepEqual(stale, [], `Allowlist entries with no real processMessage call site anymore: ${stale.join(', ')}`);
+});
+
+// The three leaks themselves, asserted on behaviour not on source text — these
+// go red if the briefOnly/fullOnly calls are removed.
+check('checkin-worker sends the BRIEF to Slack and the bell, and persists the raw reply', () => {
+  const src = fs.readFileSync(path.join(SRC_DIR, 'checkin-worker.ts'), 'utf8');
+  const cleaned = stripCommentsAndStrings(src);
+  assert.match(cleaned, /const\s+nudgeText\s*=\s*briefOnly\(response\)/, 'checkin nudge must be brief-only');
+  assert.match(cleaned, /text:\s*nudgeText/, 'the Slack post must use the brief');
+  assert.match(cleaned, /body:\s*nudgeText/, 'the notification body must use the brief');
+  // NB: stripCommentsAndStrings blanks string literals, so 'assistant' is
+  // whitespace here — match on the shape, not the literal.
+  assert.match(cleaned, /addTurn\(notificationsConversationId,\s+,\s*response\)/, 'the persisted turn must stay RAW');
+});
+
+check('both webhook responses are full-only', () => {
+  const cleaned = stripCommentsAndStrings(fs.readFileSync(path.join(SRC_DIR, 'handlers', 'webhook.ts'), 'utf8'));
+  const hits = cleaned.match(/fullOnly\(await processMessage\(/g) ?? [];
+  assert.equal(hits.length, 2, `expected both /intake and /intake/reply to wrap processMessage in fullOnly, found ${hits.length}`);
 });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);

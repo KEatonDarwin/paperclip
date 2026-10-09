@@ -1,6 +1,7 @@
 import express from 'express';
 import { processMessage, ConversationBusyError } from '../agent.js';
 import { handlePaperclipWebhook } from './paperclip-webhook.js';
+import { fullOnly } from '../reply-brevity.js';
 
 export function createWebhookRouter(): express.Router {
   const router = express.Router();
@@ -33,7 +34,11 @@ export function createWebhookRouter(): express.Router {
     const conversationId = sessionId ? `webhook:${sessionId}` : `webhook:${Date.now()}`;
 
     try {
-      const response = await processMessage(text.trim(), conversationId);
+      // Reply-brevity dial (tree-c8e32ef9): a programmatic caller has no
+      // expander, so it gets the complete reply with no marker — same rule as
+      // every other machine consumer. processMessage's return value bypasses
+      // the turns table, which is why the #1572 getTurns sweep missed this.
+      const response = fullOnly(await processMessage(text.trim(), conversationId));
       res.json({ response, conversationId, source });
     } catch (err) {
       if (err instanceof ConversationBusyError) {
@@ -57,7 +62,8 @@ export function createWebhookRouter(): express.Router {
     }
 
     try {
-      const response = await processMessage(text.trim(), conversationId);
+      // Machine consumer — full reply, no marker (see /intake above).
+      const response = fullOnly(await processMessage(text.trim(), conversationId));
       res.json({ response, conversationId });
     } catch (err) {
       if (err instanceof ConversationBusyError) {

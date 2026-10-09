@@ -9,7 +9,7 @@
 // Both are global settings-KV values with an optional per-thread override
 // (conversations.brevity_level / brevity_view, NULL = inherit global).
 
-import { getSetting, setSetting, getConversation } from './conversation-db.js';
+import { getSetting, setSetting, getConversation, type ConversationRow } from './conversation-db.js';
 import { memoryProfileForThread } from './prompt.js';
 
 export type BrevityLevel = 0 | 1 | 2 | 3;
@@ -68,6 +68,20 @@ export interface ResolvedBrevity {
   view: BrevityView;
 }
 
+export interface ResolveBrevityOpts {
+  /** A conversation row the caller already holds, to skip the re-fetch.
+   *  Omit the key entirely to let resolveBrevity look it up. */
+  conv?: ConversationRow | null;
+  /** The global pair, read once by a caller resolving many threads. */
+  globals?: ResolvedBrevity;
+}
+
+/** Both global axes in one call, so a caller resolving N threads reads the
+ *  settings table twice instead of 2N times. */
+export function getBrevityGlobals(): ResolvedBrevity {
+  return { level: getGlobalBrevityLevel(), view: getGlobalBrevityView() };
+}
+
 /**
  * Resolve the effective brevity settings for one thread: worker-thread hard
  * exclusion > per-thread override > global setting > default. Reuses
@@ -77,15 +91,24 @@ export interface ResolvedBrevity {
  * contract, which requires a VERDICT line to stay the first line of the
  * reply, so it must never get a prepended brief.
  */
-export function resolveBrevity(externalId: string | null | undefined): ResolvedBrevity {
+export function resolveBrevity(
+  externalId: string | null | undefined,
+  opts?: ResolveBrevityOpts,
+): ResolvedBrevity {
   if (memoryProfileForThread(externalId) === 'worker') {
     return { level: 0, view: DEFAULT_VIEW };
   }
-  const conv = externalId ? getConversation(externalId) : undefined;
+  // A caller that already HOLDS the row passes it (threadDescriptor does) —
+  // re-fetching it per thread is what made LIST /threads do ~600 extra
+  // synchronous sqlite reads across 200 threads, on the one surface whose
+  // event-loop stalls Kevin has already felt once. `undefined` = fetch it;
+  // an explicit `null` = "no such conversation", don't go looking.
+  const conv = opts && 'conv' in opts ? opts.conv : externalId ? getConversation(externalId) : undefined;
+  const globals = opts?.globals ?? getBrevityGlobals();
   const threadLevel = conv?.brevity_level;
   const threadView = conv?.brevity_view;
-  const level = isBrevityLevel(threadLevel) ? threadLevel : getGlobalBrevityLevel();
-  const view = isBrevityView(threadView) ? threadView : getGlobalBrevityView();
+  const level = isBrevityLevel(threadLevel) ? threadLevel : globals.level;
+  const view = isBrevityView(threadView) ? threadView : globals.view;
   return { level, view };
 }
 
@@ -204,7 +227,17 @@ export function briefOnly(text: string): string {
 /** The full half, discarding the brief (and the marker). A no-op when there
  *  is no marker. For consumers that must never see a partial/abbreviated
  *  reply — summarizers, cross-thread reads, exports, anything that feeds
- *  another model or is read without an expand affordance. */
+ *  another model or is read without an expand affordance.
+ *
+ *  FALLBACK (review finding, tree-c8e32ef9 #1573): a run that dies right
+ *  after emitting the marker leaves an EMPTY full half, and returning '' there
+ *  would hand every full-only consumer a blank assistant turn — losing the one
+ *  thing that DID survive. Mirror briefOnly's fallback: degrade to the brief,
+ *  then to the raw text, and only ever return '' when the input was itself
+ *  empty. "Never lose it" has to hold hardest when the reply is damaged. */
 export function fullOnly(text: string): string {
-  return splitBrevityReply(text).full;
+  const { brief, full } = splitBrevityReply(text);
+  if (full.trim().length) return full;
+  if (brief != null && brief.trim().length) return brief;
+  return text;
 }

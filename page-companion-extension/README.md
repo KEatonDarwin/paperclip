@@ -1,6 +1,6 @@
 # JARVIS Page Companion — Chrome extension (v0.1)
 
-Tree `tree-e753d989`, node #1575. Design: `outbox/page-companion-concept-2026-10-09.md`.
+Tree `tree-e753d989`, nodes #1574–#1576. Design: `outbox/page-companion-concept-2026-10-09.md`.
 Server contract: `darwin-assistant/docs/page-companion/CONTRACT.md`.
 
 Kevin opens a page. The extension asks the cockpit "is this one of ours?". If it
@@ -8,9 +8,10 @@ is, a floating button appears bottom-right with a badge counting the cockpit
 chats that already touched that page. If it isn't, **nothing happens at all** —
 not one node, not one stylesheet.
 
-This node builds the detection ping and the button. The chat panel (tabbed
-iframes of `/thread/<external_id>`, plus "new chat about this page") is the next
-node; clicking the button today opens a placeholder listing what it found.
+Clicking the button opens a panel with one tab per related chat — each an
+embedded `/thread/<external_id>` iframe, with a pop-out to the cockpit's own
+thread window — plus **+ New** to start a fresh chat scoped to that page. The
+last tab open on a page is reopened the next time you land on it.
 
 ## Install
 
@@ -53,8 +54,12 @@ background.js  (service worker — the ONLY place the key is read)
 { ours, project, registry_id, threads[], normalized_url }
    │
    ▼
-content.js → Shadow DOM button + badge (only when ours === true)
+content.js → Shadow DOM button + badge + panel (only when ours === true)
 ```
+
+The panel's **+ New** and the per-page last-tab memory take the same route: the
+content script messages the worker, which POSTs `/page-companion/new-chat` or
+reads/writes `chrome.storage.local` on its behalf.
 
 - **The key never reaches a page.** The content script has no `fetch`, no
   `chrome.storage` and no `Authorization` — it asks the worker and gets an
@@ -75,14 +80,22 @@ content.js → Shadow DOM button + badge (only when ours === true)
 
 ```
 npm test                              # 16 unit tests, no deps, no network
-xvfb-run -a node test/e2e-browser.mjs # 15 real-browser assertions
+xvfb-run -a node test/e2e-browser.mjs # 22 real-browser assertions
+```
+
+Server side, from `darwin-assistant/`:
+
+```
+npm run page-companion:check        # 31 unit tests (registry, lookup, seeding)
+npm run page-companion:route-check  # 55 route checks against the real router
 ```
 
 `test/e2e-browser.mjs` is the real proof: it mounts the **real** Express
 `/page-companion` router on a scratch `/tmp` sqlite DB, serves a registered and
 an unregistered static page, loads this extension unpacked into a real Chromium,
-configures it through the real options page, and asserts the button appears with
-the right count on one page and that the other page's DOM comes out byte-identical
+configures it through the real options page, drives the panel (tab switching,
+pop-out, **+ New**, last-tab restore), and asserts the button appears with the
+right count on one page and that the other page's DOM comes out byte-identical
 to what the server sent. Hermetic: no live DB, no network beyond 127.0.0.1, zero
 model calls. It borrows Playwright from `jarvis-command-center/node_modules`
 (override with `PLAYWRIGHT_DIR`); this extension has no dependencies of its own.
@@ -91,6 +104,4 @@ model calls. It borrows Playwright from `jarvis-command-center/node_modules`
 
 ## Not done here (next nodes)
 
-- The panel: tabs of `/thread/<external_id>` iframes, switchable, with history.
-- "New chat about this page" → `POST /page-companion/new-chat`.
 - Firefox port (MV3 ports over nearly as-is).

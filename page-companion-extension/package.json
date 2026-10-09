@@ -1,0 +1,12 @@
+{
+  "name": "jarvis-page-companion-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome MV3 extension — floating JARVIS button on pages in the cockpit page registry. No build step: load unpacked.",
+  "scripts": {
+    "test": "node --test 'test/*.test.mjs'",
+    "e2e": "node test/e2e-browser.mjs",
+    "icons": "node scripts/generate-icons.mjs"
+  }
+}

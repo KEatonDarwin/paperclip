@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>JARVIS Page Companion — settings</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0; padding: 28px; background: #10172a; color: #e9eefc; max-width: 640px;
+        font: 400 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      h1 { font-size: 19px; margin: 0 0 4px; }
+      p.lede { margin: 0 0 22px; opacity: .72; }
+      label { display: block; font-weight: 600; margin: 18px 0 6px; }
+      .hint { font-weight: 400; opacity: .66; font-size: 12.5px; margin-top: 4px; }
+      input[type="text"], input[type="password"] {
+        width: 100%; box-sizing: border-box; padding: 9px 11px; border-radius: 8px;
+        border: 1px solid #2c3a5c; background: #16203a; color: #e9eefc; font: inherit;
+      }
+      input:focus { outline: 2px solid #4b7bff; outline-offset: 1px; border-color: #4b7bff; }
+      .row { display: flex; align-items: center; gap: 9px; margin-top: 20px; }
+      .row label { margin: 0; }
+      button {
+        margin-top: 24px; padding: 9px 18px; border-radius: 8px; border: 0; cursor: pointer;
+        background: #2f6df6; color: #fff; font: 600 14px/1 inherit;
+      }
+      button.secondary { background: #2c3a5c; margin-left: 8px; }
+      code {
+        background: #16203a; border: 1px solid #2c3a5c; border-radius: 5px;
+        padding: 1px 5px; font-size: 12.5px;
+      }
+      .resolved { margin-top: 20px; padding: 12px 14px; border-radius: 9px; background: #16203a; border: 1px solid #2c3a5c; }
+      .resolved .k { opacity: .66; font-size: 12.5px; }
+      #status { margin-top: 14px; min-height: 20px; font-size: 13px; }
+      #status.ok { color: #6ee7a8; }
+      #status.bad { color: #ff9b9b; }
+    </style>
+  </head>
+  <body>
+    <h1>JARVIS Page Companion</h1>
+    <p class="lede">
+      Checks every page you open against the cockpit's page registry. If it's one of ours, a
+      floating button appears with the chats that touched it.
+    </p>
+
+    <label for="cockpitBase">Cockpit base URL</label>
+    <input id="cockpitBase" type="text" spellcheck="false" placeholder="http://192.168.1.25:8080" />
+    <div class="hint">
+      LAN IP or Tailscale MagicDNS — whatever you actually load the cockpit on. On
+      <code>:8080</code> the extension talks through the cockpit's own
+      <code>/cockpit-api</code> proxy, which holds the key server-side.
+    </div>
+
+    <label for="apiBase">API base <span class="hint" style="display:inline">(optional override)</span></label>
+    <input id="apiBase" type="text" spellcheck="false" placeholder="leave blank to derive from the base above" />
+    <div class="hint">
+      Blank is right almost always. Set it to point straight at JARVIS, e.g.
+      <code>http://192.168.1.25:3201/api/v1</code>.
+    </div>
+
+    <label for="apiKey">Bearer API key</label>
+    <input id="apiKey" type="password" spellcheck="false" autocomplete="off" placeholder="JARVIS_COCKPIT_KEY" />
+    <div class="hint" id="keyHint"></div>
+
+    <div class="row">
+      <input id="enabled" type="checkbox" />
+      <label for="enabled">Enabled</label>
+    </div>
+
+    <div class="resolved">
+      <div class="k">Lookups will POST to</div>
+      <div id="resolved"><code>—</code></div>
+    </div>
+
+    <div>
+      <button id="save" type="button">Save</button>
+      <button id="test" class="secondary" type="button">Test connection</button>
+    </div>
+    <div id="status" role="status"></div>
+
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

@@ -3,7 +3,7 @@ import { processMessage, clearConversation } from '../agent.js';
 import { buildMorningBriefing } from '../briefing.js';
 import { getOrCreateConversation, addTurn } from '../conversation-db.js';
 import { sseBus, type SSEEvent } from '../sse-bus.js';
-import { briefOnly } from '../reply-brevity.js';
+import { briefOnly, briefOnlyForThread } from '../reply-brevity.js';
 
 const BRIEFING_TRIGGERS = /\b(morning briefing|good morning|briefing|morning|wake up|what's my day|what is my day|day look like)\b/i;
 
@@ -133,7 +133,9 @@ export function createSlackApp() {
       }
       // Slack is the glanceable surface — the cockpit holds the full reply.
       // Reply-brevity marker (tree-c8e32ef9) never reaches Slack either way.
-      response = briefOnly(response);
+      // Gated on the thread's dial: with the dial OFF, a reply that merely
+      // MENTIONS the marker must not have its tail silently dropped here.
+      response = briefOnlyForThread(conversationId, response);
 
       if (statusTs) {
         try {
@@ -178,6 +180,11 @@ export async function sendDailyBriefing(app: App): Promise<void> {
     return;
   }
   try {
+    // NOTE (review finding #1573): buildMorningBriefing() returns assembled
+    // text, not a dial-shaped model reply, so there is never a marker here and
+    // this is in practice the identity function. Kept deliberately — it is the
+    // guard that holds if the briefing ever starts carrying model output — but
+    // do not read it as live coverage of anything today.
     const briefing = await buildMorningBriefing();
     const postResult = await app.client.chat.postMessage({ channel: userId, text: briefOnly(briefing) });
     console.log('[briefing] Morning briefing sent to Kevin');

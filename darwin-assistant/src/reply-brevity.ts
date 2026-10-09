@@ -224,6 +224,25 @@ export function briefOnly(text: string): string {
   return brief ?? text;
 }
 
+/**
+ * briefOnly, GATED on the thread's dial actually being on.
+ *
+ * Review finding (tree-c8e32ef9 #1573): marker detection was unconditioned on
+ * the level, so with the dial OFF a reply that merely MENTIONED the marker on
+ * its own line still split — and briefOnly then silently DROPPED everything
+ * after it. Proven: a level-0 reply ending "Kevin, I need you to merge the
+ * branch." had that ask dropped from the Slack text. Dropping an ask is the
+ * worst outcome this feature can produce, so the two brief-only (lossy)
+ * consumers resolve the level first. At level 0 there is no legitimate marker
+ * to find, so this is the identity function.
+ *
+ * Only the BRIEF-only direction is gated. fullOnly is left ungated on purpose:
+ * see "Known gaps" in docs/reply-brevity/CONTRACT.md.
+ */
+export function briefOnlyForThread(externalId: string, text: string): string {
+  return resolveBrevity(externalId).level === 0 ? text : briefOnly(text);
+}
+
 /** The full half, discarding the brief (and the marker). A no-op when there
  *  is no marker. For consumers that must never see a partial/abbreviated
  *  reply — summarizers, cross-thread reads, exports, anything that feeds

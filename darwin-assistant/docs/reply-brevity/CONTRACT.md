@@ -210,3 +210,50 @@ looking for a path that violates it.
 | `notifications.ts` — notification `body` | Carries turn/reply content when a caller passes it. | Per-caller (see `checkin-worker.ts` above) | `checkin-worker.ts` is the one caller that passes reply text, and it passes the brief. Every other caller (`agent.ts`'s chat-importance ping, `tech-tasks.ts`, `mike-radar-report.ts`, `hopper-engine.ts`, …) uses static/templated strings or hopper-node `result` text (see below). An earlier draft of this table claimed *no* caller did — the class-2 guard is what makes that claim checkable instead of assumed. |
 | `tree-cue.ts`, `hopper-engine.ts` (finish-contract parsing), `goals.ts` / `goals-autopilot*.ts` (verdict parsing), `night-shift.ts`, `shift-narrator.ts`, `result-summary.ts`, `layman-summary.ts`, `mike-radar-report.ts`, `tech-tasks.ts` | All read a hopper-node worker's `result` text, supplied directly in the finish-contract POST body (`parsed.result`) — never read back out of `turns.content`. | N/A | Doubly safe: (1) this text never round-trips through the DB turn-content column at all; (2) even if it did, every hopper-node/unblocker worker thread hard-excludes to level 0 (see above), so a worker's own reply never gets a brief or a marker in the first place. `mike-radar-report.ts`'s `row.text` is scraped Teams/Slack content from `mike_activity`, not a JARVIS turn at all. |
 | `notepad-dossier-sources.ts`, `group-chat-context.ts`, `big-board.ts`, `workbench.ts` (`read_up`), `briefing.ts`, `jarvis-brief.ts` | Read `thread_summaries.content` (a pre-generated summary) or `thread_todos.content` (a todo's own text). | N/A | Neither table ever stores raw turn content with a marker — summaries are freshly generated text, todos are authored separately. |
+
+## The level gate — "level 0 is byte-for-byte" has to include detection
+
+Marker detection was originally unconditioned on the dial. That left one real
+hole, found by the review of this branch (tree-c8e32ef9 node #1573): with the
+dial **off**, a reply that merely *mentions* the marker on its own line — e.g.
+me explaining this very feature to Kevin — was still split. In the cockpit that
+sprouted a toggle that hid half the reply; in Slack `briefOnly` silently
+**dropped everything after it**. The proven case was a level-0 reply whose
+final line was an ask ("Kevin, I need you to merge the branch.") — the ask
+vanished from the Slack text. Dropping an ask is the single worst thing this
+feature can do.
+
+Gated in the two places where loss was possible:
+
+- **The cockpit renderer** takes the thread's effective `level` as a prop and
+  skips the split entirely at level 0 (`BrevityReply.tsx`). `undefined` (the
+  first-paint window before the thread descriptor lands) still splits — the
+  descriptor arrives on the same fetch as the timeline, so this is a frame,
+  not a steady state.
+- **`briefOnlyForThread(externalId, text)`** resolves the level first and is
+  the identity function at level 0. Both brief-only consumers
+  (`handlers/slack.ts` live reply, `checkin-worker.ts` nudge) use it.
+
+### Known gaps
+
+- **`fullOnly` is deliberately NOT level-gated.** Its consumers are exports,
+  digests, polling APIs, the admin drill-down, cross-thread reads and the
+  model's own transcript replay — all of which hold the conversation but would
+  each need a level resolved and threaded through per call site, which is a
+  wider change than the defect justifies. The residual behaviour: at level 0, a
+  reply containing a bare marker line would have its pre-marker text trimmed in
+  an export or digest. Nothing is *lost* — the authoritative turn in the DB and
+  the cockpit bubble both still hold the complete text — but that export would
+  be incomplete. If this ever bites, the exact fix is a `brevity_level` column
+  on `turns`, written at persist time, so the split decision is per-turn rather
+  than per-thread.
+- **Fence tracking is a toggle, not a parser.** A nested or unbalanced code
+  fence can defeat the "marker inside a fence doesn't count" rule. Documented
+  in `splitBrevityReply`, covered by a fixture for the balanced case only.
+- **Slack has no expand affordance.** By design: Kevin gets the brief there and
+  the cockpit holds the full reply. The check-in notification works around this
+  by linking to the thread that holds both halves.
+- **The manual-expand memory is keyed on a hash of the brief**, not on a turn
+  id, because the event id is not stable across the stream-end key swap. Two
+  byte-identical briefs in one thread therefore share one expand state. It is
+  per-session UI state and dies with the page.

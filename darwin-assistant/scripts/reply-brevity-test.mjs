@@ -45,6 +45,7 @@ const {
   splitBrevityReply,
   stripBrevityMarker,
   briefOnly,
+  briefOnlyForThread,
   fullOnly,
   resolveBrevity,
   getBrevityGlobals,
@@ -290,38 +291,57 @@ check('a non-worker thread with the same number suffix is NOT excluded (prefix m
 // synchronous sqlite reads on the one surface whose event-loop stalls have
 // already bitten once. The opts form must give the SAME answer as the
 // fetching form, or the hot path and the cold path would disagree.
-check('resolveBrevity(ext, {conv}) matches the self-fetching form exactly', () => {
+// NB on how this is asserted: a test that only checks
+// `resolveBrevity(ext, {conv}) === resolveBrevity(ext)` is VACUOUS — it stays
+// green when the implementation ignores the passed-in row and re-fetches,
+// which is the exact behaviour being eliminated. (Caught by mutation-testing
+// the first draft of this very test, which passed with the opts handling
+// deleted.) So these assert on a row that DISAGREES with the database: the
+// passed-in row must win, which can only happen if no re-fetch occurred.
+check('resolveBrevity(ext, {conv}) uses the row it was handed and does NOT re-fetch', () => {
   const EXT = 'cockpit:reply-brevity-opts-test';
   const conv = convDb.getOrCreateConversation(EXT, null);
   setGlobalBrevityLevel(1);
   setGlobalBrevityView('full');
-  const fresh = convDb.getConversation(EXT);
-  assert.deepEqual(resolveBrevity(EXT, { conv: fresh }), resolveBrevity(EXT));
-  convDb.setThreadBrevityOverride(conv.id, 3, 'brief');
-  const afterOverride = convDb.getConversation(EXT);
-  assert.deepEqual(resolveBrevity(EXT, { conv: afterOverride }), { level: 3, view: 'brief' });
-  assert.deepEqual(resolveBrevity(EXT, { conv: afterOverride }), resolveBrevity(EXT));
+  convDb.setThreadBrevityOverride(conv.id, 3, 'brief'); // DB says 3/brief
+  assert.deepEqual(resolveBrevity(EXT), { level: 3, view: 'brief' }, 'self-fetching form reads the DB');
+  const disagreeing = { ...convDb.getConversation(EXT), brevity_level: 1, brevity_view: 'full' };
+  assert.deepEqual(
+    resolveBrevity(EXT, { conv: disagreeing }),
+    { level: 1, view: 'full' },
+    'the handed-in row must win — if this reports 3/brief, resolveBrevity re-fetched',
+  );
   convDb.setThreadBrevityOverride(conv.id, null, null);
   setGlobalBrevityLevel(0);
   setGlobalBrevityView('brief');
 });
 
-check('resolveBrevity honours a caller-supplied globals pair and an explicit conv:null', () => {
+check('resolveBrevity with conv:null skips the lookup entirely', () => {
+  const EXT = 'cockpit:reply-brevity-convnull-test';
+  const conv = convDb.getOrCreateConversation(EXT, null);
+  convDb.setThreadBrevityOverride(conv.id, 3, 'full'); // a real override in the DB
+  // conv:null = "there is no conversation to consider". If the lookup still
+  // happened, the DB override (3/full) would surface instead of the globals.
+  assert.deepEqual(resolveBrevity(EXT, { conv: null, globals: { level: 1, view: 'brief' } }), {
+    level: 1,
+    view: 'brief',
+  });
+  convDb.setThreadBrevityOverride(conv.id, null, null);
+});
+
+check('resolveBrevity honours a caller-supplied globals pair over the stored settings', () => {
   const EXT = 'cockpit:reply-brevity-globals-test';
   convDb.getOrCreateConversation(EXT, null);
-  // Global setting says 0/brief; the passed-in pair must win for a thread with
+  setGlobalBrevityLevel(0);
+  setGlobalBrevityView('brief');
+  // Stored settings say 0/brief; the passed-in pair must win for a thread with
   // no override — this is what the read-once list hoist relies on.
   assert.deepEqual(
     resolveBrevity(EXT, { conv: convDb.getConversation(EXT), globals: { level: 2, view: 'full' } }),
     { level: 2, view: 'full' },
   );
-  // conv:null = "there is no such conversation" — no lookup, globals apply.
-  assert.deepEqual(resolveBrevity('cockpit:does-not-exist', { conv: null, globals: { level: 1, view: 'brief' } }), {
-    level: 1,
-    view: 'brief',
-  });
   // A worker thread still wins over everything, including supplied globals.
-  assert.deepEqual(
+  assert.equal(
     resolveBrevity('cockpit:hopper-node-999', { conv: null, globals: { level: 3, view: 'full' } }).level,
     0,
   );
@@ -440,12 +460,48 @@ check('ephemeral-chat.ts widget reads the full half only (structural — no expa
 // (already exhaustively proven pure above) — this is a structural guard that
 // the two outbound-to-Slack call sites still apply it, so a future edit can't
 // silently drop the line and start leaking the marker into Slack DMs.
-check('handlers/slack.ts applies briefOnly to both outbound-to-Slack paths', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'handlers', 'slack.ts'), 'utf8');
-  assert.ok(/import\s*\{\s*briefOnly\s*\}\s*from\s*['"]\.\.\/reply-brevity\.js['"]/.test(src), 'must import briefOnly');
-  assert.ok(/response\s*=\s*briefOnly\(response\)/.test(src), 'the live chat path (processMessage/buildMorningBriefing response) must be brief-onlyed before being sent');
-  assert.ok(/chat\.postMessage\(\{\s*channel:\s*userId,\s*text:\s*briefOnly\(briefing\)\s*\}\)/.test(src), 'the daily-briefing Slack post must be brief-onlyed');
-  assert.ok(/addTurn\(conv\.id,\s*'assistant',\s*briefing\)/.test(src), 'the PERSISTED turn must stay the full original text (marker included), only the Slack post is brief-onlyed');
+// The outbound-Slack decision, tested on BEHAVIOUR (the review flagged the
+// previous version of this check as a regex-over-source test that proves a
+// line exists, not that it works — and it passed green while a third Slack
+// path leaked, so it had encoded the sweep's blind spot as a guarantee).
+check('briefOnlyForThread sends the brief when the dial is on', () => {
+  const EXT = 'cockpit:reply-brevity-slack-on';
+  convDb.getOrCreateConversation(EXT, null);
+  setGlobalBrevityLevel(2);
+  const text = `Short bit.\n\n${FULL_MARKER}\n\nFull bit with detail.`;
+  assert.equal(briefOnlyForThread(EXT, text), 'Short bit.');
+  setGlobalBrevityLevel(0);
+});
+
+// Review finding: a LEVEL-0 reply that merely MENTIONS the marker on its own
+// line used to be split anyway, and briefOnly then dropped everything after
+// it. The proven case was a reply whose final line was an ASK.
+check('briefOnlyForThread never drops anything when the dial is OFF', () => {
+  const EXT = 'cockpit:reply-brevity-slack-off';
+  convDb.getOrCreateConversation(EXT, null);
+  setGlobalBrevityLevel(0);
+  const mentions = `Here is how the dial works. The marker line is:\n\n${FULL_MARKER}\n\nKevin, I need you to merge the branch.`;
+  assert.equal(briefOnlyForThread(EXT, mentions), mentions, 'level 0 must be the identity function');
+  assert.ok(briefOnlyForThread(EXT, mentions).includes('merge the branch'), 'the ask must survive');
+});
+
+check('briefOnlyForThread is identity on a thread with no marker at any level', () => {
+  const EXT = 'cockpit:reply-brevity-slack-nomarker';
+  convDb.getOrCreateConversation(EXT, null);
+  for (const level of [0, 1, 2, 3]) {
+    setGlobalBrevityLevel(level);
+    assert.equal(briefOnlyForThread(EXT, 'plain reply, no marker'), 'plain reply, no marker');
+  }
+  setGlobalBrevityLevel(0);
+});
+
+check('handlers/slack.ts wires both outbound paths to the gated helper', () => {
+  const cleaned = stripCommentsAndStrings(
+    fs.readFileSync(path.join(__dirname, '..', 'src', 'handlers', 'slack.ts'), 'utf8'),
+  );
+  assert.match(cleaned, /response\s*=\s*briefOnlyForThread\(conversationId,\s*response\)/, 'the live chat path must use the dial-gated helper');
+  assert.match(cleaned, /text:\s*briefOnly\(briefing\)/, 'the daily-briefing post keeps the ungated helper (assembled text, never dial-shaped)');
+  assert.match(cleaned, /addTurn\(conv\.id,\s+,\s*briefing\)/, 'the PERSISTED turn must stay the full original text');
 });
 
 // ═════════ C. HTTP: GET/PATCH /reply-brevity + PATCH /threads/:ext/reply-brevity ═
@@ -841,7 +897,7 @@ check('processMessage allowlist is not stale', () => {
 check('checkin-worker sends the BRIEF to Slack and the bell, and persists the raw reply', () => {
   const src = fs.readFileSync(path.join(SRC_DIR, 'checkin-worker.ts'), 'utf8');
   const cleaned = stripCommentsAndStrings(src);
-  assert.match(cleaned, /const\s+nudgeText\s*=\s*briefOnly\(response\)/, 'checkin nudge must be brief-only');
+  assert.match(cleaned, /const\s+nudgeText\s*=\s*briefOnlyForThread\(conversationId,\s*response\)/, 'checkin nudge must use the dial-gated brief helper');
   assert.match(cleaned, /text:\s*nudgeText/, 'the Slack post must use the brief');
   assert.match(cleaned, /body:\s*nudgeText/, 'the notification body must use the brief');
   // NB: stripCommentsAndStrings blanks string literals, so 'assistant' is

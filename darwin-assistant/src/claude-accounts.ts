@@ -435,7 +435,13 @@ export function selectActiveClaudeAccount(ceiling: number, opts?: SelectAccountO
   // that just hit the wall even under a focus mode naming it. At the default
   // mode `auto` the filter is the identity function and the ranking is
   // least-used, i.e. byte-identical to before the throttle existed.
-  const plan = throttleClaudeCandidates(perAccount, { forSpawn: opts?.forSpawn === true });
+  // ⚡ PACER: `forClaim` tracks `forSpawn` exactly — enforce mode may redirect a
+  // new WORKER claim away from an account the pacer says to hold, but Kevin's own
+  // interactive turns and the read-only status views keep today's ranking.
+  const plan = throttleClaudeCandidates(perAccount, {
+    forSpawn: opts?.forSpawn === true,
+    forClaim: opts?.forSpawn === true,
+  });
 
   const pickLowest = (pool: AccountUsageEntry[]): ClaudeAccount | null => {
     let best: AccountUsageEntry | null = null;

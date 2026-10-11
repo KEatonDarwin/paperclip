@@ -311,6 +311,7 @@ import { planProject as runFoundryPlanner } from '../foundry-planner.js';
 import { getFoundryModelSetting } from '../foundry-settings.js';
 import {
   createHopperTree,
+  type IntegrationTreeInput,
   agreeHopperTree,
   getHopperTree,
   listHopperTrees,
@@ -4299,15 +4300,41 @@ export function createApiV1Router(): Router {
   });
 
   router.post('/hopper-trees', (req: AuthedRequest, res) => {
-    const body = (req.body ?? {}) as { topic?: unknown; origin_thread?: unknown; nodes?: unknown; draft?: unknown };
+    const body = (req.body ?? {}) as { topic?: unknown; origin_thread?: unknown; nodes?: unknown; draft?: unknown; integration?: unknown };
     const topic = typeof body.topic === 'string' ? body.topic.trim() : '';
+    // Sprint lane (2026-10-10): an INTEGRATION tree (PARALLEL-CONTRACT §2) can be
+    // planted straight from the API — per-node branches cut from
+    // `integration_branch`, merge-back + `build_gate_cmd` on finish. Optional and
+    // additive: omit `integration` and this route behaves exactly as before.
+    let integration: IntegrationTreeInput | null = null;
+    if (body.integration && typeof body.integration === 'object') {
+      const i = body.integration as Record<string, unknown>;
+      const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v.trim() : null);
+      integration = {
+        repo_path: str(i.repo_path),
+        integration_branch: str(i.integration_branch),
+        // '' is a deliberate "no gate" (§3.6) and must survive, so only null-ify non-strings.
+        build_gate_cmd: typeof i.build_gate_cmd === 'string' ? i.build_gate_cmd : null,
+      };
+      if ((integration.repo_path == null) !== (integration.integration_branch == null)) {
+        sendError(res, 400, 'invalid_request', 'integration needs BOTH repo_path and integration_branch');
+        return;
+      }
+    }
     const nodes = Array.isArray(body.nodes) ? (body.nodes as NewNodeInput[]) : [];
     if (!topic || !nodes.length || nodes.some((n) => typeof n?.title !== 'string' || !n.title.trim())) {
       sendError(res, 400, 'invalid_request', 'topic and a non-empty nodes array (each with a title) are required');
       return;
     }
     const origin = typeof body.origin_thread === 'string' && body.origin_thread.trim() ? body.origin_thread.trim() : null;
-    const created = createHopperTree(topic, origin, nodes);
+    let created: ReturnType<typeof createHopperTree>;
+    try {
+      created = createHopperTree(topic, origin, nodes, integration);
+    } catch (err) {
+      // assertMergeTargetSafe refuses master/main as an integration branch (§8.3).
+      sendError(res, 400, 'invalid_integration', err instanceof Error ? err.message : String(err));
+      return;
+    }
     // Kevin's directive (2026-10-05): trees skip the draft/approval gate — by the
     // time something is a tree it is ready to go. Drafting/approval/steps live in
     // the goal system now, not here. Auto-agree on plant so the tree goes live and

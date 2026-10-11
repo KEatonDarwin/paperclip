@@ -1188,6 +1188,21 @@ function markIntegrated(node: HopperNodeRow, tree: HopperTreeRow, note: string):
  *   - `resources = ["integration:<tree_id>"]` (§5)
  *   - adapter/model inherited from the failed node
  */
+/** How many `integrate nX` rungs sit between a node and the original packet. */
+const MAX_REPAIR_CHAIN_DEPTH = 2;
+function repairChainDepth(node: HopperNodeRow): number {
+  let depth = 0;
+  let cursor = node.integrates_node_id;
+  const seen = new Set<number>([node.id]);
+  while (cursor != null && !seen.has(cursor) && depth < 1000) {
+    seen.add(cursor);
+    depth += 1;
+    const parent = getNodeStmt.get(cursor);
+    cursor = parent?.integrates_node_id ?? null;
+  }
+  return depth;
+}
+
 function createIntegrationRepairNode(
   node: HopperNodeRow,
   tree: HopperTreeRow,
@@ -1197,6 +1212,37 @@ function createIntegrationRepairNode(
   extra: { worktree: string; gate: string | null },
 ): void {
   setNode(node.id, { integration_state: 'integration_pending' });
+
+  // ── Runaway guard (2026-10-11, tree-2482c4ea: 28 repair nodes in 25 min) ──
+  // A repair node exists to resolve what a WORKER can fix: a merge conflict or
+  // a red gate on its own work. Two things a worker can never fix:
+  //   (a) the gate's toolchain is missing in the integration worktree — that is
+  //       tree configuration, so spawning a worker just burns a model turn and
+  //       fails identically;
+  //   (b) a repair-of-a-repair-of-a-repair — if two rungs of repair did not land
+  //       the work, a third will not either.
+  // In both cases: no new node, pause the tree so nothing else dispatches, and
+  // raise an error-level notification for the orchestrator/Kevin.
+  const chainDepth = repairChainDepth(node);
+  const unfixableByWorker = reason === 'build_toolchain_missing';
+  if (unfixableByWorker || chainDepth >= MAX_REPAIR_CHAIN_DEPTH) {
+    const why = unfixableByWorker
+      ? `the build gate's toolchain is missing in the integration worktree (${reason}) — tree configuration, not something a worker can fix`
+      : `repair chain depth ${chainDepth} reached the cap of ${MAX_REPAIR_CHAIN_DEPTH} — the same failure keeps repeating`;
+    sqliteDb.prepare(`UPDATE hopper_trees SET status = 'draft', updated_at = datetime('now') WHERE id = ?`).run(tree.id);
+    notifyTreeStatusListeners(tree.id, 'blocked'); // the tree-cue wakes the origin thread
+    console.error(`[hopper-engine] node ${node.id} merge-back failed (${reason}); NOT spawning a repair node: ${why}. Tree ${tree.id} paused.`);
+    if (!isFoundryTree(tree)) {
+      createNotification({
+        severity: 'error',
+        title: `🔴 tree paused: node #${node.id} cannot be integrated`,
+        body: `${why}. Fix the tree's build_gate_cmd / toolchain, then reactivate the tree.\n\n${output.slice(0, 1500)}`,
+        source: 'hopper-engine',
+        link: tree.origin_thread_ext ? `/threads?open=${encodeURIComponent(tree.origin_thread_ext)}` : null,
+      });
+    }
+    return;
+  }
 
   const spec = [
     `AUTO-CREATED BY THE HOPPER ENGINE (PARALLEL-CONTRACT.md §3.5).`,

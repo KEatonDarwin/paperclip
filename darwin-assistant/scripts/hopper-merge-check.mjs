@@ -564,6 +564,59 @@ console.log('\n[MB-10] merge batching: a red gate whose ROLLBACK also fails must
 }
 
 // ===========================================================================
+console.log('\n[MB-11] runaway guard: a gate whose TOOLCHAIN is missing spawns NO repair node and pauses the tree (tree-2482c4ea, 28 repairs in 25 min)');
+{
+  const TREE = 'tree-mb-toolchain';
+  const BR = 'hopper/mb-toolchain';
+  const spawnsAtStart11 = spawnCalls;
+  const notesBefore = sqliteDb.prepare(`SELECT count(*) AS n FROM notifications`).get().n;
+  mkTree(TREE, BR, 'definitely-not-a-real-tool-xyz --version');   // sh exit 127 → build_toolchain_missing
+  const a = mkNode(TREE, 'node A');
+  claim(a.id);
+  workIn(a.id, { 'ra.txt': 'from A\n' });
+  engine.finishHopperNode(a.id, 'done', { result: 'A' });
+  await engine.integrationIdle(TREE);
+  const A = engine.getHopperNode(a.id);
+  check('A is integration_pending', A.integration_state === 'integration_pending', String(A.integration_state));
+  check('NO repair node was created for A', repairNodeFor(TREE, a.id) === null);
+  check('the tree is PAUSED (draft) so nothing else dispatches', engine.getHopperTree(TREE).status === 'draft', engine.getHopperTree(TREE).status);
+  check('no worker was spawned for a repair', spawnCalls - spawnsAtStart11 === 0, `delta=${spawnCalls - spawnsAtStart11}`);
+  const note = sqliteDb.prepare(`SELECT severity, title FROM notifications ORDER BY id DESC LIMIT 1`).get();
+  check('an error-level notification names the paused tree', sqliteDb.prepare(`SELECT count(*) AS n FROM notifications`).get().n === notesBefore + 1 && note?.severity === 'error' && /paused/.test(note?.title ?? ''), JSON.stringify(note));
+  check('the integration branch is untouched (A not merged)', fileOnBranch(BR, 'ra.txt') === null);
+}
+
+// ===========================================================================
+console.log('\n[MB-12] runaway guard: a repair-of-a-repair that fails again is CAPPED, not re-spawned');
+{
+  const TREE = 'tree-mb-repaircap';
+  const BR = 'hopper/mb-repaircap';
+  mkTree(TREE, BR, 'exit 1');   // a gate that is ALWAYS red → build_gate_failed every time (a worker-fixable class)
+  const a = mkNode(TREE, 'node A');
+  claim(a.id);
+  workIn(a.id, { 'ra.txt': 'from A\n' });
+  engine.finishHopperNode(a.id, 'done', { result: 'A' });
+  await engine.integrationIdle(TREE);
+  const r1 = repairNodeFor(TREE, a.id);
+  check('rung 1: a repair node exists for A', !!r1, r1?.title);
+  check('tree still active after rung 1', engine.getHopperTree(TREE).status === 'active');
+  claim(r1.id); workIn(r1.id, { 'r1.txt': 'repair 1\n' });
+  engine.finishHopperNode(r1.id, 'done', { result: 'r1' });
+  await engine.integrationIdle(TREE);
+  const r2 = repairNodeFor(TREE, r1.id);
+  check('rung 2: a repair-of-the-repair exists', !!r2, r2?.title);
+  check('tree still active after rung 2', engine.getHopperTree(TREE).status === 'active');
+  const spawnsAtCap = spawnCalls;
+  claim(r2.id); workIn(r2.id, { 'r2.txt': 'repair 2\n' });
+  engine.finishHopperNode(r2.id, 'done', { result: 'r2' });
+  await engine.integrationIdle(TREE);
+  check('rung 3 is NOT created — the chain is capped at depth 2', repairNodeFor(TREE, r2.id) === null);
+  check('the tree is PAUSED at the cap', engine.getHopperTree(TREE).status === 'draft', engine.getHopperTree(TREE).status);
+  check('no worker spawned past the cap', spawnCalls - spawnsAtCap === 0, `delta=${spawnCalls - spawnsAtCap}`);
+  check('total repair nodes for this tree is exactly 2', engine.listTreeNodes(TREE).filter((n) => n.integrates_node_id != null).length === 2);
+}
+
+// ===========================================================================
 console.log('\n[MB-7] §8 safety invariants held through all of it');
 {
   const TREE = 'tree-mb-accept';

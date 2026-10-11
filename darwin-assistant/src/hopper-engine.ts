@@ -1019,15 +1019,25 @@ function markIntegrated(node: HopperNodeRow, tree: HopperTreeRow, note: string):
   setNode(node.id, { integration_state: 'merged' });
   pruneNodeWorktree(tree.repo_path!, tree.id, node.id);
   console.log(`[hopper-engine] node ${node.id} integrated into ${tree.integration_branch} (${note})`);
-  if (node.integrates_node_id) {
-    const original = getNodeStmt.get(node.integrates_node_id);
-    if (original && original.integration_state === 'integration_pending') {
+  // Walk the WHOLE repair chain (sprint 2026-10-10 finding): when a repair node's
+  // own merge fails, the engine creates `integrate n<repair>`, so landing that one
+  // must land the repair AND the original two levels up. A one-level walk left
+  // the original `integration_pending` forever and deadlocked its dependents
+  // (tree-183bb0b6 node #1596 behind n1598 → n1600).
+  const seen = new Set<number>([node.id]);
+  let cursor = node.integrates_node_id;
+  while (cursor && !seen.has(cursor)) {
+    seen.add(cursor);
+    const original = getNodeStmt.get(cursor);
+    if (!original) break;
+    if (original.integration_state === 'integration_pending') {
       setNode(original.id, { integration_state: 'merged' });
       pruneNodeWorktree(tree.repo_path!, tree.id, original.id);
       console.log(`[hopper-engine] repair node ${node.id} also landed node ${original.id}`);
       const fresh = getNodeStmt.get(original.id);
       if (fresh) settleAncestors(fresh);
     }
+    cursor = original.integrates_node_id;
   }
 }
 

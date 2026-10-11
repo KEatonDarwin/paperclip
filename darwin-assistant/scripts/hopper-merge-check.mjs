@@ -464,6 +464,72 @@ console.log('\n[MB-6] §3.5 landing a repair node also lands the node it repaire
 }
 
 // ===========================================================================
+console.log('\n[MB-8] merge batching: N nodes finishing together → N merge commits, ONE gate run');
+{
+  const TREE = 'tree-mb-batch';
+  const BR = 'hopper/mb-batch';
+  const COUNTER = path.join(gitRoot, 'gate-runs-batch.txt');
+  const spawnsAtStart8 = spawnCalls;
+  mkTree(TREE, BR, `echo run >> ${COUNTER}`);
+  const a = mkNode(TREE, 'node A');
+  const b = mkNode(TREE, 'node B');
+  const c = mkNode(TREE, 'node C');
+  claim(a.id); claim(b.id); claim(c.id);
+  workIn(a.id, { 'ba.txt': 'from A\n' });
+  workIn(b.id, { 'bb.txt': 'from B\n' });
+  workIn(c.id, { 'bc.txt': 'from C\n' });
+  engine.finishHopperNode(a.id, 'done', { result: 'A' });
+  engine.finishHopperNode(b.id, 'done', { result: 'B' });
+  engine.finishHopperNode(c.id, 'done', { result: 'C' });
+  await engine.integrationIdle(TREE);
+  const runs = fs.existsSync(COUNTER) ? fs.readFileSync(COUNTER, 'utf8').trim().split('\n').filter(Boolean).length : 0;
+  check('all three integrated', ['merged','merged','merged'].join() === [a,b,c].map((n) => engine.getHopperNode(n.id).integration_state).join());
+  check('all three files are on the integration branch', fileOnBranch(BR, 'ba.txt') === 'from A' && fileOnBranch(BR, 'bb.txt') === 'from B' && fileOnBranch(BR, 'bc.txt') === 'from C');
+  const subjects = logOf(BR);
+  check('still one --no-ff merge commit PER NODE, named by node',
+    [a,b,c].every((n) => subjects.some((x) => x.startsWith(`hopper: integrate n${n.id} `))), subjects.join(' | '));
+  check('merge commits are in finish order (A below B below C)',
+    subjects.indexOf(`hopper: integrate n${c.id} node C`) < subjects.indexOf(`hopper: integrate n${b.id} node B`) &&
+    subjects.indexOf(`hopper: integrate n${b.id} node B`) < subjects.indexOf(`hopper: integrate n${a.id} node A`), subjects.join(' | '));
+  check('the gate ran exactly ONCE for the batch of three', runs === 1, String(runs));
+  check('the tree finished', engine.getHopperTree(TREE).status === 'done');
+  check('no new model calls in this section', spawnCalls === spawnsAtStart8, `spawnCalls=${spawnCalls}`);
+}
+
+// ===========================================================================
+console.log('\n[MB-9] merge batching: a red batch gate is blamed on the ONE node that caused it');
+{
+  const TREE = 'tree-mb-batchred';
+  const BR = 'hopper/mb-batchred';
+  // Gate: red iff bad.txt exists on the integration head.
+  const spawnsAtStart9 = spawnCalls;
+  mkTree(TREE, BR, 'test ! -f bad.txt');
+  const a = mkNode(TREE, 'node A');
+  const b = mkNode(TREE, 'node B');
+  const c = mkNode(TREE, 'node C');
+  claim(a.id); claim(b.id); claim(c.id);
+  workIn(a.id, { 'ra.txt': 'from A\n' });
+  workIn(b.id, { 'bad.txt': 'B breaks the gate\n' });
+  workIn(c.id, { 'rc.txt': 'from C\n' });
+  engine.finishHopperNode(a.id, 'done', { result: 'A' });
+  engine.finishHopperNode(b.id, 'done', { result: 'B' });
+  engine.finishHopperNode(c.id, 'done', { result: 'C' });
+  await engine.integrationIdle(TREE);
+  const A = engine.getHopperNode(a.id), B = engine.getHopperNode(b.id), C = engine.getHopperNode(c.id);
+  check('A integrated (replayed per node after the red batch)', A.integration_state === 'merged', String(A.integration_state));
+  check('C integrated', C.integration_state === 'merged', String(C.integration_state));
+  check('B is integration_pending — the gate failure landed on B alone', B.integration_state === 'integration_pending', String(B.integration_state));
+  check('A and C files are on the branch, bad.txt is NOT', fileOnBranch(BR, 'ra.txt') === 'from A' && fileOnBranch(BR, 'rc.txt') === 'from C' && fileOnBranch(BR, 'bad.txt') === null);
+  const repair = repairNodeFor(TREE, b.id);
+  check('exactly B got an integrate node', !!repair && !repairNodeFor(TREE, a.id) && !repairNodeFor(TREE, c.id), repair?.title);
+  check('the repair node names the gate failure', !!repair?.spec?.includes('build gate'), repair?.spec?.slice(0, 200));
+  check('the integration worktree is clean after the undo + replay', g(hg.integrationWorktreePath(REPO, TREE), ['status', '--porcelain']) === '');
+  const treeRow = engine.getHopperTree(TREE);
+  check('the tree is NOT finished (B still unlanded)', treeRow.status !== 'done', `status=${treeRow.status} nodes=${engine.listTreeNodes(TREE).map((n) => `${n.id}:${n.status}:${n.integration_state}`).join(',')}`);
+  check('at most the ONE repair worker was spawned in this section', spawnCalls - spawnsAtStart9 <= 1, `delta=${spawnCalls - spawnsAtStart9}`);
+}
+
+// ===========================================================================
 console.log('\n[MB-7] §8 safety invariants held through all of it');
 {
   const TREE = 'tree-mb-accept';

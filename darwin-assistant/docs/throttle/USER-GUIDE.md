@@ -59,6 +59,40 @@ running right now (e.g. "goal 6 has 2 of 2 workers — raise throttle_max_per_go
 governor reason like weekly ceiling or a stale usage meter). This is meant to replace reading
 server logs — if the pool looks idle, this line says why.
 
+## Pacer accelerator (gov_pacer_mode)
+
+A separate, model-free advisor (the window-burn pacer) writes
+`/home/kevin/window-burn/pacer.json` with a per-account recommendation — `release`, `hold`, or
+`flush` — plus a target, a reserve, headroom, minutes-to-reset, and a plain-English reason. The
+path is overridable with the `PACER_JSON` env var (tests and sims use that; production reads the
+default path). The `gov_pacer_mode` dial decides how much say that advice gets.
+
+**Three modes:**
+
+- **`off`** — the pacer is ignored entirely; nothing reads the file.
+- **`advise`** (the default) — dispatch, account selection, and the split cursor behave exactly
+  as they did before the pacer existed. The only difference is that `throttle status` now
+  carries a `pace` block per Claude account (the advice, a `fresh` flag, and one plain sentence)
+  plus a top-level `pace.mode`.
+- **`enforce`** — for NEW worker claims only, an account whose fresh advice is `hold` is skipped
+  as long as another account can still serve the claim. When the advice is `flush`, that account
+  may run even while you're at the keyboard (the `kevin_active` hold) — but only while its 5h
+  utilization is still below `100 - reserve`, and only when no other eligible account could have
+  taken the claim normally. Your own interactive turns are never re-routed by the pacer, in any
+  mode.
+
+**Hard stops the pacer can never cross:** the 5h ceiling, the weekly ceiling, usage staleness,
+focus modes (A only/B only), per-thread pins, `gov_override_*`, and the per-account reserve. The
+pacer can only redirect *which* account a claim lands on, or waive the Kevin-at-the-keyboard
+pause below the reserve — it can never spend past a ceiling, and it can never be the sole reason
+dispatch stops: if every account says `hold`, dispatch continues on the normal ranking.
+
+**No advice is not a hold.** A missing `pacer.json`, unreadable JSON, or an entry whose `ts` is
+more than 15 minutes old is treated as "no opinion" and ignored — never as `hold`.
+
+To set it: `mcp__jarvis__throttle` with `operation: 'set', gov_pacer_mode: 'enforce'`, or
+`PATCH /throttle`.
+
 ## The one gotcha: slots vs. admission
 
 There are actually **two** ceilings on how many automated things can run at once: the

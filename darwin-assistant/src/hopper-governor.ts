@@ -7,7 +7,8 @@ import { listClaudeAccounts, readAccountUsage, isAccountEligible, type AccountUs
 // applied only in claude-accounts.ts, this lane would report OPEN because B has
 // headroom while the selector returned A (focused, spent), and a worker would
 // spawn onto an account that cannot serve it. Worse than the bug it fixes.
-import { throttleClaudeCandidates, focusHoldDetail, overrideFor, type OverrideState } from './throttle.js';
+import { throttleClaudeCandidates, focusHoldDetail, overrideFor, pacerMode, type OverrideState } from './throttle.js';
+import { pacerAdviceFor, pacerFlushOverride, readPacerAdvice, type PacerAdvice } from './pacer-advice.js';
 
 // HOPPER GOVERNOR v2 — the subscription throttle for overnight autonomous runs
 // (Kevin, 2026-09-06: "meter the connection and run all night"; upgraded
@@ -137,6 +138,8 @@ export interface ClaudeAccountView {
   weekly: number | null;
   /** True for the account a new Claude worker would run on right now. */
   active: boolean;
+  /** The window-burn pacer's live advice for this account; null when gov_pacer_mode='off'. */
+  pace?: PacerAdvice | null;
 }
 
 export interface GovernorVerdict {
@@ -415,13 +418,20 @@ function evaluate(provider: GovernorProvider, opts?: GovernorOptions): GovernorV
   if (isDefaultSingle) {
     const v = evaluateClaudeLegacy(CONFIG, opts, bypass);
     const acct = enabledAccounts[0];
+    const pMode = pacerMode();
     // Additive only — the gating decision above is untouched.
     return {
       ...v,
       override,
       active_account: acct.key,
       claude_accounts: [
-        { key: acct.key, five_hour: v.five_hour ?? null, weekly: v.weekly ?? null, active: v.allow },
+        {
+          key: acct.key,
+          five_hour: v.five_hour ?? null,
+          weekly: v.weekly ?? null,
+          active: v.allow,
+          pace: pMode === 'off' ? null : pacerAdviceFor(acct.key),
+        },
       ],
     };
   }
@@ -494,13 +504,24 @@ function evaluateClaudeLegacy(CONFIG: GovernorConfig, opts?: GovernorOptions, by
     };
   }
 
+  let flushNote = '';
   if (!bypass && !opts?.ignoreKevinActive && kevinActive()) {
     // 2026-09-11: "it's OK to use Claude while I'm here" below half the 5h
     // window burned. Unknown utilization never grants the waiver — it holds
     // exactly like an at/above-threshold reading would.
     const maxActive = CONFIG.kevin_active_claude_max_5h;
     const waived = fiveHour != null && fiveHour < maxActive;
-    if (!waived) {
+    // ⚡ PACER: a fresh 'flush' may waive THIS gate and only this gate, and only
+    // while the account is still below (100 - reserve). The reserve is Kevin's.
+    const flushOverride =
+      !waived &&
+      pacerFlushOverride({
+        mode: pacerMode(),
+        advice: pacerAdviceFor('a'),
+        utilizationPct: fiveHour,
+        otherAccountCanServe: false, // single-account path: nowhere else to run
+      });
+    if (!waived && !flushOverride) {
       return {
         allow: false,
         reason: 'kevin_active',
@@ -513,12 +534,13 @@ function evaluateClaudeLegacy(CONFIG: GovernorConfig, opts?: GovernorOptions, by
         config: CONFIG,
       };
     }
+    if (flushOverride) flushNote = ' — pacer flush override (kevin_active waived, still under the reserve)';
   }
 
   return {
     allow: true,
     reason: 'ok',
-    detail: `5h ${fiveHour ?? '?'}% / weekly ${weekly ?? '?'}% — clear to dispatch`,
+    detail: `5h ${fiveHour ?? '?'}% / weekly ${weekly ?? '?'}% — clear to dispatch${flushNote}`,
     provider,
     five_hour: fiveHour,
     weekly,
@@ -575,18 +597,24 @@ function evaluateClaudeAccounts(
   });
 
   // ⚡ THROTTLE §4.6 — ONE candidate function, shared with the selector. Its
-  // `forSpawn` stays false here: the governor asks "is the lane open", it does
-  // not launch anything, so it must never consume the split cursor's turn.
-  const plan = throttleClaudeCandidates(entries, { forSpawn: false });
+  // `forSpawn` stays false here (the governor asks "is the lane open", it does
+  // not launch anything, so it must never consume the split cursor's turn), but
+  // `forClaim: true` because the governor IS the new-claim view — selector and
+  // governor can never disagree about which account a claim lands on (§4.6).
+  const plan = throttleClaudeCandidates(entries, { forSpawn: false, forClaim: true });
   const withHeadroom = plan.eligible;
   const picked = plan.rank(withHeadroom);
   const selected = picked ? (entries.find((e) => e.account.key === picked.key) ?? null) : null;
+
+  const pMode = pacerMode();
+  const adviceMap = pMode === 'off' ? {} : readPacerAdvice();
 
   const claude_accounts: ClaudeAccountView[] = entries.map((e) => ({
     key: e.account.key,
     five_hour: e.usage.five_hour,
     weekly: e.usage.weekly,
     active: selected != null && e.account.key === selected.account.key,
+    pace: pMode === 'off' ? null : pacerAdviceFor(e.account.key, adviceMap),
   }));
 
   const withPayload = (v: Omit<GovernorVerdict, 'provider' | 'config' | 'active_account' | 'claude_accounts'>): GovernorVerdict => ({
@@ -609,10 +637,22 @@ function evaluateClaudeAccounts(
       );
     }
     // Kevin-active waiver still applies globally, keyed to the account we'd run on.
+    let flushNote = '';
     if (!bypass && !opts?.ignoreKevinActive && kevinActive()) {
       const maxActive = CONFIG.kevin_active_claude_max_5h;
       const waived = s.usage.five_hour != null && s.usage.five_hour < maxActive;
-      if (!waived) {
+      const otherAccountCanServe = plan.eligible.some(
+        (e) => e.account.key !== s.account.key && e.usage.five_hour != null && e.usage.five_hour < maxActive,
+      );
+      const flushOverride =
+        !waived &&
+        pacerFlushOverride({
+          mode: pMode,
+          advice: pacerAdviceFor(s.account.key, adviceMap),
+          utilizationPct: s.usage.five_hour,
+          otherAccountCanServe,
+        });
+      if (!waived && !flushOverride) {
         return withPayload({
           allow: false,
           reason: 'kevin_active',
@@ -621,11 +661,12 @@ function evaluateClaudeAccounts(
           weekly: s.usage.weekly,
         });
       }
+      if (flushOverride) flushNote = ` — pacer flush override on ${s.account.key} (kevin_active waived, still under the reserve)`;
     }
     return withPayload({
       allow: true,
       reason: 'ok',
-      detail: `account ${s.account.key}: 5h ${s.usage.five_hour}% / weekly ${s.usage.weekly ?? '?'}% — clear (of ${entries.length} Claude accounts)`,
+      detail: `account ${s.account.key}: 5h ${s.usage.five_hour}% / weekly ${s.usage.weekly ?? '?'}% — clear (of ${entries.length} Claude accounts)${flushNote}`,
       five_hour: s.usage.five_hour,
       weekly: s.usage.weekly,
     });

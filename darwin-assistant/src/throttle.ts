@@ -30,6 +30,7 @@ import { activeAutomatedTurns } from './turn-admission.js';
 import { createNotification } from './notifications.js';
 import type { AccountUsage, AccountUsageEntry, ClaudeAccount } from './claude-accounts.js';
 import type { GovernorProvider, GovernorVerdict } from './hopper-governor.js';
+import { pacerAdviceFor, pacerSaysHold, readPacerAdvice, type PacerAdvice, type PacerMode } from './pacer-advice.js';
 
 // ─── §1.1 the dials ───────────────────────────────────────────────────────────
 
@@ -46,6 +47,7 @@ export interface ThrottleDials {
   throttle_provider_order: GovernorProvider[];
   throttle_provider_fallback: OnOff;
   throttle_preset: string;
+  gov_pacer_mode: PacerMode;
 }
 
 const ALL_PROVIDERS: readonly GovernorProvider[] = ['claude', 'codex', 'auggie', 'devin'];
@@ -70,6 +72,7 @@ const ENUM_VALUES: Record<string, readonly string[]> = {
   throttle_claude_mode: CLAUDE_MODES,
   throttle_provider_fallback: ['on', 'off'],
   gov_weekly_mode: ['soft', 'hard'],
+  gov_pacer_mode: ['off', 'advise', 'enforce'],
 };
 
 /** CSV keys → the vocabulary a member must belong to (null = any account key). */
@@ -212,7 +215,13 @@ export function readThrottleDials(): ThrottleDials {
     throttle_provider_order: csvSetting('throttle_provider_order', DEFAULT_PROVIDER_ORDER) as GovernorProvider[],
     throttle_provider_fallback: enumSetting<OnOff>('throttle_provider_fallback', 'off'),
     throttle_preset: getSetting('throttle_preset')?.trim() || 'normal',
+    gov_pacer_mode: pacerMode(),
   };
+}
+
+/** advise (the default) is observe-only — it changes nothing about dispatch. */
+export function pacerMode(): PacerMode {
+  return enumSetting<PacerMode>('gov_pacer_mode', 'advise');
 }
 
 /**
@@ -620,6 +629,7 @@ export interface ClaudeCandidatePlan {
    * re-implement it, which is exactly the drift §4.6 forbids.
    */
   narrow: (pool: AccountUsageEntry[]) => AccountUsageEntry[];
+  pacer: { mode: PacerMode; applied: boolean; held: string[] };
 }
 
 function pickLeastUsed(pool: AccountUsageEntry[]): ClaudeAccount | null {
@@ -764,7 +774,7 @@ export function noteWorkerSpawnAccount(key: string): void {
  */
 export function throttleClaudeCandidates(
   entries: AccountUsageEntry[],
-  opts?: { forSpawn?: boolean },
+  opts?: { forSpawn?: boolean; forClaim?: boolean },
 ): ClaudeCandidatePlan {
   const dials = readThrottleDials();
   const mode = dials.throttle_claude_mode;
@@ -800,7 +810,26 @@ export function throttleClaudeCandidates(
     rank = pickHighestBurnScore(ceiling5h, ceilingWeek);
   }
 
-  return { mode, focusKey, narrow, rank, eligible: narrow(entries).filter((e) => e.eligible) };
+  // ⚡ PACER (enforce mode only, NEW CLAIMS only): an account whose fresh advice
+  // is 'hold' is dropped from the candidate pool — unless that would empty it.
+  // The pacer is an accelerator, never a stop: it may redirect which account a
+  // claim lands on, never be the sole reason nothing dispatches. In off/advise
+  // mode, and for interactive turns/status reads, the file is not even read.
+  const baseEligible = narrow(entries).filter((e) => e.eligible);
+  const pMode = pacerMode();
+  let eligible = baseEligible;
+  let held: string[] = [];
+  let applied = false;
+  if (pMode === 'enforce' && opts?.forClaim === true) {
+    const advice = readPacerAdvice();
+    held = baseEligible.filter((e) => pacerSaysHold(pacerAdviceFor(e.account.key, advice))).map((e) => e.account.key);
+    const kept = baseEligible.filter((e) => !held.includes(e.account.key));
+    if (held.length > 0 && kept.length > 0) {
+      eligible = kept;
+      applied = true;
+    }
+  }
+  return { mode, focusKey, narrow, rank, eligible, pacer: { mode: pMode, applied, held } };
 }
 
 /** Why a focused account can't serve — for the `claude_focus_account_full` detail. */
@@ -816,6 +845,28 @@ export function focusHoldDetail(focusKey: string, entries: AccountUsageEntry[]):
   else if (usage.five_hour == null) cause = '5h utilization unknown';
   else cause = `5h ${usage.five_hour}% over the ceiling`;
   return `focused on account ${focusKey}: ${cause} — "${focusKey.toUpperCase()} only" holds rather than spilling to the other subscription (use Ordered to spill)`;
+}
+
+/**
+ * The reroutes-style line for the status payload: did enforce mode actually
+ * change which account a new claim would land on? Pure and read-only —
+ * `forSpawn` stays false in both plans so the split cursor is never consumed.
+ */
+export function pacerSelectionNote(entries: AccountUsageEntry[]): { mode: PacerMode; selection_note: string | null } {
+  const mode = pacerMode();
+  if (mode !== 'enforce') return { mode, selection_note: null };
+  const base = throttleClaudeCandidates(entries, { forSpawn: false, forClaim: false });
+  const claim = throttleClaudeCandidates(entries, { forSpawn: false, forClaim: true });
+  const basePick = base.rank(base.eligible);
+  const claimPick = claim.rank(claim.eligible);
+  if (!basePick || !claimPick || basePick.key === claimPick.key) return { mode, selection_note: null };
+  const why = claim.pacer.held
+    .map((key) => `${key}: ${pacerAdviceFor(key).sentence}`)
+    .join('; ');
+  return {
+    mode,
+    selection_note: `pacer preferred account ${claimPick.key} over ${basePick.key} for new claims (${why || 'fresh hold advice'})`,
+  };
 }
 
 // ─── §6.4 provider overrides — `gov_override_*` wins over everything ──────────
@@ -1101,6 +1152,7 @@ export interface ThrottleAccountView {
   five_hour_resets_at: string | null;
   weekly_resets_at: string | null;
   five_hour_ceiling: number;
+  pace?: PacerAdvice | null;
 }
 
 export interface ThrottleProviderView {
@@ -1131,6 +1183,7 @@ export interface ThrottleStatus {
   reroutes: RerouteRecord[];
   presets: Record<string, ThrottlePreset>;
   presets_source: 'settings' | 'seeded_fallback';
+  pace: { mode: PacerMode; selection_note: string | null };
 }
 
 /**
@@ -1147,6 +1200,7 @@ export interface ThrottleStatusInputs {
   nightPausedTrees?: ReadonlySet<string>;
   /** Kevin-at-the-keyboard + the non-Claude daytime cap, for the hold reason. */
   daytime?: { active: boolean; cap: number; nonClaudeRunning: number };
+  pace?: { mode: PacerMode; selection_note: string | null };
 }
 
 /**
@@ -1244,6 +1298,7 @@ export function throttleStatus(inputs?: ThrottleStatusInputs): ThrottleStatus {
     reroutes: listRecentReroutes(),
     presets: listThrottlePresets(),
     presets_source: throttlePresetsSource(),
+    pace: inputs?.pace ?? { mode: pacerMode(), selection_note: null },
   };
 }
 

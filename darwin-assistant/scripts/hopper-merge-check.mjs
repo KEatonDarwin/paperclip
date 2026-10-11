@@ -28,6 +28,7 @@
 //   MB-7  §8 safety: reset --hard cannot reach a node worktree, a master/main
 //         merge target throws before git runs, and NO branch was deleted
 
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -527,6 +528,39 @@ console.log('\n[MB-9] merge batching: a red batch gate is blamed on the ONE node
   const treeRow = engine.getHopperTree(TREE);
   check('the tree is NOT finished (B still unlanded)', treeRow.status !== 'done', `status=${treeRow.status} nodes=${engine.listTreeNodes(TREE).map((n) => `${n.id}:${n.status}:${n.integration_state}`).join(',')}`);
   check('at most the ONE repair worker was spawned in this section', spawnCalls - spawnsAtStart9 <= 1, `delta=${spawnCalls - spawnsAtStart9}`);
+}
+
+// ===========================================================================
+console.log('\n[MB-10] merge batching: a red gate whose ROLLBACK also fails must not replay (review finding 2026-10-11)');
+{
+  const TREE = 'tree-mb-rollbackfail';
+  const BR = 'hopper/mb-rollbackfail';
+  // The gate sabotages the integration worktree's own git dir (read-only) and
+  // then fails. The engine's reset --hard back to the pre-batch sha then
+  // CANNOT run — a real injected rollback failure, not a mocked one.
+  const spawnsAtStart10 = spawnCalls;
+  mkTree(TREE, BR, 'chmod -R a-w "$(git rev-parse --git-dir)" && exit 1');
+  const a = mkNode(TREE, 'node A');
+  const b = mkNode(TREE, 'node B');
+  claim(a.id); claim(b.id);
+  workIn(a.id, { 'ra.txt': 'from A\n' });
+  workIn(b.id, { 'rb.txt': 'from B\n' });
+  engine.finishHopperNode(a.id, 'done', { result: 'A' });
+  engine.finishHopperNode(b.id, 'done', { result: 'B' });
+  await engine.integrationIdle(TREE);
+  const intWt = hg.integrationWorktreePath(REPO, TREE);
+  // restore the git dir FIRST so later checks/cleanup can run
+  const gitDir = g(intWt, ['rev-parse', '--git-dir']);
+  spawnSync('chmod', ['-R', 'u+w', path.isAbsolute(gitDir) ? gitDir : path.join(intWt, gitDir)]);
+  const A = engine.getHopperNode(a.id), B = engine.getHopperNode(b.id);
+  check('A is integration_pending (no replay after a failed rollback)', A.integration_state === 'integration_pending', String(A.integration_state));
+  check('B is integration_pending (no replay after a failed rollback)', B.integration_state === 'integration_pending', String(B.integration_state));
+  const ra = repairNodeFor(TREE, a.id), rb = repairNodeFor(TREE, b.id);
+  check('BOTH merged nodes got an integrate node', !!ra && !!rb, `${ra?.title} / ${rb?.title}`);
+  check('the repair node says the branch could not be rolled back', !!ra?.spec?.includes('could not be rolled back'), ra?.spec?.slice(0, 300));
+  const treeRow = engine.getHopperTree(TREE);
+  check('the tree is NOT finished', treeRow.status !== 'done', `status=${treeRow.status}`);
+  check('at most the repair workers were spawned (no replay spawns)', spawnCalls - spawnsAtStart10 <= 2, `delta=${spawnCalls - spawnsAtStart10}`);
 }
 
 // ===========================================================================

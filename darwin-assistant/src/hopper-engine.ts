@@ -1000,28 +1000,39 @@ function enqueueIntegration(node: HopperNodeRow, tree: HopperTreeRow): void {
   const queue = pendingIntegration.get(tree.id) ?? [];
   queue.push(node.id);
   pendingIntegration.set(tree.id, queue);
-  if (integrationChains.has(tree.id)) return; // the running drain re-reads the queue after each batch
+  startIntegrationDrain(tree.id);
+}
+
+/**
+ * One drain per tree. It re-reads the queue after every batch, and when it
+ * exits for ANY reason (loop guard, throw) with work still queued it schedules
+ * a fresh drain — a node that finished during the last awaited gate can never
+ * be stranded `integration_pending` (review finding, 2026-10-11).
+ */
+function startIntegrationDrain(treeId: string): void {
+  if (integrationChains.has(treeId)) return; // the running drain re-reads the queue after each batch
   const drain: Promise<void> = (async () => {
     for (let guard = 0; guard < 10_000; guard += 1) {
       // Yield one macrotask so finishes landing in the same tick coalesce into
       // ONE batch instead of the first node merging alone.
       await new Promise<void>((resolve) => setImmediate(resolve));
-      const batch = pendingIntegration.get(tree.id) ?? [];
+      const batch = pendingIntegration.get(treeId) ?? [];
       if (!batch.length) break;
-      pendingIntegration.set(tree.id, []);
+      pendingIntegration.set(treeId, []);
       try {
-        await integrateBatch(tree.id, batch);
+        await integrateBatch(treeId, batch);
       } catch (err) {
         // integrateBatch/integrateFinishedNode convert every expected failure into
         // an `integrate nX` node; reaching here means something unexpected threw,
         // and the drain must survive it or the tree's later merges never run.
-        console.error(`[hopper-engine] integration batch error on tree ${tree.id} nodes ${batch.join(',')}:`, err);
+        console.error(`[hopper-engine] integration batch error on tree ${treeId} nodes ${batch.join(',')}:`, err);
       }
     }
   })().finally(() => {
-    if (integrationChains.get(tree.id) === drain) integrationChains.delete(tree.id);
+    if (integrationChains.get(treeId) === drain) integrationChains.delete(treeId);
+    if ((pendingIntegration.get(treeId) ?? []).length) setImmediate(() => startIntegrationDrain(treeId));
   });
-  integrationChains.set(tree.id, drain);
+  integrationChains.set(treeId, drain);
 }
 
 /** Merge every queued node in finish order, gate once; on red, replay per node. */
@@ -1075,9 +1086,27 @@ async function integrateBatch(treeId: string, ids: number[]): Promise<void> {
       // Blame per node, never the batch: undo the whole batch and replay each
       // merged node through the single-node path (its own merge + its own gate).
       const undo = resetHardTo(repoPath, tree.id, integ.worktree_path, preBatchSha);
-      if (!undo.ok) console.error(`[hopper-engine] batch undo failed on ${integrationBranch}: ${undo.output}`);
-      console.log(`[hopper-engine] batch gate red on tree ${tree.id} (${merged.length} nodes) — replaying per node`);
-      for (const id of merged) await integrateFinishedNode(id); // settles + ticks per node
+      if (!undo.ok) {
+        // The batch is still on the branch, so per-node replay would blame the
+        // wrong node and could leave failing changes merged. Stop here and make
+        // the rollback failure visible as a repair node per merged node.
+        console.error(`[hopper-engine] batch undo failed on ${integrationBranch}: ${undo.output}`);
+        for (const id of merged) {
+          const node = getNodeStmt.get(id);
+          if (!node) continue;
+          createIntegrationRepairNode(
+            node, tree,
+            'the batch gate failed and the branch could not be rolled back',
+            'batch_rollback_failed',
+            `gate:\n${gate.output}\n\n[restoring ${integrationBranch} to ${preBatchSha} failed: ${undo.output}]`,
+            { worktree: integ.worktree_path, gate: gateCmd },
+          );
+        }
+        settled.push(...merged);
+      } else {
+        console.log(`[hopper-engine] batch gate red on tree ${tree.id} (${merged.length} nodes) — replaying per node`);
+        for (const id of merged) await integrateFinishedNode(id); // settles + ticks per node
+      }
     }
   }
   for (const id of settled) {

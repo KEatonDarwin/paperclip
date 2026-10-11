@@ -4307,8 +4307,20 @@ export function createApiV1Router(): Router {
     // `integration_branch`, merge-back + `build_gate_cmd` on finish. Optional and
     // additive: omit `integration` and this route behaves exactly as before.
     let integration: IntegrationTreeInput | null = null;
-    if (body.integration && typeof body.integration === 'object') {
+    if (body.integration != null) {
+      // Supplied means supplied: anything but a plain object of string fields is
+      // rejected rather than silently planting a tree WITHOUT integration.
+      if (typeof body.integration !== 'object' || Array.isArray(body.integration)) {
+        sendError(res, 400, 'invalid_request', 'integration must be an object {repo_path, integration_branch, build_gate_cmd?}');
+        return;
+      }
       const i = body.integration as Record<string, unknown>;
+      for (const k of ['repo_path', 'integration_branch', 'build_gate_cmd'] as const) {
+        if (i[k] != null && typeof i[k] !== 'string') {
+          sendError(res, 400, 'invalid_request', `integration.${k} must be a string`);
+          return;
+        }
+      }
       const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v.trim() : null);
       integration = {
         repo_path: str(i.repo_path),

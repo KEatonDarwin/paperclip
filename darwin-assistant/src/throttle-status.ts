@@ -24,17 +24,21 @@ import {
   overrideFor,
   readStopLoss,
   runningWorkerAdapters,
+  pacerMode,
+  pacerSelectionNote,
   type ThrottleStatus,
   type ThrottleAccountView,
   type ThrottleProviderView,
 } from './throttle.js';
 import { governorStatusAll, kevinActive, concurrencyCap, providerFor, type GovernorProvider } from './hopper-governor.js';
 import { claudeFiveHourCeiling, selectActiveClaudeAccount } from './claude-accounts.js';
+import { pacerAdviceFor, readPacerAdvice, type PacerAdvice, type PacerMode } from './pacer-advice.js';
 
 export interface ComposedThrottleInputs {
   providers: Partial<Record<GovernorProvider, ThrottleProviderView>>;
   accounts: ThrottleAccountView[];
   daytime: { active: boolean; cap: number; nonClaudeRunning: number };
+  pace: { mode: PacerMode; selection_note: string | null };
 }
 
 /**
@@ -65,6 +69,8 @@ export function composeThrottleInputs(): ComposedThrottleInputs {
 
   const ceiling = claudeFiveHourCeiling();
   const selection = selectActiveClaudeAccount(ceiling);
+  const pMode = pacerMode();
+  const adviceMap = pMode === 'off' ? {} : readPacerAdvice();
   const accounts: ThrottleAccountView[] = selection.perAccount.map(({ account, usage, eligible }) => ({
     key: account.key,
     label: account.label,
@@ -78,6 +84,7 @@ export function composeThrottleInputs(): ComposedThrottleInputs {
     five_hour_resets_at: usage.five_hour_resets_at,
     weekly_resets_at: usage.weekly_resets_at,
     five_hour_ceiling: ceiling,
+    pace: pMode === 'off' ? null : pacerAdviceFor(account.key, adviceMap),
   }));
 
   // The non-Claude daytime cap, so the hold line can name it honestly.
@@ -85,7 +92,8 @@ export function composeThrottleInputs(): ComposedThrottleInputs {
   const nonClaudeRunning = active
     ? runningWorkerAdapters().filter((a) => providerFor(a ?? 'claude') !== 'claude').length
     : 0;
-  return { providers, accounts, daytime: { active, cap: concurrencyCap(), nonClaudeRunning } };
+  const pace = pacerSelectionNote(selection.perAccount);
+  return { providers, accounts, daytime: { active, cap: concurrencyCap(), nonClaudeRunning }, pace };
 }
 
 /** The complete, honest `GET /throttle` payload. Use this, never a bare

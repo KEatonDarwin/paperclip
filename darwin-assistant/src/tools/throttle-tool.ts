@@ -23,7 +23,7 @@ import { dispatchTick } from '../hopper-engine.js';
 export const throttle: ToolDef = {
   name: 'throttle',
   description:
-    "Kevin's ⚡ Throttle — the manual dials over the autonomous work rate: total simultaneous workers (hopper_slots), max workers per goal / per tree, which Claude account or provider runs the work (throttle_claude_mode: auto | ordered | split | a | b), and the per-provider stop-loss ceilings. 'status' is a read-only snapshot: the dials, the live running-by-goal/by-tree breakdown, each account's 5h/weekly % and reset countdown, and ONE honest hold reason explaining why nothing is dispatching — call it freely whenever Kevin asks how hard the system is running, why a tree is stalled, or how much subscription is left. 'set' writes dials and 'preset' applies one of the saved presets (turned_up · normal · conserve · overnight). ONLY call 'set' or 'preset' when Kevin asked for that change in words in this conversation — these are HIS dials, never yours to self-tune, and raising your own ceilings is exactly the thing you must not do. Dial changes affect FUTURE claims only; a running worker is never interrupted.",
+    "Kevin's ⚡ Throttle — the manual dials over the autonomous work rate: total simultaneous workers (hopper_slots), max workers per goal / per tree, which Claude account or provider runs the work (throttle_claude_mode: auto | ordered | split | a | b), the per-provider stop-loss ceilings, and the window-burn pacer's influence on dispatch (gov_pacer_mode: off | advise | enforce). 'status' is a read-only snapshot: the dials, the live running-by-goal/by-tree breakdown, each account's 5h/weekly % and reset countdown, pacer advice per account, and ONE honest hold reason explaining why nothing is dispatching — call it freely whenever Kevin asks how hard the system is running, why a tree is stalled, or how much subscription is left. 'set' writes dials and 'preset' applies one of the saved presets (turned_up · normal · conserve · overnight). ONLY call 'set' or 'preset' when Kevin asked for that change in words in this conversation — these are HIS dials, never yours to self-tune, and raising your own ceilings is exactly the thing you must not do. Dial changes affect FUTURE claims only; a running worker is never interrupted.",
   parameters: {
     type: 'object',
     properties: {
@@ -48,6 +48,12 @@ export const throttle: ToolDef = {
       gov_5h_ceiling: { type: 'number', description: 'Claude 5-hour stop-loss %, max 98.' },
       gov_weekly_ceiling: { type: 'number', description: 'Claude weekly stop-loss %, max 98.' },
       gov_weekly_mode: { type: 'string', enum: ['soft', 'hard'], description: 'soft = notify and continue; hard = park.' },
+      gov_pacer_mode: {
+        type: 'string',
+        enum: ['off', 'advise', 'enforce'],
+        description:
+          "The window-burn pacer's influence on dispatch. off = ignored · advise (default) = status shows the pacer's advice but dispatch is unchanged · enforce = new worker claims prefer an account the pacer says 'release' over one it says 'hold', and a 'flush' account may run while Kevin is at the keyboard while it stays under its reserve. The 5h/weekly ceilings and the reserve are hard stops the pacer can never cross.",
+      },
       gov_kevin_active_claude_max_5h: { type: 'number', description: 'Run Claude while Kevin is at the keyboard below this 5h %, max 98.' },
       gov_codex_ceiling: { type: 'number', description: 'Codex stop-loss %, max 98.' },
       gov_auggie_ceiling: { type: 'number', description: 'Augment stop-loss %, max 98.' },

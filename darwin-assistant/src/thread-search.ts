@@ -74,6 +74,12 @@ export async function searchThreadsByQuery(
 
   const corpus = candidates
     .map((c) => {
+      // A password-locked chat is matched on its TITLE only: none of its content
+      // (summary, recent turns, matched text) goes to the model, so the one-line
+      // reason shown in the results can't echo it either.
+      if (c.password_hash) {
+        return `- thread_id: ${c.external_id}\n  title: ${c.title ?? '(untitled)'}\n  snippet: (password-locked — content hidden; match on the title only)`;
+      }
       const hit = matched?.get(c.id)?.replace(/\s+/g, ' ').trim().slice(0, MATCHED_TEXT_MAX);
       return `- thread_id: ${c.external_id}\n  title: ${c.title ?? '(untitled)'}\n  snippet: ${threadSnippet(c).replace(/\n/g, ' ') || '(no messages yet)'}`
         + (hit ? `\n  matched text: ${hit}` : '');

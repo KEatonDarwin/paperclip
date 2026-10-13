@@ -60,4 +60,7 @@ darwin-assistant/jarvis.db
 darwin-assistant/jarvis.db-shm
 darwin-assistant/jarvis.db-wal
 darwin-assistant/jarvis.db.bak-*
+darwin-assistant/jarvis-search.db
+darwin-assistant/jarvis-search.db-shm
+darwin-assistant/jarvis-search.db-wal
 darwin-assistant/node_modules

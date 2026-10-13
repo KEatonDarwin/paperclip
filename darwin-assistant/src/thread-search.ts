@@ -39,7 +39,7 @@ Query:
 ${query}
 """
 
-Threads (thread_id, title, then a content snippet):
+Threads (thread_id, title, a content snippet, and — when the full-text index found it — the matched text from anywhere in the chat):
 ${corpus}
 
 Respond with ONLY a JSON array, no prose, no markdown fences. Most relevant first, at most 5 entries. Each entry: {"thread_id": "<the exact thread_id from above>", "reason": "<one short sentence on why this matches>"}. If nothing genuinely matches, respond with [].`;
@@ -55,14 +55,35 @@ function extractJsonArray(text: string): unknown[] {
   return parsed;
 }
 
+// Cap on the full-text "matched text" line per candidate, so 40 candidates
+// keep the ranker prompt bounded (~12k chars of match text at most).
+export const MATCHED_TEXT_MAX = 300;
+
+/**
+ * `matched` (Find Any Chat): the full-text index's snippet per conversation id.
+ * A hit can sit anywhere in a long chat — far outside the latest summary or
+ * the last 4 turns that threadSnippet() shows — so the matched text is passed
+ * to the ranker too, or it would be blind to why the chat is a candidate.
+ */
 export async function searchThreadsByQuery(
   query: string,
   candidates: ConversationRow[],
+  matched?: ReadonlyMap<number, string>,
 ): Promise<ThreadSearchResult[]> {
   if (!candidates.length) return [];
 
   const corpus = candidates
-    .map((c) => `- thread_id: ${c.external_id}\n  title: ${c.title ?? '(untitled)'}\n  snippet: ${threadSnippet(c).replace(/\n/g, ' ') || '(no messages yet)'}`)
+    .map((c) => {
+      // A password-locked chat is matched on its TITLE only: none of its content
+      // (summary, recent turns, matched text) goes to the model, so the one-line
+      // reason shown in the results can't echo it either.
+      if (c.password_hash) {
+        return `- thread_id: ${c.external_id}\n  title: ${c.title ?? '(untitled)'}\n  snippet: (password-locked — content hidden; match on the title only)`;
+      }
+      const hit = matched?.get(c.id)?.replace(/\s+/g, ' ').trim().slice(0, MATCHED_TEXT_MAX);
+      return `- thread_id: ${c.external_id}\n  title: ${c.title ?? '(untitled)'}\n  snippet: ${threadSnippet(c).replace(/\n/g, ' ') || '(no messages yet)'}`
+        + (hit ? `\n  matched text: ${hit}` : '');
+    })
     .join('\n');
 
   const result = await runClaude(SEARCH_PROMPT(query, corpus), null);

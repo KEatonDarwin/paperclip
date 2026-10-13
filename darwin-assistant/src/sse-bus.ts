@@ -415,6 +415,18 @@ export interface MikeReportEvent {
   summary: string | null;
 }
 
+// CHAT TOPICS (tree-c9800208, node #1578) — a conversation gained/updated a
+// topic assignment (many-to-many; a pivot ADDs, never removes). Global like
+// GoalEvent (no required conversationId filter on the client), but carries
+// conversationId so a thread view can also key off it directly.
+export interface TopicAssignedEvent {
+  type: 'topic_assigned';
+  conversationId: number;
+  topicId: number;
+  isPrimary: boolean;
+  topic: import('./chat-topics-store.js').TopicRow;
+}
+
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
   | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
@@ -431,7 +443,7 @@ export type SSEEvent =
   | NightRunEvent | NightItemEvent
   | HealthSampleEvent | HealthEventEvent
   | MikeProjectEvent | MikeActivityEvent | MikeReportEvent
-  | TechTaskEvent | BugfixEvent;
+  | TechTaskEvent | BugfixEvent | TopicAssignedEvent;
 
 // ---------------------------------------------------------------------------
 // THE GLOBAL-STREAM EVENT CONTRACT — one list, server-owned.
@@ -473,6 +485,7 @@ export const GLOBAL_STREAM_EVENT_TYPES = [
   'tech_task',   // Tech Tasks (2026-10-01): email-pipeline rows on the big board + dashboard
   'bugfix',      // Bug Intake (2026-10-05): Ctrl+Shift+B modal rows + triage status
   'mike_project', 'mike_activity', 'mike_report',   // Mike Radar (tree-49d228a8): live /mike-radar rail + feed + report pane
+  'topic_assigned',   // Chat Topics (tree-c9800208): live topic pivots on the thread/topic rail
 ] as const satisfies readonly SSEEvent['type'][];
 
 export type GlobalStreamEventType = (typeof GLOBAL_STREAM_EVENT_TYPES)[number];

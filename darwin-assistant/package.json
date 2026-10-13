@@ -88,7 +88,13 @@
     "mike-radar:route-check": "npm run build && JARVIS_DB_PATH=/tmp/mike-radar-route-check.db JARVIS_SIM=1 node scripts/mike-radar-route-check.mjs",
     "mike-radar:chat-check": "npm run build && JARVIS_DB_PATH=/tmp/mike-radar-chat-check.db JARVIS_SIM=1 node scripts/mike-radar-chat-check.mjs",
     "work-board:test": "npm run build && JARVIS_DB_PATH=/tmp/work-board-test.db node scripts/work-board-test.mjs",
-    "teams-radar:check": "npm run build && JARVIS_DB_PATH=/tmp/teams-radar-check.db node scripts/teams-radar-check.mjs"
+    "teams-radar:check": "npm run build && JARVIS_DB_PATH=/tmp/teams-radar-check.db node scripts/teams-radar-check.mjs",
+    "page-companion:check": "npm run build && JARVIS_DB_PATH=/tmp/page-companion-check.db node scripts/page-companion-check.mjs",
+    "page-companion:route-check": "npm run build && JARVIS_DB_PATH=/tmp/page-companion-route-check.db node scripts/page-companion-route-check.mjs",
+    "chat-topics:check": "npm run build && JARVIS_DB_PATH=/tmp/chat-topics-check.db node scripts/chat-topics-check.mjs",
+    "chat-topics-derive:check": "npm run build && JARVIS_DB_PATH=/tmp/chat-topics-derive-check.db node scripts/chat-topics-derive-check.mjs",
+    "chat-topics-overlap:route-check": "npm run build && JARVIS_DB_PATH=/tmp/chat-topics-overlap-route-check.db node scripts/chat-topics-overlap-route-check.mjs",
+    "page-companion:deploy-check": "npm run build && JARVIS_DB_PATH=/tmp/page-companion-deploy-check.db node scripts/page-companion-deploy-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

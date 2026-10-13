@@ -221,14 +221,19 @@ export async function nativeCall(
   server: string,
   tool: string,
   args: Record<string, unknown>,
+  /** Per-call override of DEFAULT_TIMEOUT_MS. A caller on a user-facing path
+   *  (the Page Companion's deployment read) needs seconds, not the 60s a
+   *  background tool call can afford to wait. */
+  timeoutMs?: number,
 ): Promise<NativeCallResult> {
   const target = resolveNativeServer(server);
   if (!target) {
     return { ok: false, tool, result: '', error: `no native transport for server '${server}'` };
   }
+  const budget = timeoutMs && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
   const started = Date.now();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), budget);
   try {
     const session = sessionFor(target.url, target.headers);
     const result = await session.callTool(tool, args ?? {}, controller.signal);
@@ -239,7 +244,7 @@ export async function nativeCall(
       duration_ms: Date.now() - started,
     };
   } catch (err) {
-    const msg = controller.signal.aborted ? `native MCP call timed out after ${DEFAULT_TIMEOUT_MS}ms` : errMsg(err);
+    const msg = controller.signal.aborted ? `native MCP call timed out after ${budget}ms` : errMsg(err);
     return { ok: false, tool, result: '', error: msg, duration_ms: Date.now() - started };
   } finally {
     clearTimeout(timer);

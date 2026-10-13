@@ -435,6 +435,69 @@ def sentinel_hopper_stall(c, now):
 
 
 
+RUNAWAY_WINDOW_MIN = 20     # look-back for the repair-storm check
+RUNAWAY_REPAIRS = 4         # ≥ this many `integrate nX` nodes created in the window = a storm
+RUNAWAY_NODES = 15          # ≥ this many nodes of ANY kind created in the window = a storm
+
+
+def sentinel_runaway(c, now, window_min=RUNAWAY_WINDOW_MIN, act=True, any_status=False):
+    # 2026-10-11, tree-2482c4ea: a misconfigured build gate made EVERY merge-back
+    # fail, and every failure spawned a new `integrate nX` repair node — 28 nodes
+    # and 29 model turns in 25 minutes while the warning bells rang unheeded.
+    # The engine now refuses to spawn repairs for worker-unfixable reasons, but
+    # the watchdog must catch the SHAPE regardless of cause: a tree creating
+    # nodes faster than any honest build does is a runaway. Model-free: pause the
+    # tree (status → draft stops all new claims), ring an error bell, and wake
+    # the origin chat so JARVIS rectifies with judgment the watchdog does not have.
+    rows = c.execute(
+        "SELECT t.id, t.topic, t.origin_thread_ext,"
+        " SUM(CASE WHEN n.title LIKE 'integrate n%' THEN 1 ELSE 0 END) AS repairs,"
+        " COUNT(*) AS created"
+        " FROM hopper_trees t JOIN hopper_nodes n ON n.tree_id=t.id"
+        " WHERE (t.status='active' OR ?) AND n.created_at >= datetime('now', ?)"
+        " GROUP BY t.id", (1 if any_status else 0, f"-{int(window_min)} minutes",)
+    ).fetchall()
+    fired = []
+    for tree_id, topic, origin, repairs, created in rows:
+        storm = repairs >= RUNAWAY_REPAIRS or created >= RUNAWAY_NODES
+        key = f"tree-{tree_id}"
+        state = "runaway" if storm else "normal"
+        prev, _ = seen_state(c, "runaway", key)
+        if not storm:
+            if prev == "runaway":
+                record_state(c, "runaway", key, state, "success", state)
+            continue
+        reason = c.execute(
+            "SELECT spec FROM hopper_nodes WHERE tree_id=? AND title LIKE 'integrate n%'"
+            " ORDER BY id DESC LIMIT 1", (tree_id,)).fetchone()
+        why = ""
+        if reason and reason[0]:
+            import re as _re
+            m = _re.search(r"\(`([a-z_]+)`\)", reason[0])
+            why = m.group(1) if m else ""
+        msg = (f"Tree {tree_id} created {created} node(s) in {window_min} min, {repairs} of them "
+               f"repair nodes{' (' + why + ')' if why else ''} — a runaway, not a build.")
+        fired.append((tree_id, msg))
+        if not act:
+            log(f"  [test] would PAUSE {tree_id}: {msg}")
+            continue
+        if prev == "runaway":
+            continue  # one action per episode; the state resets when the storm ends
+        c.execute("UPDATE hopper_trees SET status='draft', updated_at=datetime('now') WHERE id=?", (tree_id,))
+        c.commit()
+        record_state(c, "runaway", key, state, "error", msg)
+        notify("error", f"🔴 runaway tree PAUSED: {topic[:80]}",
+               msg + " Paused automatically; JARVIS has been woken in the origin chat to rectify.",
+               link=(f"/threads?open={urllib.parse.quote(origin, safe='')}" if origin else None))
+        if origin:
+            try:
+                http("POST", COCKPIT + "/threads/" + urllib.parse.quote(origin, safe="") + "/messages",
+                     COCKPIT_KEY, {"text": f"[watchdog] {msg} I paused the tree. Find the cause, fix the tree config, then reactivate it."})
+            except Exception as e:
+                log(f"  runaway wake FAILED: {e}")
+    return fired
+
+
 def sentinel_memory_bloat(c, now):
     """Memory diet guard (Kevin, 2026-09-25): memory.md is injected into EVERY
     turn — it was 446KB (~110K tokens/turn) before the diet cut it to ~25KB.
@@ -480,6 +543,7 @@ def main():
     sentinels = [("dead_turn", sentinel_dead_turn),
                  ("commitments", sentinel_commitments), ("services", sentinel_services),
                  ("hopper_stall", sentinel_hopper_stall),
+                 ("runaway", sentinel_runaway),
                  ("memory_bloat", sentinel_memory_bloat)]
     if PAPERCLIP_WATCH:  # mothballed 2026-09-24 — see PAPERCLIP_WATCH above
         sentinels.insert(0, ("foreman", sentinel_foreman))
@@ -493,7 +557,7 @@ def main():
     try:
         with open(HEARTBEAT, "w") as f:
             json.dump({"ran_at": now.isoformat() + "Z", "errors": errors,
-                       "sentinels": ["foreman", "dead_turn", "commitments", "services", "hopper_stall", "memory_bloat"]}, f)
+                       "sentinels": ["foreman", "dead_turn", "commitments", "services", "hopper_stall", "runaway", "memory_bloat"]}, f)
     except Exception:
         pass
     if errors:
@@ -503,4 +567,11 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys as _sys
+    if "--test-runaway" in _sys.argv:
+        # Prove the detector against REAL history: a wide window, no mutation.
+        _c = sqlite3.connect(DB, timeout=20); ensure_schema(_c)
+        _f = sentinel_runaway(_c, datetime.datetime.now(datetime.timezone.utc), window_min=180, act=False, any_status=True)
+        print(f"would fire on {len(_f)} tree(s):", *[f"\n  {t}: {m}" for t, m in _f] if _f else ["none"])
+        _sys.exit(0)
     main()

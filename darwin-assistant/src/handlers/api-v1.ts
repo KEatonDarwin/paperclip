@@ -132,6 +132,15 @@ import {
   type HopperStatus,
 } from '../hopper.js';
 import {
+  isTopicEligible,
+  listTopics,
+  listTopicsForConversation,
+  listConversationsForTopicDetailed,
+  listPrimaryTopicAssignments,
+} from '../chat-topics-store.js';
+import { deriveTopicsForConversation } from '../chat-topics-derive.js';
+import { findOverlapCandidates } from '../chat-topics-overlap.js';
+import {
   GoalError,
   listGoals,
   createGoal,
@@ -243,6 +252,16 @@ import {
   resetWorkBoardSince,
 } from '../work-board.js';
 import { listTeamsRadarCatches, openTeamsRadarChat } from '../teams-radar.js';
+import {
+  lookupPage,
+  createPageChat,
+  listPageRegistry,
+  upsertPageRegistry,
+  seedPageRegistry,
+  getPageRegistryById,
+  PageCompanionError,
+} from '../page-companion.js';
+import { getPageDeployment } from '../page-companion-deploy.js';
 import {
   INTEL_LANES,
   createIntelRun,
@@ -3364,6 +3383,102 @@ export function createApiV1Router(): Router {
     res.json(result);
   });
 
+  // == Page Companion (tree-e753d989): "is this page one of ours?" ===========
+  // The Chrome extension content script POSTs every page it loads to /lookup.
+  // Answer shape is fixed by the extension contract (see src/page-companion.ts):
+  //   { ours, project, registry_id, threads: [{external_id,title,last_active}] }
+  // A non-page URL (chrome://, a file://, junk) is NOT an error — it's just
+  // `ours: false`, because the extension asks about every page Kevin opens.
+
+  router.post('/page-companion/lookup', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { url?: unknown };
+    if (typeof body.url !== 'string' || !body.url.trim()) {
+      sendError(res, 400, 'invalid_request', 'url is required and must be a non-empty string');
+      return;
+    }
+    res.json(lookupPage(body.url));
+  });
+
+  // Start a fresh chat scoped to one page. Costs zero model calls — the page
+  // pin goes in as an assistant turn and the thread_links row is written now,
+  // so the next lookup on that page already lists this chat.
+  router.post('/page-companion/new-chat', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as { url?: unknown; project?: unknown };
+    try {
+      res.status(201).json(createPageChat(body.url, body.project));
+    } catch (err) {
+      if (err instanceof PageCompanionError) {
+        sendError(res, err.status, err.code, err.message);
+        return;
+      }
+      sendError(res, 500, 'new_chat_failed', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.get('/page-companion/registry', (_req: AuthedRequest, res) => {
+    res.json({ pages: listPageRegistry() });
+  });
+
+  // Register (or re-point) a page. Idempotent on the canonical pattern — this
+  // is the "any time I ship a page, add a registry row" path.
+  router.post('/page-companion/registry', (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as {
+      url_pattern?: unknown; project?: unknown; primary_thread_ext?: unknown; source?: unknown;
+    };
+    if (typeof body.url_pattern !== 'string' || typeof body.project !== 'string') {
+      sendError(res, 400, 'invalid_request', 'url_pattern and project are required strings');
+      return;
+    }
+    try {
+      res.status(201).json({
+        page: upsertPageRegistry({
+          url_pattern: body.url_pattern,
+          project: body.project,
+          primary_thread_ext: typeof body.primary_thread_ext === 'string' ? body.primary_thread_ext : null,
+          source: typeof body.source === 'string' ? body.source : 'manual',
+        }),
+      });
+    } catch (err) {
+      if (err instanceof PageCompanionError) {
+        sendError(res, err.status, err.code, err.message);
+        return;
+      }
+      sendError(res, 500, 'registry_write_failed', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  // Re-run the back-fill on demand (it also runs once at boot). Idempotent.
+  router.post('/page-companion/seed', (_req: AuthedRequest, res) => {
+    res.json(seedPageRegistry());
+  });
+
+  // BRANCH AWARENESS (node #1586). Deliberately NOT part of /lookup: the panel
+  // calls this lazily after it has already opened, so page-load latency and the
+  // ours/not-ours answer are completely untouched by a slow or dead deploy
+  // source. Always 200 with `known:false` when there is nothing to say — the
+  // panel renders the branch line only when known is true.
+  router.get('/page-companion/deployment', async (req: AuthedRequest, res) => {
+    const raw = typeof req.query.registry_id === 'string' ? req.query.registry_id : '';
+    const id = Number(raw);
+    if (!raw || !Number.isInteger(id) || id <= 0) {
+      sendError(res, 400, 'invalid_request', 'registry_id is required and must be a positive integer');
+      return;
+    }
+    const page = getPageRegistryById(id);
+    if (!page) {
+      sendError(res, 404, 'page_not_found', `no page_registry row with id ${id}`);
+      return;
+    }
+    try {
+      res.json(await getPageDeployment(page.id, page.deploy_target));
+    } catch (err) {
+      // getPageDeployment folds every data-shaped failure into known:false, so
+      // this is a programmer error — still answer 200-shaped rather than
+      // handing the panel a 500 it would have to special-case.
+      sendError(res, 500, 'deployment_read_failed', err instanceof Error ? err.message : String(err));
+    }
+  });
+
   // == Task Hopper (candidate tasks awaiting Kevin's yes/dismiss) ==============
   // Global list. A candidate lands here when something MIGHT be a task but the
   // ask is ambiguous; Kevin reviews it in the standalone hopper window and
@@ -3466,6 +3581,70 @@ export function createApiV1Router(): Router {
     }
     deleteHopperItem(id);
     res.status(204).end();
+  });
+
+  // == Chat Topics (tree-c9800208) =============================================
+  // Living topics over cockpit chats + the duplicate-open nudge. Node #1578
+  // built the store/schema, #1579 the derivation engine; this is the index +
+  // overlap-matcher API consumed by the cockpit UI.
+
+  // Grouped topic index: every topic that currently has at least one eligible
+  // cockpit chat, newest-active topic first, each chat carrying whether this
+  // topic is ITS primary plus (separately) its actual current primary label —
+  // the two differ when the chat is being listed under a secondary topic.
+  router.get('/chat-topics', (_req: AuthedRequest, res) => {
+    const primaryLabelByConversation = new Map<number, string>();
+    for (const row of listPrimaryTopicAssignments()) {
+      primaryLabelByConversation.set(row.conversation_id, row.label);
+    }
+    const topics = listTopics({ limit: 500 })
+      .map((topic) => {
+        const chats = listConversationsForTopicDetailed(topic.id)
+          .filter((c) => isTopicEligible(c.external_id))
+          .map((c) => ({
+            external_id: c.external_id,
+            title: c.title,
+            updated_at: c.updated_at,
+            is_primary: !!c.is_primary,
+            now_about: primaryLabelByConversation.get(c.id) ?? null,
+          }));
+        return {
+          topic_id: topic.id,
+          label: topic.label,
+          slug: topic.slug,
+          last_active_at: topic.last_active_at,
+          chats,
+        };
+      })
+      .filter((group) => group.chats.length > 0);
+    res.json({ topics });
+  });
+
+  // Duplicate-open nudge: given the text about to seed a NEW chat, returns up
+  // to 3 recent eligible chats that already cover the same topic. Must never
+  // block or 500 — findOverlapCandidates resolves to [] on any failure.
+  router.post('/chat-topics/overlap', async (req: AuthedRequest, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const text = typeof body.text === 'string' ? body.text : '';
+    const excludeExternalId = typeof body.exclude_external_id === 'string' ? body.exclude_external_id : null;
+    const candidates = await findOverlapCandidates(text, excludeExternalId);
+    res.json({ candidates });
+  });
+
+  // Manual re-derive: bypasses shouldRederive's debounce so Kevin (or the UI)
+  // can force a fresh topic pass on one conversation right now.
+  router.post('/chat-topics/derive/:convId', async (req: AuthedRequest, res) => {
+    const convId = parseInt(String(req.params.convId), 10);
+    if (!Number.isFinite(convId)) {
+      sendError(res, 400, 'invalid_request', 'convId must be a numeric conversation id');
+      return;
+    }
+    if (!getConversationById(convId)) {
+      sendError(res, 404, 'conversation_not_found', 'conversation not found');
+      return;
+    }
+    await deriveTopicsForConversation(convId);
+    res.json({ topics: listTopicsForConversation(convId) });
   });
 
   // == Goals ===================================================================

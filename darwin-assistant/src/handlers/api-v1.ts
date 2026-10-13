@@ -6057,7 +6057,11 @@ export function createApiV1Router(): Router {
     }
 
     try {
-      const matchedText = new Map([...ftsInfo].map(([id, info]) => [id, info.snippet]));
+      // Password-locked chats: their verbatim matched text never leaves the server —
+      // not into the ranker prompt, not into the response. (Title + the ranker's
+      // one-line reason behave exactly as before this feature.)
+      const lockedIds = new Set(candidates.filter((c) => !!c.password_hash).map((c) => c.id));
+      const matchedText = new Map([...ftsInfo].filter(([id]) => !lockedIds.has(id)).map(([id, info]) => [id, info.snippet]));
       const matches = await searchThreadsByQuery(query, candidates, matchedText);
       const byId = new Map(candidates.map((c) => [c.external_id, c]));
       const results: Record<string, unknown>[] = [];
@@ -6069,7 +6073,7 @@ export function createApiV1Router(): Router {
           results.push({
             ...threadDescriptor(conv, req, searchBrevityGlobals),
             search_reason: m.reason,
-            search_snippet: info?.snippet ?? null,
+            search_snippet: conv.password_hash ? null : info?.snippet ?? null,
             last_user_at: info ? info.lastUserAt : lastUserTurnAt(conv.id),
           });
         }

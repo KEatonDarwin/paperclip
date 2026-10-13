@@ -265,6 +265,18 @@ try {
   const c13 = F.searchCandidates('obsidian walrus').map((c) => c.conversationId);
   check('13 deleted chat is skipped by searchCandidates', !c13.includes(gone.id), `hits=${JSON.stringify(c13)}`);
 
+  // ---- 14. (review r3) a password-locked chat's matched text never leaves the server
+  const lockedConv = C.getOrCreateConversation('cockpit:locked-secret');
+  C.addTurn(lockedConv.id, 'user', 'the platypus vault combination is private');
+  C.setThreadPassword(lockedConv.id, 'hunter2');
+  const r14 = await search({ query: 'platypus vault' });
+  const row14 = (r14.body.results ?? []).find((r) => r.thread_id === 'cockpit:locked-secret');
+  const block14 = (lastPrompt().split('cockpit:locked-secret')[1] ?? '').split('thread_id:')[0];
+  check('14 locked chat: no search_snippet in the response and no "matched text" line in the ranker prompt',
+    r14.status === 200 && !!row14 && row14.search_snippet === null && row14.locked === true && block14.length > 0 &&
+      !/matched text:/i.test(block14),
+    `status=${r14.status} found=${!!row14} snippet=${JSON.stringify(row14?.search_snippet)} locked=${row14?.locked} block_has_matched=${/matched text:/i.test(block14)}`);
+
   // ---- 6. sidecar unwritable → search still answers via the fallback
   const errs = [];
   const origErr = console.error;

@@ -218,7 +218,8 @@ def check_overdue_posts_once(watchdog, stub):
     assert text.endswith("check this and report status in one line.")
     status, notes = row_status(conn, row_id)
     assert status == "breached"
-    assert "woke=" in notes
+    assert "woke=" in notes and "pending" not in notes, notes
+    assert "wake=posted" in notifications(stub)[0]["body"]["body"]
     watchdog.sentinel_commitments(conn, NOW)
     assert len(thread_posts(stub)) == 1, "second run posted again"
     conn.close()
@@ -313,6 +314,83 @@ def check_preexisting_breached_never_wakes(watchdog, stub):
     conn.close()
 
 
+class BreachLockedConn:
+    """Delegates to a real connection but raises 'database is locked' on the breach UPDATE."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.locked = True
+
+    def execute(self, sql, *args):
+        if self.locked and "status='breached'" in sql and sql.lstrip().upper().startswith("UPDATE"):
+            raise sqlite3.OperationalError("database is locked")
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def check_breach_write_fails_never_double_wakes(watchdog, stub):
+    stub.reset()
+    conn = make_db(watchdog, "breach-locked")
+    set_flag(watchdog, True)
+    row_id = add_commitment(conn, thread_ext="thread-locked")
+    locked = BreachLockedConn(conn)
+    try:
+        watchdog.sentinel_commitments(locked, NOW)
+    except sqlite3.OperationalError:
+        pass  # main()'s per-sentinel handler swallows this in production
+    assert len(thread_posts(stub)) == 0, "posted before the breach was committed"
+    assert row_status(conn, row_id)[0] == "open"
+    locked.locked = False
+    watchdog.sentinel_commitments(locked, NOW)
+    watchdog.sentinel_commitments(locked, NOW)
+    assert len(thread_posts(stub)) == 1, f"expected exactly 1 wake across retries, saw {len(thread_posts(stub))}"
+    conn.close()
+
+
+def check_post_failure_marks_and_never_retries(watchdog, stub):
+    stub.reset()
+    conn = make_db(watchdog, "post-fails")
+    set_flag(watchdog, True)
+    row_id = add_commitment(conn, thread_ext="thread-post-fails")
+    real_http = watchdog.http
+    attempts = []
+
+    def failing_http(method, url, key, payload=None, timeout=20):
+        if "/threads/" in url:
+            attempts.append(timeout)
+            raise OSError("connection refused")
+        return real_http(method, url, key, payload, timeout)
+
+    watchdog.http = failing_http
+    try:
+        watchdog.sentinel_commitments(conn, NOW)
+        watchdog.sentinel_commitments(conn, NOW)
+    finally:
+        watchdog.http = real_http
+    assert len(attempts) == 1, f"wake attempted {len(attempts)} times"
+    assert attempts[0] <= 5, f"wake POST timeout {attempts[0]}s > 5s"
+    status, notes = row_status(conn, row_id)
+    assert status == "breached"
+    assert "wake_failed=" in notes and "woke=" not in notes, notes
+    assert "wake=failed" in notifications(stub)[0]["body"]["body"]
+    conn.close()
+
+
+def check_chat_report_same_second(watchdog, stub):
+    stub.reset()
+    conn = make_db(watchdog, "report-same-second")
+    set_flag(watchdog, True)
+    row_id = add_commitment(conn, check_type="chat_report", check_ref="child-same",
+                            thread_ext="origin-same")
+    add_turn(conn, "origin-same", "[report:child-same] done", created_at=CREATED)
+    watchdog.sentinel_commitments(conn, NOW)
+    assert row_status(conn, row_id)[0] == "satisfied"
+    assert len(thread_posts(stub)) == 0
+    conn.close()
+
+
 def check_preflight_cockpit_key_can_post_cross_thread():
     api_v1 = (ROOT / "src" / "handlers" / "api-v1.ts").read_text(encoding="utf-8")
     api_keys = (ROOT / "src" / "api-keys.ts").read_text(encoding="utf-8")
@@ -340,6 +418,9 @@ def main():
     try:
         stub = StubServer()
     except PermissionError:
+        if os.environ.get("WATCHDOG_WAKE_BACK_ALLOW_INPROC") != "1":
+            raise SystemExit("FAIL local socket unavailable; real HTTP path not exercised "
+                             "(set WATCHDOG_WAKE_BACK_ALLOW_INPROC=1 to accept the in-process stub)")
         stub = InProcessStub()
         print("WARN local socket unavailable; using in-process HTTP stub")
     stub.start()
@@ -356,8 +437,14 @@ def main():
         ("chat_report marker satisfies without post", lambda: check_chat_report_satisfied(watchdog, stub)),
         ("chat_report missing after created_at breaches", lambda: check_chat_report_missing_breaches(watchdog, stub)),
         ("preexisting breached row never wakes", lambda: check_preexisting_breached_never_wakes(watchdog, stub)),
-        ("preflight route auth read-only proof", check_preflight_cockpit_key_can_post_cross_thread),
+        ("breach write fails: no post, then exactly one wake", lambda: check_breach_write_fails_never_double_wakes(watchdog, stub)),
+        ("wake POST fails: wake_failed noted, never retried, 5s timeout", lambda: check_post_failure_marks_and_never_retries(watchdog, stub)),
+        ("chat_report marker in the same second satisfies", lambda: check_chat_report_same_second(watchdog, stub)),
+        ("preflight route auth read-only proof (source string match, not runtime)", check_preflight_cockpit_key_can_post_cross_thread),
     ]
+    only = os.environ.get("WATCHDOG_WAKE_BACK_ONLY")
+    if only:
+        checks = [c for c in checks if only in c[0]]
     try:
         for name, fn in checks:
             run_check(name, fn)

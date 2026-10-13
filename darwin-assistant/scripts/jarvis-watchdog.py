@@ -122,7 +122,7 @@ def wake_commitment(row, detail):
         return False
     http("POST",
          COCKPIT + "/threads/" + urllib.parse.quote(row["thread_ext"], safe="") + "/messages",
-         COCKPIT_KEY, {"text": wake_back_text(row, detail)})
+         COCKPIT_KEY, {"text": wake_back_text(row, detail)}, timeout=5)
     return True
 
 
@@ -362,23 +362,36 @@ def sentinel_commitments(c, now):
         c.execute("UPDATE watch_commitments SET last_checked=datetime('now') WHERE id=?", (row["id"],))
         c.commit()
         if due and now >= due:
-            notes = detail
-            if row.get("thread_ext") and wake_back_enabled() and wakes < WAKE_BACK_CAP:
+            will_wake = bool(row.get("thread_ext")) and wake_back_enabled() and wakes < WAKE_BACK_CAP
+            # Breach is committed BEFORE any wake POST: if this UPDATE fails (db locked) the
+            # row stays open and nothing was posted; if the POST later fails the row is still
+            # breached. Either way a row can never wake twice.
+            c.execute("UPDATE watch_commitments SET status='breached', resolved_at=datetime('now'),"
+                      " notes=? WHERE id=?",
+                      (f"{detail} | woke=pending" if will_wake else detail, row["id"]))
+            c.commit()
+            wake = "skipped"
+            if will_wake:
                 wakes += 1
                 woke_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
                 try:
-                    if wake_commitment(row, detail):
-                        notes = f"{detail} | woke={woke_at}"
-                        log(f"  commitment #{row['id']} wake-back posted to {row['thread_ext']}")
+                    wake_commitment(row, detail)
+                    wake = "posted"
+                    log(f"  commitment #{row['id']} wake-back posted to {row['thread_ext']}")
                 except Exception as e:
+                    wake = "failed"
                     log(f"  commitment #{row['id']} wake-back FAILED: {e}")
-            c.execute("UPDATE watch_commitments SET status='breached', resolved_at=datetime('now'),"
-                      " notes=? WHERE id=?", (notes, row["id"]))
-            c.commit()
+                try:
+                    c.execute("UPDATE watch_commitments SET notes=? WHERE id=?",
+                              (f"{detail} | woke={woke_at}" if wake == "posted"
+                               else f"{detail} | wake_failed={woke_at}", row["id"]))
+                    c.commit()
+                except Exception as e:
+                    log(f"  commitment #{row['id']} wake note update FAILED: {e}")
             notify("error", "JARVIS promised this and it never happened",
                    f"{row['subject']}\n\nDue {row['due_at']} UTC · check={row['check_type']}"
                    f"{':' + row['check_ref'] if row['check_ref'] else ''} · {detail}"
-                   f"\nThread: {row['thread_ext'] or 'n/a'}")
+                   f"\nThread: {row['thread_ext'] or 'n/a'} · wake={wake}")
 
 
 def check_commitment(row):
@@ -409,7 +422,7 @@ def check_commitment(row):
         try:
             c2 = sqlite3.connect(DB, timeout=15)
             n = c2.execute("SELECT COUNT(*) FROM turns t JOIN conversations cv ON cv.id=t.conversation_id "
-                           "WHERE cv.external_id=? AND t.created_at > ? "
+                           "WHERE cv.external_id=? AND t.created_at >= ? "
                            "AND instr(COALESCE(t.content,''), ?) > 0",
                            (row["thread_ext"], row["created_at"], f"[report:{ref}]")).fetchone()[0]
             c2.close()

@@ -1387,7 +1387,7 @@ function watchdogRow(): WorkloadRow {
   try { heartbeat = JSON.parse(fs.readFileSync('/tmp/jarvis-watchdog-heartbeat.json', 'utf8')) as { ts?: string; checked?: number }; }
   catch { heartbeat = null; }
   const open = safeQuery<{ id: number; promise: string; status: string; due_at: string | null }>(
-    `SELECT id, promise, status, due_at FROM watch_commitments WHERE status IN ('open','breached') ORDER BY id DESC LIMIT 20`, [],
+    `SELECT id, subject AS promise, status, due_at FROM watch_commitments WHERE status IN ('open','breached') ORDER BY id DESC LIMIT 20`, [],
   );
   const breached = open.filter((c) => c.status === 'breached').length;
   const ageMin = minutesSince(heartbeat?.ts ?? null);

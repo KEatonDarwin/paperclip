@@ -6046,9 +6046,10 @@ export function createApiV1Router(): Router {
       ftsInfo.clear();
       candidates = [];
     }
-    // No index, or no hit with no date window → today's recent-100 list. With
-    // a date window and a working index, "nothing matched" is the honest answer.
-    if (ftsFailed || (!candidates.length && !before && !after)) {
+    // Only a FAILED index falls back to today's recent-100 list. A working index
+    // that found nothing (an OR of every query word across all chats) means
+    // nothing matched, and the empty result is the honest answer.
+    if (ftsFailed) {
       candidates = listAllConversations().filter(visible);
       if (before || after) {
         const inWindow = filterByLastUserTurn(candidates.map((c) => c.id), { before, after });
@@ -6072,6 +6073,8 @@ export function createApiV1Router(): Router {
           const info = ftsInfo.get(conv.id);
           results.push({
             ...threadDescriptor(conv, req, searchBrevityGlobals),
+            // A locked chat's summary is content too: not in a search result.
+            ...(conv.password_hash ? { latest_summary: null } : {}),
             search_reason: m.reason,
             search_snippet: conv.password_hash ? null : info?.snippet ?? null,
             last_user_at: info ? info.lastUserAt : lastUserTurnAt(conv.id),

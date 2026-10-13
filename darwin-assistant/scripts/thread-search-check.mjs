@@ -279,6 +279,35 @@ try {
       !/combination is private/i.test(JSON.stringify(row14)),
     `status=${r14.status} found=${!!row14} snippet=${JSON.stringify(row14?.search_snippet)} locked=${row14?.locked} block_has_matched=${/matched text:/i.test(block14)}`);
 
+  // ---- 15. (review r5) a working index with zero hits → [] and the ranker is never called
+  const promptsBefore = (globalThis.__rankerPrompts ?? []).length;
+  const r15 = await search({ query: 'xyzzyquux plughfrob' });
+  check('15 zero FTS hits → empty result, no recent-100 fallback, ranker not invoked',
+    r15.status === 200 && Array.isArray(r15.body.results) && r15.body.results.length === 0 &&
+      (globalThis.__rankerPrompts ?? []).length === promptsBefore,
+    `status=${r15.status} results=${r15.body.results?.length} ranker calls=${(globalThis.__rankerPrompts ?? []).length - promptsBefore}`);
+
+  // ---- 16. (review r5) summary watermark advances past summaries of skipped chats
+  let s16 = null;
+  try {
+    const eph = C.getOrCreateConversation('ephemeral:summary-tail');
+    for (let i = 0; i < 5; i += 1) db.prepare(`INSERT INTO thread_summaries (conversation_id, content, anchor_turn_index) VALUES (?, ?, ?)`).run(eph.id, `ephemeral summary ${i}`, i);
+    const maxSum = db.prepare(`SELECT MAX(id) AS m FROM thread_summaries`).get().m;
+    const a16 = F.catchUp();
+    s16 = { maxSum, wm: a16.lastSummaryId };
+  } catch (e) { s16 = { err: String(e.message).slice(0, 120) }; }
+  check('16 summary watermark advances past a tail of skipped summaries',
+    !!s16 && !s16.err && s16.wm === s16.maxSum, JSON.stringify(s16));
+
+  // ---- 17. (review r5) a locked chat's latest_summary is not in its search result
+  db.prepare(`INSERT INTO thread_summaries (conversation_id, content, anchor_turn_index) VALUES (?, ?, ?)`)
+    .run(lockedConv.id, 'Summary: the platypus vault combination is private', 0);
+  const r17 = await search({ query: 'platypus vault' });
+  const row17 = (r17.body.results ?? []).find((r) => r.thread_id === 'cockpit:locked-secret');
+  check('17 locked result carries latest_summary=null even when the chat HAS a summary',
+    !!row17 && row17.latest_summary === null && !/combination is private/i.test(JSON.stringify(r17.body)),
+    `found=${!!row17} latest_summary=${JSON.stringify(row17?.latest_summary)?.slice(0, 80)}`);
+
   // ---- 6. sidecar unwritable → search still answers via the fallback
   const errs = [];
   const origErr = console.error;

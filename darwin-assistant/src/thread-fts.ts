@@ -71,6 +71,7 @@ export interface CatchUpStats {
   titles: number;
   summaries: number;
   lastTurnId: number;
+  lastSummaryId?: number;
 }
 
 /**
@@ -162,10 +163,13 @@ export function catchUp(): CatchUpStats {
   let lastSummary = Number(getMeta(db, 'last_summary_id') ?? 0);
   let summaryBatch;
   try {
-    summaryBatch = sqliteDb.prepare<[number, number], { id: number; conversation_id: number; content: string }>(
-      `SELECT s.id, s.conversation_id, s.content FROM thread_summaries s
-         JOIN conversations c ON c.id = s.conversation_id
-        WHERE s.id > ? AND ${NOT_THROWAWAY}
+    // Raw summary ids, like turns: the watermark must move past skipped rows too.
+    summaryBatch = sqliteDb.prepare<[number, number], { id: number; conversation_id: number; content: string | null; keep: number }>(
+      `SELECT s.id, s.conversation_id,
+              CASE WHEN c.id IS NOT NULL AND ${NOT_THROWAWAY} THEN s.content END AS content,
+              CASE WHEN c.id IS NOT NULL AND ${NOT_THROWAWAY} THEN 1 ELSE 0 END AS keep
+         FROM thread_summaries s LEFT JOIN conversations c ON c.id = s.conversation_id
+        WHERE s.id > ?
         ORDER BY s.id LIMIT ?`,
     );
   } catch {
@@ -176,6 +180,7 @@ export function catchUp(): CatchUpStats {
     if (!rows.length) break;
     db.transaction(() => {
       for (const r of rows) {
+        if (!r.keep || !r.content) continue;
         del.run(-2 * r.conversation_id - 1);
         ins.run(-2 * r.conversation_id - 1, r.conversation_id, null, 'summary', r.content);
         stats.summaries += 1;
@@ -186,6 +191,7 @@ export function catchUp(): CatchUpStats {
     if (rows.length < BATCH) break;
   }
 
+  stats.lastSummaryId = lastSummary;
   return stats;
 }
 

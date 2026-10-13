@@ -147,6 +147,11 @@ await check('2c. a typo in the TOP-level dir is refused, not skipped (/hom/kevin
   }
 });
 
+await check('2e. a missing file with a :line suffix is refused (/home/kevin/missing-spawn.ts:12, /tmp/nope-spawn:)', async () => {
+  const r = spawnMod.checkBrief(goodBrief({ context: 'see /home/kevin/missing-spawn.ts:12 and /tmp/nope-spawn: too' }), { title: 't' });
+  assert.deepEqual(r.errors.sort(), ['path_not_found:/home/kevin/missing-spawn.ts', 'path_not_found:/tmp/nope-spawn'].sort(), JSON.stringify(r));
+});
+
 await check('2d. over-cap brief is refused before any path/secret scan', async () => {
   let scanned = 0;
   const r = spawnMod.checkBrief(goodBrief({ context: '/home/kevin/nope ' + 'x'.repeat(13000) }), { title: 't', pathExists: () => { scanned++; return false; } });
@@ -219,14 +224,18 @@ await check('5. report_back from child posts [report:<child>] turn to the ORIGIN
   assert.equal(badOrigin.error, 'not_a_spawned_chat', 'the origin itself is not a spawned chat');
 });
 
-await check('6. SPAWN_CHAT_ENABLED unset → tools absent; =1 → present (and in the MCP manifest source)', async () => {
+await check('6. SPAWN_CHAT_ENABLED unset → tools absent AND no chat_spawns table created; =1 → present', async () => {
   const names = tools.ALL_TOOLS.map((t) => t.name);
   assert.ok(names.includes('spawn_chat') && names.includes('report_back'), 'present when enabled');
-  const probe = `const t = await import(${JSON.stringify(pathToFileURL(path.join(distDir, 'tools', 'index.js')).href)}); console.log(JSON.stringify(t.ALL_TOOLS.map(x => x.name))); process.exit(0);`;
-  const env = { ...process.env, JARVIS_DB_PATH: path.join(path.dirname(DB_PATH), 'probe.db') };
+  const probeDb = path.join(path.dirname(DB_PATH), 'probe.db');
+  for (const p of [probeDb, `${probeDb}-wal`, `${probeDb}-shm`]) fs.rmSync(p, { force: true });
+  const probe = `const t = await import(${JSON.stringify(pathToFileURL(path.join(distDir, 'tools', 'index.js')).href)}); const c = await import(${JSON.stringify(pathToFileURL(path.join(distDir, 'conversation-db.js')).href)}); const has = !!c.sqliteDb.prepare("SELECT 1 FROM sqlite_master WHERE name='chat_spawns'").get(); console.log(JSON.stringify({ names: t.ALL_TOOLS.map(x => x.name), has })); process.exit(0);`;
+  const env = { ...process.env, JARVIS_DB_PATH: probeDb };
   delete env.SPAWN_CHAT_ENABLED;
   const out = execFileSync(process.execPath, ['--input-type=module', '-e', probe], { env, encoding: 'utf8', timeout: 60_000 });
-  const off = JSON.parse(out.trim().split('\n').at(-1));
+  const probeOut = JSON.parse(out.trim().split('\n').at(-1));
+  const off = probeOut.names;
+  assert.equal(probeOut.has, false, 'flag off: importing the tools created chat_spawns (rollback not clean)');
   assert.ok(off.length > 30, `probe listed ${off.length} tools`);
   assert.ok(!off.includes('spawn_chat') && !off.includes('report_back'), 'absent when unset');
 });

@@ -34,41 +34,10 @@ import {
 } from '../conversation-db.js';
 import { findClaudeAccount, listClaudeAccounts } from '../claude-accounts.js';
 
-// ─── Schema ──────────────────────────────────────────────────────────────────
-
-sqliteDb.exec(`
-  CREATE TABLE IF NOT EXISTS chat_spawns (
-    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-    origin_conversation_id INTEGER NOT NULL REFERENCES conversations(id),
-    child_conversation_id  INTEGER NOT NULL REFERENCES conversations(id),
-    created_at             TEXT NOT NULL DEFAULT (datetime('now')),
-    reported_at            TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_chat_spawns_origin ON chat_spawns(origin_conversation_id, created_at);
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_spawns_child ON chat_spawns(child_conversation_id);
-`);
-
-// The watchdog (scripts/jarvis-watchdog.py ensure_schema) owns this table; it
-// already exists on the live DB. Mirrored verbatim so a fresh/scratch DB can
-// take the commitment row instead of silently dropping it.
-sqliteDb.exec(`
-  CREATE TABLE IF NOT EXISTS watch_commitments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    subject TEXT NOT NULL,
-    thread_ext TEXT,
-    check_type TEXT NOT NULL DEFAULT 'manual',
-    check_ref TEXT,
-    due_at TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'open',
-    recovery_attempts INTEGER NOT NULL DEFAULT 0,
-    last_checked TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    resolved_at TEXT,
-    notes TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_watch_commitments_status
-    ON watch_commitments(status, due_at);
-`);
+// ─── Schema (lazy) ───────────────────────────────────────────────────────────
+// Created on FIRST USE, not at import: with SPAWN_CHAT_ENABLED unset the module is
+// still imported by tools/index.ts, and rollback ("remove the env var") must leave
+// the DB untouched.
 
 export interface ChatSpawnRow {
   id: number;
@@ -78,23 +47,65 @@ export interface ChatSpawnRow {
   reported_at: string | null;
 }
 
-const insertSpawnStmt = sqliteDb.prepare<[number, number]>(
+function makeStatements() {
+  sqliteDb.exec(`
+    CREATE TABLE IF NOT EXISTS chat_spawns (
+      id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+      origin_conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+      child_conversation_id  INTEGER NOT NULL REFERENCES conversations(id),
+      created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+      reported_at            TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_spawns_origin ON chat_spawns(origin_conversation_id, created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_spawns_child ON chat_spawns(child_conversation_id);
+  `);
+
+  // The watchdog (scripts/jarvis-watchdog.py ensure_schema) owns this table; it
+  // already exists on the live DB. Mirrored verbatim so a fresh/scratch DB can
+  // take the commitment row instead of silently dropping it.
+  sqliteDb.exec(`
+    CREATE TABLE IF NOT EXISTS watch_commitments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      subject TEXT NOT NULL,
+      thread_ext TEXT,
+      check_type TEXT NOT NULL DEFAULT 'manual',
+      check_ref TEXT,
+      due_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      recovery_attempts INTEGER NOT NULL DEFAULT 0,
+      last_checked TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      resolved_at TEXT,
+      notes TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_watch_commitments_status
+      ON watch_commitments(status, due_at);
+  `);
+
+  return {
+    insertSpawn: sqliteDb.prepare<[number, number]>(
   `INSERT INTO chat_spawns (origin_conversation_id, child_conversation_id) VALUES (?, ?)`,
-);
-const countRecentStmt = sqliteDb.prepare<[number], { n: number }>(
+    ),
+    countRecent: sqliteDb.prepare<[number], { n: number }>(
   `SELECT COUNT(*) AS n FROM chat_spawns
    WHERE origin_conversation_id = ? AND created_at > datetime('now', '-1 hour')`,
-);
-const spawnByChildStmt = sqliteDb.prepare<[number], ChatSpawnRow>(
+    ),
+    spawnByChild: sqliteDb.prepare<[number], ChatSpawnRow>(
   `SELECT * FROM chat_spawns WHERE child_conversation_id = ?`,
-);
-const markReportedStmt = sqliteDb.prepare<[number]>(
+    ),
+    markReported: sqliteDb.prepare<[number]>(
   `UPDATE chat_spawns SET reported_at = datetime('now') WHERE id = ?`,
-);
-const insertCommitmentStmt = sqliteDb.prepare<[string, string, string, string]>(
+    ),
+    insertCommitment: sqliteDb.prepare<[string, string, string, string]>(
   `INSERT INTO watch_commitments (subject, thread_ext, check_type, check_ref, due_at, status)
    VALUES (?, ?, 'chat_report', ?, ?, 'open')`,
-);
+    ),
+  };
+}
+let stmtCache: ReturnType<typeof makeStatements> | null = null;
+function S(): ReturnType<typeof makeStatements> {
+  return (stmtCache ??= makeStatements());
+}
 
 export const SPAWN_LIMIT_PER_HOUR = 5;
 export const BRIEF_MAX_CHARS = 12_000;
@@ -137,7 +148,8 @@ function str(v: unknown): string {
  * except the shapes that are unambiguously web routes:
  *   · inside a URL (`https://host/x` — never matched: preceded by a host, not a boundary)
  *   · starting with `/api/`
- *   · immediately followed by `?`, `#` or `:` (`/threads?open=…`, `/x#a`, `/hopper-nodes/:id`)
+ *   · immediately followed by `?` or `#`, or a `/:param` segment (`/threads?open=…`, `/x#a`, `/hopper-nodes/:id`)
+ *   (`/home/x.ts:12` is a file + line number — the file is checked)
  * Anything else that is meant as a route must be written as a full URL.
  */
 export function extractAbsolutePaths(text: string): string[] {
@@ -145,7 +157,9 @@ export function extractAbsolutePaths(text: string): string[] {
   const re = /(?:^|[\s`'"(\[<=])(\/[A-Za-z0-9._~@+\-/]+)([?#:]?)/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
-    if (m[2]) continue; // route shape: followed by ? # or :
+    // route shapes: followed by ? or #, or a `/:param` segment. A `:` after a FILE
+    // name is a line suffix (`/home/x.ts:12`) — the path is still checked.
+    if (m[2] === '?' || m[2] === '#' || (m[2] === ':' && m[1].endsWith('/'))) continue;
     const p = m[1].replace(/[.,;)\]>'"`]+$/, '').replace(/\/+$/, '');
     if (!p || p === '/') continue;
     if (p === '/api' || p.startsWith('/api/')) continue;
@@ -319,7 +333,7 @@ export const spawnChat: ToolDef = {
       };
     }
 
-    if ((countRecentStmt.get(origin.id)?.n ?? 0) >= SPAWN_LIMIT_PER_HOUR) {
+    if ((S().countRecent.get(origin.id)?.n ?? 0) >= SPAWN_LIMIT_PER_HOUR) {
       return { error: 'rate_limited', message: `max ${SPAWN_LIMIT_PER_HOUR} spawns per chat per hour` };
     }
 
@@ -362,10 +376,10 @@ export const spawnChat: ToolDef = {
       renameConversation(child.id, title.slice(0, 120));
       if (pin) setThreadModelOverride(child.id, pin.adapter, pin.model);
       if (account) setThreadClaudeAccount(child.id, account);
-      spawnId = Number(insertSpawnStmt.run(origin.id, child.id).lastInsertRowid);
+      spawnId = Number(S().insertSpawn.run(origin.id, child.id).lastInsertRowid);
       if (reportBack) {
         const due = new Date(Date.now() + dueHours * 3600_000).toISOString();
-        insertCommitmentStmt.run(`Spawned chat reports back: ${title}`.slice(0, 200), origin.external_id, childExt, due);
+        S().insertCommitment.run(`Spawned chat reports back: ${title}`.slice(0, 200), origin.external_id, childExt, due);
       }
     })();
 
@@ -412,7 +426,7 @@ export const reportBack: ToolDef = {
     const childId = context?.conversationId;
     const child = childId ? getConversationById(childId) : undefined;
     if (!child) return { error: 'no_conversation' };
-    const spawn = spawnByChildStmt.get(child.id);
+    const spawn = S().spawnByChild.get(child.id);
     if (!spawn) return { error: 'not_a_spawned_chat', message: 'report_back only works in a chat opened by spawn_chat.' };
     const summary = str(args.summary).trim();
     if (!summary) return { error: 'missing_summary' };
@@ -425,7 +439,7 @@ export const reportBack: ToolDef = {
     const text = `[report:${child.external_id}] ${summary}`;
     const { agent, queue } = await loadDispatch();
     postToThread(agent, queue, origin.id, origin.external_id, text, `spawn-report:${spawn.id}`);
-    markReportedStmt.run(spawn.id);
+    S().markReported.run(spawn.id);
     return { ok: true, origin_external_id: origin.external_id };
   },
 };

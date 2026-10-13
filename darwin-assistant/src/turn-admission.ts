@@ -45,6 +45,9 @@ const AUTOMATED_KEY_PREFIXES = [
   // `mike-report:<date>` — one turn per day, but it fires at 23:40 CT while the
   // night shift's lanes are typically live, so it waits for a slot like the rest.
   'mike-report:',
+  // SPAWN CHAT (overnight 2026-10-12): a spawned child's report_back wakes its
+  // origin thread with `spawn-report:<spawn_id>` — automated, so it waits too.
+  'spawn-report:',
 ];
 
 export function isAutomatedTurn(externalId: string, correlationKey?: string): boolean {

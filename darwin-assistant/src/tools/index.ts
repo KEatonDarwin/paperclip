@@ -146,6 +146,7 @@ import { nightShift } from './night-shift-tool.js';
 import { throttle } from './throttle-tool.js';
 import { workSwitch } from './work-switch-tool.js';
 import { health } from './health-tool.js';
+import { SPAWN_CHAT_TOOLS } from './spawn-chat-tool.js';
 
 function instrumentTool(tool: ToolDef): ToolDef {
   return {
@@ -221,6 +222,10 @@ export const ALL_TOOLS: ToolDef[] = [
   throttle,
   workSwitch,
   health,
+  // spawn_chat + report_back (overnight 2026-10-12). Off unless the unit env
+  // sets SPAWN_CHAT_ENABLED=1 — and since the MCP manifest (/internal/tools) is
+  // built from ALL_TOOLS, the same flag gates mcp__jarvis__spawn_chat too.
+  ...(process.env.SPAWN_CHAT_ENABLED === '1' ? SPAWN_CHAT_TOOLS : []),
 ].map(instrumentTool);
 
 export const TOOL_MAP: Map<string, ToolDef> = new Map(

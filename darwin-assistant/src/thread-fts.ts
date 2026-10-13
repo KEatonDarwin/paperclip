@@ -90,10 +90,18 @@ export function catchUp(): CatchUpStats {
 
   // 1. Turns past the watermark.
   let last = Number(getMeta(db, 'last_turn_id') ?? 0);
-  const turnBatch = sqliteDb.prepare<[number, number], { id: number; conversation_id: number; role: string; content: string | null }>(
-    `SELECT t.id, t.conversation_id, t.role, t.content
-       FROM turns t JOIN conversations c ON c.id = t.conversation_id
-      WHERE t.id > ? AND t.role IN ('user', 'assistant') AND ${NOT_THROWAWAY}
+  // Page over RAW turn ids and advance the watermark past every row scanned —
+  // kept or not. Filtering in the WHERE would leave the watermark stuck behind a
+  // tail of tool/ephemeral/checkin turns, so every search would rescan it.
+  // Skipped rows carry no content (it's never read for them).
+  const turnBatch = sqliteDb.prepare<[number, number], { id: number; conversation_id: number; role: string; content: string | null; keep: number }>(
+    `SELECT t.id, t.conversation_id, t.role,
+            CASE WHEN t.role IN ('user', 'assistant') AND c.id IS NOT NULL AND ${NOT_THROWAWAY}
+                 THEN t.content END AS content,
+            CASE WHEN t.role IN ('user', 'assistant') AND c.id IS NOT NULL AND ${NOT_THROWAWAY}
+                 THEN 1 ELSE 0 END AS keep
+       FROM turns t LEFT JOIN conversations c ON c.id = t.conversation_id
+      WHERE t.id > ?
       ORDER BY t.id LIMIT ?`,
   );
   for (;;) {
@@ -101,7 +109,7 @@ export function catchUp(): CatchUpStats {
     if (!rows.length) break;
     db.transaction(() => {
       for (const r of rows) {
-        if (r.content && r.content.trim()) {
+        if (r.keep && r.content && r.content.trim()) {
           del.run(r.id);
           ins.run(r.id, r.conversation_id, r.id, r.role, r.content);
           stats.turns += 1;
@@ -231,7 +239,11 @@ export function searchCandidates(
     const id = Number(h.conversation_id);
     if (seen.has(id)) continue;
     seen.add(id);
-    if (opts.prefix && !externalIdOf(id)?.startsWith(opts.prefix)) continue;
+    // A chat deleted from jarvis.db still has rows in the sidecar; skip it here so it
+    // can't take one of the `limit` slots from a live chat.
+    const ext = externalIdOf(id);
+    if (!ext) continue;
+    if (opts.prefix && !ext.startsWith(opts.prefix)) continue;
     const lastUserAt = lastUserTurnAt(id);
     if (!inDateWindow(lastUserAt, before, after)) continue;
     out.push({ conversationId: id, snippet: h.snip.replace(/\s+/g, ' ').trim(), lastUserAt });

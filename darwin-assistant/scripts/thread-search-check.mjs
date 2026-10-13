@@ -244,6 +244,27 @@ try {
     victim.id < Number(wm.conv_id) && c11.includes(victim.id),
     `watermark=(${wm.conv_updated_at}, ${wm.conv_id}) victim=${victim.id} hits=${JSON.stringify(c11)}`);
 
+  // ---- 12. (review r2) a tail of ONLY skipped turns still moves the watermark
+  const tailConv = C.getOrCreateConversation('ephemeral:tail-only');
+  for (let i = 0; i < 30; i += 1) C.addTurn(tailConv.id, 'user', `ephemeral tail ${i}`);
+  const toolConv = seeded[2];
+  for (let i = 0; i < 30; i += 1) db.prepare(`INSERT INTO turns (conversation_id, role, content, turn_index) VALUES (?, 'tool', ?, ?)`).run(toolConv.id, `tool output ${i}`, 9000 + i);
+  const maxTurn = db.prepare(`SELECT MAX(id) AS m FROM turns`).get().m;
+  const s12 = F.catchUp();
+  const s12b = F.catchUp();
+  check('12 watermark advances past a tail of only skipped (ephemeral/tool) turns',
+    s12.lastTurnId === maxTurn && s12b.lastTurnId === maxTurn && s12b.turns === 0,
+    `max turn id=${maxTurn} watermark=${s12.lastTurnId} second pass turns=${s12b.turns}`);
+
+  // ---- 13. (review r2) a chat deleted from jarvis.db can't take a candidate slot
+  const gone = C.getOrCreateConversation('cockpit:deleted-later');
+  C.addTurn(gone.id, 'user', 'obsidian walrus manifest');
+  F.catchUp();
+  db.prepare(`DELETE FROM turns WHERE conversation_id = ?`).run(gone.id);
+  db.prepare(`DELETE FROM conversations WHERE id = ?`).run(gone.id);
+  const c13 = F.searchCandidates('obsidian walrus').map((c) => c.conversationId);
+  check('13 deleted chat is skipped by searchCandidates', !c13.includes(gone.id), `hits=${JSON.stringify(c13)}`);
+
   // ---- 6. sidecar unwritable → search still answers via the fallback
   const errs = [];
   const origErr = console.error;

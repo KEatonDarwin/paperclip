@@ -152,6 +152,11 @@ await check('2e. a missing file with a :line suffix is refused (/home/kevin/miss
   assert.deepEqual(r.errors.sort(), ['path_not_found:/home/kevin/missing-spawn.ts', 'path_not_found:/tmp/nope-spawn'].sort(), JSON.stringify(r));
 });
 
+await check('2f. label-colon paths are checked (path:/home/kevin/missing-spawn.md, see:/tmp/nope-spawn2); scheme:// URLs still skipped', async () => {
+  const r = spawnMod.checkBrief(goodBrief({ context: 'path:/home/kevin/missing-spawn.md and see:/tmp/nope-spawn2 but https://example.com/home/zz is fine' }), { title: 't' });
+  assert.deepEqual(r.errors.sort(), ['path_not_found:/home/kevin/missing-spawn.md', 'path_not_found:/tmp/nope-spawn2'].sort(), JSON.stringify(r));
+});
+
 await check('2d. over-cap brief is refused before any path/secret scan', async () => {
   let scanned = 0;
   const r = spawnMod.checkBrief(goodBrief({ context: '/home/kevin/nope ' + 'x'.repeat(13000) }), { title: 't', pathExists: () => { scanned++; return false; } });
@@ -238,6 +243,19 @@ await check('6. SPAWN_CHAT_ENABLED unset → tools absent AND no chat_spawns tab
   assert.equal(probeOut.has, false, 'flag off: importing the tools created chat_spawns (rollback not clean)');
   assert.ok(off.length > 30, `probe listed ${off.length} tools`);
   assert.ok(!off.includes('spawn_chat') && !off.includes('report_back'), 'absent when unset');
+});
+
+await check('7. six CONCURRENT spawns from one origin → exactly five succeed (rate check is atomic)', async () => {
+  const O = 'cockpit:spawn-check-race';
+  const rs = await Promise.all([1, 2, 3, 4, 5, 6].map((i) => spawn({ title: `race ${i}`, brief: goodBrief(), report_back: false }, O)));
+  const ok = rs.filter((r) => r.ok).length;
+  assert.equal(ok, 5, `ok=${ok}: ${JSON.stringify(rs.map((r) => r.error ?? 'ok'))}`);
+  assert.equal(rs.filter((r) => r.error === 'rate_limited').length, 1);
+});
+
+await check('8. report_back cues are NOT admission-gated (a skip would drop the [report:] marker)', async () => {
+  const adm = await import(path.join(distDir, 'turn-admission.js'));
+  assert.equal(adm.isAutomatedTurn('cockpit:origin', 'spawn-report:1'), false);
 });
 
 console.log(`\n[spawn-chat-check] ${pass} passed, ${fails.length} failed`);

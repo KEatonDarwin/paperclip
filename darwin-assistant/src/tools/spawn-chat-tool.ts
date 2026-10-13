@@ -154,12 +154,13 @@ function str(v: unknown): string {
  */
 export function extractAbsolutePaths(text: string): string[] {
   const out = new Set<string>();
-  const re = /(?:^|[\s`'"(\[<=])(\/[A-Za-z0-9._~@+\-/]+)([?#:]?)/gm;
+  const re = /(?:^|[\s`'"(\[<=:])(\/[A-Za-z0-9._~@+\-/]+)([?#:]?)/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     // route shapes: followed by ? or #, or a `/:param` segment. A `:` after a FILE
     // name is a line suffix (`/home/x.ts:12`) — the path is still checked.
     if (m[2] === '?' || m[2] === '#' || (m[2] === ':' && m[1].endsWith('/'))) continue;
+    if (m[1].startsWith('//')) continue; // `scheme://host/…` — a URL, not a path
     const p = m[1].replace(/[.,;)\]>'"`]+$/, '').replace(/\/+$/, '');
     if (!p || p === '/') continue;
     if (p === '/api' || p.startsWith('/api/')) continue;
@@ -333,10 +334,6 @@ export const spawnChat: ToolDef = {
       };
     }
 
-    if ((S().countRecent.get(origin.id)?.n ?? 0) >= SPAWN_LIMIT_PER_HOUR) {
-      return { error: 'rate_limited', message: `max ${SPAWN_LIMIT_PER_HOUR} spawns per chat per hour` };
-    }
-
     const { agent, queue } = await loadDispatch();
 
     // Validate model + account BEFORE writing anything.
@@ -369,10 +366,15 @@ export const spawnChat: ToolDef = {
     const text = composeBriefMessage(title, brief, { originExt: origin.external_id, reportBack });
 
     // Create the chat the createPageChat way (page-companion.ts).
+    // Rate check + every write in ONE synchronous transaction, with no await in
+    // between: two concurrent spawn_chat calls from one origin can't both pass.
     const childExt = `cockpit:spawn-${randomUUID()}`;
-    const child = getOrCreateConversation(childExt);
+    let child: { id: number } | undefined;
     let spawnId = 0;
+    let limited = false;
     sqliteDb.transaction(() => {
+      if ((S().countRecent.get(origin.id)?.n ?? 0) >= SPAWN_LIMIT_PER_HOUR) { limited = true; return; }
+      child = getOrCreateConversation(childExt);
       renameConversation(child.id, title.slice(0, 120));
       if (pin) setThreadModelOverride(child.id, pin.adapter, pin.model);
       if (account) setThreadClaudeAccount(child.id, account);
@@ -382,16 +384,20 @@ export const spawnChat: ToolDef = {
         S().insertCommitment.run(`Spawned chat reports back: ${title}`.slice(0, 200), origin.external_id, childExt, due);
       }
     })();
+    if (limited || !child) {
+      return { error: 'rate_limited', message: `max ${SPAWN_LIMIT_PER_HOUR} spawns per chat per hour` };
+    }
+    const childId = (child as { id: number }).id;
 
     // Brief = the child's first message, through the server-owned queue, then
     // drained immediately the way installQueueDrain does (nothing is running on
     // a brand-new chat, so nothing else would ever drain it).
-    queue.enqueueMessage(child.id, text);
-    if (!agent.getInFlightMessageId(child.id)) {
-      const next = queue.shiftQueuedMessage(child.id);
+    queue.enqueueMessage(childId, text);
+    if (!agent.getInFlightMessageId(childId)) {
+      const next = queue.shiftQueuedMessage(childId);
       if (next) {
         agent.processMessage(next.content, childExt, `spawn-chat:${spawnId}`).catch((err: unknown) => {
-          if (err instanceof agent.ConversationBusyError) queue.enqueueMessage(child.id, next.content, next.images);
+          if (err instanceof agent.ConversationBusyError) queue.enqueueMessage(childId, next.content, next.images);
           else console.error(`[spawn-chat] brief dispatch to ${childExt} failed`, err);
         });
       }

@@ -110,6 +110,7 @@ def wake_back_enabled():
 
 
 def wake_back_text(row, detail):
+    detail = detail if len(detail or "") <= 300 else detail[:300] + "…"
     return (f"[watchdog] Commitment breached.\n"
             f"Subject: \"{row['subject']}\"\n"
             f"Due: \"{row['due_at']} UTC\"\n"

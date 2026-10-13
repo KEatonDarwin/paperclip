@@ -378,6 +378,11 @@ def check_post_failure_marks_and_never_retries(watchdog, stub):
     conn.close()
 
 
+def check_wake_detail_capped(watchdog, stub):
+    text = watchdog.wake_back_text({"subject": "s", "due_at": PAST}, "x" * 5000)
+    assert len(text) < 600, f"wake text {len(text)} chars"
+
+
 def check_chat_report_same_second(watchdog, stub):
     stub.reset()
     conn = make_db(watchdog, "report-same-second")
@@ -439,6 +444,7 @@ def main():
         ("preexisting breached row never wakes", lambda: check_preexisting_breached_never_wakes(watchdog, stub)),
         ("breach write fails: no post, then exactly one wake", lambda: check_breach_write_fails_never_double_wakes(watchdog, stub)),
         ("wake POST fails: wake_failed noted, never retried, 5s timeout", lambda: check_post_failure_marks_and_never_retries(watchdog, stub)),
+        ("wake detail capped at 300 chars", lambda: check_wake_detail_capped(watchdog, stub)),
         ("chat_report marker in the same second satisfies", lambda: check_chat_report_same_second(watchdog, stub)),
         ("preflight route auth read-only proof (source string match, not runtime)", check_preflight_cockpit_key_can_post_cross_thread),
     ]

@@ -133,11 +133,26 @@ for (const [label, brief, want] of [
   });
 }
 
-await check('2b. checkBrief is pure: URL paths / API routes are not files; ok brief passes', async () => {
-  const r = spawnMod.checkBrief(goodBrief({ context: 'https://example.com/home/x and /api/v1/threads and /tmp' }), { title: 't' });
+await check('2b. checkBrief is pure: URLs / API routes / ?#: routes are not files; ok brief passes', async () => {
+  const r = spawnMod.checkBrief(goodBrief({ context: 'https://example.com/home/x and /api/v1/threads and /threads?open=cockpit%3Ax and /hopper-nodes/:id/finish and /tmp' }), { title: 't' });
   assert.deepEqual(r, { ok: true, errors: [] });
   const r2 = spawnMod.checkBrief(goodBrief({ context: 'look at /home/kevin/zzz' }), { pathExists: (p) => p === '/home' });
   assert.deepEqual(r2.errors, ['path_not_found:/home/kevin/zzz']);
+});
+
+await check('2c. a typo in the TOP-level dir is refused, not skipped (/hom/kevin/x, /definitely-not-real/x)', async () => {
+  for (const p of ['/hom/kevin/x', '/definitely-not-real/x']) {
+    const r = spawnMod.checkBrief(goodBrief({ context: `read ${p} first` }), { title: 't' });
+    assert.deepEqual(r.errors, [`path_not_found:${p}`], `${p}: ${JSON.stringify(r)}`);
+  }
+});
+
+await check('2d. over-cap brief is refused before any path/secret scan', async () => {
+  let scanned = 0;
+  const r = spawnMod.checkBrief(goodBrief({ context: '/home/kevin/nope ' + 'x'.repeat(13000) }), { title: 't', pathExists: () => { scanned++; return false; } });
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.startsWith('brief_too_long:')), JSON.stringify(r.errors));
+  assert.equal(scanned, 0, 'path scan ran on an over-cap brief');
 });
 
 await check('3. 6th spawn within an hour from one origin is refused', async () => {

@@ -132,21 +132,23 @@ function str(v: unknown): string {
 }
 
 /**
- * Absolute filesystem paths named in the text. A candidate counts only when its
- * first segment is a real top-level directory (`/home/…`, `/tmp/…`, `/etc/…`) —
- * so an API route like `/api/v1/threads` or a URL path is not mistaken for a
- * file. Starts at line start or after whitespace/quote/bracket, so the path
- * inside `https://host/x` (preceded by ':' or a host) is never picked up.
+ * Absolute filesystem paths named in the text. EVERY absolute path counts —
+ * a typo in the top-level dir (`/hom/kevin/x`) must be refused, not skipped —
+ * except the shapes that are unambiguously web routes:
+ *   · inside a URL (`https://host/x` — never matched: preceded by a host, not a boundary)
+ *   · starting with `/api/`
+ *   · immediately followed by `?`, `#` or `:` (`/threads?open=…`, `/x#a`, `/hopper-nodes/:id`)
+ * Anything else that is meant as a route must be written as a full URL.
  */
-export function extractAbsolutePaths(text: string, pathExists: (p: string) => boolean = fs.existsSync): string[] {
+export function extractAbsolutePaths(text: string): string[] {
   const out = new Set<string>();
-  const re = /(?:^|[\s`'"(\[<=])(\/[A-Za-z0-9._~@+\-/]+)/gm;
+  const re = /(?:^|[\s`'"(\[<=])(\/[A-Za-z0-9._~@+\-/]+)([?#:]?)/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
-    const p = m[1].replace(/[.,:;)\]>'"`]+$/, '').replace(/\/+$/, '') || '/';
-    const top = p.split('/')[1];
-    if (!top) continue;
-    if (!pathExists(`/${top}`)) continue;
+    if (m[2]) continue; // route shape: followed by ? # or :
+    const p = m[1].replace(/[.,;)\]>'"`]+$/, '').replace(/\/+$/, '');
+    if (!p || p === '/') continue;
+    if (p === '/api' || p.startsWith('/api/')) continue;
     out.add(p);
   }
   return [...out];
@@ -191,7 +193,7 @@ export function composeBriefMessage(
  */
 export function checkBrief(
   rawBrief: unknown,
-  opts: BriefCheckOptions & { title?: string } = {},
+  opts: BriefCheckOptions & { title?: string; originExt?: string } = {},
 ): BriefCheckResult {
   const pathExists = opts.pathExists ?? fs.existsSync;
   const b = (rawBrief && typeof rawBrief === 'object' ? rawBrief : {}) as Record<string, unknown>;
@@ -206,16 +208,22 @@ export function checkBrief(
   if (!brief.goal.trim()) errors.push('missing_goal');
   if (!brief.done_means.trim()) errors.push('missing_done_means');
 
+  // Length first, on the exact message that will be sent — and before any
+  // regex/fs scanning, so a huge brief costs nothing to refuse.
+  const composed = composeBriefMessage(opts.title ?? '', brief, { originExt: opts.originExt, reportBack: true });
+  if (composed.length > BRIEF_MAX_CHARS) {
+    errors.push(`brief_too_long:${composed.length}`);
+    return { ok: false, errors };
+  }
+
   const allText = [opts.title ?? '', brief.goal, brief.context, brief.constraints, brief.done_means].join('\n');
 
-  for (const p of extractAbsolutePaths(allText, pathExists)) {
+  for (const p of extractAbsolutePaths(allText)) {
     if (!pathExists(p)) errors.push(`path_not_found:${p}`);
   }
   for (const { kind, re } of SECRET_PATTERNS) {
     if (re.test(allText)) errors.push(`secret_detected:${kind}`);
   }
-  const composed = composeBriefMessage(opts.title ?? '', brief, { reportBack: true });
-  if (composed.length > BRIEF_MAX_CHARS) errors.push(`brief_too_long:${composed.length}`);
 
   return { ok: errors.length === 0, errors };
 }
@@ -300,8 +308,16 @@ export const spawnChat: ToolDef = {
     const title = str(args.title).trim();
     if (!title) return { error: 'missing_title' };
 
-    const check = checkBrief(args.brief, { title });
-    if (!check.ok) return { error: 'brief_rejected', errors: check.errors };
+    const check = checkBrief(args.brief, { title, originExt: origin.external_id });
+    if (!check.ok) {
+      return {
+        error: 'brief_rejected',
+        errors: check.errors,
+        ...(check.errors.some((e) => e.startsWith('path_not_found:'))
+          ? { hint: 'Every absolute path in a brief must exist. Write web routes as a full URL (or /api/…, or with their ?query).' }
+          : {}),
+      };
+    }
 
     if ((countRecentStmt.get(origin.id)?.n ?? 0) >= SPAWN_LIMIT_PER_HOUR) {
       return { error: 'rate_limited', message: `max ${SPAWN_LIMIT_PER_HOUR} spawns per chat per hour` };

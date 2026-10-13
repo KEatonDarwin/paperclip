@@ -22,14 +22,18 @@ ONCE, not every minute.
 """
 import sqlite3, json, os, subprocess, urllib.parse, urllib.request, datetime, traceback
 
-DB          = "/home/kevin/paperclip/darwin-assistant/jarvis.db"
+DEFAULT_DB      = "/home/kevin/paperclip/darwin-assistant/jarvis.db"
+DEFAULT_COCKPIT = "http://localhost:3201/api/v1"
+DB          = os.environ.get("WATCHDOG_DB", DEFAULT_DB)
 COCKPIT_ENV = "/home/kevin/paperclip/jarvis-command-center/.env"
 JARVIS_ENV  = "/home/kevin/paperclip/darwin-assistant/.env"
-COCKPIT     = "http://localhost:3201/api/v1"
+COCKPIT     = os.environ.get("WATCHDOG_COCKPIT", DEFAULT_COCKPIT)
 PAPERCLIP   = "http://localhost:3100/api/v1"
 COMPANY_ID  = "ffbbb56f-af79-49a0-a95a-9eb89f5b3034"
 HEARTBEAT   = "/tmp/jarvis-watchdog-heartbeat.json"
 LOG         = "/tmp/jarvis-watchdog.log"
+WAKE_BACK_FLAG = "/home/kevin/.jarvis/wake-back.enabled"
+WAKE_BACK_CAP = 3
 
 # --- thresholds (minutes) ---
 FOREMAN_STALE_MIN   = 20   # active job with no update this long -> stuck
@@ -99,6 +103,28 @@ def notify(sev, title, body, link=None):
         log(f"  NOTIFY [{sev}] {title}")
     except Exception as e:
         log(f"  notify FAILED: {e}")
+
+
+def wake_back_enabled():
+    return os.path.exists(WAKE_BACK_FLAG)
+
+
+def wake_back_text(row, detail):
+    detail = detail if len(detail or "") <= 300 else detail[:300] + "…"
+    return (f"[watchdog] Commitment breached.\n"
+            f"Subject: \"{row['subject']}\"\n"
+            f"Due: \"{row['due_at']} UTC\"\n"
+            f"Detail: \"{detail}\"\n"
+            "check this and report status in one line.")
+
+
+def wake_commitment(row, detail):
+    if not row.get("thread_ext"):
+        return False
+    http("POST",
+         COCKPIT + "/threads/" + urllib.parse.quote(row["thread_ext"], safe="") + "/messages",
+         COCKPIT_KEY, {"text": wake_back_text(row, detail)}, timeout=5)
+    return True
 
 
 def parse_ts(s):
@@ -323,6 +349,7 @@ def sentinel_commitments(c, now):
     """Registered promises. Overdue + unmet => escalate."""
     rows = c.execute("SELECT * FROM watch_commitments WHERE status='open'").fetchall()
     cols = [d[0] for d in c.execute("SELECT * FROM watch_commitments LIMIT 0").description]
+    wakes = 0
     for r in rows:
         row = dict(zip(cols, r))
         due = parse_ts(row["due_at"])
@@ -336,13 +363,36 @@ def sentinel_commitments(c, now):
         c.execute("UPDATE watch_commitments SET last_checked=datetime('now') WHERE id=?", (row["id"],))
         c.commit()
         if due and now >= due:
+            will_wake = bool(row.get("thread_ext")) and wake_back_enabled() and wakes < WAKE_BACK_CAP
+            # Breach is committed BEFORE any wake POST: if this UPDATE fails (db locked) the
+            # row stays open and nothing was posted; if the POST later fails the row is still
+            # breached. Either way a row can never wake twice.
             c.execute("UPDATE watch_commitments SET status='breached', resolved_at=datetime('now'),"
-                      " notes=? WHERE id=?", (detail, row["id"]))
+                      " notes=? WHERE id=?",
+                      (f"{detail} | woke=pending" if will_wake else detail, row["id"]))
             c.commit()
+            wake = "skipped"
+            if will_wake:
+                wakes += 1
+                woke_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+                try:
+                    wake_commitment(row, detail)
+                    wake = "posted"
+                    log(f"  commitment #{row['id']} wake-back posted to {row['thread_ext']}")
+                except Exception as e:
+                    wake = "failed"
+                    log(f"  commitment #{row['id']} wake-back FAILED: {e}")
+                try:
+                    c.execute("UPDATE watch_commitments SET notes=? WHERE id=?",
+                              (f"{detail} | woke={woke_at}" if wake == "posted"
+                               else f"{detail} | wake_failed={woke_at}", row["id"]))
+                    c.commit()
+                except Exception as e:
+                    log(f"  commitment #{row['id']} wake note update FAILED: {e}")
             notify("error", "JARVIS promised this and it never happened",
                    f"{row['subject']}\n\nDue {row['due_at']} UTC · check={row['check_type']}"
                    f"{':' + row['check_ref'] if row['check_ref'] else ''} · {detail}"
-                   f"\nThread: {row['thread_ext'] or 'n/a'}")
+                   f"\nThread: {row['thread_ext'] or 'n/a'} · wake={wake}")
 
 
 def check_commitment(row):
@@ -367,6 +417,19 @@ def check_commitment(row):
             return (n > 0), f"{n} assistant turn(s) since {ref}"
         except Exception as e:
             return False, f"reply check failed: {e}"
+    if t == "chat_report" and ref:
+        if not row.get("thread_ext"):
+            return False, "chat_report missing origin thread"
+        try:
+            c2 = sqlite3.connect(DB, timeout=15)
+            n = c2.execute("SELECT COUNT(*) FROM turns t JOIN conversations cv ON cv.id=t.conversation_id "
+                           "WHERE cv.external_id=? AND t.created_at >= ? "
+                           "AND instr(COALESCE(t.content,''), ?) > 0",
+                           (row["thread_ext"], row["created_at"], f"[report:{ref}]")).fetchone()[0]
+            c2.close()
+            return (n > 0), f"{n} report marker(s) for {ref} after {row['created_at']}"
+        except Exception as e:
+            return False, f"chat_report check failed: {e}"
     return False, "manual commitment — never auto-satisfied, mark it done explicitly"
 
 

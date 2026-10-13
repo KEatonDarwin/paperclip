@@ -6034,7 +6034,10 @@ export function createApiV1Router(): Router {
     const ftsInfo = new Map<number, { snippet: string; lastUserAt: string | null }>();
     try {
       ftsCatchUp();
-      const hits = searchCandidates(query, { limit: 40, before, after });
+      // Visibility is applied INSIDE the candidate scan (before the 40 cap),
+      // so a non-admin caller's own hits can't be crowded out by chats it
+      // isn't allowed to see.
+      const hits = searchCandidates(query, { limit: 40, before, after, prefix: seesAllThreads ? null : prefix });
       for (const h of hits) ftsInfo.set(h.conversationId, { snippet: h.snippet, lastUserAt: h.lastUserAt });
       candidates = getConversationsByIds(hits.map((h) => h.conversationId)).filter(visible);
     } catch (err) {
@@ -6054,7 +6057,8 @@ export function createApiV1Router(): Router {
     }
 
     try {
-      const matches = await searchThreadsByQuery(query, candidates);
+      const matchedText = new Map([...ftsInfo].map(([id, info]) => [id, info.snippet]));
+      const matches = await searchThreadsByQuery(query, candidates, matchedText);
       const byId = new Map(candidates.map((c) => [c.external_id, c]));
       const results: Record<string, unknown>[] = [];
       const searchBrevityGlobals = getBrevityGlobals();

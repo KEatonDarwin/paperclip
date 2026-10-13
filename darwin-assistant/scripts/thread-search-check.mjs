@@ -16,20 +16,32 @@ import { pathToFileURL } from 'node:url';
 const here = path.dirname(new URL(import.meta.url).pathname);
 register(pathToFileURL(path.join(here, 'thread-search-check.hooks.mjs')), import.meta.url);
 
-const DIR = process.env.THREAD_SEARCH_CHECK_DIR ?? '/tmp/find-any-chat/check';
-fs.rmSync(DIR, { recursive: true, force: true });
-fs.mkdirSync(DIR, { recursive: true });
-const DB = path.join(DIR, 'jarvis.db');
-process.env.JARVIS_DB_PATH = DB;
-process.env.JARVIS_SIM = '1';
-process.env.HEALTH_MONITOR = '0';
-const PORT = Number(process.env.THREAD_SEARCH_CHECK_PORT ?? 3997);
-
 const results = [];
 const check = (name, ok, detail = '') => {
   results.push({ name, ok });
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  — ${detail}` : ''}`);
 };
+
+// ---- 0. scratch safety. The scratch dir is ALWAYS a fresh mkdtemp under
+// ROOT; no env var can point it anywhere, and only what this run created is
+// ever removed. Proof: a sentinel dir is planted under ROOT and the old
+// override variable is aimed at it — it must survive scratch setup.
+const ROOT = '/tmp/find-any-chat';
+fs.mkdirSync(ROOT, { recursive: true });
+const sentinel = fs.mkdtempSync(path.join(ROOT, 'sentinel-'));
+fs.writeFileSync(path.join(sentinel, 'keep.txt'), 'must survive');
+process.env.THREAD_SEARCH_CHECK_DIR = sentinel; // a "bad" override — must be ignored
+const DIR = fs.mkdtempSync(path.join(ROOT, 'check-'));
+const underRoot = (p) => path.resolve(p).startsWith(`${ROOT}/`) && path.resolve(p) !== ROOT;
+check('0 scratch dir is a fresh mkdtemp under /tmp/find-any-chat/ and ignores THREAD_SEARCH_CHECK_DIR',
+  underRoot(DIR) && DIR !== sentinel && fs.existsSync(path.join(sentinel, 'keep.txt')) && fs.readdirSync(DIR).length === 0,
+  `dir=${DIR} sentinel kept=${fs.existsSync(path.join(sentinel, 'keep.txt'))}`);
+fs.rmSync(sentinel, { recursive: true, force: true }); // ours: created above
+const DB = path.join(DIR, 'jarvis.db');
+process.env.JARVIS_DB_PATH = DB;
+process.env.JARVIS_SIM = '1';
+process.env.HEALTH_MONITOR = '0';
+const PORT = Number(process.env.THREAD_SEARCH_CHECK_PORT ?? 3997);
 
 // ---- 1. FTS5 in the bundled better-sqlite3 (everything else is moot without it)
 {
@@ -56,6 +68,7 @@ const C = await import(path.join(dist, 'conversation-db.js'));
 const F = await import(path.join(dist, 'thread-fts.js'));
 const { createApiV1Router } = await import(path.join(dist, 'handlers', 'api-v1.js'));
 const { mintApiKey } = await import(path.join(dist, 'api-keys.js'));
+const { createThreadSummary } = await import(path.join(dist, 'thread-summaries.js'));
 const db = C.sqliteDb;
 
 // ---- seed: 150 chats, oldest first. Each has 8 turns; the OLDEST chat's
@@ -91,11 +104,21 @@ const get = async (p) => {
   const r = await fetch(`http://localhost:${PORT}/api/v1${p}`, { headers: hdr });
   return { status: r.status, body: await r.json() };
 };
-const search = async (body) => {
-  const r = await fetch(`http://localhost:${PORT}/api/v1/threads/search`, { method: 'POST', headers: hdr, body: JSON.stringify(body) });
+const search = async (body, headers = hdr) => {
+  const r = await fetch(`http://localhost:${PORT}/api/v1/threads/search`, { method: 'POST', headers, body: JSON.stringify(body) });
   return { status: r.status, body: await r.json() };
 };
 const lastPrompt = () => (globalThis.__rankerPrompts ?? []).at(-1) ?? '';
+const resultIds = (r) => (r.body.results ?? []).map((x) => x.thread_id);
+// The ranker-prompt block for one thread (from its "- thread_id:" line up to
+// the next block / the instructions).
+const promptBlock = (prompt, externalId) => {
+  const start = prompt.indexOf(`- thread_id: ${externalId}\n`);
+  if (start === -1) return null;
+  const rest = prompt.slice(start + 1);
+  const end = rest.search(/\n- thread_id: |\n\nRespond with ONLY/);
+  return '-' + (end === -1 ? rest : rest.slice(0, end));
+};
 
 try {
   // ---- 2. the oldest chat is findable; today's candidate list excludes it
@@ -131,8 +154,9 @@ try {
   const r4 = await search({ query: 'zanzibar quokka' });
   const c4 = F.searchCandidates('zanzibar quokka');
   check('4 watermark catch-up indexes the new turn',
-    c4.length === 1 && c4[0].conversationId === mid.id && r4.status === 200 && lastPrompt().includes(mid.external_id),
-    `candidates=${JSON.stringify(c4.map((c) => c.conversationId))} status=${r4.status}`);
+    c4.length === 1 && c4[0].conversationId === mid.id && r4.status === 200 && lastPrompt().includes(mid.external_id) &&
+      JSON.stringify(resultIds(r4)) === JSON.stringify([mid.external_id]),
+    `candidates=${JSON.stringify(c4.map((c) => c.conversationId))} status=${r4.status} results=${JSON.stringify(resultIds(r4))}`);
 
   const c4b = F.searchCandidates('accounting data recovery');
   check('4b ephemeral: chats are never indexed', c4b.length === 1 && c4b[0].conversationId === oldest.id,
@@ -154,8 +178,71 @@ try {
   const r5 = await search({ query: 'marmalade', before: '2026-10-01' });
   check('5 before excludes a chat whose last user turn is newer, despite old updated_at',
     JSON.stringify(ids(before)) === JSON.stringify([b.id]) && JSON.stringify(ids(after)) === JSON.stringify([a.id]) &&
-      r5.status === 200 && lastPrompt().includes('cockpit:date-b') && !lastPrompt().includes('cockpit:date-a'),
-    `before=${JSON.stringify(ids(before))} after=${JSON.stringify(ids(after))} (a=${a.id} b=${b.id})`);
+      r5.status === 200 && lastPrompt().includes('cockpit:date-b') && !lastPrompt().includes('cockpit:date-a') &&
+      JSON.stringify(resultIds(r5)) === JSON.stringify(['cockpit:date-b']),
+    `before=${JSON.stringify(ids(before))} after=${JSON.stringify(ids(after))} (a=${a.id} b=${b.id}) results=${JSON.stringify(resultIds(r5))}`);
+
+  // ---- 8. (review blocker #2) a match buried in an EARLY turn of a long chat
+  // — outside the last 4 turns and absent from its summary — reaches the
+  // ranker as that candidate's "matched text", so the (honest) ranker picks it.
+  const buried = C.getOrCreateConversation('cockpit:buried');
+  for (let t = 0; t < 12; t += 1) {
+    const role = t % 2 === 0 ? 'user' : 'assistant';
+    C.addTurn(buried.id, role, t === 1
+      ? 'Noted — the pelican invoice reconciliation is parked until the vendor files arrive.'
+      : `Buried chat line ${t}: lunch plans, parking, and the printer.`);
+  }
+  createThreadSummary(buried.id, 'Mostly lunch plans, parking and a broken printer.', null, 11);
+  const r8 = await search({ query: 'pelican invoice reconciliation' });
+  const b8 = promptBlock(lastPrompt(), 'cockpit:buried') ?? '';
+  const m8 = (b8.match(/\n  matched text: (.*)/) ?? [])[1] ?? '';
+  check('8 buried early-turn match reaches the ranker prompt and the results',
+    r8.status === 200 && /pelican invoice reconciliation/i.test(m8) && m8.length <= 300 &&
+      !/pelican/i.test(b8.replace(/\n  matched text: .*/, '')) && resultIds(r8).includes('cockpit:buried'),
+    `status=${r8.status} matched="${m8}" results=${JSON.stringify(resultIds(r8))}`);
+
+  // ---- 9. (review blocker #3) the stubbed ranker is honest: candidates that
+  // don't contain the phrase are NOT returned, so the API checks above can fail.
+  const r9 = await search({ query: 'routine zebra marmalade' });
+  const blocks9 = (lastPrompt().match(/\n- thread_id: /g) ?? []).length;
+  check('9 ranker stub returns nothing when no candidate block contains the phrase',
+    r9.status === 200 && blocks9 >= 5 && resultIds(r9).length === 0,
+    `status=${r9.status} candidate blocks=${blocks9} results=${JSON.stringify(resultIds(r9))}`);
+
+  // ---- 10. (advisory) visibility before limit: a non-admin caller's own hit
+  // isn't crowded out of the 40-candidate cap by chats it can't see.
+  const { id: userKeyId, plaintext: userKey } = mintApiKey('thread-search-check-user', 'jarvis');
+  const userPrefix = `api:${userKeyId}:`;
+  for (let i = 0; i < 45; i += 1) {
+    const o = C.getOrCreateConversation(`cockpit:vis-${i}`);
+    C.addTurn(o.id, 'user', 'quasar quasar quasar nebula');
+  }
+  const mine = C.getOrCreateConversation(`${userPrefix}mine`);
+  C.addTurn(mine.id, 'user', `A long note that mentions a quasar once, among ${'many other ordinary words '.repeat(20)}`);
+  db.prepare(`UPDATE conversations SET updated_at = '2020-01-01 00:00:00' WHERE id = ?`).run(mine.id); // out of the recent-100 fallback
+  F.catchUp();
+  const crowd = F.searchCandidates('quasar').map((c) => c.conversationId);
+  const own = F.searchCandidates('quasar', { prefix: userPrefix }).map((c) => c.conversationId);
+  const r10 = await search({ query: 'quasar' }, { Authorization: `Bearer ${userKey}`, 'Content-Type': 'application/json' });
+  check('10 non-admin caller still gets its own hit when 40+ hidden chats outrank it',
+    crowd.length === 40 && !crowd.includes(mine.id) && JSON.stringify(own) === JSON.stringify([mine.id]) &&
+      r10.status === 200 && JSON.stringify(resultIds(r10)) === JSON.stringify([mine.external_id]),
+    `unfiltered top-40 has mine=${crowd.includes(mine.id)} prefixed=${JSON.stringify(own)} status=${r10.status} results=${JSON.stringify(resultIds(r10))}`);
+
+  // ---- 11. (advisory) title catch-up: a rename stamped in the SAME second as
+  // the title watermark, on a lower id, is still indexed on the next pass.
+  F.catchUp();
+  const Database = (await import('better-sqlite3')).default;
+  const side0 = new Database(F.searchDbPath(), { readonly: true });
+  const wm = Object.fromEntries(side0.prepare(`SELECT key, value FROM meta`).all().map((r) => [r.key, r.value]));
+  side0.close();
+  const victim = seeded[1];
+  db.prepare(`UPDATE conversations SET title = 'Gryphon fiscal atlas', updated_at = ? WHERE id = ?`).run(wm.conv_updated_at, victim.id);
+  F.catchUp();
+  const c11 = F.searchCandidates('gryphon atlas').map((c) => c.conversationId);
+  check('11 same-second rename on a lower id is caught by the 2s overlap',
+    victim.id < Number(wm.conv_id) && c11.includes(victim.id),
+    `watermark=(${wm.conv_updated_at}, ${wm.conv_id}) victim=${victim.id} hits=${JSON.stringify(c11)}`);
 
   // ---- 6. sidecar unwritable → search still answers via the fallback
   const errs = [];
@@ -184,7 +271,7 @@ try {
   const fellBack = errs.filter((e) => e.includes('FTS unavailable')).length;
   check('6 unwritable sidecar → results via fallback',
     r6a.status === 200 && r6a.body.results.length > 0 && r6b.status === 200 && r6b.body.results.length > 0 && threw && fellBack === 3 &&
-      r6c.status === 200 && p6c.includes('cockpit:date-b') && !p6c.includes('cockpit:date-a'),
+      r6c.status === 200 && p6c.includes('cockpit:date-b') && !p6c.includes('cockpit:date-a') && resultIds(r6c).includes('cockpit:date-b'),
     `6a status=${r6a.status} n=${r6a.body.results?.length}; 6b status=${r6b.status} n=${r6b.body.results?.length}; 6c (before) status=${r6c.status} date-b in=${p6c.includes('cockpit:date-b')} date-a in=${p6c.includes('cockpit:date-a')}; catchUp threw=${threw}; fallbacks logged=${fellBack}`);
   fs.chmodSync(side, 0o644);
   F.closeSearchDb();
@@ -198,4 +285,7 @@ try {
 
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
+// Remove only the mkdtemp dir this run created (kept on failure for a look).
+if (!failed.length && underRoot(DIR)) fs.rmSync(DIR, { recursive: true, force: true });
+else console.log(`scratch kept for inspection: ${DIR}`);
 process.exit(failed.length ? 1 : 0);

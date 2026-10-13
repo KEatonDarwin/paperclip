@@ -115,9 +115,16 @@ export function catchUp(): CatchUpStats {
   stats.lastTurnId = last;
 
   // 2. Titles — any conversation touched since the last pass (a rename bumps
-  //    updated_at). Watermark is (updated_at, id) so equal timestamps page.
-  let convAt = getMeta(db, 'conv_updated_at') ?? '';
-  let convId = Number(getMeta(db, 'conv_id') ?? 0);
+  //    updated_at). The cursor is (updated_at, id) so equal timestamps page.
+  //    Each pass starts 2s BEFORE the stored watermark (id cursor reset):
+  //    updated_at has 1-second resolution, so a chat renamed in the same
+  //    second as the watermark row but with a lower id would otherwise be
+  //    skipped forever. Re-indexing a title is an idempotent replace.
+  const storedAt = getMeta(db, 'conv_updated_at') ?? '';
+  let convAt = storedAt
+    ? sqliteDb.prepare<[string], { at: string | null }>(`SELECT datetime(?, '-2 seconds') AS at`).get(storedAt)?.at ?? storedAt
+    : '';
+  let convId = 0;
   const convBatch = sqliteDb.prepare<[string, string, number, number], { id: number; title: string | null; updated_at: string }>(
     `SELECT c.id, c.title, c.updated_at FROM conversations c
       WHERE (c.updated_at > ? OR (c.updated_at = ? AND c.id > ?)) AND ${NOT_THROWAWAY}
@@ -196,11 +203,13 @@ export interface SearchCandidate {
  * Best-matching chats for `q`, best first, one entry per chat. `before` /
  * `after` (ISO or 'YYYY-MM-DD HH:MM:SS') filter on the chat's newest USER
  * turn — "when did I last touch it", not updated_at (which JARVIS's own
- * replies and background jobs bump).
+ * replies and background jobs bump). `prefix` keeps only chats whose
+ * external_id starts with it — applied before `limit`, so a non-admin caller
+ * gets up to `limit` of ITS OWN chats, not 40 hits it then can't see.
  */
 export function searchCandidates(
   q: string,
-  opts: { limit?: number; before?: string | null; after?: string | null } = {},
+  opts: { limit?: number; before?: string | null; after?: string | null; prefix?: string | null } = {},
 ): SearchCandidate[] {
   const limit = Math.max(1, Math.min(200, opts.limit ?? 40));
   const match = toFtsQuery(q);
@@ -222,12 +231,19 @@ export function searchCandidates(
     const id = Number(h.conversation_id);
     if (seen.has(id)) continue;
     seen.add(id);
+    if (opts.prefix && !externalIdOf(id)?.startsWith(opts.prefix)) continue;
     const lastUserAt = lastUserTurnAt(id);
     if (!inDateWindow(lastUserAt, before, after)) continue;
     out.push({ conversationId: id, snippet: h.snip.replace(/\s+/g, ' ').trim(), lastUserAt });
     if (out.length >= limit) break;
   }
   return out;
+}
+
+function externalIdOf(conversationId: number): string | null {
+  return sqliteDb
+    .prepare<[number], { external_id: string }>(`SELECT external_id FROM conversations WHERE id = ?`)
+    .get(conversationId)?.external_id ?? null;
 }
 
 /** created_at of the newest role='user' turn in a chat, read from jarvis.db

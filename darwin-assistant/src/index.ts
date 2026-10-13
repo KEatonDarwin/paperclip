@@ -6,6 +6,7 @@ import { startCheckinWorker } from './checkin-worker.js';
 import { startThreadReminderWorker } from './thread-reminders.js';
 import { enqueueCalendarCheckins } from './briefing.js';
 import { startUiServer } from './ui-server.js';
+import { catchUp as ftsCatchUp } from './thread-fts.js';
 import { reconcileInterruptedRuns, autoHideStaleThreads } from './conversation-db.js';
 import { getSetting } from './conversation-db.js';
 import { shutdownActiveRuns, processMessage, abortConversationRun } from './agent.js';
@@ -123,6 +124,20 @@ async function main() {
   const slackApp = SLACK_ENABLED ? createSlackApp() : null;
 
   startUiServer(slackApp ?? undefined);
+
+  // Find Any Chat: warm the full-text sidecar 15s after boot so the first
+  // search doesn't pay for indexing. It's the same catch-up a search runs —
+  // synchronous, so it blocks the event loop once (a few seconds on a cold
+  // sidecar, ~ms when already current). Failure is harmless: search falls
+  // back on its own.
+  setTimeout(() => {
+    try {
+      const s = ftsCatchUp();
+      console.log(`[thread-fts] warm-up: indexed ${s.turns} turns, ${s.titles} titles, ${s.summaries} summaries`);
+    } catch (err) {
+      console.error('[thread-fts] warm-up failed (search will fall back):', err);
+    }
+  }, 15_000).unref();
 
   // Auto-hide stale threads (runs regardless of Slack).
   runAutoHideSweep();

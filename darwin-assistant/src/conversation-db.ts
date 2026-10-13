@@ -655,6 +655,58 @@ export function listAllConversations(): ConversationRow[] {
   return stmts.listAllConversations.all();
 }
 
+// Find Any Chat (overnight 2026-10-12): the uncapped page behind GET /threads.
+// listAllConversations above stays capped at 100 on purpose — its other
+// callers (group membership, big board, …) are unchanged. This one honours
+// `limit` up to 500 and drops throwaway ephemeral:/checkin: rows in SQL, so a
+// page of 200 is 200 real threads instead of whatever survives the top 100.
+export const CONVERSATIONS_PAGE_MAX = 500;
+
+export function listConversationsPage(
+  limit: number,
+  offset = 0,
+  opts: { prefix?: string | null; status?: string | null } = {},
+): ConversationRow[] {
+  const lim = Math.max(1, Math.min(CONVERSATIONS_PAGE_MAX, Math.floor(limit) || 1));
+  const off = Math.max(0, Math.floor(offset) || 0);
+  const where = [`external_id NOT LIKE 'ephemeral:%'`, `external_id NOT LIKE 'checkin:%'`];
+  const params: (string | number)[] = [];
+  if (opts.prefix) {
+    // substr() instead of LIKE so a '%' or '_' in a caller prefix is literal.
+    where.push(`substr(external_id, 1, ?) = ?`);
+    params.push(opts.prefix.length, opts.prefix);
+  }
+  if (opts.status) {
+    where.push(`status = ?`);
+    params.push(opts.status);
+  }
+  return db
+    .prepare<(string | number)[], ConversationRow>(
+      `SELECT * FROM conversations WHERE ${where.join(' AND ')}
+       ORDER BY pinned DESC, pinned_at DESC, updated_at DESC LIMIT ? OFFSET ?`,
+    )
+    .all(...params, lim, off);
+}
+
+/** Rows for the given conversation ids, in the order the ids were given
+ *  (unknown ids are skipped). Used to hydrate search candidates. */
+export function getConversationsByIds(ids: number[]): ConversationRow[] {
+  const unique = [...new Set(ids.filter((id) => Number.isInteger(id)))];
+  if (!unique.length) return [];
+  const byId = new Map<number, ConversationRow>();
+  // Chunked to stay well under SQLite's bound-parameter limit.
+  for (let i = 0; i < unique.length; i += 500) {
+    const chunk = unique.slice(i, i + 500);
+    const rows = db
+      .prepare<number[], ConversationRow>(
+        `SELECT * FROM conversations WHERE id IN (${chunk.map(() => '?').join(',')})`,
+      )
+      .all(...chunk);
+    for (const r of rows) byId.set(r.id, r);
+  }
+  return unique.map((id) => byId.get(id)).filter((r): r is ConversationRow => !!r);
+}
+
 export function countTurns(conversationId: number): number {
   return stmts.countTurns.get(conversationId)?.cnt ?? 0;
 }

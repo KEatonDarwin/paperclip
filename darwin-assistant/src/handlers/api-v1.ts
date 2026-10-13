@@ -30,6 +30,9 @@ import {
   setThreadClaudeAccount,
   setThreadBrevityOverride,
   listAllConversations,
+  listConversationsPage,
+  getConversationsByIds,
+  CONVERSATIONS_PAGE_MAX,
   deriveSource,
   renameConversation,
   setConversationStatus,
@@ -453,6 +456,7 @@ import { generateThreadSummary } from '../thread-summarize.js';
 import { condenseThread, buildSmartForkMessage } from '../thread-condense.js';
 import { listThreadSummaries, getLatestThreadSummary } from '../thread-summaries.js';
 import { searchThreadsByQuery } from '../thread-search.js';
+import { catchUp as ftsCatchUp, searchCandidates, lastUserTurnAt, filterByLastUserTurn } from '../thread-fts.js';
 import { getBrief } from '../jarvis-brief.js';
 import {
   listJarvisDecisions,
@@ -5974,19 +5978,18 @@ export function createApiV1Router(): Router {
     const caller = req.apiKey!;
     const prefix = callerExternalIdPrefix(caller.id);
     const seesAllThreads = isAdminScope(caller.scope);
-    const limit = Math.max(1, Math.min(200, parseInt(String(req.query.limit ?? '50'), 10) || 50));
+    const limit = Math.max(1, Math.min(CONVERSATIONS_PAGE_MAX, parseInt(String(req.query.limit ?? '50'), 10) || 50));
+    const offset = Math.max(0, parseInt(String(req.query.offset ?? '0'), 10) || 0);
     const statusFilter = typeof req.query.status === 'string' ? req.query.status : null;
 
-    const all = listAllConversations();
-    const filtered = all.filter((c) => {
-      // Ephemeral chats are full JARVIS on a throwaway conversation — never a
-      // saved thread, so they never appear in the sidebar list.
-      if (c.external_id.startsWith('ephemeral:')) return false;
-      if (c.external_id.startsWith('checkin:')) return false;
-      if (!seesAllThreads && !c.external_id.startsWith(prefix)) return false;
-      if (statusFilter && c.status !== statusFilter) return false;
-      return true;
-    }).slice(0, limit);
+    // Find Any Chat: the page is filtered in SQL (ephemeral:/checkin: chats —
+    // full JARVIS on a throwaway conversation — never appear, nor do other
+    // callers' threads), so `limit` threads really come back instead of
+    // whatever survived listAllConversations' top-100 cap.
+    const filtered = listConversationsPage(limit, offset, {
+      prefix: seesAllThreads ? null : prefix,
+      status: statusFilter,
+    });
 
     // Read the two global brevity settings ONCE for the whole page instead of
     // per thread (up to 200 descriptors here).
@@ -6008,11 +6011,47 @@ export function createApiV1Router(): Router {
       return;
     }
 
-    const candidates = listAllConversations().filter((c) => {
+    // Optional date window, keyed on the chat's newest USER turn ("when did
+    // I last touch it"). Accepted in the body or the query string.
+    const dateParam = (k: 'before' | 'after'): string | null => {
+      const v = req.body?.[k] ?? req.query[k];
+      return typeof v === 'string' && v.trim() ? v.trim() : null;
+    };
+    const before = dateParam('before');
+    const after = dateParam('after');
+    const visible = (c: ConversationRow) => {
       if (c.external_id.startsWith('ephemeral:')) return false;
       if (c.external_id.startsWith('checkin:')) return false;
       return seesAllThreads || c.external_id.startsWith(prefix);
-    });
+    };
+
+    // Find Any Chat: full-text candidates from EVERY chat (sidecar index,
+    // caught up from its watermark first), then the existing model ranker
+    // picks among them. If the index can't be used (sidecar unwritable,
+    // corrupt, …) or finds nothing, fall back to today's recent-100 list.
+    let candidates: ConversationRow[] = [];
+    let ftsFailed = false;
+    const ftsInfo = new Map<number, { snippet: string; lastUserAt: string | null }>();
+    try {
+      ftsCatchUp();
+      const hits = searchCandidates(query, { limit: 40, before, after });
+      for (const h of hits) ftsInfo.set(h.conversationId, { snippet: h.snippet, lastUserAt: h.lastUserAt });
+      candidates = getConversationsByIds(hits.map((h) => h.conversationId)).filter(visible);
+    } catch (err) {
+      console.error('[thread-search] FTS unavailable, falling back to recent threads:', err);
+      ftsFailed = true;
+      ftsInfo.clear();
+      candidates = [];
+    }
+    // No index, or no hit with no date window → today's recent-100 list. With
+    // a date window and a working index, "nothing matched" is the honest answer.
+    if (ftsFailed || (!candidates.length && !before && !after)) {
+      candidates = listAllConversations().filter(visible);
+      if (before || after) {
+        const inWindow = filterByLastUserTurn(candidates.map((c) => c.id), { before, after });
+        candidates = candidates.filter((c) => inWindow.has(c.id));
+      }
+    }
 
     try {
       const matches = await searchThreadsByQuery(query, candidates);
@@ -6022,7 +6061,13 @@ export function createApiV1Router(): Router {
       for (const m of matches) {
         const conv = byId.get(m.thread_id);
         if (conv) {
-          results.push({ ...threadDescriptor(conv, req, searchBrevityGlobals), search_reason: m.reason });
+          const info = ftsInfo.get(conv.id);
+          results.push({
+            ...threadDescriptor(conv, req, searchBrevityGlobals),
+            search_reason: m.reason,
+            search_snippet: info?.snippet ?? null,
+            last_user_at: info ? info.lastUserAt : lastUserTurnAt(conv.id),
+          });
         }
       }
       res.json({ results });

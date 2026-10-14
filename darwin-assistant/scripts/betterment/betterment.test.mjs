@@ -146,4 +146,43 @@ test('a change with fewer than 3 live days is warming, not judged', () => {
   assert.equal(r.verdict, null);
 });
 
+test('review F2: cache_ratio denominator includes cache_write_tokens', () => {
+  const db = new Database(SRC);
+  // 1000 input + 8000 cache_read + 1000 cache_write => ratio 0.8, not 8000/9000
+  db.prepare(`INSERT INTO turns (conversation_id, turn_index, role, content, created_at, input_tokens, output_tokens,
+    cache_read_tokens, cache_write_tokens, error_detail) VALUES (3, 0, 'assistant', 'x', '2026-01-20 05:00:00', 1000, 10, 8000, 1000, NULL)`).run();
+  db.close();
+  run('collect.mjs', '--source', SRC, '--days', '1', '--end', '2026-01-20');
+  assert.equal(metric('cache_ratio')['2026-01-20'], 0.8);
+});
+
+test('review F1: default --end is yesterday UTC — a partial today is never recorded', () => {
+  const today = new Date().toISOString().slice(0, 10);
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const db = new Database(SRC);
+  const ins = db.prepare(`INSERT INTO turns (conversation_id, turn_index, role, content, created_at, input_tokens, output_tokens,
+    cache_read_tokens, cache_write_tokens, error_detail) VALUES (3, 0, 'assistant', 'x', ?, 100, 10, 100, 0, NULL)`);
+  ins.run(`${today} 01:00:00`);
+  ins.run(`${yesterday} 01:00:00`);
+  db.close();
+  run('collect.mjs', '--source', SRC); // no --end
+  const days = metric('tokens_per_turn');
+  assert.ok(days[yesterday] !== undefined, 'yesterday must be collected');
+  assert.equal(days[today], undefined, 'the partial current day must not be collected');
+});
+
+test('review G2: a live mean inside one baseline stdev is inconclusive, not green/red', () => {
+  const db = new Database(path.join(DIR, 'betterment.db'));
+  const ins = db.prepare('INSERT OR REPLACE INTO metrics_daily (day, metric, value) VALUES (?, ?, ?)');
+  for (let d = 1; d <= 14; d++) ins.run(`2026-02-${String(d).padStart(2, '0')}`, 'tokens_per_turn_worker', d % 2 ? 100 : 200);
+  [120, 180, 120, 180, 130].forEach((v, i) => ins.run(`2026-02-${15 + i}`, 'tokens_per_turn_worker', v));
+  db.close();
+  const c = JSON.parse(run('ledger.mjs', 'add', '--title', 'Noise change', '--kind', 'flag', '--flag', 'noise_v1',
+    '--metric', 'tokens_per_turn_worker', '--direction', 'down', '--applied-at', '2026-02-15'));
+  const r = JSON.parse(run('report.mjs')).changes.find((x) => x.id === c.id);
+  assert.equal(r.verdict, 'inconclusive'); // live mean 146 vs baseline 150, stdev ~52
+  assert.ok(r.baseline_stdev > 0);
+  assert.equal(r.guard, 'ok');
+});
+
 test.after(() => fs.rmSync(tmp, { recursive: true, force: true }));

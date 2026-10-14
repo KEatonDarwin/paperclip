@@ -15,12 +15,14 @@ export const LIVE_JARVIS_DB = '/home/kevin/paperclip/darwin-assistant/jarvis.db'
 // `better` is the direction a healthy change usually pushes the metric — the
 // ledger still records its own direction per change.
 export const METRICS = {
-  tokens_per_turn:             { label: 'Tokens per model call (all threads)', better: 'down' },
-  tokens_per_turn_worker:      { label: 'Tokens per model call (worker threads)', better: 'down' },
-  tokens_per_turn_interactive: { label: 'Tokens per model call (Kevin\'s chats)', better: 'down' },
-  cache_ratio:                 { label: 'Share of input served from cache (all threads)', better: 'up' },
-  cache_ratio_worker:          { label: 'Share of input served from cache (worker threads)', better: 'up' },
-  cache_ratio_interactive:     { label: 'Share of input served from cache (Kevin\'s chats)', better: 'up' },
+  // A turns row carries the WHOLE CLI run's usage, so these are per reply, not per API call.
+  // "interactive" = every non-worker thread (Kevin's chats, goals, shifts, ephemerals).
+  tokens_per_turn:             { label: 'Tokens per reply / CLI run (all threads)', better: 'down' },
+  tokens_per_turn_worker:      { label: 'Tokens per reply / CLI run (worker threads)', better: 'down' },
+  tokens_per_turn_interactive: { label: 'Tokens per reply / CLI run (non-worker threads)', better: 'down' },
+  cache_ratio:                 { label: 'Share of input-side tokens served from cache (all threads)', better: 'up' },
+  cache_ratio_worker:          { label: 'Share of input-side tokens served from cache (worker threads)', better: 'up' },
+  cache_ratio_interactive:     { label: 'Share of input-side tokens served from cache (non-worker threads)', better: 'up' },
   turns_per_day:               { label: 'Replies per day', better: 'up' },
   repair_nodes_per_day:        { label: 'Merge-repair nodes created per day', better: 'down' },
   dead_turns_per_day:          { label: 'Hung / failed replies per day', better: 'down' },

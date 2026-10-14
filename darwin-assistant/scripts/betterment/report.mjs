@@ -55,6 +55,16 @@ function judge(c) {
   if (c.promised_delta_pct != null) {
     r.promise = r.improvement_pct != null && r.improvement_pct >= c.promised_delta_pct ? 'met' : 'missed';
   }
+  // Noise band: daily values swing a lot (tokens_per_turn ±50% is normal), so a
+  // live mean inside one baseline stdev proves nothing either way.
+  const baseStdev = base.length > 1
+    ? Math.sqrt(base.reduce((s, x) => s + (x.value - baseline) ** 2, 0) / (base.length - 1))
+    : null;
+  r.baseline_stdev = round(baseStdev);
+  if (baseStdev != null && Math.abs(liveMean - baseline) <= baseStdev && r.promise !== 'missed') {
+    r.verdict = 'inconclusive';
+    return r;
+  }
   r.verdict = movedRight && r.promise !== 'missed' ? 'green' : 'red';
   return r;
 }

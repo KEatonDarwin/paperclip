@@ -33,7 +33,9 @@ const args = parseArgs(process.argv.slice(2));
 const source = args.source && args.source !== true ? args.source : LIVE_JARVIS_DB;
 const days = Number(args.days ?? 30);
 if (!Number.isInteger(days) || days < 1) throw new Error('--days must be a positive integer');
-const end = args.end && args.end !== true ? args.end : utcDay(new Date());
+// Default end = YESTERDAY (UTC): the current day is always partial and a partial
+// day poisons count metrics (a 09:40 UTC run would record ~20% of a real day).
+const end = args.end && args.end !== true ? args.end : addDays(utcDay(new Date()), -1);
 const start = addDays(end, -(days - 1));
 const endExclusive = addDays(end, 1);
 
@@ -69,7 +71,8 @@ if (has(turnCols, 'conversation_id', 'created_at', 'input_tokens', 'output_token
            SUM(COALESCE(t.input_tokens,0) + COALESCE(t.cache_read_tokens,0)
              + COALESCE(t.cache_write_tokens,0) + COALESCE(t.output_tokens,0)) AS tokens,
            SUM(COALESCE(t.cache_read_tokens,0)) AS cache_read,
-           SUM(COALESCE(t.input_tokens,0) + COALESCE(t.cache_read_tokens,0)) AS input_side
+           SUM(COALESCE(t.input_tokens,0) + COALESCE(t.cache_read_tokens,0)
+             + COALESCE(t.cache_write_tokens,0)) AS input_side
     FROM turns t LEFT JOIN conversations c ON c.id = t.conversation_id
     WHERE t.input_tokens IS NOT NULL AND t.created_at >= ? AND t.created_at < ?
     GROUP BY day, cls

@@ -529,6 +529,8 @@ import {
   resolveConversationRuntime,
   getInFlightMessageId,
   getLiveStream,
+  getLiveThinking,
+  getLiveThinkingTokens,
   abortConversationRun,
   ConversationBusyError,
   getActiveRunCount,
@@ -804,6 +806,10 @@ function threadDescriptor(
     // In-progress streamed text (null unless a text block is streaming right now)
     // so a second browser opening this thread mid-run sees the live "thinking".
     live_stream: getLiveStream(conv.id),
+    // In-progress THINKING, same contract as live_stream (own field so the
+    // cockpit renders it in its own dim block, never inside the reply).
+    live_thinking: getLiveThinking(conv.id),
+    live_thinking_tokens: getLiveThinkingTokens(conv.id),
     // Server-owned submit queue (survives refresh, mirrored across browsers).
     queued: listQueuedMessages(conv.id),
     created_at: conv.created_at,

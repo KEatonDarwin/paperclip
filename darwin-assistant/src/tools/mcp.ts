@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ToolDef } from './index.js';
 import { nativeCall, resolveNativeServer } from './mcp-native.js';
+import { withRetry, classifyFailure, describeFailure, type FailureClass } from './mcp-retry.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -30,14 +31,44 @@ async function dispatchCall(
   tool: string,
   args: Record<string, unknown>,
 ): Promise<BridgeResult> {
+  // Native-reachable servers (smarty-pants): retry a transient blip a couple of
+  // times before paying for the CLI bridge. The native client already re-inits a
+  // dropped *session* (404/400) internally; this adds retries for 5xx / timeout /
+  // network / 429 — the failures that used to surface as a "connector drop".
   if (!NATIVE_DISABLED && resolveNativeServer(server)) {
-    const native = await nativeCall(server, bareToolName(tool), args);
+    const native = await withRetry(() => nativeCall(server, bareToolName(tool), args), {
+      retries: 2,
+      baseDelayMs: 300,
+      maxDelayMs: 2_000,
+    });
     if (native.ok) {
-      return { ok: true, tool: native.tool, result: native.result, duration_ms: native.duration_ms };
+      return {
+        ok: true,
+        tool: native.tool,
+        result: native.result,
+        duration_ms: native.duration_ms,
+        attempts: native.attempts,
+      };
     }
-    // Native path failed — degrade gracefully to the bridge.
+    // Native exhausted its retries — degrade to the CLI bridge as a last resort.
   }
-  return bridgeCall(server, tool, args);
+
+  // Bridge path (claude.ai connectors, or native fall-through): one retry on a
+  // transient/auth blip, since spinning a model turn is comparatively expensive.
+  const bridge = await withRetry(() => bridgeCall(server, tool, args), {
+    retries: 1,
+    baseDelayMs: 500,
+    maxDelayMs: 2_000,
+  });
+
+  if (!bridge.ok) {
+    const cls = bridge.failure_class ?? classifyFailure(bridge.error);
+    bridge.failure_class = cls;
+    bridge.error = `${describeFailure(cls)} [${cls}] after ${bridge.attempts ?? 1} attempt(s): ${
+      bridge.error ?? 'unknown error'
+    }`;
+  }
+  return bridge;
 }
 
 // Phase 1 "fast-path bridge" (DAR-677): JARVIS makes MCP tool calls by shelling
@@ -75,6 +106,10 @@ interface BridgeResult {
   cost_usd?: number;
   duration_ms?: number;
   error?: string;
+  // Auto-heal metadata (mcp-retry): set on the surfaced result so JARVIS can
+  // name *why* a call failed instead of calling everything a "dropped connector".
+  failure_class?: FailureClass;
+  attempts?: number;
 }
 
 function resolveToolName(server: string, tool: string): string {

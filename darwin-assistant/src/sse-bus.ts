@@ -90,6 +90,20 @@ export interface StreamEndEvent {
   conversationId: number;
 }
 
+// THINKING, streamed live (2026-10-13). Deliberately its own event rather than
+// more `stream_delta`: thinking must render in its own dim block in the
+// cockpit, must never be mixed into the composing reply, and must never end up
+// in the text persisted as a partial answer on error.
+export interface StreamThinkingEvent {
+  type: 'stream_thinking';
+  conversationId: number;
+  /** Reasoning text, when the CLI actually hands any over (codex does). */
+  delta?: string;
+  /** Cumulative reasoning-token estimate. The Claude CLI redacts the text and
+   *  gives only this, so it is the whole live thinking signal on Claude. */
+  tokens?: number;
+}
+
 export interface AutonomyLedgerEvent {
   type: 'autonomy_ledger_entry';
   entry: AutonomyLedgerRow;
@@ -429,7 +443,7 @@ export interface TopicAssignedEvent {
 
 export type SSEEvent =
   | TurnEvent | ConversationUpdatedEvent | ConversationCreatedEvent | StatusEvent
-  | StreamStartEvent | StreamDeltaEvent | StreamEndEvent
+  | StreamStartEvent | StreamDeltaEvent | StreamEndEvent | StreamThinkingEvent
   | AutonomyLedgerEvent | AutonomyLedgerReviewEvent
   | ThreadTodoEvent | ThreadLinkEvent | JarvisDecisionEvent
   | ConversationRenamedEvent | ConversationDeletedEvent
@@ -470,7 +484,7 @@ export type SSEEvent =
 export const GLOBAL_STREAM_EVENT_TYPES = [
   'turn', 'conversation_created', 'conversation_updated',
   'conversation_renamed', 'conversation_deleted', 'status',
-  'stream_start', 'stream_delta', 'stream_end',
+  'stream_start', 'stream_delta', 'stream_end', 'stream_thinking',
   'note', 'quick_capture', 'notification',
   'thread_todo', 'thread_link', 'thread_reminder', 'thread_summary',
   'thread_group', 'queued_message',

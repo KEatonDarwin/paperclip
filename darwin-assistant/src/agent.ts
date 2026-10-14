@@ -27,7 +27,8 @@ import {
 } from './conversation-db.js';
 import { selectActiveClaudeAccount, claudeFiveHourCeiling, listClaudeAccounts, decideClaudeAccountForTurn, focusedClaudeAccount, type ClaudeAccount } from './claude-accounts.js';
 import { noteWorkerSpawnAccount } from './throttle.js';
-import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent, type StreamEndEvent, type ToolCallEvent } from './sse-bus.js';
+import { sseBus, type StatusEvent, type StreamStartEvent, type StreamDeltaEvent, type StreamEndEvent, type StreamThinkingEvent, type ToolCallEvent } from './sse-bus.js';
+import { createStreamAccumulator } from './live-stream.js';
 import { buildGroupChatContext } from './group-chat-context.js';
 import { buildQuickChatContext } from './quick-chat-profiles.js';
 import { buildWorkbenchThreadContext } from './workbench.js';
@@ -37,6 +38,7 @@ import { buildMikeThreadContext } from './mike-radar-chat.js';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getOrCreateInternalMcpKey } from './api-keys.js';
+import { autocompactPctFor, memoryRefreshForResume } from './token-diet.js';
 import { refuseModelTurnInScratch } from './sim-guard.js';
 import { isAutomatedTurn, acquireAutomatedSlot, releaseAutomatedSlot } from './turn-admission.js';
 import { consumeWorkBoardWatch } from './work-board.js';
@@ -292,6 +294,14 @@ const ADAPTERS: Record<string, AdapterConfig> = {
     },
     buildArgs({ sessionId, model, options, imageDirs }) {
       const args = ['--print', '-', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
+      // LIVE STREAMING (2026-10-13, Kevin: "it starts to show it's thinking and
+      // then doesn't"). Without this the CLI emits only COMPLETE assistant
+      // messages, so the cockpit sat frozen for minutes and then dumped a whole
+      // paragraph at once — and no thinking signal arrived at all. With it we
+      // get content_block_deltas (reply text token-by-token) plus thinking_delta
+      // token estimates. The extra lines are dropped before the turn's raw
+      // output is persisted (see parseClaudeOutput) so this costs no storage.
+      args.push('--include-partial-messages');
       if (model) args.push('--model', model);
       if (sessionId) args.push('--resume', sessionId);
       // Prefer the unified `reasoning_effort` key; fall back to the legacy
@@ -610,6 +620,24 @@ export function getLiveStream(conversationId: number): string | null {
   return s && s.length ? s : null;
 }
 
+// Same idea for the THINKING stream (2026-10-13), kept in its own map so a
+// refresh mid-turn restores the thinking block too, and so thinking can never
+// be mistaken for the reply text that gets persisted on an interrupted turn.
+const liveThinking = new Map<number, string>();
+export function getLiveThinking(conversationId: number): string | null {
+  const s = liveThinking.get(conversationId);
+  return s && s.length ? s : null;
+}
+
+// The Claude CLI redacts reasoning TEXT and emits only a cumulative token
+// estimate (see src/live-stream.ts), so on Claude this count — not the map
+// above — is the live "it is thinking" signal a refresh has to restore.
+const liveThinkingTokens = new Map<number, number>();
+export function getLiveThinkingTokens(conversationId: number): number | null {
+  const n = liveThinkingTokens.get(conversationId);
+  return typeof n === 'number' && n > 0 ? n : null;
+}
+
 // Whether a turn is currently running on a specific conversation.
 export function isConversationActive(conversationId: number): boolean {
   return activeRuns.has(conversationId);
@@ -925,12 +953,23 @@ function parseClaudeOutput(stdout: string): ClaudeResult {
   let sessionId: string | null = null;
   let usage: ClaudeUsage | undefined;
   let model: string | undefined;
+  // --include-partial-messages makes the CLI emit one `stream_event` line per
+  // token on top of the complete messages, which would bloat the persisted
+  // per-turn raw output ~13x for zero gain (turn-steps.ts only reads the
+  // complete `assistant` messages). Keep the structural lines, drop the deltas.
+  const kept: string[] = [];
+  const keep = (line: string, event: Record<string, unknown> | null) => {
+    if (event && event.type === 'stream_event') return;
+    kept.push(line);
+  };
+  const raw = () => kept.join('\n');
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
     let event: Record<string, unknown>;
-    try { event = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+    try { event = JSON.parse(line) as Record<string, unknown>; } catch { keep(line, null); continue; }
+    keep(line, event);
 
     if (typeof event.session_id === 'string' && event.session_id) {
       sessionId = event.session_id;
@@ -973,11 +1012,11 @@ function parseClaudeOutput(stdout: string): ClaudeResult {
         };
       }
       const r = typeof event.result === 'string' ? event.result.trim() : '';
-      return { text: r || texts.join('').trim(), sessionId, usage, model, rawOutput: stdout };
+      return { text: r || texts.join('').trim(), sessionId, usage, model, rawOutput: raw() };
     }
   }
 
-  return { text: texts.join('').trim() || stdout.trim(), sessionId, usage, model, rawOutput: stdout };
+  return { text: texts.join('').trim() || raw().trim(), sessionId, usage, model, rawOutput: raw() };
 }
 
 function parseCodexOutput(stdout: string): ClaudeResult {
@@ -1110,6 +1149,11 @@ export async function runClaude(
   const options = runtime?.options ?? getActiveOptions();
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
   adapter.envOverrides?.(env);
+  // Token diet (2026-10-13): summarize long 1M-window sessions at ~250K instead of ~970K. See token-diet.ts.
+  if (adapter.id === 'claude' && !env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE) {
+    const pct = autocompactPctFor(model);
+    if (pct !== null) env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = String(pct);
+  }
 
   // Multi-Claude (tree-44d2ff4a): route this claude run to its active account by
   // pointing CLAUDE_CONFIG_DIR at that account's isolated login (own OAuth token /
@@ -1422,7 +1466,7 @@ async function processMessageInner(
     return await runConversationTurn(conv, input, abort.signal, images, opts?.resumeLastUserTurn === true);
   } finally {
     activeRuns.delete(conv.id);
-    liveStreams.delete(conv.id);
+    liveStreams.delete(conv.id); liveThinking.delete(conv.id); liveThinkingTokens.delete(conv.id);
     sseBus.emit('sse', {
       type: 'status',
       running: false,
@@ -1671,7 +1715,7 @@ async function runConversationTurn(
   // instead of the full memory on every prompt path.
   const memoryProfile = memoryProfileForThread(conv.external_id);
   let stdinContent = perTurnContextPrefix + (sessionId
-    ? `<memory_refresh>\n${loadMemoryBlock(resumeMemoryMaxChars, memoryProfile)}\n</memory_refresh>\n\n${modelInput}`
+    ? `${memoryRefreshForResume(conv.id, sessionId, loadMemoryBlock(resumeMemoryMaxChars, memoryProfile))}\n\n${modelInput}`
     : (turns.length > 1 ? buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { memoryProfile }) : buildInitialPrompt(modelInput, memoryProfile)));
 
   // DAR-756: only one aggressive-compaction retry per turn — if the destination
@@ -1685,32 +1729,27 @@ async function runConversationTurn(
   let accountSwapRetried = false;
 
   for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
-    let accumulatedText = '';
-    liveStreams.delete(conv.id); // reset the cross-browser buffer each tool-turn
+    // LIVE STREAM (rebuilt 2026-10-13 — see src/live-stream.ts for the bug this
+    // replaced: one turn-wide accumulator was being diffed against per-message
+    // snapshots, which silently froze the stream on a shorter message and ate
+    // the first N characters of a longer one). All the ordering logic lives in
+    // the accumulator so it can be tested without a model: scripts/live-stream-test.mjs.
+    const stream = createStreamAccumulator();
+    liveStreams.delete(conv.id); liveThinking.delete(conv.id); liveThinkingTokens.delete(conv.id); // reset the cross-browser buffer each tool-turn
     const onStreamEvent = (event: Record<string, unknown>) => {
-      if (event.type === 'content_block_delta') {
-        const delta = event.delta as Record<string, unknown> | undefined;
-        if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
-          sseBus.emit('sse', { type: 'stream_delta', conversationId: conv.id, delta: delta.text } satisfies StreamDeltaEvent);
-          accumulatedText += delta.text;
-          liveStreams.set(conv.id, accumulatedText);
-          return;
+      for (const emit of stream.handle(event)) {
+        if (emit.kind === 'thinking_progress') {
+          sseBus.emit('sse', { type: 'stream_thinking', conversationId: conv.id, tokens: emit.tokens } satisfies StreamThinkingEvent);
+          liveThinkingTokens.set(conv.id, emit.tokens);
+          continue;
         }
-      }
-      if (event.type === 'assistant') {
-        const content = (event.message as Record<string, unknown> | null)?.content;
-        if (Array.isArray(content)) {
-          let fullText = '';
-          for (const block of content) {
-            const b = block as Record<string, unknown>;
-            if (b.type === 'text' && typeof b.text === 'string') fullText += b.text;
-          }
-          if (fullText.length > accumulatedText.length) {
-            sseBus.emit('sse', { type: 'stream_delta', conversationId: conv.id, delta: fullText.slice(accumulatedText.length) } satisfies StreamDeltaEvent);
-            accumulatedText = fullText;
-            liveStreams.set(conv.id, accumulatedText);
-          }
+        if (emit.kind === 'thinking') {
+          sseBus.emit('sse', { type: 'stream_thinking', conversationId: conv.id, delta: emit.delta } satisfies StreamThinkingEvent);
+          liveThinking.set(conv.id, stream.thinking);
+          continue;
         }
+        sseBus.emit('sse', { type: 'stream_delta', conversationId: conv.id, delta: emit.delta } satisfies StreamDeltaEvent);
+        liveStreams.set(conv.id, stream.text);
       }
     };
 
@@ -1726,7 +1765,7 @@ async function runConversationTurn(
         console.log(`[agent] Session ${sessionId} expired, starting fresh`);
         sessionId = null;
         stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model);
-        accumulatedText = '';
+        stream.reset();
         sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
         result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext);
         sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
@@ -1745,7 +1784,7 @@ async function runConversationTurn(
         console.log(`[agent] Conversation ${conv.id} overflowed ${adapter.id}'s context window; retrying with an aggressively compacted continuation prompt`);
         sessionId = null;
         stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { aggressive: true });
-        accumulatedText = '';
+        stream.reset();
         try {
           sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
           result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext);
@@ -1809,7 +1848,7 @@ async function runConversationTurn(
           runClaudeRuntime.claudeAccount = rescueAccount;
           sessionId = null;
           stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model);
-          accumulatedText = '';
+          stream.reset();
           try {
             sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
             result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext);
@@ -1818,8 +1857,8 @@ async function runConversationTurn(
             // The rescue account also walled/failed → all headroom exhausted →
             // finish/hold as today (node fails; the model-tier ladder runs next).
             sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
-            const partial = accumulatedText.trim()
-              ? `${accumulatedText}\n\n${INTERRUPTED_SUFFIX}`
+            const partial = stream.text.trim()
+              ? `${stream.text}\n\n${INTERRUPTED_SUFFIX}`
               : INTERRUPTED_MARKER;
             const rescueDetail = (rescueErr instanceof Error
               ? `${rescueErr.message}\n\n${rescueErr.stack ?? ''}`
@@ -1835,8 +1874,8 @@ async function runConversationTurn(
         } else {
           // No other account has headroom → all Claude accounts exhausted →
           // persist the partial and rethrow exactly like the default error path.
-          const partial = accumulatedText.trim()
-            ? `${accumulatedText}\n\n${INTERRUPTED_SUFFIX}`
+          const partial = stream.text.trim()
+            ? `${stream.text}\n\n${INTERRUPTED_SUFFIX}`
             : INTERRUPTED_MARKER;
           const errorDetail = (err instanceof Error
             ? `${err.message}\n\n${err.stack ?? ''}`
@@ -1854,8 +1893,8 @@ async function runConversationTurn(
         // whatever streamed so far as the assistant reply (marked interrupted when
         // empty) and stop the stream, then rethrow so the ingress layer records the
         // error state instead of leaving the thread stuck "thinking".
-        const partial = accumulatedText.trim()
-          ? `${accumulatedText}\n\n${INTERRUPTED_SUFFIX}`
+        const partial = stream.text.trim()
+          ? `${stream.text}\n\n${INTERRUPTED_SUFFIX}`
           : INTERRUPTED_MARKER;
         // Capture the raw error so the cockpit can expose it behind "Details"
         // instead of hiding it behind the clean interrupted sentence.
@@ -1899,7 +1938,7 @@ async function runConversationTurn(
     // streamed text so the reply is persisted instead of a blank turn.
     const persistedText = (result.text && result.text.trim())
       ? result.text
-      : accumulatedText;
+      : stream.text;
 
     const toolCall = parseToolCall(persistedText);
 

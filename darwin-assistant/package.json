@@ -19,6 +19,7 @@
     "claude-ratelimit-rescue:test": "JARVIS_DB_PATH=/tmp/claude-ratelimit-rescue-test.db node scripts/claude-ratelimit-rescue-test.mjs",
     "claude-account-pin:test": "npm run build && JARVIS_DB_PATH=/tmp/claude-account-pin-test.db node scripts/claude-account-pin-test.mjs",
     "thread-search:check": "npm run build && JARVIS_SIM=1 node scripts/thread-search-check.mjs",
+    "live-stream:test": "npm run build && node scripts/live-stream-test.mjs",
     "reply-brevity:test": "npm run build && JARVIS_DB_PATH=/tmp/reply-brevity-test.db node scripts/reply-brevity-test.mjs",
     "claude-account-pin:sim": "npm run build && JARVIS_DB_PATH=/tmp/claude-account-pin-sim.db node scripts/claude-account-pin-sim.mjs",
     "claude-accounts-route:test": "JARVIS_DB_PATH=/tmp/claude-accounts-route-test.db node scripts/claude-accounts-route-test.mjs",

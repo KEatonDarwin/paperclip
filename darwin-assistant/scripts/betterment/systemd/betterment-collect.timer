@@ -1,0 +1,11 @@
+# TEMPLATE ONLY — not installed. See betterment-collect.service for the install steps.
+[Unit]
+Description=Run the JARVIS betterment collector daily at 04:40
+
+[Timer]
+OnCalendar=*-*-* 04:40:00
+Persistent=true
+Unit=betterment-collect.service
+
+[Install]
+WantedBy=timers.target

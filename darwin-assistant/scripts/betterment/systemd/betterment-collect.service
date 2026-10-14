@@ -1,0 +1,19 @@
+# TEMPLATE ONLY — not installed. To install (after review/deploy of this branch to the live checkout):
+#   (1) merge+deploy this branch so scripts/betterment/ exists in /home/kevin/paperclip/darwin-assistant
+#   sudo cp betterment-collect.service betterment-collect.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now betterment-collect.timer
+#   systemctl list-timers betterment-collect.timer   # verify next run 04:40
+[Unit]
+Description=JARVIS betterment lane — nightly model-free metrics collect + before/after report
+After=network.target
+
+[Service]
+Type=oneshot
+User=kevin
+WorkingDirectory=/home/kevin/paperclip/darwin-assistant
+Environment=BETTERMENT_DIR=/home/kevin/jarvis-betterment
+# collect opens jarvis.db read-only; both scripts write only to $BETTERMENT_DIR.
+ExecStart=/usr/bin/node scripts/betterment/collect.mjs --days 30
+ExecStart=/usr/bin/node scripts/betterment/report.mjs
+Nice=10

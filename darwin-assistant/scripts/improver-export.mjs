@@ -49,6 +49,7 @@ const HEALTHY_WATCH_STATES = ['ok', 'flowing', 'active', 'resolved', 'recovered'
 
 /** Key-shaped base64/alnum run: 20+ chars with digits and either mixed case or no separators. */
 function looksLikeKey(run) {
+  if (/^[0-9a-fA-F]+$/.test(run)) return false; // pure hex is the hex rule's job (incl. its kept-SHA exemption)
   const digits = (run.match(/\d/g) || []).length;
   if (digits < 3 || !/[A-Za-z]/.test(run)) return false;
   return (/[A-Z]/.test(run) && /[a-z]/.test(run)) || !/[-_]/.test(run);
@@ -58,13 +59,24 @@ function looksLikeKey(run) {
 export function scrub(input, max = MAX_EXCERPT) {
   if (input === null || input === undefined) return null;
   let s = String(input).slice(0, max * 10);
-  // URL userinfo: scheme://user:pass@host
-  s = s.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s\/:@]+:[^\s@\/]+@/gi, '$1[REDACTED_CREDS]@');
+  // PEM private-key blocks (whole block, even if the END marker was truncated off)
+  s = s.replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g, '[REDACTED_PEM]');
+  // URL userinfo: scheme://userinfo@host — greedy to the LAST @ before whitespace, so
+  // passwords containing '@' or '/' are fully covered (redis://u:p@ss@host, mongodb+srv://u:a/b@host)
+  s = s.replace(/([a-z][a-z0-9+.-]*:\/\/)\S+@/gi, '$1[REDACTED_CREDS]@');
+  // JWTs: three dot-separated base64url segments starting eyJ — no length floor (short/dev JWTs leak too)
+  s = s.replace(/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, '[REDACTED_JWT]');
+  // AWS key ids: fixed 4-char prefix + 16 of [A-Z0-9] (often <3 digits, so the generic rules miss them)
+  s = s.replace(/\b(?:AKIA|ASIA|AIDA|AROA|AGPA)[A-Z0-9]{16}\b/g, '[REDACTED_AWS_KEY]');
+  // AWS-style 40-char secrets: exactly 40 of base64-ish incl. '/', mixed case + a digit
+  s = s.replace(/(?<![A-Za-z0-9+\/=])[A-Za-z0-9+\/]{40}(?![A-Za-z0-9+\/=])/g, (m) =>
+    (/[A-Z]/.test(m) && /[a-z]/.test(m) && /\d/.test(m) ? '[REDACTED_KEY40]' : m));
   // Provider token shapes (OpenAI/Anthropic sk-, GitHub gho_/ghp_, Slack xox*, JWTs)
   s = s.replace(/\b(sk|gho|ghp|xoxb|xoxp|eyJ[A-Za-z0-9_-]{20,})[A-Za-z0-9_\-\.]{8,}/g, '[REDACTED_TOKEN]');
   // Authorization schemes
   s = s.replace(/\bBearer\s+[^\s"',;]+/gi, 'Bearer [REDACTED]');
   s = s.replace(/\bBasic\s+[A-Za-z0-9+\/]{8,}={0,2}/g, 'Basic [REDACTED]');
+  s = s.replace(/\bJWT\s+[A-Za-z0-9_\-\.]{8,}/g, 'JWT [REDACTED]');
   // NAME=value / "name": "value" where the name smells like a credential
   s = s.replace(
     /[A-Za-z0-9_.\-]*(?:pass(?:word|wd)?|pwd|secret|token|api[_-]?key|private[_-]?key|access[_-]?key|key)["']?\s*[:=]\s*("[^"]*"|'[^']*'|[^\s,;&]+)/gi,
@@ -75,10 +87,12 @@ export function scrub(input, max = MAX_EXCERPT) {
   // Emails except our own domain
   s = s.replace(/[A-Za-z0-9._%+\-]+@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})/g, (m, dom) =>
     /(^|\.)darwininvestornetwork\.com$/i.test(dom) ? m : '[REDACTED_EMAIL]');
-  // Long hex runs (keys, hashes, session ids)
-  s = s.replace(/\b[0-9a-fA-F]{20,}\b/g, '[REDACTED_HEX]');
-  // Key-shaped base64 runs
-  s = s.replace(/[A-Za-z0-9+_\-]{20,}={0,2}/g, (m) => (looksLikeKey(m) ? '[REDACTED_B64]' : m));
+  // Long hex runs (keys, hashes, session ids) — but keep a 40-hex git SHA when the
+  // surrounding text says that's what it is (useful signal for the improver's miner)
+  s = s.replace(/\b[0-9a-fA-F]{20,}\b/g, (m, off, str) =>
+    (m.length === 40 && /(?:commit|sha1?|rev(?:ision)?)[\s:=#'"-]*$/i.test(str.slice(Math.max(0, off - 16), off)) ? m : '[REDACTED_HEX]'));
+  // Key-shaped base64 runs (incl. '/' so slash-bearing secrets don't split under the 20-char floor)
+  s = s.replace(/[A-Za-z0-9+\/_\-]{20,}={0,2}/g, (m) => (looksLikeKey(m) ? '[REDACTED_B64]' : m));
   return s.length > max ? s.slice(0, max) : s;
 }
 
@@ -259,6 +273,7 @@ function main() {
   if (!existsSync(args.db)) { console.error(`improver-export: --db file not found: ${args.db}`); process.exit(2); }
   if (!args.out) { console.error(`improver-export: --out is required\n${USAGE}`); process.exit(2); }
   if (!(args.days > 0)) { console.error('improver-export: --days must be a positive number'); process.exit(2); }
+  if (resolve(args.out) === resolve(args.db)) { console.error('improver-export: --out must not be the --db file'); process.exit(2); }
 
   const repo = args.repo ?? resolve(dirname(fileURLToPath(import.meta.url)), '..');
   const db = new Database(args.db, { readonly: true, fileMustExist: true });

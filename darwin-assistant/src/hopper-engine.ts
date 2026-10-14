@@ -134,6 +134,8 @@ export interface HopperNodeRow {
    *  result-summary.ts. Null until generation completes (or forever, on failure) —
    *  the cockpit falls back to showing `result` raw when this is null. */
   result_summary: string | null;
+  /** Harness spine S2: the command/check the worker says proved its finish (optional, unenforced). */
+  done_evidence: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -290,6 +292,11 @@ for (const col of [
   // Readable-node-results (tree-bf5f54d9): layman summary of `result`, generated
   // fire-and-forget at finish time. Null on every existing row until backfilled.
   'result_summary TEXT',
+  // Harness spine S2 (2026-10-13 review §3): what command/check PROVED the finish
+  // ("npx tsc --noEmit clean; npm run x:test 12/12"). Optional on the finish
+  // payload, stored + surfaced only — nothing enforces it yet. Null on every
+  // legacy row and on any finish that omits it.
+  'done_evidence TEXT',
 ]) {
   try {
     sqliteDb.exec(`ALTER TABLE hopper_nodes ADD COLUMN ${col}`);
@@ -726,14 +733,14 @@ function depsSatisfied(node: HopperNodeRow): boolean {
   }
 }
 
-function depResults(node: HopperNodeRow): Array<{ title: string; result: string }> {
+function depResults(node: HopperNodeRow): Array<{ title: string; result: string; evidence: string | null }> {
   if (!node.depends_on) return [];
   try {
     const deps = JSON.parse(node.depends_on) as number[];
     return deps
       .map((d) => getNodeStmt.get(d))
       .filter((d): d is HopperNodeRow => !!d && !!d.result)
-      .map((d) => ({ title: d.title, result: d.result! }));
+      .map((d) => ({ title: d.title, result: d.result!, evidence: d.done_evidence ?? null }));
   } catch {
     return [];
   }
@@ -772,7 +779,10 @@ export function composeWorkerPrompt(node: HopperNodeRow, tree: HopperTreeRow): s
   if (node.answer) lines.push('', `**Kevin answered a previous blocking question on this task:**`, `Q: ${node.question ?? '(see spec)'}`, `A: ${node.answer}`);
   if (deps.length) {
     lines.push('', '**Results from tasks this one depends on:**');
-    for (const d of deps) lines.push(`- ${d.title}: ${d.result.slice(0, 1500)}`);
+    for (const d of deps) {
+      lines.push(`- ${d.title}: ${d.result.slice(0, 1500)}`);
+      if (d.evidence) lines.push(`  (evidence: ${d.evidence.slice(0, 500)})`);
+    }
   }
   lines.push(
     '',
@@ -786,7 +796,7 @@ export function composeWorkerPrompt(node: HopperNodeRow, tree: HopperTreeRow): s
     'If the finish curl fails, retry the same exact curl up to three times with a few seconds between attempts. If it still fails, print the exact JSON payload as your final assistant message so the reconciler can recover it. Never invent a successful finish: either the POST succeeds or the payload is visible for recovery.',
     '',
     'Pick ONE payload:',
-    `- Task complete → {"outcome":"done","result":"<what you did + artifacts/paths/commits, concise but complete — dependents read this>"}`,
+    `- Task complete → {"outcome":"done","result":"<what you did + artifacts/paths/commits, concise but complete — dependents read this>","evidence":"<optional: the command/check that proved it, e.g. npx tsc --noEmit clean; npm run x:test 12/12>"}`,
     `- Task too big for one worker → {"outcome":"split","children":[{"title":"...","spec":"...","depends_on_prev":false}, ...]} — make NO changes yourself; you exited as a planner. Set depends_on_prev true on a child that must wait for the one before it.`,
     `- You need ONE decision only Kevin can make → {"outcome":"blocked_question","question":"<the single question, with enough context to answer cold>"} — then stop; a fresh worker resumes with his answer.`,
     `- Genuinely stuck (missing access, broken dependency) → {"outcome":"blocked","result":"<why, precisely>"}`,
@@ -1429,11 +1439,16 @@ async function generateAndStoreResultSummary(id: number, title: string, outcome:
 export function finishHopperNode(
   id: number,
   outcome: 'done' | 'split' | 'blocked_question' | 'blocked',
-  payload: { result?: string; question?: string; children?: Array<{ title: string; spec?: string; depends_on_prev?: boolean }> },
+  payload: { result?: string; question?: string; evidence?: string; children?: Array<{ title: string; spec?: string; depends_on_prev?: boolean }> },
 ): HopperNodeRow | null {
   const node = getNodeStmt.get(id);
   if (!node || node.status !== 'running') return node ?? null;
   const tree = getHopperTree(node.tree_id);
+  // Harness spine S2: done-evidence is storage + surfacing only (no enforcement).
+  // Written for any outcome that carries it; an omitted field leaves the column
+  // untouched so a legacy finish is byte-identical.
+  const evidence = typeof payload.evidence === 'string' ? payload.evidence.trim().slice(0, 4000) : '';
+  if (evidence) setNode(id, { done_evidence: evidence });
 
   if (outcome === 'done') {
     // PARALLEL-CONTRACT §3.5 — on an INTEGRATION tree, `done` is only half of it:

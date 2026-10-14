@@ -4582,6 +4582,8 @@ export function createApiV1Router(): Router {
     }
     const body = (req.body ?? {}) as {
       outcome?: unknown; result?: unknown; question?: unknown; worker_thread_ext?: unknown;
+      // Optional (harness spine S2): what command/check proved it. Stored, not enforced.
+      evidence?: unknown;
       children?: Array<{ title: string; spec?: string; depends_on_prev?: boolean }>;
     };
     // Optional attempt pin (governor-v2): a caller that knows which worker
@@ -4613,6 +4615,7 @@ export function createApiV1Router(): Router {
     const updated = finishHopperNode(id, outcome, {
       result: typeof body.result === 'string' ? body.result : undefined,
       question: typeof body.question === 'string' ? body.question : undefined,
+      evidence: typeof body.evidence === 'string' ? body.evidence : undefined,
       children: body.children,
     });
     res.json({ node: updated });

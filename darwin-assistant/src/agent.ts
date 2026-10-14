@@ -44,6 +44,21 @@ import { isAutomatedTurn, acquireAutomatedSlot, releaseAutomatedSlot } from './t
 import { consumeWorkBoardWatch } from './work-board.js';
 import { createNotification } from './notifications.js';
 import type { SavedImage } from './image-store.js';
+import {
+  LineSplitter,
+  StderrTail,
+  parseJsonLine,
+  classifyChildOutcome,
+  killProcessGroup,
+  hasExited,
+  tolerateStdinErrors,
+  createClaudeAccumulator,
+  createCodexAccumulator,
+  createTextAccumulator,
+  type OutputAccumulator,
+  type ClaudeResult,
+} from './child-run.js';
+export type { ClaudeResult, ClaudeUsage } from './child-run.js';
 
 const MAX_TOOL_TURNS = 50;
 
@@ -118,24 +133,32 @@ const BUFFERED_RUN_TIMEOUT_MS = (() => {
   const raw = Number(process.env.JARVIS_BUFFERED_RUN_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : 90 * 60 * 1000; // 90 min
 })();
-// Grace period between SIGTERM and SIGKILL when force-killing a subprocess.
-const CHILD_KILL_GRACE_MS = 5_000;
-
 // Live model subprocesses, tracked so a service shutdown (SIGTERM/SIGINT) can tear
 // them down deterministically instead of orphaning them mid-run.
 const activeChildren = new Set<ChildProcess>();
+let pendingKills: Promise<void>[] = [];
 
-/** Kill a subprocess: SIGTERM, then SIGKILL after a grace period if still alive. */
+/**
+ * Kill a subprocess AND its descendants (harness spine S2): children are spawned
+ * detached (own process group), so SIGTERM goes to the whole group, we await the
+ * real 'exit' (child.killed only means a signal was sent), then SIGKILL the group
+ * after CHILD_KILL_GRACE_MS. MCP servers / shells the CLI spawned no longer leak.
+ */
 function killChild(child: ChildProcess): void {
-  try {
-    child.kill('SIGTERM');
-  } catch {}
-  const grace = setTimeout(() => {
-    try {
-      if (!child.killed) child.kill('SIGKILL');
-    } catch {}
-  }, CHILD_KILL_GRACE_MS);
-  grace.unref?.();
+  if (hasExited(child)) return;
+  const p = killProcessGroup(child).catch(() => {});
+  pendingKills.push(p);
+  void p.finally(() => { pendingKills = pendingKills.filter((x) => x !== p); });
+}
+
+/**
+ * Resolves once every kill started by killChild/shutdownActiveRuns has reaped its
+ * group. The service shutdown path deliberately does NOT wait on this (it exits
+ * right after the synchronous group SIGTERM; systemd's cgroup kill is the
+ * backstop) — it exists for tests and callers that need the reap confirmed.
+ */
+export function activeRunsDrained(): Promise<void> {
+  return Promise.all(pendingKills).then(() => undefined);
 }
 
 /**
@@ -238,8 +261,10 @@ export interface AdapterConfig {
   // resume instead of transcript replay). Claude/Codex (id in stdout) leave unset.
   captureSessionFromExport?: boolean;
   envOverrides?: (env: Record<string, string>) => void;
-  // Optional adapter-specific stdout parser. Defaults to the claude JSONL parser.
-  parseOutput?: (stdout: string) => ClaudeResult;
+  // Optional adapter-specific stdout accumulator (fed one already-parsed line at a
+  // time; decides what is retained and whether a final result was seen — see
+  // child-run.ts). Defaults to the claude stream-json accumulator.
+  createOutputParser?: () => OutputAccumulator;
   // Optional per-line event mapper to translate adapter-native JSONL into claude-shaped
   // events for the SSE stream. Return null to drop an event from the stream.
   mapStreamEvent?: (event: Record<string, unknown>) => Record<string, unknown> | null;
@@ -372,7 +397,7 @@ const ADAPTERS: Record<string, AdapterConfig> = {
       args.push('-');
       return args;
     },
-    parseOutput: parseCodexOutput,
+    createOutputParser: () => createCodexAccumulator(),
     mapStreamEvent: codexMapStreamEvent,
     unknownSessionPattern: /(session|thread)[^\n]*not found|no such (session|thread)|unknown (session|thread)/i,
   },
@@ -416,6 +441,9 @@ const ADAPTERS: Record<string, AdapterConfig> = {
     // --output-format json prints one blob at the end, so nothing re-arms the idle
     // watchdog while auggie works.
     idleTimeoutMs: BUFFERED_RUN_TIMEOUT_MS,
+    // Claude-shaped JSON when it parses; otherwise the plain text IS the answer, so
+    // non-JSON lines are retained in full and the exit code alone decides.
+    createOutputParser: () => createClaudeAccumulator({ requiresFinal: false, nonJson: 'all' }),
   },
   devin: {
     id: 'devin',
@@ -468,7 +496,7 @@ const ADAPTERS: Record<string, AdapterConfig> = {
     unknownSessionPattern: /No session found matching/i,
     // Devin --print emits the final answer as plain text; the session id comes
     // from the export file (captureSessionFromExport), not stdout.
-    parseOutput: (stdout: string): ClaudeResult => ({ text: stdout.trim(), sessionId: null }),
+    createOutputParser: () => createTextAccumulator((stdout: string): ClaudeResult => ({ text: stdout.trim(), sessionId: null })),
     envOverrides(env) { delete env['ANTHROPIC_API_KEY']; delete env['OPENAI_API_KEY']; },
     // Same buffered-output situation as auggie.
     idleTimeoutMs: BUFFERED_RUN_TIMEOUT_MS,
@@ -930,152 +958,6 @@ export function buildContinuationPrompt(
   ].join('\n\n');
 }
 
-interface ClaudeUsage {
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens?: number;
-  cacheWriteTokens?: number;
-}
-
-export interface ClaudeResult {
-  text: string;
-  sessionId: string | null;
-  usage?: ClaudeUsage;
-  model?: string;
-  rawOutput?: string;
-  // Multi-Claude (tree-44d2ff4a): which Claude account this run was routed to
-  // (the `claude_accounts` key, e.g. 'a'/'b'), or null for non-Claude runs / when
-  // no account could be resolved. Lets the caller persist session_account and lets
-  // the monitor see which subscription the work burned.
-  accountKey?: string | null;
-}
-
-function parseClaudeOutput(stdout: string): ClaudeResult {
-  const texts: string[] = [];
-  let sessionId: string | null = null;
-  let usage: ClaudeUsage | undefined;
-  let model: string | undefined;
-  // --include-partial-messages makes the CLI emit one `stream_event` line per
-  // token on top of the complete messages, which would bloat the persisted
-  // per-turn raw output ~13x for zero gain (turn-steps.ts only reads the
-  // complete `assistant` messages). Keep the structural lines, drop the deltas.
-  const kept: string[] = [];
-  const keep = (line: string, event: Record<string, unknown> | null) => {
-    if (event && event.type === 'stream_event') return;
-    kept.push(line);
-  };
-  const raw = () => kept.join('\n');
-
-  for (const rawLine of stdout.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    let event: Record<string, unknown>;
-    try { event = JSON.parse(line) as Record<string, unknown>; } catch { keep(line, null); continue; }
-    keep(line, event);
-
-    if (typeof event.session_id === 'string' && event.session_id) {
-      sessionId = event.session_id;
-    }
-
-    if (typeof event.model === 'string' && event.model) {
-      model = event.model;
-    }
-
-    if (event.type === 'system' && event.subtype === 'init') {
-      if (typeof event.session_id === 'string' && event.session_id) {
-        sessionId = event.session_id;
-      }
-    }
-
-    if (event.type === 'assistant') {
-      if (typeof (event as Record<string, unknown>).session_id === 'string') {
-        sessionId = (event as Record<string, unknown>).session_id as string;
-      }
-      const content = (event.message as Record<string, unknown> | null)?.content;
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          const b = block as Record<string, unknown>;
-          if (b.type === 'text' && typeof b.text === 'string') texts.push(b.text);
-        }
-      }
-    }
-
-    if (event.type === 'result') {
-      if (typeof event.session_id === 'string' && event.session_id) {
-        sessionId = event.session_id;
-      }
-      const u = event.usage as Record<string, unknown> | undefined;
-      if (u) {
-        usage = {
-          inputTokens: (typeof u.input_tokens === 'number' ? u.input_tokens : 0),
-          outputTokens: (typeof u.output_tokens === 'number' ? u.output_tokens : 0),
-          cacheReadTokens: typeof u.cache_read_input_tokens === 'number' ? u.cache_read_input_tokens : undefined,
-          cacheWriteTokens: typeof u.cache_creation_input_tokens === 'number' ? u.cache_creation_input_tokens : undefined,
-        };
-      }
-      const r = typeof event.result === 'string' ? event.result.trim() : '';
-      return { text: r || texts.join('').trim(), sessionId, usage, model, rawOutput: raw() };
-    }
-  }
-
-  return { text: texts.join('').trim() || raw().trim(), sessionId, usage, model, rawOutput: raw() };
-}
-
-function parseCodexOutput(stdout: string): ClaudeResult {
-  const messages: string[] = [];
-  let sessionId: string | null = null;
-  let usage: ClaudeUsage | undefined;
-
-  for (const rawLine of stdout.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    let event: Record<string, unknown>;
-    try { event = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
-
-    if (event.type === 'thread.started' && typeof event.thread_id === 'string' && event.thread_id) {
-      sessionId = event.thread_id;
-    }
-
-    if (event.type === 'item.completed') {
-      const item = event.item as Record<string, unknown> | undefined;
-      if (item && item.type === 'agent_message' && typeof item.text === 'string') {
-        messages.push(item.text);
-      }
-    }
-
-    if (event.type === 'turn.completed') {
-      const u = event.usage as Record<string, unknown> | undefined;
-      if (u) {
-        usage = {
-          inputTokens: typeof u.input_tokens === 'number' ? u.input_tokens : 0,
-          outputTokens: typeof u.output_tokens === 'number' ? u.output_tokens : 0,
-          cacheReadTokens: typeof u.cached_input_tokens === 'number' ? u.cached_input_tokens : undefined,
-        };
-      }
-    }
-  }
-
-  // Prefer the LAST NON-EMPTY agent_message. Codex sometimes ends a runaway
-  // turn with an empty final agent_message (text:"") — the old code then fell
-  // back to `stdout` and persisted the ENTIRE raw JSONL stream (every
-  // command_execution event, hundreds of KB) as the assistant turn content,
-  // which the markdown renderer dumped raw (CODEX RAW-JSONL PERSIST BUG,
-  // 2026-09-10, node 61). Never surface the raw stream as turn text: fall back
-  // to the last message that actually had content, then to a short stub. The
-  // full stream is still preserved in `rawOutput` for debugging.
-  let finalText = '';
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const t = messages[i]?.trim();
-    if (t) { finalText = t; break; }
-  }
-  return {
-    text: finalText || '[codex worker produced no final message]',
-    sessionId,
-    usage,
-    rawOutput: stdout,
-  };
-}
-
 // Codex's `--json` stream emits one `agent_message` per progress/final update.
 // We cannot know which one is final until the process exits, so persistence is
 // fixed in parseCodexOutput() and parseTurnSteps(). Live SSE still surfaces
@@ -1263,10 +1145,17 @@ export async function runClaude(
   }
 
   return new Promise((resolve, reject) => {
-    const child = spawn(adapter.bin, args, { env, cwd: JARVIS_CLI_CWD });
-    const outChunks: Buffer[] = [];
-    const errChunks: Buffer[] = [];
-    let lineBuffer = '';
+    // detached: the child leads its own process group, so killChild() can take
+    // down grandchildren (MCP servers, shells) with it instead of orphaning them.
+    const child = spawn(adapter.bin, args, { env, cwd: JARVIS_CLI_CWD, detached: true });
+    tolerateStdinErrors(child, adapter.id);
+    // Stream hygiene (harness spine S2): one byte-aware line splitter, each line
+    // JSON-parsed exactly once and handed to BOTH the live SSE forwarder and the
+    // output accumulator. The accumulator keeps structural events; noise goes to
+    // a byte-capped diagnostic tail. Nothing retains the raw chunk stream.
+    const splitter = new LineSplitter();
+    const output = adapter.createOutputParser ? adapter.createOutputParser() : createClaudeAccumulator();
+    const errTail = new StderrTail();
 
     // Fix C (DAR-676): track this child for shutdown teardown and cap its lifetime.
     activeChildren.add(child);
@@ -1287,6 +1176,7 @@ export async function runClaude(
     // (auggie, devin) override the budget since nothing re-arms the timer for them.
     const idleTimeoutMs = adapter.idleTimeoutMs ?? RUN_TIMEOUT_MS;
     let killTimer: ReturnType<typeof setTimeout>;
+    let exitTimer: ReturnType<typeof setTimeout> | undefined;
     const armIdleTimer = () => {
       clearTimeout(killTimer);
       killTimer = setTimeout(() => {
@@ -1298,6 +1188,7 @@ export async function runClaude(
     armIdleTimer();
     const cleanup = () => {
       clearTimeout(killTimer);
+      clearTimeout(exitTimer);
       signal?.removeEventListener('abort', onAbort);
       activeChildren.delete(child);
       if (promptFilePath) { try { unlinkSync(promptFilePath); } catch { /* noop */ } }
@@ -1305,33 +1196,46 @@ export async function runClaude(
       if (mcpConfigPath) { try { unlinkSync(mcpConfigPath); } catch { /* noop */ } }
     };
 
-    const forwardEvent = (event: Record<string, unknown>) => {
-      if (!onEvent) return;
-      const mapped = adapter.mapStreamEvent ? adapter.mapStreamEvent(event) : event;
-      if (mapped) onEvent(mapped);
+    const consumeLine = (line: string) => {
+      const event = parseJsonLine(line);
+      if (event && onEvent) {
+        const mapped = adapter.mapStreamEvent ? adapter.mapStreamEvent(event) : event;
+        if (mapped) onEvent(mapped);
+      }
+      output.line(line, event);
     };
 
     child.stdout.on('data', (chunk: Buffer) => {
-      outChunks.push(chunk);
       armIdleTimer(); // progress → not hung; reset the idle clock
-
-      if (onEvent) {
-        lineBuffer += chunk.toString('utf8');
-        const lines = lineBuffer.split('\n');
-        lineBuffer = lines.pop() ?? '';
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          try {
-            forwardEvent(JSON.parse(trimmed) as Record<string, unknown>);
-          } catch {}
-        }
-      }
+      for (const line of splitter.push(chunk)) consumeLine(line);
     });
 
-    child.stderr.on('data', (chunk: Buffer) => { errChunks.push(chunk); armIdleTimer(); });
-    child.on('error', (err) => { cleanup(); reject(err); });
-    child.on('close', (code) => {
+    child.stderr.on('data', (chunk: Buffer) => { errTail.push(chunk); armIdleTimer(); });
+
+    let settled = false;
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    });
+
+    // 'close' waits for stdio to close; a stray grandchild holding stdout open would
+    // otherwise stall the run until the idle watchdog. Once the real 'exit' lands,
+    // give the pipes a short grace and then finalize anyway.
+    child.on('exit', () => {
+      exitTimer = setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finalize(child.exitCode, child.signalCode);
+      }, 2_000);
+      exitTimer.unref?.();
+    });
+    child.on('close', (code, sig) => finalize(code, sig));
+
+    const finalize = (code: number | null, sig: NodeJS.Signals | null) => {
+      if (settled) return;
+      settled = true;
       // Read the native session id out of Devin's export file BEFORE cleanup
       // unlinks it (the id isn't in stdout for --print adapters).
       let exportSessionId: string | null = null;
@@ -1356,26 +1260,38 @@ export async function runClaude(
         return;
       }
 
-      if (onEvent && lineBuffer.trim()) {
-        try { forwardEvent(JSON.parse(lineBuffer.trim()) as Record<string, unknown>); } catch {}
-      }
+      for (const line of splitter.end()) consumeLine(line);
+      const acc = output.finish();
+      const stderr = errTail.end();
+      const firstErr = stderr.split('\n').find((l) => l.trim())?.trim() ?? null;
 
-      const stdout = Buffer.concat(outChunks).toString('utf8');
-      const stderr = Buffer.concat(errChunks).toString('utf8');
+      // Typed outcome (harness spine S2): a nonzero exit is a failure unless the
+      // CLI actually delivered its final result — stdout noise is not success.
+      const outcome = classifyChildOutcome({
+        code,
+        signal: sig,
+        final: acc.final,
+        finalError: acc.finalError,
+        requiresFinal: output.requiresFinal,
+        diagnostic: firstErr,
+        noFinalReason: acc.noFinalReason,
+      });
 
-      if ((code ?? 0) !== 0 && !stdout.trim()) {
-        const combined = stderr + '\n' + stdout;
+      if (outcome.kind === 'failure') {
+        const combined = `${stderr}\n${acc.finalError ?? ''}\n${acc.result.rawOutput ?? ''}`;
         const unknownSessionRe = adapter.unknownSessionPattern ?? UNKNOWN_SESSION_RE;
         if (sessionId && unknownSessionRe.test(combined)) {
           resolve({ text: '', sessionId: null, accountKey: activeClaudeAccountKey });
           return;
         }
-        const firstErr = stderr.split('\n').find((l) => l.trim()) ?? `exit code ${code}`;
-        reject(new Error(`${adapter.id}: ${firstErr}`));
+        reject(new Error(`${adapter.id}: ${outcome.reason}`));
         return;
       }
-      const parse = adapter.parseOutput ?? parseClaudeOutput;
-      const parsed = parse(stdout);
+      if (outcome.kind === 'success_with_warning') {
+        console.warn(`[agent] ${adapter.id}: ${outcome.warning} — keeping the delivered result`);
+      }
+
+      const parsed = acc.result;
       // Native session resume: prefer the id captured from the export file over
       // whatever the stdout parser produced (Devin's stdout has none).
       if (exportSessionId) parsed.sessionId = exportSessionId;
@@ -1383,12 +1299,18 @@ export async function runClaude(
       // persist session_account and the monitor can see it.
       parsed.accountKey = activeClaudeAccountKey;
       resolve(parsed);
-    });
+    };
 
     // promptFileArg adapters (Devin) already have the prompt on argv via a temp
     // file — don't also pipe it to stdin (Devin ignores stdin in --print mode).
-    if (!promptFilePath) child.stdin.write(input, 'utf8');
-    child.stdin.end();
+    // A child that dies before draining stdin raises EPIPE asynchronously; the
+    // 'error' handler above absorbs it and the exit outcome tells the real story.
+    try {
+      if (!promptFilePath) child.stdin.write(input, 'utf8');
+      child.stdin.end();
+    } catch (err) {
+      console.warn(`[agent] ${adapter.id}: stdin write failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   });
 }
 

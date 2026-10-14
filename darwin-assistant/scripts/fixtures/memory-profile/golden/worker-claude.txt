@@ -1,0 +1,34 @@
+=== resume (first wake) ===
+<memory_refresh>
+## Worker Rules (ephemeral worker — full JARVIS memory deliberately not loaded)
+
+# Worker Core (FIXTURE)
+
+WORKER-CORE-MARKER-c21e: ephemeral worker rules only. NO API KEYS. Finish contract applies.
+
+---
+</memory_refresh>
+=== continuation ===
+## Current Memory
+
+<memory_refresh>
+## Worker Rules (ephemeral worker — full JARVIS memory deliberately not loaded)
+
+# Worker Core (FIXTURE)
+
+WORKER-CORE-MARKER-c21e: ephemeral worker rules only. NO API KEYS. Finish contract applies.
+
+---
+</memory_refresh>
+=== recovery (aggressive) ===
+## Current Memory
+
+<memory_refresh>
+## Worker Rules (ephemeral worker — full JARVIS memory deliberately not loaded)
+
+# Worker Core (FIXTURE)
+
+WORKER-CORE-MARKER-c21e: ephemeral worker rules only. NO API KEYS. Finish contract applies.
+
+---
+</memory_refresh>

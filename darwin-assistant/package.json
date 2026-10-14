@@ -96,7 +96,8 @@
     "chat-topics:check": "npm run build && JARVIS_DB_PATH=/tmp/chat-topics-check.db node scripts/chat-topics-check.mjs",
     "chat-topics-derive:check": "npm run build && JARVIS_DB_PATH=/tmp/chat-topics-derive-check.db node scripts/chat-topics-derive-check.mjs",
     "chat-topics-overlap:route-check": "npm run build && JARVIS_DB_PATH=/tmp/chat-topics-overlap-route-check.db node scripts/chat-topics-overlap-route-check.mjs",
-    "page-companion:deploy-check": "npm run build && JARVIS_DB_PATH=/tmp/page-companion-deploy-check.db node scripts/page-companion-deploy-check.mjs"
+    "page-companion:deploy-check": "npm run build && JARVIS_DB_PATH=/tmp/page-companion-deploy-check.db node scripts/page-companion-deploy-check.mjs",
+    "memory-profile:test": "npx tsx --test scripts/memory-profile-fixtures-test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

@@ -1,0 +1,43 @@
+=== resume (first wake) ===
+<memory_refresh>
+## Your Persistent Memory (auto-loaded every message)
+_Source: <FIXTURES>/memory.md. This is injected fresh on EVERY message you receive — not just the first. The content below is always current. Treat the rules and facts here as authoritative. Use `write_memory` to update it — changes take effect on the very next message._
+
+# JARVIS memory (FIXTURE — not Kevin's real memory)
+
+PERSONAL-MEMORY-MARKER-7f3a: Kevin's private preferences, family notes and commitments live here.
+- Fixture fact one.
+- Fixture fact two.
+
+---
+</memory_refresh>
+=== continuation ===
+## Current Memory
+
+<memory_refresh>
+## Your Persistent Memory (auto-loaded every message)
+_Source: <FIXTURES>/memory.md. This is injected fresh on EVERY message you receive — not just the first. The content below is always current. Treat the rules and facts here as authoritative. Use `write_memory` to update it — changes take effect on the very next message._
+
+# JARVIS memory (FIXTURE — not Kevin's real memory)
+
+PERSONAL-MEMORY-MARKER-7f3a: Kevin's private preferences, family notes and commitments live here.
+- Fixture fact one.
+- Fixture fact two.
+
+---
+</memory_refresh>
+=== recovery (aggressive) ===
+## Current Memory
+
+<memory_refresh>
+## Your Persistent Memory (auto-loaded every message)
+_Source: <FIXTURES>/memory.md. This is injected fresh on EVERY message you receive — not just the first. The content below is always current. Treat the rules and facts here as authoritative. Use `write_memory` to update it — changes take effect on the very next message._
+
+# JARVIS memory (FIXTURE — not Kevin's real memory)
+
+PERSONAL-MEMORY-MARKER-7f3a: Kevin's private preferences, family notes and commitments live here.
+- Fixture fact one.
+- Fixture fact two.
+
+---
+</memory_refresh>

@@ -864,20 +864,22 @@ export function buildContinuationPrompt(
   userMessage: string,
   adapterId: string = 'claude',
   model: string | null = null,
-  opts?: { aggressive?: boolean; memoryProfile?: MemoryProfile },
+  // memoryProfile is REQUIRED (2026-10-13 harness review): it used to default to 'full', so the
+  // recovery/retry call sites that forgot it injected Kevin's full personal memory into worker threads.
+  opts: { aggressive?: boolean; memoryProfile: MemoryProfile },
 ): string {
   const priorTurns = turns.length && turns[turns.length - 1]?.role === 'user'
     ? turns.slice(0, -1)
     : turns;
 
-  const memoryProfile = opts?.memoryProfile ?? 'full';
+  const memoryProfile = opts.memoryProfile;
   // Memory rides in the `## Current Memory` refresh block below, not in the
   // system prompt — passing omitMemory kills the historical double injection.
   const systemPrompt = buildSystemPrompt(memoryProfile, { omitMemory: true });
   const toolsBlock = buildToolsBlock();
 
   const windowTokens = contextWindowTokensFor(adapterId, model);
-  const aggressive = opts?.aggressive ?? false;
+  const aggressive = opts.aggressive ?? false;
   const headroomTokens = aggressive ? OUTPUT_HEADROOM_TOKENS * 2 : OUTPUT_HEADROOM_TOKENS;
 
   // The memory block is the single biggest fixed cost (~44.5k tokens full-size)
@@ -1712,10 +1714,18 @@ async function runConversationTurn(
   const resumeMemoryMaxChars =
     contextWindowTokensFor(adapter.id, runtime.model) <= 128_000 ? 12_000 : undefined;
   // Memory diet (2026-09-25): ephemeral workers get worker-core.md (~5KB rules)
-  // instead of the full memory on every prompt path.
+  // instead of the full memory on every prompt path — INCLUDING the recovery
+  // paths below (session-expired, context-overflow, account-swap), which must
+  // all pass this same profile.
   const memoryProfile = memoryProfileForThread(conv.external_id);
-  let stdinContent = perTurnContextPrefix + (sessionId
-    ? `${memoryRefreshForResume(conv.id, sessionId, loadMemoryBlock(resumeMemoryMaxChars, memoryProfile))}\n\n${modelInput}`
+  // Acknowledged baseline: the dedup state only advances once the resumed turn
+  // is actually delivered (see commitMemoryBaseline below / token-diet.ts).
+  const memoryRefresh = sessionId
+    ? memoryRefreshForResume(conv.id, sessionId, loadMemoryBlock(resumeMemoryMaxChars, memoryProfile))
+    : null;
+  let commitMemoryBaseline: (() => void) | null = memoryRefresh?.commit ?? null;
+  let stdinContent = perTurnContextPrefix + (memoryRefresh
+    ? `${memoryRefresh.block}\n\n${modelInput}`
     : (turns.length > 1 ? buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { memoryProfile }) : buildInitialPrompt(modelInput, memoryProfile)));
 
   // DAR-756: only one aggressive-compaction retry per turn — if the destination
@@ -1764,13 +1774,20 @@ async function runConversationTurn(
       if (sessionId && !result.text && !result.sessionId) {
         console.log(`[agent] Session ${sessionId} expired, starting fresh`);
         sessionId = null;
-        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model);
+        commitMemoryBaseline = null; // the memory_refresh never reached a live session
+        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { memoryProfile });
         stream.reset();
         sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
         result = await runClaude(stdinContent, null, onStreamEvent, runClaudeRuntime, signal, imageDirs, imagePaths, mcpToolContext);
         sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
+      } else if (commitMemoryBaseline) {
+        // The resumed session took the turn → the memory_refresh was delivered; only now advance the baseline.
+        commitMemoryBaseline();
       }
+      commitMemoryBaseline = null;
     } catch (err) {
+      // Spawn failed: the memory_refresh was NOT delivered, so the baseline must not advance.
+      commitMemoryBaseline = null;
       sseBus.emit('sse', { type: 'stream_end', conversationId: conv.id } satisfies StreamEndEvent);
       const message = err instanceof Error ? err.message : String(err);
 
@@ -1783,7 +1800,7 @@ async function runConversationTurn(
         contextOverflowRetried = true;
         console.log(`[agent] Conversation ${conv.id} overflowed ${adapter.id}'s context window; retrying with an aggressively compacted continuation prompt`);
         sessionId = null;
-        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { aggressive: true });
+        stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { aggressive: true, memoryProfile });
         stream.reset();
         try {
           sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);
@@ -1847,7 +1864,7 @@ async function runConversationTurn(
           activeClaudeAccount = rescueAccount;
           runClaudeRuntime.claudeAccount = rescueAccount;
           sessionId = null;
-          stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model);
+          stdinContent = perTurnContextPrefix + buildContinuationPrompt(turns, modelInput, adapter.id, runtime.model, { memoryProfile });
           stream.reset();
           try {
             sseBus.emit('sse', { type: 'stream_start', conversationId: conv.id } satisfies StreamStartEvent);

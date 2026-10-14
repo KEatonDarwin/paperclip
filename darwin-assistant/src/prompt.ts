@@ -1,12 +1,16 @@
 import { readFileSync } from 'node:fs';
 
-const MEMORY_FILE = '/home/kevin/obsidian/paperclip-wiki/agent-memory/jarvis/memory.md';
+// Paths are env-overridable (read at call time) so the golden prompt fixtures in
+// scripts/memory-profile-fixtures-test.ts run against marker files, never Kevin's real memory.
+const MEMORY_FILE_DEFAULT = '/home/kevin/obsidian/paperclip-wiki/agent-memory/jarvis/memory.md';
+const memoryFile = () => process.env.JARVIS_MEMORY_FILE || MEMORY_FILE_DEFAULT;
 
 // Memory diet (Kevin, 2026-09-25): ephemeral workers get a ~5KB rules-only core
 // instead of the full chief-of-staff memory — their node spec carries the task,
 // and the full file at its worst (446KB ≈ 110K tokens) was injected into every
 // worker turn for nothing.
-const WORKER_CORE_FILE = '/home/kevin/obsidian/paperclip-wiki/agent-memory/jarvis/worker-core.md';
+const WORKER_CORE_FILE_DEFAULT = '/home/kevin/obsidian/paperclip-wiki/agent-memory/jarvis/worker-core.md';
+const workerCoreFile = () => process.env.JARVIS_WORKER_CORE_FILE || WORKER_CORE_FILE_DEFAULT;
 
 export type MemoryProfile = 'full' | 'worker';
 
@@ -29,7 +33,7 @@ export function loadMemoryBlock(maxChars?: number, profile: MemoryProfile = 'ful
   if (profile === 'worker') {
     let core: string;
     try {
-      core = readFileSync(WORKER_CORE_FILE, 'utf-8').trim();
+      core = readFileSync(workerCoreFile(), 'utf-8').trim();
     } catch {
       // Fail safe: a missing core file must never strip a worker of the rules.
       core = [
@@ -50,7 +54,7 @@ export function loadMemoryBlock(maxChars?: number, profile: MemoryProfile = 'ful
   }
   let body: string;
   try {
-    body = readFileSync(MEMORY_FILE, 'utf-8').trim();
+    body = readFileSync(memoryFile(), 'utf-8').trim();
   } catch {
     body = '_(memory file unavailable)_';
   }
@@ -60,7 +64,7 @@ export function loadMemoryBlock(maxChars?: number, profile: MemoryProfile = 'ful
   }
   return [
     '## Your Persistent Memory (auto-loaded every message)',
-    `_Source: ${MEMORY_FILE}. This is injected fresh on EVERY message you receive — not just the first. The content below is always current. Treat the rules and facts here as authoritative. Use \`write_memory\` to update it — changes take effect on the very next message._`,
+    `_Source: ${memoryFile()}. This is injected fresh on EVERY message you receive — not just the first. The content below is always current. Treat the rules and facts here as authoritative. Use \`write_memory\` to update it — changes take effect on the very next message._`,
     '',
     body,
     '',

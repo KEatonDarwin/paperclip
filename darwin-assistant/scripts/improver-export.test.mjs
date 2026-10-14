@@ -110,6 +110,27 @@ test('scrub removes password assignment, bearer token, long hex run and foreign 
     'VERDICT: PASS\nat claimNode (/home/kevin/paperclip/src/hopper-engine.ts:12:9)');
 });
 
+test('scrub blocks the adversarial shapes from the 2026-10-14 review (AKIA, AWS secret, @-in-password, short JWT, PEM)', () => {
+  const adversarial = scrub([
+    'aws_access AKIAIOSFODNN7EXAMPLE used',
+    'secret wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY end',
+    'redis://default:p@ssw0rdX@cache.local:6379',
+    'mongodb+srv://admin:ab/cdEF12@cluster0.mongodb.net/x',
+    'Authorization: JWT eyJhbGciOiJub25lIn0.eyJhIjoxfQ.c2ln',
+    '-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7x9Zq\nabcdef\n-----END RSA PRIVATE KEY-----',
+  ].join('\n'));
+  for (const s of ['AKIAIOSFODNN7EXAMPLE', 'wJalrXUtnFEMI', 'CYEXAMPLEKEY', 'ssw0rdX', 'ab/cdEF12', 'admin:', 'eyJhbGciOiJub25lIn0', 'MIIEpAIBAAKCAQEA']) {
+    assert.ok(!adversarial.includes(s), `leaked ${s}: ${adversarial}`);
+  }
+  // hosts survive so the event is still diagnosable
+  assert.match(adversarial, /cache\.local:6379/);
+  assert.match(adversarial, /cluster0\.mongodb\.net/);
+  // a labeled 40-hex git sha is kept (miner signal), an unlabeled one is not
+  const sha = 'd74fcb46e6f3a1b2c3d4e5f60718293a4b5c6d7e';
+  assert.match(scrub(`commit ${sha} built clean`), new RegExp(sha));
+  assert.doesNotMatch(scrub(`session ${sha} opened`), new RegExp(sha));
+});
+
 test('exports the fixture to the spec schema with correct kinds, window and scrubbing', () => {
   const dir = mkdtempSync(join(tmpdir(), 'improver-export-test-'));
   try {

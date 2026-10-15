@@ -31,6 +31,7 @@ import {
   renameConversation,
   setThreadModelOverride,
   setThreadClaudeAccount,
+  getSetting,
 } from '../conversation-db.js';
 import { findClaudeAccount, listClaudeAccounts } from '../claude-accounts.js';
 
@@ -107,7 +108,26 @@ function S(): ReturnType<typeof makeStatements> {
   return (stmtCache ??= makeStatements());
 }
 
-export const SPAWN_LIMIT_PER_HOUR = 5;
+// ─── The per-hour spawn cap: a LIVE dial ─────────────────────────────────────
+// Read from the settings KV on every spawn, so Kevin can change it with
+// setSetting / the settings table and it takes effect on the very next call —
+// no rebuild, no restart. Unset / non-numeric falls back to the default rather
+// than to 0 (a parse slip must never silently stop Alpha delegating).
+
+export const SPAWN_LIMIT_SETTING_KEY = 'spawn_chat_limit_per_hour';
+export const SPAWN_LIMIT_DEFAULT = 30;
+export const SPAWN_LIMIT_MIN = 1;
+export const SPAWN_LIMIT_MAX = 100;
+
+export function spawnLimitPerHour(): number {
+  const raw = getSetting(SPAWN_LIMIT_SETTING_KEY);
+  if (raw === null) return SPAWN_LIMIT_DEFAULT;
+  const text = String(raw).trim();
+  if (!text) return SPAWN_LIMIT_DEFAULT;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return SPAWN_LIMIT_DEFAULT;
+  return Math.min(SPAWN_LIMIT_MAX, Math.max(SPAWN_LIMIT_MIN, Math.floor(n)));
+}
 export const BRIEF_MAX_CHARS = 12_000;
 const DEFAULT_REPORT_DUE_HOURS = 4;
 
@@ -292,7 +312,7 @@ function postToThread(agent: AgentMod, queue: QueueMod, convId: number, ext: str
 export const spawnChat: ToolDef = {
   name: 'spawn_chat',
   description:
-    "Open a NEW cockpit chat for a handoff ('spawn a chat for Opus 5.0 on Claude B and give it everything it needs'). You write the brief; the tool checks it (goal + done_means required, every absolute path must exist, no secrets, ≤12k chars) and refuses with named errors if it fails. On success it creates the chat, pins model + Claude account, queues the brief as its first message (the child starts working immediately), and — with report_back (default true) — registers a chat_report commitment so a child that never reports back is noticed. The child reports with the report_back tool. Limit 5 spawns per chat per hour. Returns the child's external_id and URL.",
+    "Open a NEW cockpit chat for a handoff ('spawn a chat for Opus 5.0 on Claude B and give it everything it needs'). You write the brief; the tool checks it (goal + done_means required, every absolute path must exist, no secrets, ≤12k chars) and refuses with named errors if it fails. On success it creates the chat, pins model + Claude account, queues the brief as its first message (the child starts working immediately), and — with report_back (default true) — registers a chat_report commitment so a child that never reports back is noticed. The child reports with the report_back tool. Rate limited per chat per hour (default 30; live dial `spawn_chat_limit_per_hour`, no restart needed). Returns the child's external_id and URL.",
   parameters: {
     type: 'object',
     properties: {
@@ -369,11 +389,12 @@ export const spawnChat: ToolDef = {
     // Rate check + every write in ONE synchronous transaction, with no await in
     // between: two concurrent spawn_chat calls from one origin can't both pass.
     const childExt = `cockpit:spawn-${randomUUID()}`;
+    const limit = spawnLimitPerHour();
     let child: { id: number } | undefined;
     let spawnId = 0;
     let limited = false;
     sqliteDb.transaction(() => {
-      if ((S().countRecent.get(origin.id)?.n ?? 0) >= SPAWN_LIMIT_PER_HOUR) { limited = true; return; }
+      if ((S().countRecent.get(origin.id)?.n ?? 0) >= limit) { limited = true; return; }
       child = getOrCreateConversation(childExt);
       renameConversation(child.id, title.slice(0, 120));
       if (pin) setThreadModelOverride(child.id, pin.adapter, pin.model);
@@ -385,7 +406,12 @@ export const spawnChat: ToolDef = {
       }
     })();
     if (limited || !child) {
-      return { error: 'rate_limited', message: `max ${SPAWN_LIMIT_PER_HOUR} spawns per chat per hour` };
+      return {
+        error: 'rate_limited',
+        message: `max ${limit} spawns per chat per hour (current limit; raise it with the ${SPAWN_LIMIT_SETTING_KEY} setting)`,
+        limit,
+        limit_setting: SPAWN_LIMIT_SETTING_KEY,
+      };
     }
     const childId = (child as { id: number }).id;
 

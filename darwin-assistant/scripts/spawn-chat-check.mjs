@@ -165,8 +165,10 @@ await check('2d. over-cap brief is refused before any path/secret scan', async (
   assert.equal(scanned, 0, 'path scan ran on an over-cap brief');
 });
 
-await check('3. 6th spawn within an hour from one origin is refused', async () => {
+await check('3. with the dial at 5, the 6th spawn within an hour from one origin is refused', async () => {
   const O = 'cockpit:spawn-check-rate';
+  convDb.setSetting(spawnMod.SPAWN_LIMIT_SETTING_KEY, '5');
+  assert.equal(spawnMod.spawnLimitPerHour(), 5, 'dial reads back as 5');
   for (let i = 1; i <= 5; i++) {
     const r = await spawn({ title: `rate ${i}`, brief: goodBrief(), report_back: false }, O);
     assert.equal(r.ok, true, `spawn ${i}: ${JSON.stringify(r)}`);
@@ -178,6 +180,10 @@ await check('3. 6th spawn within an hour from one origin is refused', async () =
   // a different origin is unaffected
   const other = await spawn({ title: 'other origin', brief: goodBrief(), report_back: false }, 'cockpit:spawn-check-rate-2');
   assert.equal(other.ok, true);
+  // the refusal must quote the CURRENT limit, not a baked-in number
+  assert.ok(String(r6.message).includes('max 5 spawns'), `message: ${r6.message}`);
+  assert.equal(r6.limit, 5);
+  convDb.deleteSetting(spawnMod.SPAWN_LIMIT_SETTING_KEY);
 });
 
 await check('4. commitment row: check_type=chat_report, thread_ext=origin, check_ref=child, due ≈ +4h', async () => {
@@ -247,10 +253,53 @@ await check('6. SPAWN_CHAT_ENABLED unset → tools absent AND no chat_spawns tab
 
 await check('7. six CONCURRENT spawns from one origin → exactly five succeed (rate check is atomic)', async () => {
   const O = 'cockpit:spawn-check-race';
+  convDb.setSetting(spawnMod.SPAWN_LIMIT_SETTING_KEY, '5');
   const rs = await Promise.all([1, 2, 3, 4, 5, 6].map((i) => spawn({ title: `race ${i}`, brief: goodBrief(), report_back: false }, O)));
   const ok = rs.filter((r) => r.ok).length;
   assert.equal(ok, 5, `ok=${ok}: ${JSON.stringify(rs.map((r) => r.error ?? 'ok'))}`);
   assert.equal(rs.filter((r) => r.error === 'rate_limited').length, 1);
+  convDb.deleteSetting(spawnMod.SPAWN_LIMIT_SETTING_KEY);
+});
+
+await check('9. the per-hour cap is a LIVE dial: unset → 30, and flipping the setting MOVES the gate', async () => {
+  const KEY = spawnMod.SPAWN_LIMIT_SETTING_KEY;
+  convDb.deleteSetting(KEY);
+
+  // the shipped default, and the one Kevin asked for
+  assert.equal(spawnMod.SPAWN_LIMIT_DEFAULT, 30);
+  assert.equal(spawnMod.spawnLimitPerHour(), 30, 'unset reads as the default');
+
+  // read at CALL time: no reload, no restart, no new import
+  convDb.setSetting(KEY, '7');
+  assert.equal(spawnMod.spawnLimitPerHour(), 7, 'a changed setting is seen immediately');
+  convDb.setSetting(KEY, '12');
+  assert.equal(spawnMod.spawnLimitPerHour(), 12, 'and again, with no restart in between');
+
+  // clamped 1..100; non-numeric and empty fall back to the default, never to 0
+  for (const [set, want] of [['0', 1], ['-4', 1], ['1', 1], ['100', 100], ['101', 100],
+                             ['99999', 100], ['2.9', 2], ['abc', 30], ['', 30], ['  ', 30]]) {
+    convDb.setSetting(KEY, set);
+    assert.equal(spawnMod.spawnLimitPerHour(), want, `setting ${JSON.stringify(set)} → ${want}`);
+  }
+
+  // and the GATE moves with it, not just the getter: dial of 2 refuses the 3rd
+  convDb.setSetting(KEY, '2');
+  const O = 'cockpit:spawn-check-dial';
+  for (let i = 1; i <= 2; i++) {
+    const r = await spawn({ title: `dial ${i}`, brief: goodBrief(), report_back: false }, O);
+    assert.equal(r.ok, true, `spawn ${i}: ${JSON.stringify(r)}`);
+  }
+  const third = await spawn({ title: 'dial 3', brief: goodBrief(), report_back: false }, O);
+  assert.equal(third.error, 'rate_limited', JSON.stringify(third));
+  assert.ok(String(third.message).includes('max 2 spawns'), `message: ${third.message}`);
+  assert.equal(third.limit_setting, KEY, 'the refusal names the dial to change');
+
+  // raise the dial mid-flight and the SAME origin can spawn again — the point of
+  // the whole change. 30 would also let it through, so prove 3 does and 2 did not.
+  convDb.setSetting(KEY, '3');
+  const fourth = await spawn({ title: 'dial 3 again', brief: goodBrief(), report_back: false }, O);
+  assert.equal(fourth.ok, true, `raising the dial unblocked the origin: ${JSON.stringify(fourth)}`);
+  convDb.deleteSetting(KEY);
 });
 
 await check('8. report_back cues are NOT admission-gated (a skip would drop the [report:] marker)', async () => {

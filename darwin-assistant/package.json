@@ -1,7 +1,7 @@
 {
   "name": "darwin-assistant",
   "version": "0.1.0",
-  "description": "External Darwin AI assistant — voice intake, Slack bot, full Paperclip access",
+  "description": "External Darwin AI assistant \u2014 voice intake, Slack bot, full Paperclip access",
   "private": true,
   "type": "module",
   "scripts": {
@@ -98,7 +98,9 @@
     "chat-topics-derive:check": "npm run build && JARVIS_DB_PATH=/tmp/chat-topics-derive-check.db node scripts/chat-topics-derive-check.mjs",
     "chat-topics-overlap:route-check": "npm run build && JARVIS_DB_PATH=/tmp/chat-topics-overlap-route-check.db node scripts/chat-topics-overlap-route-check.mjs",
     "page-companion:deploy-check": "npm run build && JARVIS_DB_PATH=/tmp/page-companion-deploy-check.db node scripts/page-companion-deploy-check.mjs",
-    "health:commitments-column-check": "npm run build && node scripts/health-commitments-column-check.mjs"
+    "health:commitments-column-check": "npm run build && node scripts/health-commitments-column-check.mjs",
+    "spawn-limit:mutate": "python3 -I scripts/spawn-limit-mutate.py",
+    "spawn-chat:test": "JARVIS_DB_PATH=/tmp/spawn-chat-tool/check.db JARVIS_SIM=1 node scripts/spawn-chat-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

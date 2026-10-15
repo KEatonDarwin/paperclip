@@ -143,6 +143,7 @@ import {
 } from '../chat-topics-store.js';
 import { deriveTopicsForConversation } from '../chat-topics-derive.js';
 import { findOverlapCandidates } from '../chat-topics-overlap.js';
+import { buildAlphaDesk, DEFAULT_ORIGIN_EXT as ALPHA_DESK_DEFAULT_ORIGIN } from '../alpha-desk.js';
 import {
   GoalError,
   listGoals,
@@ -3649,6 +3650,17 @@ export function createApiV1Router(): Router {
     }
     await deriveTopicsForConversation(convId);
     res.json({ topics: listTopicsForConversation(convId) });
+  });
+
+  // == Alpha desk ==============================================================
+  // Every chat Alpha JARVIS has delegated work to, with whether that work is
+  // going the right way. Read-only and model-free (see src/alpha-desk.ts).
+  // `?origin=` supervises a different orchestrator; default is Alpha's own chat.
+  router.get('/alpha-desk', (req: AuthedRequest, res) => {
+    const raw = req.query.origin;
+    const origin = typeof raw === 'string' && raw.trim() ? raw.trim() : ALPHA_DESK_DEFAULT_ORIGIN;
+    // The in-flight check is JARVIS's own, same signal as the thread status pill.
+    res.json(buildAlphaDesk(origin, (convId: number) => getInFlightMessageId(convId) != null));
   });
 
   // == Goals ===================================================================

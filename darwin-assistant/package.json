@@ -14,6 +14,8 @@
     "governor-multiclaude:sim": "JARVIS_DB_PATH=/tmp/governor-multiclaude-sim.db node scripts/governor-multiclaude-sim.mjs",
     "governor-pacer:sim": "JARVIS_DB_PATH=/tmp/governor-pacer-sim.db node scripts/governor-pacer-sim.mjs",
     "spawn-monitor:test": "node scripts/spawn-monitor-test.mjs",
+    "alpha-desk:test": "npm run build && node scripts/alpha-desk-test.mjs",
+    "alpha-desk:mutate": "npm run build && python3 -I scripts/alpha-desk-mutate.py",
     "claude-accounts:test": "JARVIS_DB_PATH=/tmp/claude-accounts-test.db node scripts/claude-accounts-test.mjs",
     "claude-adapter-account:test": "JARVIS_DB_PATH=/tmp/claude-adapter-account-test.db node scripts/claude-adapter-account-test.mjs",
     "claude-ratelimit-rescue:test": "JARVIS_DB_PATH=/tmp/claude-ratelimit-rescue-test.db node scripts/claude-ratelimit-rescue-test.mjs",

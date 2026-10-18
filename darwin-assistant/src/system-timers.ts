@@ -101,7 +101,15 @@ export function parseShowBlocks(text: string): Array<Record<string, string>> {
     const props: Record<string, string> = {};
     for (const line of block.split('\n')) {
       const eq = line.indexOf('=');
-      if (eq > 0) props[line.slice(0, eq)] = line.slice(eq + 1);
+      if (eq <= 0) continue;
+      const key = line.slice(0, eq);
+      const val = line.slice(eq + 1);
+      // systemd prints ONE line per spec, so TimersMonotonic/TimersCalendar can
+      // repeat (14 timers on this box print both OnUnitActiveUSec and OnBootUSec).
+      // Last-wins would discard the real cadence and kill the overdue rule, so
+      // accumulate: parseTimersMonotonic/parseTimersCalendar use matchAll and
+      // read a newline-joined value unchanged.
+      props[key] = key in props ? `${props[key]}\n${val}` : val;
     }
     if (props.Id) out.push(props);
   }

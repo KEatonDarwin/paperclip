@@ -120,6 +120,30 @@ ok('overdue: not flagged within 2x (threshold is inclusive of slack)', () => {
   const t = byUnit(build(CAPTURE_NOW + 15 * 60_000), 'hub-error-triage.timer'); // 10-min timer, <=~25 min since fire
   assert.equal(t.overdue, false);
 });
+// ── repeated systemd property lines (review FAIL on tree-0dbc1aa9) ─────────
+// systemd prints ONE line per monotonic spec, so 13 timers in the fixture print
+// both OnUnitActiveUSec (the real cadence) and OnBootUSec. A last-wins parser
+// kept only OnBootUSec, interval_ms went null, and the overdue rule went dead
+// for every engine heartbeat on the box.
+ok('repeated TimersMonotonic lines are both kept, not last-wins', () => {
+  const blocks = T.parseShowBlocks(read('timers.show'));
+  const dup = blocks.filter((b) => (b.TimersMonotonic ?? '').split('\n').length > 1);
+  assert.equal(dup.length, 13, 'the fixture itself must still carry the repeats');
+  const w = blocks.find((b) => b.Id === 'jarvis-watchdog.timer');
+  const specs = T.parseTimersMonotonic(w.TimersMonotonic);
+  assert.deepEqual(specs.map((x) => x.name).sort(), ['OnBootSec', 'OnUnitActiveSec']);
+  assert.equal(specs.find((x) => x.name === 'OnUnitActiveSec').ms, 60_000);
+});
+ok('a 1-min heartbeat keeps its interval and CAN go overdue', () => {
+  const r = byUnit(build(CAPTURE_NOW), 'jarvis-watchdog.timer');
+  assert.equal(r.interval_ms, 60_000, 'OnBootUSec must not win over OnUnitActiveUSec');
+  assert.equal(r.abnormal, false, 'healthy at capture time');
+  assert.ok(r.schedule.some((s) => s.startsWith('OnUnitActiveSec=')), 'cadence shown to the UI');
+  // the failure the review described: stalled for 6h, 360x its own interval
+  const stalled = byUnit(build(CAPTURE_NOW + 6 * 3_600_000), 'jarvis-watchdog.timer');
+  assert.equal(stalled.overdue, true);
+  assert.deepEqual(stalled.reasons, ['overdue']);
+});
 ok('weekday spec uses its real max gap (Fri->Mon = 3d), not 24h', () => {
   const r = byUnit(build(CAPTURE_NOW), 'alpha-debrief-cue.timer');
   assert.equal(r.interval_ms, 3 * DAY);

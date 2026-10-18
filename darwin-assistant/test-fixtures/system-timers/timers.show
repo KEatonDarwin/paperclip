@@ -1,0 +1,648 @@
+Unit=ad-review-build.service
+TimersMonotonic={ OnBootUSec=3min ; next_elapse=6min 6.218301s }
+TimersCalendar={ OnCalendar=*-*-* *:00/15:00 ; next_elapse=Sun 2026-10-18 11:45:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:45:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:30:01 CDT
+Persistent=yes
+Id=ad-review-build.timer
+Description=Refresh Ad Review Board data every 15 minutes
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=ad-review-deployed-refresh.service
+TimersCalendar={ OnCalendar=*-*-* *:00/15:00 ; next_elapse=Sun 2026-10-18 11:45:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:45:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:30:01 CDT
+Persistent=yes
+Id=ad-review-deployed-refresh.timer
+Description=Every 15 min, refresh the deployed Ad Review Board so the team sees current campaigns
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=alpha-debrief-cue.service
+TimersCalendar={ OnCalendar=Mon..Fri *-*-* 17:00:00 America/Chicago ; next_elapse=Mon 2026-10-19 22:00:00 UTC }
+NextElapseUSecRealtime=Mon 2026-10-19 17:00:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Fri 2026-10-16 17:00:03 CDT
+Persistent=no
+Id=alpha-debrief-cue.timer
+Description=Weekday 5pm timer for the alpha debrief cue
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Thu 2026-10-15 13:25:01 UTC
+
+Unit=alpha-morning-cue.service
+TimersCalendar={ OnCalendar=Mon..Fri *-*-* 07:30:00 America/Chicago ; next_elapse=Mon 2026-10-19 12:30:00 UTC }
+NextElapseUSecRealtime=Mon 2026-10-19 07:30:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Fri 2026-10-16 07:30:00 CDT
+Persistent=no
+Id=alpha-morning-cue.timer
+Description=Weekday 07:30 CT timer for the Alpha morning cue
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Fri 2026-10-16 01:11:09 UTC
+
+Unit=alpha-silence-ping.service
+TimersCalendar={ OnCalendar=*-*-* *:00/10:00 ; next_elapse=Sun 2026-10-18 11:40:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:40:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:30:01 CDT
+Persistent=no
+Id=alpha-silence-ping.timer
+Description=Every 10 minutes, check whether Alpha should nudge Kevin
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Thu 2026-10-15 13:40:19 UTC
+
+Unit=alpha-trainer-distill.service
+TimersCalendar={ OnCalendar=*-*-* 23:30:00 America/Chicago ; next_elapse=Mon 2026-10-19 04:30:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 23:30:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sat 2026-10-17 23:30:00 CDT
+Persistent=no
+Id=alpha-trainer-distill.timer
+Description=Nightly timer for alpha-trainer observe + distill pass
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Thu 2026-10-15 13:25:01 UTC
+
+Unit=apt-daily-upgrade.service
+TimersCalendar={ OnCalendar=*-*-* 06:00:00 ; next_elapse=Sun 2026-10-18 11:00:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:43:56 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sat 2026-10-17 06:27:47 CDT
+Persistent=yes
+Id=apt-daily-upgrade.timer
+Description=Daily apt upgrade and clean activities
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=apt-daily.service
+TimersCalendar={ OnCalendar=*-*-* 06,18:00:00 ; next_elapse=Sun 2026-10-18 11:00:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 14:40:02 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 00:30:50 CDT
+Persistent=yes
+Id=apt-daily.timer
+Description=Daily apt download activities
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=chat-topics-derive.service
+TimersMonotonic={ OnBootUSec=5min ; next_elapse=8min 6.218301s }
+TimersCalendar={ OnCalendar=*-*-* *:05/20:00 ; next_elapse=Sun 2026-10-18 11:45:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:45:11 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:25:42 CDT
+Persistent=yes
+Id=chat-topics-derive.timer
+Description=Refresh cockpit chat topics every 20 minutes
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=claude-usage-poll.service
+TimersMonotonic={ OnUnitActiveUSec=1min ; next_elapse=4d 11h 25min 32.602042s }
+TimersMonotonic={ OnBootUSec=10s ; next_elapse=3min 16.218301s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=4d 11h 25min 32.602042s
+LastTriggerUSec=Sun 2026-10-18 06:35:48 CDT
+Persistent=no
+Id=claude-usage-poll.timer
+Description=Run claude-usage-poll every 60s
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=claude-usage-poll@b.service
+TimersMonotonic={ OnUnitActiveUSec=1min ; next_elapse=4d 11h 25min 32.602750s }
+TimersMonotonic={ OnBootUSec=15s ; next_elapse=3min 21.218301s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=4d 11h 25min 32.602750s
+LastTriggerUSec=Sun 2026-10-18 06:35:48 CDT
+Persistent=no
+Id=claude-usage-poll@b.timer
+Description=Run claude-usage-poll for account b every 60s
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=cloud-agents-poll.service
+TimersMonotonic={ OnUnitActiveUSec=10min ; next_elapse=4d 11h 28min 20.104403s }
+TimersMonotonic={ OnBootUSec=3min ; next_elapse=6min 6.218301s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=4d 11h 28min 20.104403s
+LastTriggerUSec=Sun 2026-10-18 06:29:35 CDT
+Persistent=yes
+Id=cloud-agents-poll.timer
+Description=Poll cloud-agent dispatches every 10 min
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=codex-usage-poll.service
+TimersMonotonic={ OnUnitActiveUSec=1min ; next_elapse=4d 11h 25min 32.603432s }
+TimersMonotonic={ OnBootUSec=15s ; next_elapse=3min 21.218301s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=4d 11h 25min 32.603432s
+LastTriggerUSec=Sun 2026-10-18 06:35:48 CDT
+Persistent=no
+Id=codex-usage-poll.timer
+Description=Run codex-usage-poll every 60s
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=darwin-kpi-run.service
+TimersMonotonic={ OnUnitActiveUSec=15min ; next_elapse=4d 11h 27min 33.104180s }
+TimersMonotonic={ OnBootUSec=5min ; next_elapse=8min 6.218301s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=4d 11h 27min 33.104180s
+LastTriggerUSec=Sun 2026-10-18 06:23:48 CDT
+Persistent=yes
+Id=darwin-kpi-run.timer
+Description=Run darwin-kpi every 15 minutes (each KPI's own cadence_minutes decides if it is due)
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=db-privilege-watch.service
+TimersMonotonic={ OnBootUSec=4min ; next_elapse=7min 6.218301s }
+TimersCalendar={ OnCalendar=*-*-* *:22:00 ; next_elapse=Sun 2026-10-18 12:22:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 07:22:28 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:22:02 CDT
+Persistent=yes
+Id=db-privilege-watch.timer
+Description=Run the DB privilege watch hourly at :22
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=dpkg-db-backup.service
+TimersCalendar={ OnCalendar=*-*-* 00:00:00 ; next_elapse=Mon 2026-10-19 05:00:00 UTC }
+NextElapseUSecRealtime=Mon 2026-10-19 00:00:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 00:00:01 CDT
+Persistent=yes
+Id=dpkg-db-backup.timer
+Description=Daily dpkg database backup timer
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=e2scrub_all.service
+TimersCalendar={ OnCalendar=Sun *-*-* 03:10:00 ; next_elapse=Sun 2026-10-25 08:10:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-25 03:10:49 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 03:10:50 CDT
+Persistent=yes
+Id=e2scrub_all.timer
+Description=Periodic ext4 Online Metadata Check for All Filesystems
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=env-testing-sweep.service
+TimersMonotonic={ OnBootUSec=2min ; next_elapse=5min 6.218301s }
+TimersCalendar={ OnCalendar=*-*-* *:00/5:00 ; next_elapse=Sun 2026-10-18 11:40:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:40:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:35:00 CDT
+Persistent=yes
+Id=env-testing-sweep.timer
+Description=Sweep for reappearing .env.testing files every 5 minutes
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=fstrim.service
+TimersCalendar={ OnCalendar=Mon *-*-* 00:00:00 ; next_elapse=(null) }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=infinity
+LastTriggerUSec=
+Persistent=yes
+Id=fstrim.timer
+Description=Discard unused filesystem blocks once a week
+ActiveState=inactive
+SubState=dead
+UnitFileState=enabled
+ActiveEnterTimestamp=
+
+Unit=hub-error-fixer.service
+TimersMonotonic={ OnUnitInactiveUSec=5min ; next_elapse=4d 11h 28min 43.800262s }
+TimersMonotonic={ OnBootUSec=4min ; next_elapse=7min 6.218301s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=4d 11h 28min 43.800262s
+LastTriggerUSec=Sun 2026-10-18 06:34:59 CDT
+Persistent=yes
+Id=hub-error-fixer.timer
+Description=Run the Hub Error Desk fixer every 5 minutes
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=hub-error-install-watch.service
+TimersMonotonic={ OnUnitInactiveUSec=1min ; next_elapse=4d 11h 25min 9.300353s }
+TimersMonotonic={ OnBootUSec=2min ; next_elapse=5min 6.218301s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=4d 11h 25min 9.300353s
+LastTriggerUSec=Sun 2026-10-18 06:35:24 CDT
+Persistent=no
+Id=hub-error-install-watch.timer
+Description=Run the Hub Error Desk install watcher every minute
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=hub-error-triage.service
+TimersMonotonic={ OnBootUSec=3min ; next_elapse=6min 6.218301s }
+TimersCalendar={ OnCalendar=*-*-* *:03/10:00 ; next_elapse=Sun 2026-10-18 11:43:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:44:06 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:34:17 CDT
+Persistent=yes
+Id=hub-error-triage.timer
+Description=Run Hub error triage — works out why each new Hub 500 happened and proposes the fix
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Fri 2026-10-16 13:08:48 UTC
+
+Unit=hub1-heartbeat.service
+TimersMonotonic={ OnUnitActiveUSec=1min ; next_elapse=4d 11h 25min 32.604082s }
+TimersMonotonic={ OnBootUSec=1min 30s ; next_elapse=4min 36.218301s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=4d 11h 25min 32.604082s
+LastTriggerUSec=Sun 2026-10-18 06:35:48 CDT
+Persistent=no
+Id=hub1-heartbeat.timer
+Description=Refresh the Hub 1.0 Heartbeat every minute
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=idea-scout.service
+TimersCalendar={ OnCalendar=*-*-* 05:45:00 America/Chicago ; next_elapse=Mon 2026-10-19 10:45:00 UTC }
+NextElapseUSecRealtime=Mon 2026-10-19 05:46:16 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 05:49:29 CDT
+Persistent=yes
+Id=idea-scout.timer
+Description=Run Idea Scout daily (before the Intel Desk's 06:30)
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Fri 2026-10-16 00:40:14 UTC
+
+Unit=intel-pull.service
+TimersCalendar={ OnCalendar=*-*-* 06:30:00 ; next_elapse=Sun 2026-10-18 11:30:00 UTC }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=infinity
+LastTriggerUSec=Sun 2026-10-18 06:30:01 CDT
+Persistent=yes
+Id=intel-pull.timer
+Description=Run JARVIS Intel Desk every morning
+ActiveState=active
+SubState=running
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=jarvis-cockpit-healthcheck.service
+TimersMonotonic={ OnUnitActiveUSec=1min ; next_elapse=4d 11h 25min 32.604735s }
+TimersMonotonic={ OnActiveUSec=2min ; next_elapse=5min 6.551171s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=4d 11h 25min 32.604735s
+LastTriggerUSec=Sun 2026-10-18 06:35:48 CDT
+Persistent=no
+Id=jarvis-cockpit-healthcheck.timer
+Description=Run JARVIS Cockpit health check every minute
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=jarvis-db-retention.service
+TimersCalendar={ OnCalendar=*-*-* 03:30:00 ; next_elapse=Mon 2026-10-19 08:30:00 UTC }
+NextElapseUSecRealtime=Mon 2026-10-19 03:30:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 03:30:00 CDT
+Persistent=yes
+Id=jarvis-db-retention.timer
+Description=Nightly JARVIS DB retention sweep
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=jarvis-spawn-reconcile.service
+TimersMonotonic={ OnUnitActiveUSec=5min ; next_elapse=4d 11h 25min 17.610107s }
+TimersMonotonic={ OnBootUSec=2min ; next_elapse=5min 6.218301s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=4d 11h 25min 17.610107s
+LastTriggerUSec=Sun 2026-10-18 06:31:33 CDT
+Persistent=no
+Id=jarvis-spawn-reconcile.timer
+Description=Run JARVIS spawn-task reconciler every 5 minutes
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=jarvis-watchdog.service
+TimersMonotonic={ OnUnitActiveUSec=1min ; next_elapse=4d 11h 25min 32.605576s }
+TimersMonotonic={ OnBootUSec=1min 30s ; next_elapse=4min 36.218301s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=4d 11h 25min 32.605576s
+LastTriggerUSec=Sun 2026-10-18 06:35:48 CDT
+Persistent=yes
+Id=jarvis-watchdog.timer
+Description=Run the JARVIS Watchdog every 60s
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=job-radar.service
+TimersCalendar={ OnCalendar=*-*-* 07:15:00 America/Chicago ; next_elapse=Sun 2026-10-18 12:15:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 07:18:42 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sat 2026-10-17 07:22:51 CDT
+Persistent=yes
+Id=job-radar.timer
+Description=Run the Job Radar daily
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=logrotate.service
+TimersCalendar={ OnCalendar=*-*-* 00:00:00 ; next_elapse=Mon 2026-10-19 05:00:00 UTC }
+NextElapseUSecRealtime=Mon 2026-10-19 00:16:31 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 00:31:10 CDT
+Persistent=yes
+Id=logrotate.timer
+Description=Daily rotation of log files
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=lovable-watch.service
+TimersMonotonic={ OnBootUSec=3min ; next_elapse=6min 6.218301s }
+TimersCalendar={ OnCalendar=*-*-* *:00:00 ; next_elapse=Sun 2026-10-18 12:00:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 07:01:46 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:01:07 CDT
+Persistent=yes
+Id=lovable-watch.timer
+Description=Run the Lovable Watcher hourly
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=model-watch.service
+TimersCalendar={ OnCalendar=*-*-* 06:45:00 ; next_elapse=Sun 2026-10-18 11:45:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:50:19 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sat 2026-10-17 06:47:00 CDT
+Persistent=yes
+Id=model-watch.timer
+Description=Daily model catalogue check
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=partner-pipeline-block.service
+TimersCalendar={ OnCalendar=Mon..Fri *-*-* 14:25:00 America/Chicago ; next_elapse=Mon 2026-10-19 19:25:00 UTC }
+NextElapseUSecRealtime=Mon 2026-10-19 14:25:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Fri 2026-10-16 14:25:00 CDT
+Persistent=no
+Id=partner-pipeline-block.timer
+Description=Fire the daily block cue on weekday afternoons (2:25pm CT, inside his float window)
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 12:50:39 UTC
+
+Unit=paused-mb-lead-watch.service
+TimersMonotonic={ OnBootUSec=4min ; next_elapse=7min 6.218301s }
+TimersCalendar={ OnCalendar=*-*-* *:00/15:00 ; next_elapse=Sun 2026-10-18 11:45:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:45:07 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:30:16 CDT
+Persistent=yes
+Id=paused-mb-lead-watch.timer
+Description=Check every 15 minutes for leads landing on paused media buys
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=phpsessionclean.service
+TimersCalendar={ OnCalendar=*-*-* *:09,39:00 ; next_elapse=Sun 2026-10-18 11:39:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:39:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:09:02 CDT
+Persistent=yes
+Id=phpsessionclean.timer
+Description=Clean PHP session files every 30 mins
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=proc-watch.service
+TimersMonotonic={ OnUnitActiveUSec=30s ; next_elapse=4d 11h 24min 57.602790s }
+TimersMonotonic={ OnBootUSec=45s ; next_elapse=3min 51.218301s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=4d 11h 24min 57.602790s
+LastTriggerUSec=Sun 2026-10-18 06:35:43 CDT
+Persistent=no
+Id=proc-watch.timer
+Description=Run the DB processlist watcher every 30s
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=product-setup-check.service
+TimersCalendar={ OnCalendar=*-*-* 07:40:00 ; next_elapse=Sun 2026-10-18 12:40:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 07:40:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sat 2026-10-17 07:40:00 CDT
+Persistent=yes
+Id=product-setup-check.timer
+Description=Daily setup check for the month in progress
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=quantum-density.service
+TimersMonotonic={ OnBootUSec=3min ; next_elapse=6min 6.218301s }
+TimersCalendar={ OnCalendar=*-*-* *:07:00 ; next_elapse=Sun 2026-10-18 12:07:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 07:08:27 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:08:39 CDT
+Persistent=yes
+Id=quantum-density.timer
+Description=Run Quantum density watch — is quantum still healthy after the product-tag patch?
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=reporting-reconcile.service
+TimersCalendar={ OnCalendar=*-*-* 07:20:00 America/Chicago ; next_elapse=Sun 2026-10-18 12:20:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 07:20:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sat 2026-10-17 07:20:01 CDT
+Persistent=yes
+Id=reporting-reconcile.timer
+Description=Daily reporting reconciliation
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Thu 2026-10-15 22:57:13 UTC
+
+Unit=send-slot-watch.service
+TimersMonotonic={ OnBootUSec=3min ; next_elapse=6min 6.218301s }
+TimersCalendar={ OnCalendar=*-*-* *:00/15:00 ; next_elapse=Sun 2026-10-18 11:45:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:45:23 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:30:29 CDT
+Persistent=yes
+Id=send-slot-watch.timer
+Description=Check for errored email send slots every 15 minutes
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=stub-radar.service
+TimersMonotonic={ OnBootUSec=3min ; next_elapse=6min 6.218301s }
+TimersCalendar={ OnCalendar=*-*-* *:12:00 ; next_elapse=Sun 2026-10-18 12:12:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 07:13:58 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:12:51 CDT
+Persistent=yes
+Id=stub-radar.timer
+Description=Run Stub Radar — hourly hunt for functions in Mike's Lovable builds that look finished and are not
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=systemd-tmpfiles-clean.service
+TimersMonotonic={ OnUnitActiveUSec=1d ; next_elapse=5d 18min 12.603260s }
+TimersMonotonic={ OnBootUSec=15min ; next_elapse=18min 6.218301s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=5d 18min 12.603260s
+LastTriggerUSec=Sat 2026-10-17 19:29:28 CDT
+Persistent=no
+Id=systemd-tmpfiles-clean.timer
+Description=Daily Cleanup of Temporary Directories
+ActiveState=active
+SubState=waiting
+UnitFileState=static
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=teams-radar.service
+TimersMonotonic={ OnBootUSec=4min ; next_elapse=7min 6.218301s }
+TimersCalendar={ OnCalendar=*-*-* *:00/5:00 ; next_elapse=Sun 2026-10-18 11:40:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:40:07 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:35:18 CDT
+Persistent=yes
+Id=teams-radar.timer
+Description=Run Teams Radar every 5 minutes
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=tech-task-watch.service
+TimersMonotonic={ OnBootUSec=2min ; next_elapse=5min 6.218301s }
+TimersCalendar={ OnCalendar=*-*-* *:00/15:00 ; next_elapse=Sun 2026-10-18 11:45:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:45:03 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:30:52 CDT
+Persistent=yes
+Id=tech-task-watch.timer
+Description=Run the Tech Task inbox sweeper every 15 minutes
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=vault-scratch-wipe.service
+TimersCalendar={ OnCalendar=*-*-* 03:15:00 ; next_elapse=Mon 2026-10-19 08:15:00 UTC }
+NextElapseUSecRealtime=Mon 2026-10-19 03:15:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 03:15:00 CDT
+Persistent=yes
+Id=vault-scratch-wipe.timer
+Description=Daily wipe of vault scratch mirrors
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=window-burn.service
+TimersCalendar={ OnCalendar=*-*-* *:00/5:00 ; next_elapse=Sun 2026-10-18 11:40:00 UTC }
+NextElapseUSecRealtime=Sun 2026-10-18 06:40:00 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:35:00 CDT
+Persistent=yes
+Id=window-burn.timer
+Description=Window-burn sampler every 5 min
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC
+
+Unit=youtube-research.service
+TimersCalendar={ OnCalendar=*-*-* 06:00:00 America/Chicago ; next_elapse=Mon 2026-10-19 11:00:00 UTC }
+NextElapseUSecRealtime=Mon 2026-10-19 06:00:58 CDT
+NextElapseUSecMonotonic=0
+LastTriggerUSec=Sun 2026-10-18 06:00:09 CDT
+Persistent=yes
+Id=youtube-research.timer
+Description=Run the YouTube Research Agent daily
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+ActiveEnterTimestamp=Wed 2026-10-14 00:14:22 UTC

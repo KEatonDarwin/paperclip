@@ -1,0 +1,383 @@
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:30:16 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:30:25 UTC
+ExecMainStatus=0
+Id=ad-review-build.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:30:01 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:30:12 UTC
+ExecMainStatus=0
+Id=ad-review-deployed-refresh.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Fri 2026-10-16 22:00:03 UTC
+ExecMainExitTimestamp=Fri 2026-10-16 22:00:03 UTC
+ExecMainStatus=0
+Id=alpha-debrief-cue.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Fri 2026-10-16 12:30:00 UTC
+ExecMainExitTimestamp=Fri 2026-10-16 12:30:00 UTC
+ExecMainStatus=0
+Id=alpha-morning-cue.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:30:01 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:30:01 UTC
+ExecMainStatus=0
+Id=alpha-silence-ping.service
+ActiveState=inactive
+SubState=dead
+
+Result=exit-code
+ExecMainStartTimestamp=Sun 2026-10-18 04:30:00 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 04:30:00 UTC
+ExecMainStatus=1
+Id=alpha-trainer-distill.service
+ActiveState=failed
+SubState=failed
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 05:30:50 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 05:30:50 UTC
+ExecMainStatus=0
+Id=apt-daily.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sat 2026-10-17 11:27:47 UTC
+ExecMainExitTimestamp=Sat 2026-10-17 11:27:48 UTC
+ExecMainStatus=0
+Id=apt-daily-upgrade.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:25:42 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:25:42 UTC
+ExecMainStatus=0
+Id=chat-topics-derive.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:35:48 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:35:48 UTC
+ExecMainStatus=0
+Id=claude-usage-poll@b.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:35:48 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:35:49 UTC
+ExecMainStatus=0
+Id=claude-usage-poll.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:29:35 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:29:38 UTC
+ExecMainStatus=0
+Id=cloud-agents-poll.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:35:48 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:35:49 UTC
+ExecMainStatus=0
+Id=codex-usage-poll.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:23:48 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:23:50 UTC
+ExecMainStatus=0
+Id=darwin-kpi-run.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:22:02 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:22:02 UTC
+ExecMainStatus=0
+Id=db-privilege-watch.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 05:00:01 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 05:00:01 UTC
+ExecMainStatus=0
+Id=dpkg-db-backup.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 08:10:50 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 08:10:50 UTC
+ExecMainStatus=0
+Id=e2scrub_all.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:35:00 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:35:00 UTC
+ExecMainStatus=0
+Id=env-testing-sweep.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=
+ExecMainExitTimestamp=
+ExecMainStatus=0
+Id=fstrim.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:35:48 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:35:54 UTC
+ExecMainStatus=0
+Id=hub1-heartbeat.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:34:59 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:34:59 UTC
+ExecMainStatus=0
+Id=hub-error-fixer.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:35:24 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:35:24 UTC
+ExecMainStatus=0
+Id=hub-error-install-watch.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:34:17 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:34:24 UTC
+ExecMainStatus=0
+Id=hub-error-triage.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 10:49:29 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 10:53:17 UTC
+ExecMainStatus=0
+Id=idea-scout.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:30:01 UTC
+ExecMainExitTimestamp=
+ExecMainStatus=0
+Id=intel-pull.service
+ActiveState=activating
+SubState=start
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:35:48 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:35:48 UTC
+ExecMainStatus=0
+Id=jarvis-cockpit-healthcheck.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 08:30:00 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 08:30:04 UTC
+ExecMainStatus=0
+Id=jarvis-db-retention.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:31:33 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:31:33 UTC
+ExecMainStatus=0
+Id=jarvis-spawn-reconcile.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:35:48 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:35:48 UTC
+ExecMainStatus=0
+Id=jarvis-watchdog.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sat 2026-10-17 12:22:51 UTC
+ExecMainExitTimestamp=Sat 2026-10-17 12:24:58 UTC
+ExecMainStatus=0
+Id=job-radar.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 05:31:10 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 05:31:10 UTC
+ExecMainStatus=0
+Id=logrotate.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:01:07 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:01:39 UTC
+ExecMainStatus=0
+Id=lovable-watch.service
+ActiveState=inactive
+SubState=dead
+
+Result=exit-code
+ExecMainStartTimestamp=Sat 2026-10-17 11:47:00 UTC
+ExecMainExitTimestamp=Sat 2026-10-17 11:47:00 UTC
+ExecMainStatus=1
+Id=model-watch.service
+ActiveState=failed
+SubState=failed
+
+Result=success
+ExecMainStartTimestamp=Fri 2026-10-16 19:25:00 UTC
+ExecMainExitTimestamp=Fri 2026-10-16 19:25:00 UTC
+ExecMainStatus=0
+Id=partner-pipeline-block.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:30:16 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:30:17 UTC
+ExecMainStatus=0
+Id=paused-mb-lead-watch.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:09:02 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:09:02 UTC
+ExecMainStatus=0
+Id=phpsessionclean.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:35:43 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:35:43 UTC
+ExecMainStatus=0
+Id=proc-watch.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sat 2026-10-17 12:40:00 UTC
+ExecMainExitTimestamp=Sat 2026-10-17 12:40:05 UTC
+ExecMainStatus=0
+Id=product-setup-check.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:08:39 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:08:51 UTC
+ExecMainStatus=0
+Id=quantum-density.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sat 2026-10-17 12:20:01 UTC
+ExecMainExitTimestamp=Sat 2026-10-17 12:21:56 UTC
+ExecMainStatus=0
+Id=reporting-reconcile.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:30:29 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:30:31 UTC
+ExecMainStatus=0
+Id=send-slot-watch.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:12:51 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:13:00 UTC
+ExecMainStatus=0
+Id=stub-radar.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 00:29:28 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 00:29:28 UTC
+ExecMainStatus=0
+Id=systemd-tmpfiles-clean.service
+ActiveState=inactive
+SubState=dead
+
+Result=exit-code
+ExecMainStartTimestamp=Sun 2026-10-18 11:35:18 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:35:18 UTC
+ExecMainStatus=203
+Id=teams-radar.service
+ActiveState=failed
+SubState=failed
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:30:52 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:31:07 UTC
+ExecMainStatus=0
+Id=tech-task-watch.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 08:15:00 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 08:15:00 UTC
+ExecMainStatus=0
+Id=vault-scratch-wipe.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:35:00 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:35:00 UTC
+ExecMainStatus=0
+Id=window-burn.service
+ActiveState=inactive
+SubState=dead
+
+Result=success
+ExecMainStartTimestamp=Sun 2026-10-18 11:00:09 UTC
+ExecMainExitTimestamp=Sun 2026-10-18 11:00:46 UTC
+ExecMainStatus=0
+Id=youtube-research.service
+ActiveState=inactive
+SubState=dead

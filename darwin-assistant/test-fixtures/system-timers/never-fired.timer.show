@@ -1,0 +1,12 @@
+Unit=tv-fixture-never-fired.service
+TimersMonotonic={ OnActiveUSec=11month 4w 2d 4h 30min ; next_elapse=1y 4d 5h 24min 50.909682s }
+NextElapseUSecRealtime=
+NextElapseUSecMonotonic=1y 4d 5h 24min 50.909682s
+LastTriggerUSec=
+Persistent=no
+Id=tv-fixture-never-fired.timer
+Description=timer-visibility fixture: armed, never fired
+ActiveState=active
+SubState=waiting
+UnitFileState=transient
+ActiveEnterTimestamp=Sun 2026-10-18 11:36:06 UTC

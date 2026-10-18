@@ -293,6 +293,9 @@ import {
   runAgentNow,
   setAgentEnabled,
 } from '../agent-stable.js';
+// 🕒 System timers — every systemd timer on the box, model-free, with one
+// `abnormal` boolean per timer (src/system-timers.ts).
+import { systemTimersPayload } from '../system-timers.js';
 // 🩺 COCKPIT HEALTH (docs/health/CONTRACT.md) — the box + workload monitor.
 import {
   noteApiRequest,
@@ -4246,6 +4249,13 @@ export function createApiV1Router(): Router {
   // failure. Nothing here ever constructs a model call itself.
   router.get('/agents', (_req: AuthedRequest, res) => {
     res.json(agentStablePayload());
+  });
+
+  // Every systemd timer (not just the agent-stable ones): systemctl parsing +
+  // one registry directory read, NEVER a model call. Read-only, same auth as
+  // /agents. `abnormal` is the one boolean the UI leads with.
+  router.get('/system-timers', (_req: AuthedRequest, res) => {
+    res.json(systemTimersPayload());
   });
 
   router.get('/agents/:key/tail', (req: AuthedRequest, res) => {

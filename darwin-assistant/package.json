@@ -13,6 +13,7 @@
     "governor-v2:sim": "JARVIS_DB_PATH=/tmp/governor-v2-sim.db node scripts/governor-v2-sim.mjs",
     "governor-multiclaude:sim": "JARVIS_DB_PATH=/tmp/governor-multiclaude-sim.db node scripts/governor-multiclaude-sim.mjs",
     "spawn-monitor:test": "node scripts/spawn-monitor-test.mjs",
+    "system-timers:test": "npm run build && node scripts/system-timers-test.mjs",
     "claude-accounts:test": "JARVIS_DB_PATH=/tmp/claude-accounts-test.db node scripts/claude-accounts-test.mjs",
     "claude-adapter-account:test": "JARVIS_DB_PATH=/tmp/claude-adapter-account-test.db node scripts/claude-adapter-account-test.mjs",
     "claude-ratelimit-rescue:test": "JARVIS_DB_PATH=/tmp/claude-ratelimit-rescue-test.db node scripts/claude-ratelimit-rescue-test.mjs",

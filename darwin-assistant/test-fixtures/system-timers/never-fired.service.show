@@ -1,0 +1,7 @@
+Result=success
+ExecMainStartTimestamp=
+ExecMainExitTimestamp=
+ExecMainStatus=0
+Id=tv-fixture-never-fired.service
+ActiveState=inactive
+SubState=dead

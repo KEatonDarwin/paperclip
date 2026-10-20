@@ -68,10 +68,10 @@ globalThis.fetch = async (_url, init) => {
   }
   if (body.method === 'tools/call') {
     const { name, arguments: args } = body.params;
-    if (name === 'relay-tool' && args.operation === 'inbox') {
+    if (name === 'relay-tool' && args.op === 'inbox') {
       return jsonRpcResult(body.id, { messages: messagesA });
     }
-    if (name === 'relay-tool' && args.operation === 'read_thread') {
+    if (name === 'relay-tool' && args.op === 'read_thread') {
       if (args.id !== 'tA') throw new Error(`fixture has no thread ${args.id}`);
       return jsonRpcResult(body.id, { thread: THREAD_A, messages: messagesA });
     }
@@ -117,8 +117,9 @@ check('(a) poll ok', p1.ok === true);
 check('(a) exactly one message mirrored', p1.messagesUpserted === 1);
 check('(a) exactly one cue row after first inbound', cueFiredCount() === 1);
 const a1Row = sqliteDb.prepare(`SELECT * FROM relay_messages WHERE message_id = 'a1'`).get();
-check('(a) a1 cue_fired_at populated', typeof a1Row.cue_fired_at === 'string' && a1Row.cue_fired_at.length > 0);
-check('(a) a1 cue_skip_reason is NULL (it fired)', a1Row.cue_skip_reason === null);
+check('(a) a1 was mirrored', a1Row !== undefined);
+check('(a) a1 cue_fired_at populated', typeof a1Row?.cue_fired_at === 'string' && a1Row.cue_fired_at.length > 0);
+check('(a) a1 cue_skip_reason is NULL (it fired)', a1Row?.cue_skip_reason === null);
 
 // -- (b) the SAME inbound replayed -> still exactly one ----------------------
 const fetchCallsBeforeReplay = fetchCalls;
@@ -152,8 +153,8 @@ await pollRelay();
 
 const a9Row = sqliteDb.prepare(`SELECT * FROM relay_messages WHERE message_id = 'a9'`).get();
 check('(c) 9th message mirrored', a9Row !== undefined);
-check('(c) 9th message did NOT cue', a9Row.cue_fired_at === null);
-check('(c) 9th message cue_skip_reason is cap_thread_exchanges', a9Row.cue_skip_reason === 'cap_thread_exchanges');
+check('(c) 9th message did NOT cue', a9Row?.cue_fired_at === null);
+check('(c) 9th message cue_skip_reason is cap_thread_exchanges', a9Row?.cue_skip_reason === 'cap_thread_exchanges');
 check('(c) cue count STILL 8 (9th did not cue)', cueFiredCount() === 8);
 const tAAfter = threadStatus('tA');
 check('(c) thread tA is now paused', tAAfter.status === 'paused');
@@ -167,8 +168,8 @@ messagesA.push({
 await pollRelay();
 const a10Row = sqliteDb.prepare(`SELECT * FROM relay_messages WHERE message_id = 'a10'`).get();
 check('(d) 10th message still mirrored despite pause', a10Row !== undefined);
-check('(d) 10th message did NOT cue (thread paused)', a10Row.cue_fired_at === null);
-check('(d) 10th message cue_skip_reason is thread_paused', a10Row.cue_skip_reason === 'thread_paused');
+check('(d) 10th message did NOT cue (thread paused)', a10Row?.cue_fired_at === null);
+check('(d) 10th message cue_skip_reason is thread_paused', a10Row?.cue_skip_reason === 'thread_paused');
 // This poll also re-mirrored tA's thread row from the fixture (which still
 // says status: 'waiting_jarvis') — proves upsertThreadStmt's CASE WHEN guard
 // (relay.ts) keeps a local pause from being clobbered by the next re-mirror.

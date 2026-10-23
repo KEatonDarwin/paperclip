@@ -1,0 +1,98 @@
+import { runClaude } from './agent.js';
+import { getTurnsLean as getTurns, type ConversationRow } from './conversation-db.js';
+import { getLatestThreadSummary } from './thread-summaries.js';
+import { stripBrevityMarker } from './reply-brevity.js';
+
+// DAR-741 — AI-mediated natural-language search over cockpit threads. Kevin
+// describes what he's looking for in a free-form paragraph (not keywords);
+// the model reads a compact corpus (title + latest summary + a couple of
+// recent messages per thread) and picks the threads that actually match.
+
+export interface ThreadSearchResult {
+  thread_id: string;
+  reason: string;
+}
+
+// Exported for scripts/reply-brevity-test.mjs — proves the both-halves
+// decision directly against a seeded conversation, without a real runClaude
+// call (searchThreadsByQuery is what actually calls runClaude).
+export function threadSnippet(conv: ConversationRow): string {
+  const summary = getLatestThreadSummary(conv.id)?.content;
+  if (summary) return summary.slice(0, 500);
+  // No summary yet — fall back to the last couple of real messages so a
+  // fresh/short thread is still searchable.
+  const turns = getTurns(conv.id).filter((t) => t.role === 'user' || t.role === 'assistant');
+  // Matching must see text from BOTH halves — strip only the marker line,
+  // keep brief + full concatenated, so a query worded like the brief still
+  // matches a thread whose stored content is brief+marker+full.
+  return turns
+    .slice(-4)
+    .map((t) => `${t.role}: ${stripBrevityMarker(t.content ?? '').slice(0, 300)}`)
+    .join('\n')
+    .slice(0, 800);
+}
+
+const SEARCH_PROMPT = (query: string, corpus: string) => `Kevin is searching his JARVIS cockpit threads by describing what he's looking for in his own words, not exact keywords. Read his query and the list of threads below, then pick the threads that actually match what he's describing.
+
+Query:
+"""
+${query}
+"""
+
+Threads (thread_id, title, a content snippet, and — when the full-text index found it — the matched text from anywhere in the chat):
+${corpus}
+
+Respond with ONLY a JSON array, no prose, no markdown fences. Most relevant first, at most 5 entries. Each entry: {"thread_id": "<the exact thread_id from above>", "reason": "<one short sentence on why this matches>"}. If nothing genuinely matches, respond with [].`;
+
+function extractJsonArray(text: string): unknown[] {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const raw = fenced ? fenced[1] : text;
+  const start = raw.indexOf('[');
+  const end = raw.lastIndexOf(']');
+  if (start === -1 || end === -1 || end < start) throw new Error('No JSON array found in search response');
+  const parsed = JSON.parse(raw.slice(start, end + 1));
+  if (!Array.isArray(parsed)) throw new Error('Search response JSON was not an array');
+  return parsed;
+}
+
+// Cap on the full-text "matched text" line per candidate, so 40 candidates
+// keep the ranker prompt bounded (~12k chars of match text at most).
+export const MATCHED_TEXT_MAX = 300;
+
+/**
+ * `matched` (Find Any Chat): the full-text index's snippet per conversation id.
+ * A hit can sit anywhere in a long chat — far outside the latest summary or
+ * the last 4 turns that threadSnippet() shows — so the matched text is passed
+ * to the ranker too, or it would be blind to why the chat is a candidate.
+ */
+export async function searchThreadsByQuery(
+  query: string,
+  candidates: ConversationRow[],
+  matched?: ReadonlyMap<number, string>,
+): Promise<ThreadSearchResult[]> {
+  if (!candidates.length) return [];
+
+  const corpus = candidates
+    .map((c) => {
+      // A password-locked chat is matched on its TITLE only: none of its content
+      // (summary, recent turns, matched text) goes to the model, so the one-line
+      // reason shown in the results can't echo it either.
+      if (c.password_hash) {
+        return `- thread_id: ${c.external_id}\n  title: ${c.title ?? '(untitled)'}\n  snippet: (password-locked — content hidden; match on the title only)`;
+      }
+      const hit = matched?.get(c.id)?.replace(/\s+/g, ' ').trim().slice(0, MATCHED_TEXT_MAX);
+      return `- thread_id: ${c.external_id}\n  title: ${c.title ?? '(untitled)'}\n  snippet: ${threadSnippet(c).replace(/\n/g, ' ') || '(no messages yet)'}`
+        + (hit ? `\n  matched text: ${hit}` : '');
+    })
+    .join('\n');
+
+  const result = await runClaude(SEARCH_PROMPT(query, corpus), null);
+  const parsed = extractJsonArray(result.text);
+  const validIds = new Set(candidates.map((c) => c.external_id));
+
+  return parsed
+    .filter((e): e is Record<string, unknown> => typeof e === 'object' && e !== null)
+    .map((e) => ({ thread_id: String(e.thread_id ?? ''), reason: String(e.reason ?? '') }))
+    .filter((e) => validIds.has(e.thread_id))
+    .slice(0, 5);
+}

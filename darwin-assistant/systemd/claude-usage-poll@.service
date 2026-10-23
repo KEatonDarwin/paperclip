@@ -1,0 +1,22 @@
+# MULTI-CLAUDE — per-account usage poller (tree-44d2ff4a node #293).
+# Committed here for JARVIS/Kevin to install at setup time (via
+# scripts/multi-claude-setup.sh, which installs the instance for one account
+# key). NOT installed by this build, and NOT used for account 'a' — that
+# account keeps its original standalone claude-usage-poll.service/.timer
+# untouched.
+#
+# This is a systemd TEMPLATE unit: `%i` is the instance name, i.e. the
+# account key (e.g. `claude-usage-poll@b.service`). Per-account config
+# (ACCOUNT_KEY/ORG_ID/COOKIE_FILE/OUT_FILE) comes from the matching
+# EnvironmentFile at ~/.claude-accounts/%i.env, written by the setup script —
+# the unit itself carries no account-specific values, so N accounts reuse one
+# pair of template files.
+
+[Unit]
+Description=Poll claude.ai usage endpoint for JARVIS provider-usage widget (account %i)
+
+[Service]
+Type=oneshot
+User=kevin
+EnvironmentFile=/home/kevin/.claude-accounts/%i.env
+ExecStart=/home/kevin/paperclip/darwin-assistant/scripts/claude-usage-poll-account.sh

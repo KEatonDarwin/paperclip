@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""agy-jarvis — JARVIS engine adapter wrapper for Google's Antigravity CLI (`agy`).
+
+The engine pipes the RAW prompt to this script's stdin and passes agy flags as
+argv (e.g. --model X --dangerously-skip-permissions --conversation ID). agy's
+print mode does not read a bare prompt from stdin; its stream-json INPUT mode
+does, as NDJSON. So we JSON-wrap the raw prompt into one `{"event":"user",...}`
+line and run agy in stream-json in+out. All agy stream events go to stdout for
+the engine's NDJSON parser; stderr stays agy's stderr. Exit code = agy's.
+
+BUG WE FIX HERE: with the previous bash wrapper, python wrote one NDJSON line
+and then exited immediately, which closed agy's stdin pipe. agy's print-mode
+stream-json handler treats stdin-close as "shutdown now, after current turn" —
+on a short turn, that shutdown races the final `result` event write and wins,
+so deltas stream through fine but the terminal `result` event is dropped. The
+engine's NDJSON parser keys end-of-turn on `event: "result"`; without it, the
+turn hangs forever (observed 2026-10-22 chat 724f983e).
+
+Fix: hold agy's stdin open until we actually see `event: "result"` on its
+stdout, THEN close stdin so agy does its orderly shutdown AFTER the result
+line has already been emitted. If stdout EOFs without a result event (worst
+case, truly crashed agy), we close stdin on EOF and exit with agy's code.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from subprocess import Popen, PIPE
+
+
+def main() -> int:
+    agy = os.environ.get("AGY_BIN") or os.path.expanduser("~/.local/bin/agy")
+
+    raw_prompt = sys.stdin.read()
+    user_line = (
+        json.dumps(
+            {"event": "user", "message": {"role": "user", "content": raw_prompt}}
+        )
+        + "\n"
+    ).encode("utf-8")
+
+    argv = [
+        agy,
+        *sys.argv[1:],
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+    ]
+
+    # stderr=None → agy's stderr inherits ours directly (unchanged behavior).
+    proc = Popen(argv, stdin=PIPE, stdout=PIPE, stderr=None, bufsize=0)
+
+    # Write the single user turn.
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(user_line)
+        proc.stdin.flush()
+    except BrokenPipeError:
+        # agy died before we could even send the prompt — drain stdout and exit.
+        pass
+
+    # Pump stdout line-by-line to our stdout; close agy's stdin as soon as we
+    # see `event: "result"` so agy's shutdown runs AFTER the terminal event
+    # has been emitted (prevents the race described in the module docstring).
+    stdin_closed = False
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        # Pass through unchanged for the engine's NDJSON parser.
+        sys.stdout.buffer.write(line)
+        sys.stdout.buffer.flush()
+
+        if stdin_closed:
+            continue
+
+        # Only parse enough to detect the terminal event; ignore malformed
+        # lines (agy's stderr/debug noise does not land on stdout, but be
+        # defensive anyway).
+        try:
+            evt = json.loads(line.decode("utf-8", errors="replace"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(evt, dict) and evt.get("event") == "result":
+            try:
+                proc.stdin.close()  # type: ignore[union-attr]
+            except (BrokenPipeError, OSError):
+                pass
+            stdin_closed = True
+
+    # stdout EOF — close stdin if we never saw a result (worst case) and
+    # return agy's exit code.
+    if not stdin_closed:
+        try:
+            proc.stdin.close()  # type: ignore[union-attr]
+        except (BrokenPipeError, OSError):
+            pass
+
+    return proc.wait()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,20 @@
+# INTEL DESK — daily intel pull. Committed here for JARVIS to install at
+# deploy time (copy to /etc/systemd/system/, daemon-reload, enable --now the
+# timer). Not installed by this build.
+#
+# PATH must include the CLI install dirs explicitly — systemd's non-interactive
+# environment does not source ~/.bashrc, and the codex/auggie usage-poll units
+# already hit this exact gotcha with claude/codex/auggie on PATH.
+
+[Unit]
+Description=JARVIS Intel Desk daily pull
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=kevin
+WorkingDirectory=/home/kevin/paperclip/darwin-assistant
+Environment=TZ=America/Chicago
+Environment=PATH=/home/kevin/.local/bin:/home/kevin/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CLAUDE_BIN=/home/kevin/.local/bin/claude
+ExecStart=/usr/bin/npx tsx /home/kevin/paperclip/darwin-assistant/scripts/intel-pull.ts --lanes all

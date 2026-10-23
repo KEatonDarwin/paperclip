@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""JARVIS Watchdog — nothing gets dropped.
+
+Runs every 60s (systemd timer). Server-owned state, model-independent: if the
+model/session dies mid-turn, if a Foreman job stalls, if JARVIS promised to do
+something and never did — this catches it, attempts a NON-DESTRUCTIVE recovery,
+and escalates to Kevin via a cockpit notification.
+
+Mission statement (Kevin, 2026-08-30): "no matter what happens, even if it's the
+foreman itself that breaks, it should attempt to be solved in a non-destructive
+way instead of just suddenly stopping or dying without being handled."
+
+Sentinels
+  foreman     — jobs stalled in an active status, or newly failed / needs_review
+  dead_turn   — a thread whose last message is Kevin's with no reply (session died)
+  commitment  — registered promises past their deadline (see jarvis-commit.py)
+  services    — the units this whole stack depends on
+  self        — writes its own heartbeat so a missing watchdog is itself visible
+
+Escalation is state-change-driven (watch_events dedupes), so a stuck thing alerts
+ONCE, not every minute.
+"""
+import sqlite3, json, os, subprocess, urllib.parse, urllib.request, datetime, traceback
+
+DEFAULT_DB      = "/home/kevin/paperclip/darwin-assistant/jarvis.db"
+DEFAULT_COCKPIT = "http://localhost:3201/api/v1"
+DB          = os.environ.get("WATCHDOG_DB", DEFAULT_DB)
+COCKPIT_ENV = "/home/kevin/paperclip/jarvis-command-center/.env"
+JARVIS_ENV  = "/home/kevin/paperclip/darwin-assistant/.env"
+COCKPIT     = os.environ.get("WATCHDOG_COCKPIT", DEFAULT_COCKPIT)
+PAPERCLIP   = "http://localhost:3100/api/v1"
+COMPANY_ID  = "ffbbb56f-af79-49a0-a95a-9eb89f5b3034"
+HEARTBEAT   = "/tmp/jarvis-watchdog-heartbeat.json"
+LOG         = "/tmp/jarvis-watchdog.log"
+WAKE_BACK_FLAG = "/home/kevin/.jarvis/wake-back.enabled"
+WAKE_BACK_CAP = 3
+
+# --- thresholds (minutes) ---
+FOREMAN_STALE_MIN   = 20   # active job with no update this long -> stuck
+DEAD_TURN_MIN       = 8    # user message with no reply this long -> turn died
+DEAD_TURN_MAX_AGE_H = 48   # ignore anything older than this (don't alert on history)
+MAX_FOREMAN_RECOVER = 2    # re-kick attempts per job, ever
+MAX_TURN_RECOVER    = 1    # auto-resume attempts per dead turn, ever
+RECOVER_MAX_AGE_H   = 24   # never auto-recover work older than this — a months-old
+                           # stalled job gets flagged for a human, not silently
+                           # re-run into live workers
+
+FOREMAN_TERMINAL = {"merged", "completed", "cancelled", "done"}
+FOREMAN_ACTIVE   = {"planning", "decomposed", "dispatched", "running",
+                    "integrating", "verifying", "queued", "pending"}
+# Paperclip + Foreman Eye were mothballed 2026-09-24 (Kevin: "I don't think we
+# need it anymore… ghost it out"). JARVIS + the cockpit replaced what Paperclip
+# did. Flip PAPERCLIP_WATCH=1 in the env to put both sentinels back if it is ever
+# revived — the code is intact, just gated.
+PAPERCLIP_WATCH = os.environ.get("PAPERCLIP_WATCH") == "1"
+
+SERVICES = ["jarvis.service", "jarvis-command-center.service"]
+if PAPERCLIP_WATCH:
+    SERVICES += ["paperclip-dev.service", "foreman-eye.service"]
+
+
+def log(msg):
+    line = f"{datetime.datetime.utcnow().isoformat()}Z {msg}"
+    print(line)
+    try:
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def env_val(path, name):
+    try:
+        for line in open(path):
+            if line.strip().startswith(name + "="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return ""
+
+
+COCKPIT_KEY = env_val(COCKPIT_ENV, "JARVIS_COCKPIT_KEY")
+PAPERCLIP_KEY = (env_val(JARVIS_ENV, "PAPERCLIP_BOARD_API_KEY")
+                 or env_val(JARVIS_ENV, "PAPERCLIP_API_KEY"))
+
+
+def http(method, url, key, payload=None, timeout=20):
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"Authorization": "Bearer " + key}
+    if data:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = r.read().decode()
+    return json.loads(body) if body.strip() else {}
+
+
+def notify(sev, title, body, link=None):
+    try:
+        http("POST", COCKPIT + "/notifications", COCKPIT_KEY,
+             {"severity": sev, "title": title, "body": body,
+              "source": "watchdog", **({"link": link} if link else {})})
+        log(f"  NOTIFY [{sev}] {title}")
+    except Exception as e:
+        log(f"  notify FAILED: {e}")
+
+
+def wake_back_enabled():
+    return os.path.exists(WAKE_BACK_FLAG)
+
+
+def wake_back_text(row, detail):
+    detail = detail if len(detail or "") <= 300 else detail[:300] + "…"
+    return (f"[watchdog] Commitment breached.\n"
+            f"Subject: \"{row['subject']}\"\n"
+            f"Due: \"{row['due_at']} UTC\"\n"
+            f"Detail: \"{detail}\"\n"
+            "check this and report status in one line.")
+
+
+def wake_commitment(row, detail):
+    if not row.get("thread_ext"):
+        return False
+    http("POST",
+         COCKPIT + "/threads/" + urllib.parse.quote(row["thread_ext"], safe="") + "/messages",
+         COCKPIT_KEY, {"text": wake_back_text(row, detail)}, timeout=5)
+    return True
+
+
+def parse_ts(s):
+    if not s:
+        return None
+    s = s.replace("T", " ").replace("Z", "")[:19]
+    try:
+        return datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def ensure_schema(c):
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS watch_commitments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      subject TEXT NOT NULL,
+      thread_ext TEXT,
+      check_type TEXT NOT NULL DEFAULT 'manual',
+      check_ref TEXT,
+      due_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      recovery_attempts INTEGER NOT NULL DEFAULT 0,
+      last_checked TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      resolved_at TEXT,
+      notes TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_watch_commitments_status
+      ON watch_commitments(status, due_at);
+    CREATE TABLE IF NOT EXISTS watch_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sentinel TEXT NOT NULL,
+      subject_key TEXT NOT NULL,
+      state TEXT,
+      severity TEXT,
+      message TEXT,
+      recovery_attempts INTEGER NOT NULL DEFAULT 0,
+      notified_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(sentinel, subject_key)
+    );
+    """)
+    c.commit()
+
+
+def seen_state(c, sentinel, key):
+    r = c.execute("SELECT state, recovery_attempts FROM watch_events "
+                  "WHERE sentinel=? AND subject_key=?", (sentinel, key)).fetchone()
+    return (r[0], r[1]) if r else (None, 0)
+
+
+def record_state(c, sentinel, key, state, sev=None, msg=None, bump_recovery=0):
+    c.execute("""INSERT INTO watch_events (sentinel, subject_key, state, severity, message,
+                   recovery_attempts, notified_at)
+                 VALUES (?,?,?,?,?,?,datetime('now'))
+                 ON CONFLICT(sentinel, subject_key) DO UPDATE SET
+                   state=excluded.state, severity=excluded.severity, message=excluded.message,
+                   recovery_attempts=watch_events.recovery_attempts+?,
+                   notified_at=datetime('now'), updated_at=datetime('now')""",
+              (sentinel, key, state, sev, msg, bump_recovery, bump_recovery))
+    c.commit()
+
+
+# ---------------------------------------------------------------- sentinels
+
+def sentinel_foreman(c, now):
+    """Stalled / failed / review-waiting Foreman jobs. Recovery = re-kick the run."""
+    if not PAPERCLIP_KEY:
+        log("  foreman: no paperclip key, skipping")
+        return
+    try:
+        jobs = http("GET", f"{PAPERCLIP}/jobs?companyId={COMPANY_ID}&limit=60",
+                    PAPERCLIP_KEY).get("jobs", [])
+    except Exception as e:
+        # Foreman/Paperclip itself is down -- that IS the alert.
+        prev, _ = seen_state(c, "foreman", "_api")
+        if prev != "down":
+            notify("error", "Foreman API unreachable",
+                   f"Watchdog could not list jobs: {e}. Paperclip may be down — "
+                   f"check paperclip-dev.service and the healthcheck timer.")
+            record_state(c, "foreman", "_api", "down", "error", str(e))
+        return
+    prev_api, _ = seen_state(c, "foreman", "_api")
+    if prev_api == "down":
+        notify("success", "Foreman API back up", "Job listing is responding again.")
+        record_state(c, "foreman", "_api", "up", "success", "recovered")
+
+    for j in jobs:
+        jid, status = j.get("id"), (j.get("status") or "").lower()
+        if status in FOREMAN_TERMINAL:
+            continue
+        upd = parse_ts(j.get("updatedAt")) or parse_ts(j.get("createdAt"))
+        age_min = (now - upd).total_seconds() / 60 if upd else 0
+        ask = (j.get("ask") or "")[:110].replace("\n", " ")
+        prev, attempts = seen_state(c, "foreman", jid)
+
+        if status == "failed":
+            if prev != "failed":
+                notify("error", "Foreman job FAILED",
+                       f"{ask}\n\nJob {jid[:8]} · {j.get('summary') or j.get('errorMessage') or 'no summary'}"
+                       f"\nForeman Eye: http://localhost:8081/jobs/{jid}")
+                record_state(c, "foreman", jid, "failed", "error", ask)
+            continue
+
+        if status == "needs_review":
+            if prev != "needs_review":
+                notify("warning", "Foreman job needs your review",
+                       f"{ask}\n\nJob {jid[:8]} · verify={j.get('verifyResult')} · "
+                       f"waiting {int(age_min//60)}h\nForeman Eye: http://localhost:8081/jobs/{jid}")
+                record_state(c, "foreman", jid, "needs_review", "warning", ask)
+            continue
+
+        if status in FOREMAN_ACTIVE and age_min >= FOREMAN_STALE_MIN:
+            too_old = age_min > RECOVER_MAX_AGE_H * 60
+            if too_old:
+                if prev != "stale_abandoned":
+                    notify("warning", "Foreman job abandoned (too old to auto-recover)",
+                           f"{ask}\n\nJob {jid[:8]} has been stuck in '{status}' for "
+                           f"{int(age_min//60)}h. Not auto-re-running it — it predates the "
+                           f"{RECOVER_MAX_AGE_H}h recovery window. Re-run or cancel it by hand."
+                           f"\nForeman Eye: http://localhost:8081/jobs/{jid}")
+                    record_state(c, "foreman", jid, "stale_abandoned", "warning", ask)
+            elif attempts < MAX_FOREMAN_RECOVER:
+                ok, err = True, ""
+                try:
+                    http("POST", f"{PAPERCLIP}/jobs/{jid}/run", PAPERCLIP_KEY, {})
+                except Exception as e:
+                    ok, err = False, str(e)
+                record_state(c, "foreman", jid, f"stalled:{status}", "warning", ask,
+                             bump_recovery=1)
+                notify("warning" if ok else "error",
+                       f"Foreman job stalled — {'re-kicked' if ok else 'recovery failed'}",
+                       f"{ask}\n\nJob {jid[:8]} stuck in '{status}' for {int(age_min)}m. "
+                       f"{'Re-ran it (attempt %d/%d).' % (attempts+1, MAX_FOREMAN_RECOVER) if ok else 'Re-run failed: ' + err}"
+                       f"\nForeman Eye: http://localhost:8081/jobs/{jid}")
+            elif prev != "stalled_exhausted":
+                notify("error", "Foreman job stuck — recovery exhausted",
+                       f"{ask}\n\nJob {jid[:8]} still stuck in '{status}' after "
+                       f"{MAX_FOREMAN_RECOVER} re-kicks ({int(age_min)}m idle). Needs a human.")
+                record_state(c, "foreman", jid, "stalled_exhausted", "error", ask)
+
+
+def sentinel_dead_turn(c, now):
+    """A thread whose LAST turn is Kevin's, with no reply — the run died mid-turn.
+
+    Auto-resume ONLY when the dead turn did literally nothing (no assistant text,
+    no tool calls) — that is safely retryable. If it did partial work, notify only;
+    replaying could double-execute a side effect.
+    """
+    cutoff = (now - datetime.timedelta(hours=DEAD_TURN_MAX_AGE_H)).strftime("%Y-%m-%d %H:%M:%S")
+    rows = c.execute("""
+        SELECT cv.id, cv.external_id, cv.title, t.role, t.created_at, t.content, t.turn_index
+        FROM conversations cv
+        JOIN turns t ON t.id = (
+            SELECT id FROM turns WHERE conversation_id = cv.id
+            ORDER BY turn_index DESC, id DESC LIMIT 1)
+        WHERE cv.updated_at > ? AND cv.status = 'active'
+    """, (cutoff,)).fetchall()
+
+    for cid, ext, title, role, tcreated, content, tindex in rows:
+        if role != "user":
+            continue
+        ts = parse_ts(tcreated)
+        if not ts or (now - ts).total_seconds() / 60 < DEAD_TURN_MIN:
+            continue
+        # is it actively running right now? server owns that answer. We must
+        # POSITIVELY confirm it is idle before any re-post — if the status check
+        # errors/times out we assume it MIGHT still be running (fail closed) and
+        # skip this tick, rather than defaulting to "idle" and double-executing.
+        running, running_known = True, False
+        try:
+            d = http("GET", COCKPIT + "/threads/" + urllib.parse.quote(ext, safe=""), COCKPIT_KEY)
+            running = bool(d.get("running"))
+            running_known = True
+        except Exception:
+            pass
+        if running or not running_known:
+            continue
+
+        key = f"{cid}:{tindex}"
+        prev, attempts = seen_state(c, "dead_turn", key)
+        if prev == "handled":
+            continue
+
+        did_work = c.execute(
+            "SELECT COUNT(*) FROM turns WHERE conversation_id=? AND turn_index>=? "
+            "AND (tool_name IS NOT NULL OR role='assistant')", (cid, tindex)).fetchone()[0]
+        label = title or ext
+        snippet = (content or "")[:160].replace("\n", " ")
+
+        if did_work == 0 and attempts < MAX_TURN_RECOVER and content:
+            ok, err = True, ""
+            try:
+                # Resume the EXISTING dead turn in place — do NOT re-post the
+                # message. /resume re-runs the last (unanswered) user turn without
+                # inserting a duplicate of Kevin's words into the thread, which is
+                # what the old POST /messages path did (Kevin, 2026-10-05: that's
+                # "absolutely not the result I want").
+                http("POST", COCKPIT + "/threads/" + urllib.parse.quote(ext, safe="") + "/resume",
+                     COCKPIT_KEY, {})
+            except Exception as e:
+                ok, err = False, str(e)
+            record_state(c, "dead_turn", key, "handled" if ok else "resume_failed",
+                         "warning", snippet, bump_recovery=1)
+            notify("warning" if ok else "error",
+                   f"Dead turn auto-resumed: {label}" if ok else f"Dead turn — resume FAILED: {label}",
+                   f"Your message got no reply for {int((now-ts).total_seconds()//60)}m "
+                   f"(session died before doing anything). "
+                   f"{'Re-running it now — no duplicate message.' if ok else 'Could not resume: ' + err}"
+                   f"\n\n> {snippet}")
+        else:
+            record_state(c, "dead_turn", key, "handled", "error", snippet)
+            notify("error", f"Dead turn — needs you: {label}",
+                   f"Your message got no reply for {int((now-ts).total_seconds()//60)}m and the run "
+                   f"had already done partial work, so I did NOT auto-replay it "
+                   f"(risk of double-executing). Open the thread and say 'continue'.\n\n> {snippet}")
+
+
+def sentinel_commitments(c, now):
+    """Registered promises. Overdue + unmet => escalate."""
+    rows = c.execute("SELECT * FROM watch_commitments WHERE status='open'").fetchall()
+    cols = [d[0] for d in c.execute("SELECT * FROM watch_commitments LIMIT 0").description]
+    wakes = 0
+    for r in rows:
+        row = dict(zip(cols, r))
+        due = parse_ts(row["due_at"])
+        satisfied, detail = check_commitment(row)
+        if satisfied:
+            c.execute("UPDATE watch_commitments SET status='satisfied', resolved_at=datetime('now'),"
+                      " last_checked=datetime('now'), notes=? WHERE id=?", (detail, row["id"]))
+            c.commit()
+            log(f"  commitment #{row['id']} satisfied: {row['subject'][:60]}")
+            continue
+        c.execute("UPDATE watch_commitments SET last_checked=datetime('now') WHERE id=?", (row["id"],))
+        c.commit()
+        if due and now >= due:
+            will_wake = bool(row.get("thread_ext")) and wake_back_enabled() and wakes < WAKE_BACK_CAP
+            # Breach is committed BEFORE any wake POST: if this UPDATE fails (db locked) the
+            # row stays open and nothing was posted; if the POST later fails the row is still
+            # breached. Either way a row can never wake twice.
+            c.execute("UPDATE watch_commitments SET status='breached', resolved_at=datetime('now'),"
+                      " notes=? WHERE id=?",
+                      (f"{detail} | woke=pending" if will_wake else detail, row["id"]))
+            c.commit()
+            wake = "skipped"
+            if will_wake:
+                wakes += 1
+                woke_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+                try:
+                    wake_commitment(row, detail)
+                    wake = "posted"
+                    log(f"  commitment #{row['id']} wake-back posted to {row['thread_ext']}")
+                except Exception as e:
+                    wake = "failed"
+                    log(f"  commitment #{row['id']} wake-back FAILED: {e}")
+                try:
+                    c.execute("UPDATE watch_commitments SET notes=? WHERE id=?",
+                              (f"{detail} | woke={woke_at}" if wake == "posted"
+                               else f"{detail} | wake_failed={woke_at}", row["id"]))
+                    c.commit()
+                except Exception as e:
+                    log(f"  commitment #{row['id']} wake note update FAILED: {e}")
+            notify("error", "JARVIS promised this and it never happened",
+                   f"{row['subject']}\n\nDue {row['due_at']} UTC · check={row['check_type']}"
+                   f"{':' + row['check_ref'] if row['check_ref'] else ''} · {detail}"
+                   f"\nThread: {row['thread_ext'] or 'n/a'} · wake={wake}")
+
+
+def check_commitment(row):
+    t, ref = row["check_type"], row["check_ref"]
+    if t == "foreman_job" and ref and PAPERCLIP_KEY:
+        try:
+            j = http("GET", f"{PAPERCLIP}/jobs/{ref}", PAPERCLIP_KEY)
+            j = j.get("job", j)
+            st = (j.get("status") or "").lower()
+            if st and st not in ("planning", "pending", "queued"):
+                return True, f"job advanced to {st}"
+            return False, f"job still {st or 'unknown'}"
+        except Exception as e:
+            return False, f"job lookup failed: {e}"
+    if t == "thread_reply" and ref:
+        try:
+            c2 = sqlite3.connect(DB, timeout=15)
+            n = c2.execute("SELECT COUNT(*) FROM turns t JOIN conversations cv ON cv.id=t.conversation_id "
+                           "WHERE cv.external_id=? AND t.role='assistant' AND t.created_at > ?",
+                           (row["thread_ext"], ref)).fetchone()[0]
+            c2.close()
+            return (n > 0), f"{n} assistant turn(s) since {ref}"
+        except Exception as e:
+            return False, f"reply check failed: {e}"
+    if t == "chat_report" and ref:
+        if not row.get("thread_ext"):
+            return False, "chat_report missing origin thread"
+        try:
+            c2 = sqlite3.connect(DB, timeout=15)
+            n = c2.execute("SELECT COUNT(*) FROM turns t JOIN conversations cv ON cv.id=t.conversation_id "
+                           "WHERE cv.external_id=? AND t.created_at >= ? "
+                           "AND instr(COALESCE(t.content,''), ?) > 0",
+                           (row["thread_ext"], row["created_at"], f"[report:{ref}]")).fetchone()[0]
+            c2.close()
+            return (n > 0), f"{n} report marker(s) for {ref} after {row['created_at']}"
+        except Exception as e:
+            return False, f"chat_report check failed: {e}"
+    return False, "manual commitment — never auto-satisfied, mark it done explicitly"
+
+
+def sentinel_services(c, now):
+    for unit in SERVICES:
+        try:
+            state = subprocess.run(["systemctl", "is-active", unit], capture_output=True,
+                                   text=True, timeout=10).stdout.strip()
+        except Exception as e:
+            state = f"unknown({e})"
+        prev, _ = seen_state(c, "service", unit)
+        if state != prev:
+            record_state(c, "service", unit, state,
+                         "error" if state != "active" else "success", state)
+            if state != "active" and prev is not None:
+                notify("error", f"Service down: {unit}",
+                       f"systemctl is-active returned '{state}'. "
+                       f"Check: journalctl -u {unit} -n 50")
+            elif state == "active" and prev not in (None, "active"):
+                notify("success", f"Service recovered: {unit}", f"back to active (was {prev})")
+
+
+HOPPER_STALL_MIN = 60
+
+
+def sentinel_hopper_stall(c, now):
+    # An agreed tree with dispatchable work but nothing running for >HOPPER_STALL_MIN
+    # means the governor (or a bug) has been holding it silently — the 2026-09-09
+    # demo-eve failure mode. Alert loudly instead of letting it sit all night.
+    rows = c.execute(
+        "SELECT t.id, t.topic,"
+        " SUM(CASE WHEN n.status='running' THEN 1 ELSE 0 END) AS running,"
+        " SUM(CASE WHEN n.status='pending' THEN 1 ELSE 0 END) AS pending,"
+        " MAX(COALESCE(n.updated_at, n.created_at)) AS last_activity"
+        " FROM hopper_trees t JOIN hopper_nodes n ON n.tree_id=t.id"
+        " WHERE t.status='active' GROUP BY t.id"
+    ).fetchall()
+    gov_reason, gov_detail = None, None
+    if rows:
+        try:
+            g = http("GET", COCKPIT + "/hopper-engine/governor", COCKPIT_KEY)
+            if not g.get("allow"):
+                gov_reason, gov_detail = g.get("reason"), g.get("detail")
+        except Exception as e:
+            gov_reason, gov_detail = "unreachable", str(e)
+    for tree_id, topic, running, pending, last_activity in rows:
+        key = f"tree-{tree_id}"
+        stalled = False
+        if running == 0 and pending > 0 and gov_reason != "kevin_active":
+            ts = parse_ts(last_activity)
+            stalled = ts is not None and (now - ts).total_seconds() > HOPPER_STALL_MIN * 60
+        state = "stalled" if stalled else "flowing"
+        prev, _ = seen_state(c, "hopper_stall", key)
+        if state != prev:
+            record_state(c, "hopper_stall", key, state,
+                         "error" if stalled else "success", state)
+            if stalled:
+                gov = (f"\nGovernor: reason={gov_reason} — {gov_detail}"
+                       if gov_reason else "\nGovernor: allowing — suspect the engine itself")
+                notify("error", f"Hopper tree stalled: {topic}",
+                       f"Tree {tree_id} is active with {pending} pending node(s) and ZERO running "
+                       f"for over {HOPPER_STALL_MIN}m (last activity {last_activity}).{gov}")
+            elif prev == "stalled":
+                notify("success", f"Hopper tree flowing again: {topic}",
+                       f"Tree {tree_id} resumed dispatching.")
+
+
+
+RUNAWAY_WINDOW_MIN = 20     # look-back for the repair-storm check
+RUNAWAY_REPAIRS = 4         # ≥ this many `integrate nX` nodes created in the window = a storm
+RUNAWAY_NODES = 15          # ≥ this many nodes of ANY kind created in the window = a storm
+
+
+def sentinel_runaway(c, now, window_min=RUNAWAY_WINDOW_MIN, act=True, any_status=False):
+    # 2026-10-11, tree-2482c4ea: a misconfigured build gate made EVERY merge-back
+    # fail, and every failure spawned a new `integrate nX` repair node — 28 nodes
+    # and 29 model turns in 25 minutes while the warning bells rang unheeded.
+    # The engine now refuses to spawn repairs for worker-unfixable reasons, but
+    # the watchdog must catch the SHAPE regardless of cause: a tree creating
+    # nodes faster than any honest build does is a runaway. Model-free: pause the
+    # tree (status → draft stops all new claims), ring an error bell, and wake
+    # the origin chat so JARVIS rectifies with judgment the watchdog does not have.
+    rows = c.execute(
+        "SELECT t.id, t.topic, t.origin_thread_ext,"
+        " SUM(CASE WHEN n.title LIKE 'integrate n%' THEN 1 ELSE 0 END) AS repairs,"
+        " COUNT(*) AS created"
+        " FROM hopper_trees t JOIN hopper_nodes n ON n.tree_id=t.id"
+        " WHERE (t.status='active' OR ?) AND n.created_at >= datetime('now', ?)"
+        " GROUP BY t.id", (1 if any_status else 0, f"-{int(window_min)} minutes",)
+    ).fetchall()
+    fired = []
+    for tree_id, topic, origin, repairs, created in rows:
+        storm = repairs >= RUNAWAY_REPAIRS or created >= RUNAWAY_NODES
+        key = f"tree-{tree_id}"
+        state = "runaway" if storm else "normal"
+        prev, _ = seen_state(c, "runaway", key)
+        if not storm:
+            if prev == "runaway":
+                record_state(c, "runaway", key, state, "success", state)
+            continue
+        reason = c.execute(
+            "SELECT spec FROM hopper_nodes WHERE tree_id=? AND title LIKE 'integrate n%'"
+            " ORDER BY id DESC LIMIT 1", (tree_id,)).fetchone()
+        why = ""
+        if reason and reason[0]:
+            import re as _re
+            m = _re.search(r"\(`([a-z_]+)`\)", reason[0])
+            why = m.group(1) if m else ""
+        msg = (f"Tree {tree_id} created {created} node(s) in {window_min} min, {repairs} of them "
+               f"repair nodes{' (' + why + ')' if why else ''} — a runaway, not a build.")
+        fired.append((tree_id, msg))
+        if not act:
+            log(f"  [test] would PAUSE {tree_id}: {msg}")
+            continue
+        if prev == "runaway":
+            continue  # one action per episode; the state resets when the storm ends
+        c.execute("UPDATE hopper_trees SET status='draft', updated_at=datetime('now') WHERE id=?", (tree_id,))
+        c.commit()
+        record_state(c, "runaway", key, state, "error", msg)
+        notify("error", f"🔴 runaway tree PAUSED: {topic[:80]}",
+               msg + " Paused automatically; JARVIS has been woken in the origin chat to rectify.",
+               link=(f"/threads?open={urllib.parse.quote(origin, safe='')}" if origin else None))
+        if origin:
+            try:
+                http("POST", COCKPIT + "/threads/" + urllib.parse.quote(origin, safe="") + "/messages",
+                     COCKPIT_KEY, {"text": f"[watchdog] {msg} I paused the tree. Find the cause, fix the tree config, then reactivate it."})
+            except Exception as e:
+                log(f"  runaway wake FAILED: {e}")
+    return fired
+
+
+def sentinel_memory_bloat(c, now):
+    """Memory diet guard (Kevin, 2026-09-25): memory.md is injected into EVERY
+    turn — it was 446KB (~110K tokens/turn) before the diet cut it to ~25KB.
+    Bell when it creeps past budget so it never silently regrows. Same check on
+    worker-core.md (the ephemeral-worker injection, budget ~15KB).
+
+    lean/prompt-diet (2026-10-17): this used to bell ONCE on the ok->bloated
+    edge and then go quiet for good. memory.md crossed 100KB on 2026-10-14, the
+    one bell fired, and the file kept growing to 123KB with nobody told. Now a
+    bloated file re-bells every 24h, and sooner if it has grown another 10KB
+    since the last bell. The budget is the file's own written contract (80KB),
+    not 100KB. When the core+packs layout is on (memory/core.md exists) the core
+    and every pack get their own budget, and the old single file is not watched.
+    (Layout = the `memory_layout` setting, same rule as src/memory-layout.ts.)"""
+    import os, glob
+    root = "/home/kevin/obsidian/paperclip-wiki/agent-memory/jarvis"
+    try:
+        r = c.execute("SELECT value FROM settings WHERE key='memory_layout'").fetchone()
+        layout = r[0] if r else "single"
+    except sqlite3.Error:
+        layout = "single"
+    # Same rule as src/memory-layout.ts: 'core' only when the setting says so AND core.md exists.
+    if layout == "core" and os.path.exists(f"{root}/memory/core.md"):
+        files = [(f"{root}/memory/core.md", 30_000, "memory/core.md")]
+        files += [(p, 25_000, "memory/packs/" + os.path.basename(p))
+                  for p in sorted(glob.glob(f"{root}/memory/packs/*.md"))]
+    else:
+        files = [(f"{root}/memory.md", 84_000, "memory.md")]
+    files.append((f"{root}/worker-core.md", 15_000, "worker-core.md"))
+    for path, budget, label in files:
+        key = f"size:{label}"
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = -1
+        if size < 0:
+            state = "missing"
+        elif size > budget:
+            state = "bloated"
+        else:
+            state = "ok"
+        prev, _ = seen_state(c, "memory_bloat", key)
+        if state == prev == "bloated":
+            r = c.execute("SELECT message, notified_at FROM watch_events WHERE sentinel='memory_bloat' "
+                          "AND subject_key=?", (key,)).fetchone()
+            try:
+                last_size = int((r[0] or "0").split()[0])
+                last_at = datetime.datetime.strptime(r[1], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                last_size, last_at = 0, now - datetime.timedelta(days=2)
+            if (now - last_at).total_seconds() < 86_400 and size - last_size < 10_000:
+                continue
+        elif state == prev:
+            continue
+        if state == "bloated":
+            notify("warning", f"Memory diet breach: {label} is {size//1024}KB (budget {budget//1024}KB)",
+                   f"{label} is injected into every JARVIS turn — trim it back (supersede in place, "
+                   f"archive sagas to agent-memory/jarvis/archive/ or move topic detail into a pack). "
+                   f"This bell repeats daily until it is back under budget.")
+        elif state == "missing":
+            notify("error", f"Memory file MISSING: {label}",
+                   f"{path} unreadable — every JARVIS turn is now running without it.")
+        elif prev in ("bloated", "missing"):
+            notify("success", f"Memory diet restored: {label} back within budget ({size//1024}KB)", "")
+        record_state(c, "memory_bloat", key, state, "warning", f"{size} bytes")
+
+
+def main():
+    now = datetime.datetime.utcnow()
+    c = sqlite3.connect(DB, timeout=20)
+    ensure_schema(c)
+    errors = []
+    sentinels = [("dead_turn", sentinel_dead_turn),
+                 ("commitments", sentinel_commitments), ("services", sentinel_services),
+                 ("hopper_stall", sentinel_hopper_stall),
+                 ("runaway", sentinel_runaway),
+                 ("memory_bloat", sentinel_memory_bloat)]
+    if PAPERCLIP_WATCH:  # mothballed 2026-09-24 — see PAPERCLIP_WATCH above
+        sentinels.insert(0, ("foreman", sentinel_foreman))
+    for name, fn in sentinels:
+        try:
+            fn(c, now)
+        except Exception:
+            errors.append(f"{name}: {traceback.format_exc(limit=3)}")
+            log(f"  SENTINEL {name} THREW:\n{traceback.format_exc(limit=3)}")
+    c.close()
+    try:
+        with open(HEARTBEAT, "w") as f:
+            json.dump({"ran_at": now.isoformat() + "Z", "errors": errors,
+                       "sentinels": ["foreman", "dead_turn", "commitments", "services", "hopper_stall", "runaway", "memory_bloat"]}, f)
+    except Exception:
+        pass
+    if errors:
+        notify("error", "Watchdog sentinel error",
+               "A watchdog sentinel threw — the watchdog itself still ran.\n" + errors[0][:600])
+    log(f"watchdog tick done ({len(errors)} sentinel error(s))")
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    if "--test-runaway" in _sys.argv:
+        # Prove the detector against REAL history: a wide window, no mutation.
+        _c = sqlite3.connect(DB, timeout=20); ensure_schema(_c)
+        _f = sentinel_runaway(_c, datetime.datetime.now(datetime.timezone.utc), window_min=180, act=False, any_status=True)
+        print(f"would fire on {len(_f)} tree(s):", *[f"\n  {t}: {m}" for t, m in _f] if _f else ["none"])
+        _sys.exit(0)
+    main()

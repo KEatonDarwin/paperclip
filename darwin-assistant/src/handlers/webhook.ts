@@ -1,0 +1,83 @@
+import express from 'express';
+import { processMessage, ConversationBusyError } from '../agent.js';
+import { handlePaperclipWebhook } from './paperclip-webhook.js';
+import { fullOnly } from '../reply-brevity.js';
+
+export function createWebhookRouter(): express.Router {
+  const router = express.Router();
+
+  router.use(express.json());
+
+  router.post('/paperclip-webhook', async (req, res) => {
+    try {
+      const result = await handlePaperclipWebhook(req.body);
+      res.json(result);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error('[paperclip-webhook] Error:', errMsg);
+      res.status(500).json({ error: errMsg });
+    }
+  });
+
+  router.post('/intake', async (req, res) => {
+    const { text, source = 'webhook', sessionId } = req.body as {
+      text?: string;
+      source?: string;
+      sessionId?: string;
+    };
+
+    if (!text?.trim()) {
+      res.status(400).json({ error: 'text is required' });
+      return;
+    }
+
+    const conversationId = sessionId ? `webhook:${sessionId}` : `webhook:${Date.now()}`;
+
+    try {
+      // Reply-brevity dial (tree-c8e32ef9): a programmatic caller has no
+      // expander, so it gets the complete reply with no marker — same rule as
+      // every other machine consumer. processMessage's return value bypasses
+      // the turns table, which is why the #1572 getTurns sweep missed this.
+      const response = fullOnly(await processMessage(text.trim(), conversationId));
+      res.json({ response, conversationId, source });
+    } catch (err) {
+      if (err instanceof ConversationBusyError) {
+        res.status(409).json({ error: err.message, pending_message_id: err.pendingMessageId });
+        return;
+      }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ error: errMsg });
+    }
+  });
+
+  router.post('/intake/reply', async (req, res) => {
+    const { text, conversationId } = req.body as {
+      text?: string;
+      conversationId?: string;
+    };
+
+    if (!text?.trim() || !conversationId) {
+      res.status(400).json({ error: 'text and conversationId are required' });
+      return;
+    }
+
+    try {
+      // Machine consumer — full reply, no marker (see /intake above).
+      const response = fullOnly(await processMessage(text.trim(), conversationId));
+      res.json({ response, conversationId });
+    } catch (err) {
+      if (err instanceof ConversationBusyError) {
+        res.status(409).json({ error: err.message, pending_message_id: err.pendingMessageId });
+        return;
+      }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ error: errMsg });
+    }
+  });
+
+  router.get('/health', (_req, res) => {
+    res.json({ status: 'ok', time: new Date().toISOString() });
+  });
+
+  return router;
+}

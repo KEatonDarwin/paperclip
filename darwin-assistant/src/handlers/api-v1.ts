@@ -7043,7 +7043,12 @@ export function createApiV1Router(): Router {
       sendError(res, 404, 'file_not_found', 'Attached file is no longer on disk');
       return;
     }
-    res.setHeader('Content-Disposition', `inline; filename="${rec.name.replace(/[^A-Za-z0-9_.-]+/g, '_')}"`);
+    // ?dl=1 (handback download chip) forces a real download; default stays inline.
+    // Markup types that could run script on this origin are never served inline.
+    const wantsDownload = req.query.dl === '1' || /^(text\/html|image\/svg\+xml|application\/(xhtml\+)?xml|text\/xml|application\/javascript|text\/javascript)/i.test(rec.mime);
+    const safeName = rec.name.replace(/[^A-Za-z0-9_.-]+/g, '_');
+    res.setHeader('Content-Disposition', `${wantsDownload ? 'attachment' : 'inline'}; filename="${safeName}"`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     res.type(rec.mime).sendFile(absPath);
   });
 

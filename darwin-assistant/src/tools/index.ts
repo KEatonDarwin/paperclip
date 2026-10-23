@@ -130,6 +130,7 @@ import { mcpCall, lovableSendMessage, supabaseExecuteSql } from './mcp.js';
 import { logDecision } from './decisions.js';
 import { threadTodos } from './thread-todos-tool.js';
 import { threadLinks } from './thread-links-tool.js';
+import { attachFile } from './attach-file-tool.js';
 import { hopper } from './hopper-tool.js';
 import { workstreams } from './workstreams-tool.js';
 import { smartTodos } from './smart-todos-tool.js';
@@ -225,6 +226,7 @@ export const ALL_TOOLS: ToolDef[] = [
   logDecision,
   threadTodos,
   threadLinks,
+  attachFile,
   hopper,
   workstreams,
   smartTodos,

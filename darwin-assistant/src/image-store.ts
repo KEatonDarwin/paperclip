@@ -9,7 +9,7 @@
 // than a nonexistent directory under the new conversation's id.
 
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -141,7 +141,7 @@ export interface SavedFile extends StoredFileRecord {
   absPath: string;
 }
 
-function sanitizeFileBaseName(name: string | undefined): string {
+export function sanitizeFileBaseName(name: string | undefined): string {
   const base = (name || 'file').split(/[\\/]/).pop() || 'file';
   // keep only chars the resolveFilePath guard accepts; preserve the extension.
   const cleaned = base.replace(/[^A-Za-z0-9_.-]+/g, '_').replace(/^\.+/, '').slice(0, 80);
@@ -204,4 +204,89 @@ export function parseStoredFiles(json: string | null): StoredFileRecord[] {
   } catch {
     return [];
   }
+}
+
+
+// ---- handback files: JARVIS attaches a file IT created to its OWN reply ----
+// (tree-7718eb70). The bytes come from an absolute path on this box instead of
+// a base64 body, and are COPIED into UPLOADS_DIR/<conversation_id>/ so the
+// served file is a frozen snapshot — later edits/deletes of the source don't
+// change what Kevin downloads. Served by the same /files/:turn_index route.
+
+// Extension -> mime for handback files (uploads carry the browser's mime; a
+// handback has only its path). Unknown extensions fall back to octet-stream.
+const FILE_EXT_MIME: Record<string, string> = {
+  ...Object.fromEntries(Object.entries(MIME_EXT).map(([mime, ext]) => [ext, mime])),
+  jpeg: 'image/jpeg',
+  svg: 'image/svg+xml',
+  pdf: 'application/pdf',
+  txt: 'text/plain',
+  log: 'text/plain',
+  md: 'text/markdown',
+  csv: 'text/csv',
+  tsv: 'text/tab-separated-values',
+  json: 'application/json',
+  html: 'text/html',
+  htm: 'text/html',
+  xml: 'application/xml',
+  yaml: 'application/yaml',
+  yml: 'application/yaml',
+  sql: 'application/sql',
+  zip: 'application/zip',
+  gz: 'application/gzip',
+  tgz: 'application/gzip',
+  tar: 'application/x-tar',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  mp4: 'video/mp4',
+};
+
+export function mimeForFileName(name: string): string {
+  const ext = path.extname(name).slice(1).toLowerCase();
+  return FILE_EXT_MIME[ext] ?? 'application/octet-stream';
+}
+
+/** Validate a handback source path: absolute, an existing regular file, within
+ *  MAX_FILE_BYTES. Returns its size; throws FileValidationError otherwise. Used
+ *  both by the attach_file tool (fail fast, at call time) and by
+ *  saveHandbackFile (the file may have changed between stage and persist). */
+export function checkHandbackSource(absSourcePath: string): number {
+  if (typeof absSourcePath !== 'string' || !path.isAbsolute(absSourcePath)) {
+    throw new FileValidationError('path must be absolute');
+  }
+  let st;
+  try {
+    st = statSync(absSourcePath);
+  } catch {
+    throw new FileValidationError(`no such file: ${absSourcePath}`);
+  }
+  if (st.isDirectory()) throw new FileValidationError(`path is a directory, not a file: ${absSourcePath}`);
+  if (!st.isFile()) throw new FileValidationError(`not a regular file: ${absSourcePath}`);
+  if (st.size > MAX_FILE_BYTES) {
+    throw new FileValidationError(`file exceeds max size of ${MAX_FILE_BYTES} bytes (${st.size})`);
+  }
+  return st.size;
+}
+
+/** Copy one file JARVIS produced into the conversation's upload dir so it can be
+ *  attached to an assistant turn. Throws FileValidationError on a bad source. */
+export function saveHandbackFile(
+  conversationId: number,
+  turnIndex: number,
+  absSourcePath: string,
+  displayName?: string,
+): SavedFile {
+  checkHandbackSource(absSourcePath);
+  const name = sanitizeFileBaseName(displayName || path.basename(absSourcePath));
+  const dir = path.join(UPLOADS_DIR, String(conversationId));
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  // `t<turn>-h<uuid8>-<name>`: the uuid keeps several handbacks with the same
+  // name (or a later turn reusing one) apart; the charset matches resolveFilePath.
+  const filename = `t${turnIndex}-h${randomUUID().slice(0, 8)}-${name}`;
+  const absPath = path.join(dir, filename);
+  copyFileSync(absSourcePath, absPath);
+  return { filename, name, mime: mimeForFileName(name), conversationId, absPath };
 }

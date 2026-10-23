@@ -48,6 +48,8 @@ import { isAutomatedTurn, acquireAutomatedSlot, releaseAutomatedSlot } from './t
 import { consumeWorkBoardWatch } from './work-board.js';
 import { createNotification } from './notifications.js';
 import type { SavedImage, SavedFile } from './image-store.js';
+import { saveHandbackFile } from './image-store.js';
+import { drainHandbackFiles } from './handback-files.js';
 
 const MAX_TOOL_TURNS = 50;
 
@@ -1703,6 +1705,31 @@ function notifyWorkBoardWatchers(conv: ConversationRow): void {
   }
 }
 
+/**
+ * Handback (tree-7718eb70): copy every file JARVIS staged with attach_file this
+ * turn onto the assistant turn about to be persisted, and return the `files`
+ * metadata for it (same JSON shape as user uploads). One bad file is skipped and
+ * logged — it never fails the reply. Call immediately before the assistant
+ * addTurn so countTurns() is that turn's index (inserts are synchronous).
+ */
+function handbackFilesMeta(conversationId: number): { files?: string } {
+  const staged = drainHandbackFiles(conversationId);
+  if (!staged.length) return {};
+  const turnIndex = countTurns(conversationId);
+  const saved: SavedFile[] = [];
+  for (const f of staged) {
+    try {
+      saved.push(saveHandbackFile(conversationId, turnIndex, f.absSourcePath, f.name));
+    } catch (err) {
+      console.warn(
+        `[agent] handback file skipped for conversation ${conversationId}: ${f.absSourcePath} — ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  if (!saved.length) return {};
+  return { files: JSON.stringify(saved.map(({ filename, name, mime, conversationId: cid }) => ({ filename, name, mime, conversationId: cid }))) };
+}
+
 async function runConversationTurn(
   conv: ConversationRow,
   input: string,
@@ -1738,6 +1765,8 @@ async function runConversationTurn(
           ...(replyToTurnIndex != null && replyToTurnIndex >= 0 ? { replyToTurnIndex } : {}),
         },
       );
+  // Handback: anything still staged belongs to a run that died before replying.
+  drainHandbackFiles(conv.id);
   const runtime = resolveConversationRuntime(conv);
   const adapter = runtime.adapter;
   const turns = getTurnsLean(conv.id);
@@ -2118,6 +2147,7 @@ async function runConversationTurn(
               ? `${rescueErr.message}\n\n${rescueErr.stack ?? ''}`
               : String(rescueErr)).slice(0, 8000);
             addTurn(conv.id, 'assistant', partial, undefined, undefined, undefined, {
+              ...handbackFilesMeta(conv.id),
               timingMs: Date.now() - claudeT0,
               claudeInput: stdinContent,
               errorDetail: `${message}\n\n(account-swap rescue on '${rescueAccount.key}' also failed: ${rescueDetail})`,
@@ -2135,6 +2165,7 @@ async function runConversationTurn(
             ? `${err.message}\n\n${err.stack ?? ''}`
             : String(err)).slice(0, 8000);
           addTurn(conv.id, 'assistant', partial, undefined, undefined, undefined, {
+            ...handbackFilesMeta(conv.id),
             timingMs: Date.now() - claudeT0,
             claudeInput: stdinContent,
             errorDetail: `${errorDetail}\n\n(all Claude accounts exhausted — no headroom to rescue onto)`,
@@ -2156,6 +2187,7 @@ async function runConversationTurn(
           ? `${err.message}\n\n${err.stack ?? ''}`
           : String(err)).slice(0, 8000);
         addTurn(conv.id, 'assistant', partial, undefined, undefined, undefined, {
+          ...handbackFilesMeta(conv.id),
           timingMs: Date.now() - claudeT0,
           claudeInput: stdinContent,
           errorDetail,
@@ -2197,7 +2229,7 @@ async function runConversationTurn(
     const toolCall = parseToolCall(persistedText);
 
     if (!toolCall) {
-      addTurn(conv.id, 'assistant', persistedText, undefined, undefined, undefined, claudeMeta);
+      addTurn(conv.id, 'assistant', persistedText, undefined, undefined, undefined, { ...claudeMeta, ...handbackFilesMeta(conv.id) });
       touchConversation(conv.id);
       return persistedText;
     }
@@ -2241,6 +2273,6 @@ async function runConversationTurn(
     stdinContent = `<tool_result name="${toolCall.name}">\n${toolResultStr}\n</tool_result>`;
   }
 
-  addTurn(conv.id, 'assistant', 'Tool call limit reached. Please try a more specific request.');
+  addTurn(conv.id, 'assistant', 'Tool call limit reached. Please try a more specific request.', undefined, undefined, undefined, handbackFilesMeta(conv.id));
   return 'Tool call limit reached. Please try a more specific request.';
 }

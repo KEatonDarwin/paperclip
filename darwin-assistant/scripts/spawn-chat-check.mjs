@@ -28,6 +28,20 @@ process.env.JARVIS_SIM = '1';
 process.env.HOPPER_GOV_ENABLED = '0';
 process.env.NIGHT_SHIFT_DRIVER = '0';
 process.env.SPAWN_CHAT_ENABLED = '1';
+const ROUTES_PATH = path.join(path.dirname(DB_PATH), 'routes.json');
+process.env.ALPHA_ROUTES_FILE = ROUTES_PATH;
+fs.writeFileSync(ROUTES_PATH, JSON.stringify({
+  default: 'build',
+  providers: {
+    'claude-b': { adapter: 'claude', account: 'b' },
+    codex: { adapter: 'codex' },
+  },
+  routes: {
+    build: { provider: 'claude-b', model: 'claude-sonnet-5-5', effort: 'medium' },
+    review: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'medium' },
+  },
+  forbidden_models: ['claude-opus-5-5', 'gpt-6-astra'],
+}));
 delete process.env.ANTHROPIC_API_KEY;
 delete process.env.OPENAI_API_KEY;
 
@@ -106,6 +120,33 @@ await check('1. spawn {model:opus-5, account:b} → pinned child + chat_spawns r
   assert.match(childCalls[0].text, /## Done means\nPage renders/);
   assert.match(childCalls[0].text, /report_back/);
   assert.equal(childCalls[0].key, `spawn-chat:${sp.id}`);
+});
+
+await check('1b. lane helper with no model resolves default build route and pins its model/account', async () => {
+  const r = await spawn({ title: 'Lane helper', brief: goodBrief(), report_back: false }, 'cockpit:alpha-lane-route-check');
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.route, 'build');
+  assert.equal(r.model, 'claude-sonnet-5-5');
+  assert.equal(r.account, 'b');
+  const row = convDb.getConversation(r.external_id);
+  assert.equal(row.thread_adapter, 'claude');
+  assert.equal(row.thread_model, 'claude-sonnet-5-5');
+  assert.equal(row.pinned_claude_account, 'b');
+});
+
+await check('1c. lane helper route override resolves through table; forbidden frontier models write nothing', async () => {
+  const r = await spawn({ title: 'Lane review', route: 'review', brief: goodBrief(), report_back: false }, 'cockpit:alpha-lane-route-review');
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.route, 'review');
+  assert.equal(r.model, 'gpt-5.6-sol');
+  const row = convDb.getConversation(r.external_id);
+  assert.equal(row.thread_adapter, 'codex');
+  const before = counts();
+  for (const model of ['claude-opus-5-5', 'gpt-6-astra']) {
+    const denied = await spawn({ title: 'Forbidden', model, brief: goodBrief() }, 'cockpit:alpha-lane-route-denied');
+    assert.equal(denied.error, 'forbidden_model', JSON.stringify(denied));
+  }
+  assert.equal(counts().spawns, before.spawns, 'forbidden models created a spawn row');
 });
 
 for (const [label, brief, want] of [

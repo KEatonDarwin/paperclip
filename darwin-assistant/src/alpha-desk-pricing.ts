@@ -26,7 +26,9 @@
 // can show the honest figure and its ceiling instead of picking one silently.
 
 export const PRICE_SOURCE = 'https://platform.claude.com/docs/en/about-claude/pricing';
+export const OPENAI_PRICE_SOURCE = 'https://developers.openai.com/api/docs/pricing';
 export const PRICE_AS_OF = '2026-10-15';
+export const OPENAI_PRICE_AS_OF = '2026-10-24';
 /** Haiku 5.5's per-request prompt-length tier boundary, in tokens. */
 export const HAIKU_LONG_PROMPT_TOKENS = 100_000;
 
@@ -46,6 +48,12 @@ export interface ModelPrice {
  * Kevin's screen with no way to tell from the page that it is wrong.
  */
 export const MODEL_PRICES: Record<string, ModelPrice> = {
+  // Official OpenAI standard short-context rates. Cache-write low/high is the
+  // documented 30-minute / 12-hour write rate; jarvis.db records writes but not
+  // their TTL, so these correctly remain a range just like Claude writes.
+  'gpt-5.6-sol':   { label: 'GPT-5.6 Sol',   input: 4, output: 20, cache_write_5m: 5,    cache_write_1h: 10,   cache_read: 0.40 },
+  'gpt-5.6-terra': { label: 'GPT-5.6 Terra', input: 2, output: 12, cache_write_5m: 2.5,  cache_write_1h: 5,    cache_read: 0.20 },
+  'gpt-5.6-luna':  { label: 'GPT-5.6 Luna',  input: 0.2, output: 1.2, cache_write_5m: 0.25, cache_write_1h: 0.5, cache_read: 0.02 },
   'fable-5-1':  { label: 'Fable 5.1',  input: 10, output: 50, cache_write_5m: 12.5, cache_write_1h: 20, cache_read: 0.25 },
   'fable-5':    { label: 'Fable 5',    input: 10, output: 50, cache_write_5m: 12.5, cache_write_1h: 20, cache_read: 1 },
   'mythos-5-1': { label: 'Mythos 5.1', input: 10, output: 50, cache_write_5m: 12.5, cache_write_1h: 20, cache_read: 0.25 },
@@ -127,7 +135,22 @@ export function priceFor(
   if (slug === 'haiku-5-5') {
     return (longPrompt ?? isLongPrompt(t)) ? HAIKU_55_LONG : MODEL_PRICES['haiku-5-5'];
   }
-  return MODEL_PRICES[slug] ?? null;
+  const p = MODEL_PRICES[slug];
+  // OpenAI prices prompts over 272k at 2x input/cache/write and 1.5x output.
+  // `isLongPrompt` is the same per-turn prompt-token test we need here; the
+  // threshold differs, so do not reuse Haiku's 100k constant.
+  if (p && slug.startsWith('gpt-5.6-') && (t.input_tokens + t.cache_read_tokens + t.cache_write_tokens > 272_000)) {
+    return {
+      ...p,
+      label: `${p.label} (prompt over 272k)`,
+      input: p.input * 2,
+      output: p.output * 1.5,
+      cache_write_5m: p.cache_write_5m * 2,
+      cache_write_1h: p.cache_write_1h * 2,
+      cache_read: p.cache_read * 2,
+    };
+  }
+  return p ?? null;
 }
 
 export interface TurnCost {

@@ -12,6 +12,7 @@ const DIST = process.env.SPEND_SPLIT_DIST ?? new URL('../dist/', import.meta.url
 const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spend-split-test-'));
 process.env.JARVIS_DB_PATH = path.join(scratchDir, 'scratch.db');
 process.env.JARVIS_SIM = '1';
+process.env.ALPHA_ROUTE_LEDGER = path.join(scratchDir, 'route-ledger.jsonl');
 
 let pass = 0;
 const failures = [];
@@ -27,13 +28,14 @@ live.close();
 
 const { sqliteDb, getOrCreateConversation } = await import(pathToFileURL(DIST + 'conversation-db.js').href);
 const { buildSpendSplit } = await import(pathToFileURL(DIST + 'spend-split.js').href);
+const { costOf } = await import(pathToFileURL(DIST + 'alpha-desk-pricing.js').href);
 sqliteDb.exec(spawnsDdl);
 
 const now = Date.now();
 const dbTime = (ms) => new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
-const conv = (ext, adapter = 'claude', account = null) => {
+const conv = (ext, adapter = 'claude', account = null, model = null) => {
   const c = getOrCreateConversation(ext);
-  sqliteDb.prepare(`UPDATE conversations SET thread_adapter=?, session_account=? WHERE id=?`).run(adapter, account, c.id);
+  sqliteDb.prepare(`UPDATE conversations SET thread_adapter=?, session_account=?, thread_model=? WHERE id=?`).run(adapter, account, model, c.id);
   return c;
 };
 let idx = 0;
@@ -49,7 +51,7 @@ const jobhunt = conv('cockpit:jobhunt-talk', 'claude', 'a');       // matched by
 const kid = conv('cockpit:spawn-aaaaaaaa-1', 'claude', 'a');
 const lane = conv('cockpit:alpha-lane-demo', 'claude', 'b');       // NO chat_spawns row — the whole point
 const laneHelper = conv('cockpit:spawn-bbbbbbbb-2', 'claude', 'b');
-const laneCodex = conv('cockpit:alpha-lane-codexy', 'codex');
+const laneCodex = conv('cockpit:alpha-lane-codexy', 'codex', null, 'gpt-5.6-sol');
 const hopper = conv('cockpit:hopper-node-9-deadbeef', 'claude', 'a');
 const direct = conv('cockpit:11111111-2222-3333-4444-555555555555', 'claude', 'a');
 spawn(talk, kid); spawn(lane, laneHelper);
@@ -60,10 +62,16 @@ usage(talk, 'claude-opus-4-8', 99999, 0, 0, 0, now - 10 * 864e5); // 10 days old
 usage(jobhunt, 'claude-opus-4-8', 10, 5, 0, 0);
 usage(kid, 'claude-sonnet-5-5', 200, 100, 0, 0);
 usage(lane, 'claude-opus-4-8', 1000, 0, 0, 0);
+usage(lane, 'claude-opus-4-8', 100, 0, 0, 0, now - 2 * 864e5);
 usage(laneHelper, 'claude-sonnet-5-5', 500, 0, 0, 0);
 usage(laneCodex, null, 7000, 0, 0, 0);
 usage(hopper, 'claude-opus-4-8', 40, 0, 0, 0);
 usage(direct, 'claude-opus-4-8', 60, 0, 0, 0);
+
+fs.writeFileSync(process.env.ALPHA_ROUTE_LEDGER, [
+  JSON.stringify({ ts: new Date(now - 2 * 3600e3).toISOString(), event: 'open', lane: lane.external_id, route: 'build', provider: 'claude-b', model: 'claude-sonnet-5-5' }),
+  JSON.stringify({ ts: new Date(now - 2 * 3600e3).toISOString(), event: 'open', lane: laneCodex.external_id, route: 'codex-build', provider: 'codex', model: 'gpt-5.6-sol' }),
+].join('\n') + '\n');
 
 const r = buildSpendSplit(now);
 const d = r.windows.last_24h, w = r.windows.last_7d;
@@ -80,12 +88,22 @@ eq('spawn_chat child counts', g.spawn_chat.totals.total, 300);
 eq('hopper and direct stay out of both sides', [g.workers_hopper.side, g.direct.side], ['other', 'other']);
 eq('chats are counted per group', [g.prime.chats, g.lanes.chats], [2, 2]);
 const codex = d.by_provider.find((p) => p.provider === 'codex');
-eq('codex tokens kept but unpriced', [codex.totals.total, codex.totals.unpriced_tokens, codex.totals.cost_usd], [7000, 7000, null]);
+ok('codex turns inherit thread_model and are priced from OpenAI rates', codex.totals.total === 7000 && codex.totals.unpriced_tokens === 0 && codex.totals.cost_usd > 0, JSON.stringify(codex));
 ok('claude accounts are split a / b', d.by_provider.some((p) => p.provider === 'claude-a') && d.by_provider.some((p) => p.provider === 'claude-b'));
 const sbp = Object.fromEntries(d.side_by_provider.map((x) => [x.provider, x]));
 eq('claude-b prime vs spawned', [sbp['claude-b'].prime.total, sbp['claude-b'].spawned.total], [1160, 1500]);
 ok('priced claude cost range is ordered', d.prime.cost_usd != null && d.prime.cost_usd_max >= d.prime.cost_usd);
 eq('an empty bucket reads null dollars, not 0', buildSpendSplit(now + 400 * 864e5).windows.last_24h.prime.cost_usd, null);
+eq('router proof separates lane turns before/after cutoff', [r.router_proof.before.totals.turns, r.router_proof.after.totals.turns], [1, 3]);
+ok('router proof has decision-grade per-reply dollars on both sides', r.router_proof.before.cost_per_reply > 0 && r.router_proof.after.cost_per_reply > 0, JSON.stringify(r.router_proof));
+eq('route ledger joins lane and its helper to build, codex lane to codex-build', Object.fromEntries(r.router_proof.by_route.map((x) => [x.key, x.totals.turns])), { build: 2, 'codex-build': 1 });
+ok('model split includes priced codex effective model', r.router_proof.by_model.some((x) => x.model === 'gpt-5.6-sol' && x.after.cost_per_reply > 0));
+eq('GPT-5.6 Sol official short-context rates include cache write TTL range', costOf('gpt-5.6-sol', {
+  input_tokens: 80_000, output_tokens: 80_000, cache_read_tokens: 80_000, cache_write_tokens: 80_000,
+}), { usd: 2.352, usd_max: 2.752 });
+eq('GPT-5.6 Sol >272k prompt multiplier is per turn', costOf('gpt-5.6-sol', {
+  input_tokens: 273_000, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
+}), { usd: 2.184, usd_max: 2.184 });
 
 fs.rmSync(scratchDir, { recursive: true, force: true });
 if (failures.length) { console.error(`spend-split-test: ${pass} passed, ${failures.length} failed`); for (const f of failures) console.error('  ✗ ' + f); process.exit(1); }

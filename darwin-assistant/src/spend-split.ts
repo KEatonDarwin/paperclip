@@ -17,12 +17,17 @@
 // codex / agy tokens are recorded but have no price table, so they are tokens-only and
 // say so (`unpriced_tokens`). Read-only: SELECTs with explicit columns, never turns.claude_*.
 
+import fs from 'node:fs';
 import { sqliteDb } from './conversation-db.js';
 import {
   ctDay, DESK_TIMEZONE, parseDbTime, emptyTotals, accumulate, finishTotals,
   type TokenTotals, type TurnTokenRow,
 } from './alpha-desk.js';
-import { PRICE_SOURCE, PRICE_AS_OF } from './alpha-desk-pricing.js';
+import { PRICE_SOURCE, PRICE_AS_OF, OPENAI_PRICE_SOURCE, OPENAI_PRICE_AS_OF } from './alpha-desk-pricing.js';
+
+const ROUTE_LEDGER = process.env.ALPHA_ROUTE_LEDGER ?? '/home/kevin/alpha-board/route-ledger.jsonl';
+/** Midnight at the start of 2026-10-24 in America/Chicago (CDT). */
+export const ROUTER_CUTOVER_MS = Date.parse('2026-10-24T00:00:00-05:00');
 
 /** Front-seat chats = "Prime". Anything named `cockpit:<x>-talk` counts too. */
 export const FRONT_SEAT_EXTS = [
@@ -70,20 +75,64 @@ export interface SpendWindow {
   /** Prime vs spawned, per provider — the "what did each provider cost on each side". */
   side_by_provider: Array<{ provider: string; prime: TokenTotals; spawned: TokenTotals }>;
 }
+export interface SpendBreakdown { key: string; totals: TokenTotals; cost_per_reply: number | null }
+export interface ModelBeforeAfter {
+  model: string;
+  before: SpendBreakdown;
+  after: SpendBreakdown;
+}
+export interface RouterProof {
+  cutoff: string;
+  scope: string;
+  before: SpendBreakdown;
+  after: SpendBreakdown;
+  by_model: ModelBeforeAfter[];
+  by_route: SpendBreakdown[];
+  route_ledger: string;
+}
 export interface SpendSplit {
   generated_at: string;
   today_timezone: string;
   today_date: string;
   price_source: string;
   price_as_of: string;
+  openai_price_source: string;
+  openai_price_as_of: string;
   basis: string;
   coverage: string;
   front_seats: string[];
+  router_proof: RouterProof;
   windows: { today: SpendWindow; last_24h: SpendWindow; last_7d: SpendWindow };
 }
 
-interface Conv { id: number; ext: string; adapter: string | null; account: string | null }
+interface Conv { id: number; ext: string; adapter: string | null; account: string | null; threadModel: string | null }
 interface Row extends TurnTokenRow { conversation_id: number }
+
+interface RouteEvent { at: number; route: string; model: string | null }
+
+function routeEvents(): Map<string, RouteEvent[]> {
+  const out = new Map<string, RouteEvent[]>();
+  try {
+    for (const line of fs.readFileSync(ROUTE_LEDGER, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      const raw = JSON.parse(line) as { ts?: string; lane?: string; route?: string; model?: string | null };
+      const at = Date.parse(raw.ts ?? '');
+      if (!raw.lane || !raw.route || !Number.isFinite(at)) continue;
+      const a = out.get(raw.lane) ?? [];
+      a.push({ at, route: raw.route, model: raw.model ?? null });
+      out.set(raw.lane, a);
+    }
+    for (const a of out.values()) a.sort((x, y) => x.at - y.at);
+  } catch { /* the endpoint stays useful without the optional ledger */ }
+  return out;
+}
+
+function routeAt(events: Map<string, RouteEvent[]>, lane: string, at: number): string {
+  const a = events.get(lane) ?? [];
+  let found: RouteEvent | undefined;
+  for (const e of a) { if (e.at <= at) found = e; else break; }
+  return found?.route ?? '(pre-router / untracked)';
+}
 
 function providerOf(c: Conv): string {
   const a = (c.adapter ?? 'claude').toLowerCase();
@@ -107,9 +156,10 @@ const dbTime = (ms: number) => new Date(ms).toISOString().slice(0, 19).replace('
 export function buildSpendSplit(now: number = Date.now()): SpendSplit {
   const convs = new Map<number, Conv>();
   for (const r of sqliteDb.prepare(
-    `SELECT id, COALESCE(external_id,'') AS ext, COALESCE(thread_adapter, session_adapter) AS adapter, session_account AS account FROM conversations`,
-  ).all() as Array<{ id: number; ext: string; adapter: string | null; account: string | null }>) {
-    convs.set(r.id, { id: r.id, ext: r.ext, adapter: r.adapter, account: r.account });
+    `SELECT id, COALESCE(external_id,'') AS ext, COALESCE(thread_adapter, session_adapter) AS adapter,
+            session_account AS account, thread_model AS threadModel FROM conversations`,
+  ).all() as Array<{ id: number; ext: string; adapter: string | null; account: string | null; threadModel: string | null }>) {
+    convs.set(r.id, { id: r.id, ext: r.ext, adapter: r.adapter, account: r.account, threadModel: r.threadModel });
   }
   const parent = new Map<number, number>();
   try {
@@ -119,6 +169,10 @@ export function buildSpendSplit(now: number = Date.now()): SpendSplit {
   } catch { /* chat_spawns absent: every chat is its own root */ }
   const rootOf = (id: number): number => { let r = id, n = 0; while (parent.has(r) && n++ < 50) r = parent.get(r) as number; return r; };
   const isFront = (c: Conv) => FRONT_SEAT_EXTS.includes(c.ext) || FRONT_SEAT_RE.test(c.ext);
+  const laneRoot = (c: Conv): Conv | null => {
+    const root = convs.get(rootOf(c.id)) ?? c;
+    return /^cockpit:alpha-lane-/.test(root.ext) ? root : null;
+  };
 
   const groupOf = (c: Conv): GroupKey => {
     const root = convs.get(rootOf(c.id)) ?? c;
@@ -158,9 +212,10 @@ export function buildSpendSplit(now: number = Date.now()): SpendSplit {
       if (ms == null || ms < fromMs) continue;
       const c = convs.get(r.conversation_id);
       if (!c) continue;
+      const pricedRow = { ...r, model: r.model || c.threadModel || '' };
       const g = groupOf(c), p = providerOf(c), side = sideOf.get(g) as Side;
-      add(byGroup, g, r); add(byGroupProv, `${g}|${p}`, r); add(byProv, p, r);
-      add(bySide, side, r); add(bySideProv, `${side}|${p}`, r); accumulate(all.totals, r, all.unpriced);
+      add(byGroup, g, pricedRow); add(byGroupProv, `${g}|${p}`, pricedRow); add(byProv, p, pricedRow);
+      add(bySide, side, pricedRow); add(bySideProv, `${side}|${p}`, pricedRow); accumulate(all.totals, pricedRow, all.unpriced);
       (chatSets.get(g) ?? chatSets.set(g, new Set()).get(g) as Set<number>).add(c.id);
     }
     const fin = (a: Acc | undefined) => finishTotals(a?.totals ?? emptyTotals(), a?.unpriced ?? new Set());
@@ -192,15 +247,61 @@ export function buildSpendSplit(now: number = Date.now()): SpendSplit {
     };
   };
 
+  // Decision-grade router comparison: lanes + helpers below lanes only. This is
+  // the population the route table controls; mixing Prime/direct chats into it
+  // would make a cheaper router look better or worse for unrelated reasons.
+  const events = routeEvents();
+  type Acc = { totals: TokenTotals; unpriced: Set<string> };
+  const mk = (): Acc => ({ totals: emptyTotals(), unpriced: new Set() });
+  const addAcc = (m: Map<string, Acc>, k: string, r: Row) => {
+    let a = m.get(k); if (!a) { a = mk(); m.set(k, a); }
+    accumulate(a.totals, r, a.unpriced);
+  };
+  const periods = new Map<string, Acc>(), models = new Map<string, Acc>(), routes = new Map<string, Acc>();
+  for (const r of rows) {
+    const c = convs.get(r.conversation_id); if (!c) continue;
+    const lane = laneRoot(c); if (!lane) continue;
+    const at = parseDbTime(r.created_at); if (at == null) continue;
+    const period = at < ROUTER_CUTOVER_MS ? 'before' : 'after';
+    const model = r.model || c.threadModel || '(model not recorded)';
+    const pricedRow = { ...r, model: model === '(model not recorded)' ? '' : model };
+    addAcc(periods, period, pricedRow);
+    addAcc(models, `${model}|${period}`, pricedRow);
+    if (period === 'after') addAcc(routes, routeAt(events, lane.ext, at), pricedRow);
+  }
+  const breakdown = (key: string, a?: Acc): SpendBreakdown => {
+    const totals = finishTotals(a?.totals ?? emptyTotals(), a?.unpriced ?? new Set());
+    const completePrice = totals.turns > 0 && totals.unpriced_tokens === 0 && totals.cost_usd != null;
+    const midpoint = completePrice ? ((totals.cost_usd as number) + (totals.cost_usd_max ?? totals.cost_usd as number)) / 2 : null;
+    return { key, totals, cost_per_reply: midpoint == null ? null : Math.round((midpoint / totals.turns) * 1e6) / 1e6 };
+  };
+  const modelNames = [...new Set([...models.keys()].map((k) => k.slice(0, k.lastIndexOf('|'))))].sort();
+  const routerProof: RouterProof = {
+    cutoff: new Date(ROUTER_CUTOVER_MS).toISOString(),
+    scope: 'Alpha lanes and spawn_chat helpers whose root ancestor is an Alpha lane.',
+    before: breakdown('before', periods.get('before')),
+    after: breakdown('after', periods.get('after')),
+    by_model: modelNames.map((model) => ({
+      model,
+      before: breakdown('before', models.get(`${model}|before`)),
+      after: breakdown('after', models.get(`${model}|after`)),
+    })),
+    by_route: [...routes.keys()].sort().map((route) => breakdown(route, routes.get(route))),
+    route_ledger: ROUTE_LEDGER,
+  };
+
   return {
     generated_at: new Date(now).toISOString(),
     today_timezone: DESK_TIMEZONE,
     today_date: ctDay(now),
     price_source: PRICE_SOURCE,
     price_as_of: PRICE_AS_OF,
+    openai_price_source: OPENAI_PRICE_SOURCE,
+    openai_price_as_of: OPENAI_PRICE_AS_OF,
     basis: 'Claude is a subscription, so dollars are what the same tokens would cost at list API prices — a range, because the cache write TTL (5 min vs 1 h) is not recorded. Tokens are exact.',
-    coverage: 'Counts model turns recorded in jarvis.db. codex/agy tokens are recorded but unpriced (tokens only). Cloud-credit runs (claude --cloud), devin sessions outside the cockpit and Agent-tool sub-runs inside a turn are not separately recorded.',
+    coverage: 'Counts model turns recorded in jarvis.db. Codex turns do not record turns.model, so their conversation thread_model is used; if a Codex thread was retuned after earlier turns, those earlier turns inherit its current thread model. agy remains unpriced. Cloud-credit runs (claude --cloud), devin sessions outside the cockpit and Agent-tool sub-runs inside a turn are not separately recorded.',
     front_seats: FRONT_SEAT_EXTS,
+    router_proof: routerProof,
     windows: {
       today: windowFor(ctMidnight(now)),
       last_24h: windowFor(now - 864e5),

@@ -130,6 +130,28 @@ export function spawnLimitPerHour(): number {
 }
 export const BRIEF_MAX_CHARS = 12_000;
 const DEFAULT_REPORT_DUE_HOURS = 4;
+const ALPHA_ROUTES_FILE = process.env.ALPHA_ROUTES_FILE ?? '/home/kevin/alpha-board/routes.json';
+const LANE_PREFIX = 'cockpit:alpha-lane-';
+const HARD_FORBIDDEN_MODELS = new Set(['claude-opus-5-5', 'gpt-6-astra']);
+
+interface AlphaRouteTable {
+  default?: string;
+  providers: Record<string, { adapter: string | null; account?: string; cloud?: boolean }>;
+  routes: Record<string, { provider: string; model?: string | null; effort?: string | null }>;
+  forbidden_models?: string[];
+}
+
+function loadAlphaRoutes(): AlphaRouteTable {
+  try { return JSON.parse(fs.readFileSync(ALPHA_ROUTES_FILE, 'utf8')) as AlphaRouteTable; }
+  catch {
+    return {
+      default: 'build',
+      providers: { 'claude-b': { adapter: 'claude', account: 'b' } },
+      routes: { build: { provider: 'claude-b', model: 'claude-sonnet-5-5', effort: 'medium' } },
+      forbidden_models: [...HARD_FORBIDDEN_MODELS],
+    };
+  }
+}
 
 // ─── Brief checker (pure) ────────────────────────────────────────────────────
 
@@ -268,11 +290,12 @@ export function checkBrief(
 type AdapterShelf = Record<string, { id: string; models: Array<{ id: string }> }>;
 
 /** 'opus-5' → claude/claude-opus-5; a full id on any adapter's shelf → that adapter. */
-function resolveModel(adapters: AdapterShelf, raw: string): { adapter: string; model: string } | null {
+function resolveModel(adapters: AdapterShelf, raw: string, preferredAdapter?: string | null): { adapter: string; model: string } | null {
   const want = raw.trim();
   const candidates = want.startsWith('claude-') ? [want] : [want, `claude-${want}`];
   for (const c of candidates) {
-    for (const a of Object.values(adapters)) {
+    const shelves = Object.values(adapters).sort((a, b) => Number(b.id === preferredAdapter) - Number(a.id === preferredAdapter));
+    for (const a of shelves) {
       if (a.models.some((m) => m.id === c)) return { adapter: a.id, model: c };
     }
   }
@@ -319,6 +342,7 @@ export const spawnChat: ToolDef = {
       title: { type: 'string', description: 'Short chat title Kevin will see.' },
       model: { type: 'string', description: "Model id, e.g. 'claude-opus-5' or shorthand 'opus-5'. Omit to inherit the default." },
       account: { type: 'string', description: "Claude account key to pin ('a', 'b', …). Omit for Auto." },
+      route: { type: 'string', description: "Route class from /home/kevin/alpha-board/routes.json. Lane helpers default to 'build'." },
       brief: {
         type: 'object',
         description: 'Everything the child needs to start cold.',
@@ -356,14 +380,39 @@ export const spawnChat: ToolDef = {
 
     const { agent, queue } = await loadDispatch();
 
+    // Lane children use the exact same route table as their parent lane. Model
+    // and account args remain explicit overrides, matching alpha_lane.py's
+    // precedence. Ordinary chats retain the old inherit-default behaviour.
+    const laneOrigin = origin.external_id.startsWith(LANE_PREFIX);
+    const explicitModel = str(args.model).trim();
+    const requestedRoute = str(args.route).trim() || (laneOrigin && !explicitModel ? (loadAlphaRoutes().default || 'build') : '');
+    const routeTable = requestedRoute ? loadAlphaRoutes() : null;
+    const route = requestedRoute ? routeTable?.routes[requestedRoute] : undefined;
+    if (requestedRoute && !route) {
+      return { error: 'unknown_route', message: `route ${requestedRoute} is not in ${ALPHA_ROUTES_FILE}` };
+    }
+    const provider = route && routeTable ? routeTable.providers[route.provider] : undefined;
+    if (route && (!provider || provider.cloud || !provider.adapter)) {
+      return { error: 'unsupported_spawn_route', message: `route ${requestedRoute} cannot open a cockpit helper` };
+    }
+
     // Validate model + account BEFORE writing anything.
     let pin: { adapter: string; model: string } | null = null;
-    const rawModel = str(args.model).trim();
+    const rawModel = explicitModel || str(route?.model).trim();
+    const forbidden = new Set([...(routeTable?.forbidden_models ?? []), ...HARD_FORBIDDEN_MODELS]);
+    if ((laneOrigin || requestedRoute) && forbidden.has(rawModel)) {
+      return { error: 'forbidden_model', message: `model ${rawModel} is forbidden for lanes/children` };
+    }
     if (rawModel) {
-      pin = resolveModel(agent.getAdapters(), rawModel);
+      // The route table is authoritative for routed helpers. Some adapters
+      // deliberately expose only a generic shelf (Codex models currently also
+      // appear on Devin's shelf), so resolving by first shelf would misroute.
+      pin = route && provider?.adapter
+        ? { adapter: provider.adapter, model: rawModel }
+        : resolveModel(agent.getAdapters(), rawModel);
       if (!pin) return { error: 'unknown_model', message: `model ${rawModel} is not on any adapter's shelf` };
     }
-    const account = str(args.account).trim() || null;
+    const account = str(args.account).trim() || (pin?.adapter === 'claude' ? provider?.account ?? null : null);
     if (account) {
       if (!findClaudeAccount(account)) {
         return { error: 'unknown_account', message: `account must be one of ${listClaudeAccounts().map((a) => a.key).join(', ')}` };
@@ -436,6 +485,7 @@ export const spawnChat: ToolDef = {
       spawn_id: spawnId,
       model: pin?.model ?? null,
       account,
+      route: requestedRoute || null,
       report_back: reportBack,
     };
   },

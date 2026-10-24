@@ -144,6 +144,7 @@ import {
 import { deriveTopicsForConversation } from '../chat-topics-derive.js';
 import { findOverlapCandidates } from '../chat-topics-overlap.js';
 import { buildAlphaDesk, DEFAULT_ORIGIN_EXT as ALPHA_DESK_DEFAULT_ORIGIN } from '../alpha-desk.js';
+import { buildSpendSplit } from '../spend-split.js';
 import {
   GoalError,
   listGoals,
@@ -3650,6 +3651,12 @@ export function createApiV1Router(): Router {
     }
     await deriveTopicsForConversation(convId);
     res.json({ topics: listTopicsForConversation(convId) });
+  });
+
+  // SPEND SPLIT — Jarvis Prime (front seats) vs everything it spawned, per provider, for
+  // today / 24h / 7d. Read-only, model-free (see src/spend-split.ts).
+  router.get('/spend-split', (_req: AuthedRequest, res) => {
+    try { res.json(buildSpendSplit()); } catch (err) { sendError(res, 500, 'spend_split_failed', (err as Error).message); }
   });
 
   // == Alpha desk ==============================================================

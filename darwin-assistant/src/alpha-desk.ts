@@ -271,7 +271,7 @@ function reportSummaryFrom(toolArgs: string | null): string | null {
 
 /** `datetime('now')`-style strings are UTC without a zone marker; make that explicit
  *  so Date parsing doesn't silently read them as local time. due_at is already ISO. */
-function parseDbTime(value: string | null): number | null {
+export function parseDbTime(value: string | null): number | null {
   if (!value) return null;
   const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)
     ? value.replace(' ', 'T') + 'Z'
@@ -305,7 +305,7 @@ export function ctDay(ms: number): string {
 // Haiku 5.5's per-request prompt-length tier exact without a second grouping key.
 // The volumes are a few thousand narrow rows, so this costs nothing.
 
-function emptyTotals(): TokenTotals {
+export function emptyTotals(): TokenTotals {
   return {
     turns: 0, input: 0, output: 0, cache_read: 0, cache_write: 0, total: 0,
     cost_usd: null, cost_usd_max: null, unpriced_tokens: 0, unpriced_models: [],
@@ -329,7 +329,7 @@ const SQL_TURN_TOKENS = `
      AND (COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
           + COALESCE(cache_read_tokens,0) + COALESCE(cache_write_tokens,0)) > 0`;
 
-interface TurnTokenRow {
+export interface TurnTokenRow {
   model: string;
   input: number;
   output: number;
@@ -339,7 +339,7 @@ interface TurnTokenRow {
 }
 
 /** Add one turn into a running total, pricing it as we go. */
-function accumulate(into: TokenTotals, row: TurnTokenRow, unpriced: Set<string>): void {
+export function accumulate(into: TokenTotals, row: TurnTokenRow, unpriced: Set<string>): void {
   const t = {
     input_tokens: row.input,
     output_tokens: row.output,
@@ -363,7 +363,7 @@ function accumulate(into: TokenTotals, row: TurnTokenRow, unpriced: Set<string>)
   }
 }
 
-function finishTotals(into: TokenTotals, unpriced: Set<string>): TokenTotals {
+export function finishTotals(into: TokenTotals, unpriced: Set<string>): TokenTotals {
   into.unpriced_models = [...unpriced].sort();
   if (into.cost_usd != null) into.cost_usd = round6(into.cost_usd);
   if (into.cost_usd_max != null) into.cost_usd_max = round6(into.cost_usd_max);

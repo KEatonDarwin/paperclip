@@ -4,6 +4,7 @@ import { createSlackApp, sendDailyBriefing } from './handlers/slack.js';
 import { createWebhookRouter } from './handlers/webhook.js';
 import { startCheckinWorker } from './checkin-worker.js';
 import { startThreadReminderWorker } from './thread-reminders.js';
+import { startTalkRolloverWorker } from './talk-rollover.js';
 import { enqueueCalendarCheckins } from './briefing.js';
 import { startUiServer } from './ui-server.js';
 import { catchUp as ftsCatchUp } from './thread-fts.js';
@@ -158,6 +159,12 @@ async function main() {
   // bumping a cockpit thread is local + SQLite-only and must not depend on
   // Slack creds the way the Postgres-backed check-in worker does.
   startThreadReminderWorker();
+
+  // Talk-seat daily rollover (goal #19). Gives the front-seat chat a fresh head
+  // each morning (04:00 CT) + a ~400k mid-day safety net, so it stops replaying
+  // a million+ cached tokens per step. Entirely gated by settings-KV
+  // `talk_daily_rollover` (default OFF) — holds timers, does no work, until flipped.
+  startTalkRolloverWorker();
 
   // Hopper Engine — the autonomous work-tree dispatcher. Event-driven (ticks
   // fire on node state writes); the 60s interval inside is only the safety net.

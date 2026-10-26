@@ -105,7 +105,9 @@
     "alpha-desk:test": "npm run build && node scripts/alpha-desk-test.mjs",
     "alpha-desk:mutate": "npm run build && python3 -I scripts/alpha-desk-mutate.py",
     "spawn-limit:mutate": "python3 -I scripts/spawn-limit-mutate.py",
-    "spawn-chat:test": "JARVIS_DB_PATH=/tmp/spawn-chat-tool/check.db JARVIS_SIM=1 node scripts/spawn-chat-check.mjs"
+    "spawn-chat:test": "JARVIS_DB_PATH=/tmp/spawn-chat-tool/check.db JARVIS_SIM=1 node scripts/spawn-chat-check.mjs",
+    "talk-rollover:check": "JARVIS_DB_PATH=/tmp/talk-rollover-check.db JARVIS_SIM=1 CLAUDE_CLI_PATH=/bin/false npx tsx scripts/talk-rollover-check.ts",
+    "talk-rollover:digest-check": "python3 -I scripts/talk-rollover/digest-check.py"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

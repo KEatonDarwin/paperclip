@@ -76,6 +76,24 @@ def main():
         ok("MUT: mutated open item appears", "MUTATED_OPEN_ITEM" in out2)
         ok("MUT: stale open item gone", "ANCHOR_OPEN_ITEM" not in out2)
 
+        # ORDER: same-date parts must sort after the bare date, and part10 after
+        # part2 (codex #3). The chronological LAST card drives the open items.
+        odir = os.path.join(tmp, "order")
+        os.makedirs(odir)
+        order_files = {
+            "2026-10-25.md": "# day\n\n## Done\n- OLDEST\n",
+            "2026-10-26.md": "# day\n\n## Done\n- BASE\n",
+            "2026-10-26-part2.md": "# day\n\n## Done\n- PART2\n",
+            "2026-10-26-part10.md": "# day\n\n## Done\n- PART10\n\n## Still open\n- PART10_OPEN\n",
+        }
+        for fn, body in order_files.items():
+            with open(os.path.join(odir, fn), "w", encoding="utf-8") as f:
+                f.write(body)
+        oout = run_digest(db_on, odir)
+        ok("ORDER: open items come from part10 (true chronological last)", "PART10_OPEN" in oout)
+        ok("ORDER: last 3 = bare date + part2 + part10 embedded", all(m in oout for m in ["BASE", "PART2", "PART10"]))
+        ok("ORDER: oldest (2026-10-25) is the one in the older index", "Older cards (1" in oout and "2026-10-25" in oout and '<day-card file="2026-10-25' not in oout)
+
         print(f"\n{passed} passed, {failed} failed")
         if failed:
             sys.exit(1)

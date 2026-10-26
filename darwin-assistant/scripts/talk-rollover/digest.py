@@ -58,6 +58,16 @@ def get_setting(c, key, default=None):
 def talk_rollover_on(c):
     return (get_setting(c, "talk_daily_rollover", "off") or "off").strip().lower() == "on"
 
+_CARD_RE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:-part(\d+))?\.md$")
+def _card_sort_key(p):
+    """Chronological key for a card path: (date, part). A bare YYYY-MM-DD.md is
+    part 1; -partN is part N. A plain lexical sort would put the bare date AFTER
+    its parts and part10 before part2 — wrong for the 'last card'."""
+    m = _CARD_RE.search(os.path.basename(p))
+    if not m:
+        return (os.path.basename(p), 0)
+    return (m.group(1), int(m.group(2)) if m.group(2) else 1)
+
 def _extract_section(card_text, heading):
     """Pull the bullet lines under a '## <heading>' section of a day card."""
     out = []
@@ -76,7 +86,7 @@ def talk_seed_section(c):
     if not talk_rollover_on(c):
         return
     try:
-        cards = sorted(glob.glob(os.path.join(TALK_DAYS_DIR, "*.md")))
+        cards = sorted(glob.glob(os.path.join(TALK_DAYS_DIR, "*.md")), key=_card_sort_key)
     except OSError:
         cards = []
     if not cards:

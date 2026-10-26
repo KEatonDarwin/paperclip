@@ -16,6 +16,17 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+
+// SAFETY: this proof inserts a test conversation + turns, so it must NEVER run
+// against the live jarvis.db. Refuse unless JARVIS_DB_PATH is set to a throwaway
+// path — before importing conversation-db (which opens whatever path is set).
+const LIVE_DB = '/home/kevin/paperclip/darwin-assistant/jarvis.db';
+const dbPath = process.env.JARVIS_DB_PATH;
+if (!dbPath || path.resolve(dbPath) === path.resolve(LIVE_DB)) {
+  console.error('REFUSING: set JARVIS_DB_PATH to a throwaway path (never the live jarvis.db).');
+  console.error('  e.g. JARVIS_DB_PATH=/tmp/talk-rollover-proof.db npx tsx scripts/talk-rollover/proof.ts');
+  process.exit(2);
+}
 import { sqliteDb, getConversation, addTurn } from '../../src/conversation-db.js';
 import { runTalkRollover, runDayCardOneShot, buildSeedSection, measureSessionTokens, type RolloverTarget } from '../../src/talk-rollover.js';
 import { findClaudeAccount } from '../../src/claude-accounts.js';

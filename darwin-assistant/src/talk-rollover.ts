@@ -66,6 +66,29 @@ export function middayTokenCap(): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_MIDDAY_TOKEN_CAP;
 }
 
+/** Chronological sort key for a card filename. `YYYY-MM-DD.md` is part 1 of its
+ *  date; `YYYY-MM-DD-partN.md` is part N. A plain lexical sort gets this wrong
+ *  twice over ('-' < '.' puts the bare date AFTER its parts, and 'part10' <
+ *  'part2'), which would pick the wrong "last card". Returns [date, part]. */
+export function cardSortKey(filename: string): [string, number] {
+  const m = /^(\d{4}-\d{2}-\d{2})(?:-part(\d+))?\.md$/.exec(filename);
+  if (!m) return [filename, 0];
+  return [m[1], m[2] ? parseInt(m[2], 10) : 1];
+}
+export function sortCardFiles(files: string[]): string[] {
+  return [...files].sort((a, b) => {
+    const [da, pa] = cardSortKey(a);
+    const [db, pb] = cardSortKey(b);
+    return da === db ? pa - pb : da < db ? -1 : 1;
+  });
+}
+
+/** In-process lock so the 04:00 run, its idle retries, the mid-day tick, and a
+ *  manual call can never summarize the same seat concurrently (they share one
+ *  event loop; the writer is awaited, so two entrants could both pass the
+ *  marker check before either advances it). */
+const rolling = new Set<string>();
+
 const WRITER_MODEL = 'claude-haiku-4-5-20251001';
 const WRITER_TIMEOUT_MS = 90_000;
 /** Cap the day's conversation text handed to the writer. The seat's own turns
@@ -132,10 +155,6 @@ const contentTurnsSinceStmt = sqliteDb.prepare<[number, number], {
    ORDER BY turn_index ASC`,
 );
 
-const maxTurnIdxStmt = sqliteDb.prepare<[number], { max_idx: number | null }>(
-  `SELECT MAX(turn_index) AS max_idx FROM turns WHERE conversation_id = ?`,
-);
-
 export interface DayTurn {
   turnIndex: number;
   role: string;
@@ -178,15 +197,23 @@ export function humanDayLabel(dateIso: string): string {
 }
 
 export function buildDayCardPrompt(label: string, turns: DayTurn[]): string {
-  let transcript = '';
-  for (const t of turns) {
+  // Build from the NEWEST turn backward so that, if the day is huge, we keep the
+  // most recent context (where we left off / what's still open) rather than the
+  // oldest. The whole window is still marked rolled — the card is a lossy summary
+  // either way — so keeping the tail is the right loss.
+  const parts: string[] = [];
+  let size = 0;
+  let trimmed = false;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i];
     const who = t.role === 'user' ? 'Kevin' : 'JARVIS';
-    transcript += `\n### ${who} (${t.createdAt})\n${t.content}\n`;
-    if (transcript.length > MAX_PROMPT_CHARS) {
-      transcript = transcript.slice(0, MAX_PROMPT_CHARS) + '\n…(earlier turns trimmed)…\n';
-      break;
-    }
+    const block = `\n### ${who} (${t.createdAt})\n${t.content}\n`;
+    if (size + block.length > MAX_PROMPT_CHARS && parts.length > 0) { trimmed = true; break; }
+    parts.push(block);
+    size += block.length;
   }
+  parts.reverse();
+  let transcript = (trimmed ? '\n…(earlier turns trimmed — oldest dropped)…\n' : '') + parts.join('');
   return `You are closing out one working day in Kevin's front-seat chat with JARVIS, so a fresh JARVIS head tomorrow can pick up exactly where this one left off WITHOUT re-reading the whole day.
 
 Write a "day card" in Markdown for ${label}. Use exactly these sections, each a "## " heading, omitting a section only if it is genuinely empty:
@@ -313,6 +340,16 @@ const clearSessionStmt = sqliteDb.prepare<[number]>(
    WHERE id = ?`,
 );
 
+/** Clear the session pointer AND advance the two markers in one transaction, so
+ *  a crash between them can't leave a window half-rolled. */
+const commitRollover = sqliteDb.transaction(
+  (convId: number, idxKey: string, idxVal: string, atKey: string, atVal: string) => {
+    clearSessionStmt.run(convId);
+    setSetting(idxKey, idxVal);
+    setSetting(atKey, atVal);
+  },
+);
+
 export interface RolloverResult {
   ran: boolean;
   reason: string;           // why it ran or was skipped
@@ -363,100 +400,129 @@ export async function runTalkRollover(opts: RolloverOpts): Promise<RolloverResul
   const isActive = opts.isActive ?? isConversationActive;
   if (isActive(conv.id)) return { ...base, reason: 'a turn is in flight — retry later' };
 
-  const lastIdxRaw = getSetting(lastIdxKey(ext));
-  const lastIdx = lastIdxRaw != null && lastIdxRaw.trim() !== '' ? parseInt(lastIdxRaw, 10) : -1;
-  const sinceIdx = Number.isFinite(lastIdx) ? lastIdx : -1;
+  // Concurrency lock: the morning run, its retries, the mid-day tick, and a
+  // manual call share one event loop and all await the writer, so without this
+  // two of them could both pass the marker check and double-roll.
+  if (rolling.has(ext)) return { ...base, reason: 'a rollover is already running for this seat' };
+  rolling.add(ext);
+  try {
+    const lastIdxRaw = getSetting(lastIdxKey(ext));
+    const lastIdx = lastIdxRaw != null && lastIdxRaw.trim() !== '' ? parseInt(lastIdxRaw, 10) : -1;
+    const sinceIdx = Number.isFinite(lastIdx) ? lastIdx : -1;
 
-  const turns = gatherTurnsSince(conv.id, sinceIdx);
-  if (turns.length === 0) {
-    return { ...base, reason: 'no new turns since last rollover — nothing to card' };
-  }
-
-  const tokensBefore = measureSessionTokens(conv.id);
-  const label = humanDayLabel(cardDateFor(turns, now));
-  const dateIso = cardDateFor(turns, now);
-
-  // 1/2. build + write the card
-  const prompt = buildDayCardPrompt(label, turns);
-  const runOneShot = opts.runOneShot ?? ((p: string) => {
-    if (isScratchEnv()) {
-      return Promise.reject(new Error('[talk-rollover] refused real one-shot in scratch env'));
+    const turns = gatherTurnsSince(conv.id, sinceIdx);
+    if (turns.length === 0) {
+      return { ...base, reason: 'no new turns since last rollover — nothing to card' };
     }
-    return runDayCardOneShot(p);
-  });
+    // The marker only ever advances to the END OF THE WINDOW WE GATHERED — never
+    // a fresh MAX(turn_index). Any turn that lands while the writer runs is left
+    // for the next rollover instead of being silently swallowed by the marker.
+    const windowEndIdx = turns[turns.length - 1].turnIndex;
 
-  let cardBody = '';
-  try {
-    cardBody = (await runOneShot(prompt)).trim();
-  } catch (err) {
-    return { ...base, reason: `writer failed: ${err instanceof Error ? err.message : String(err)}` };
-  }
-  if (!cardBody) return { ...base, reason: 'writer returned empty card' };
+    const tokensBefore = measureSessionTokens(conv.id);
+    const dateIso = cardDateFor(turns, now);
+    const label = humanDayLabel(dateIso);
 
-  const { file, part } = pickCardPath(target.daysDir, dateIso);
-  const partSuffix = part > 1 ? ` (part ${part})` : '';
-  const frontMatter =
-    `<!-- talk day card | seat=${ext} | date=${dateIso}${partSuffix} | turns=${turns.length} ` +
-    `| idx=${turns[0].turnIndex}..${turns[turns.length - 1].turnIndex} ` +
-    `| replayed_tokens_before=${tokensBefore.replayed} | generated=${now.toISOString()} -->\n`;
-  const header = `# 📅 ${label}${partSuffix}\n\n`;
-  try {
-    mkdirSync(target.daysDir, { recursive: true });
-    writeFileSync(file, frontMatter + header + cardBody + '\n', 'utf8');
-  } catch (err) {
-    return { ...base, reason: `card write failed: ${err instanceof Error ? err.message : String(err)}` };
-  }
+    // build + run the writer
+    const prompt = buildDayCardPrompt(label, turns);
+    const runOneShot = opts.runOneShot ?? ((p: string) => {
+      if (isScratchEnv()) {
+        return Promise.reject(new Error('[talk-rollover] refused real one-shot in scratch env'));
+      }
+      return runDayCardOneShot(p);
+    });
 
-  // 3. visible divider — bump role: non-user, never wakes the seat, not counted
-  //    as a transcript message. First line of the card becomes the preview.
-  const firstLine = cardBody.split(/\r?\n/).find((l) => l.trim() && !l.startsWith('#')) ?? '';
-  const dividerContent = `📅 ${label}${partSuffix} — fresh session. Yesterday's card saved.`;
-  try {
-    addTurn(
-      conv.id,
-      'bump',
-      dividerContent,
-      undefined,
-      JSON.stringify({
-        kind: 'talk_rollover',
-        date: dateIso,
+    let cardBody = '';
+    try {
+      cardBody = (await runOneShot(prompt)).trim();
+    } catch (err) {
+      return { ...base, reason: `writer failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    if (!cardBody) return { ...base, reason: 'writer returned empty card' };
+    // A card must look like a card. The stream-json parser falls back to raw
+    // text on a non-JSON line, so a CLI error string could otherwise masquerade
+    // as a card and authorize a session clear — reject anything without a
+    // '## ' section heading (fail-closed, nothing mutated).
+    if (!/^##\s/m.test(cardBody)) {
+      return { ...base, reason: 'writer output is not a valid card (no ## heading) — not rolling' };
+    }
+
+    // RE-CHECK right before mutating state: a turn may have started during the
+    // writer run, or Kevin may have flipped the switch off. Either way, abort
+    // WITHOUT writing the card or clearing the session — the next idle rollover
+    // picks the window up cleanly.
+    if (!opts.bypassKillSwitch && !rolloverEnabled()) {
+      return { ...base, reason: 'kill switch flipped off mid-roll — aborted before any change' };
+    }
+    if (isActive(conv.id)) {
+      return { ...base, reason: 'a turn started mid-roll — aborted before any change' };
+    }
+
+    const { file, part } = pickCardPath(target.daysDir, dateIso);
+    const partSuffix = part > 1 ? ` (part ${part})` : '';
+    const frontMatter =
+      `<!-- talk day card | seat=${ext} | date=${dateIso}${partSuffix} | turns=${turns.length} ` +
+      `| idx=${turns[0].turnIndex}..${windowEndIdx} ` +
+      `| replayed_tokens_before=${tokensBefore.replayed} | generated=${now.toISOString()} -->\n`;
+    const header = `# 📅 ${label}${partSuffix}\n\n`;
+    try {
+      mkdirSync(target.daysDir, { recursive: true });
+      writeFileSync(file, frontMatter + header + cardBody + '\n', 'utf8');
+    } catch (err) {
+      return { ...base, reason: `card write failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+
+    // visible divider — bump role: non-user, never wakes the seat, not counted
+    // as a transcript message. First body line becomes the preview.
+    const firstLine = cardBody.split(/\r?\n/).find((l) => l.trim() && !l.startsWith('#')) ?? '';
+    const dividerContent = `📅 ${label}${partSuffix} — fresh session. Yesterday's card saved.`;
+    try {
+      addTurn(
+        conv.id,
+        'bump',
+        dividerContent,
+        undefined,
+        JSON.stringify({
+          kind: 'talk_rollover',
+          date: dateIso,
+          part,
+          card_path: file,
+          turns: turns.length,
+          preview: firstLine.slice(0, 160),
+          trigger: opts.trigger ?? 'manual',
+          replayed_tokens_before: tokensBefore.replayed,
+        }),
+      );
+    } catch (err) {
+      // The card is on disk; without the divider the seat still rolls, but surface
+      // the failure rather than clearing the session as if all was well.
+      return {
+        ...base,
+        reason: `divider post failed (card written): ${err instanceof Error ? err.message : String(err)}`,
+        cardFile: file,
         part,
-        card_path: file,
-        turns: turns.length,
-        preview: firstLine.slice(0, 160),
-        trigger: opts.trigger ?? 'manual',
-        replayed_tokens_before: tokensBefore.replayed,
-      }),
-    );
-  } catch (err) {
-    // The card is on disk; without the divider the seat still rolls, but surface
-    // the failure rather than clearing the session as if all was well.
+      };
+    }
+
+    // clear the session pointer + advance the marker, atomically so a crash
+    // between them can't leave the window half-committed. Done LAST so any
+    // failure above never strands the seat with a wiped session and no card.
+    commitRollover(conv.id, lastIdxKey(ext), String(windowEndIdx), lastAtKey(ext), now.toISOString());
+
     return {
-      ...base,
-      reason: `divider post failed (card written): ${err instanceof Error ? err.message : String(err)}`,
+      ran: true,
+      reason: `rolled ${turns.length} turn(s) → ${path.basename(file)}`,
+      externalId: ext,
       cardFile: file,
       part,
+      label,
+      turnsRolled: turns.length,
+      lastIdx: windowEndIdx,
+      tokensBefore,
     };
+  } finally {
+    rolling.delete(ext);
   }
-
-  // 4. clear the session pointer + advance the marker. Done LAST so a failure
-  //    above never strands the seat with a wiped session and no card.
-  const newLastIdx = maxTurnIdxStmt.get(conv.id)?.max_idx ?? turns[turns.length - 1].turnIndex;
-  clearSessionStmt.run(conv.id);
-  setSetting(lastIdxKey(ext), String(newLastIdx));
-  setSetting(lastAtKey(ext), now.toISOString());
-
-  return {
-    ran: true,
-    reason: `rolled ${turns.length} turn(s) → ${path.basename(file)}`,
-    externalId: ext,
-    cardFile: file,
-    part,
-    label,
-    turnsRolled: turns.length,
-    lastIdx: newLastIdx,
-    tokensBefore,
-  };
 }
 
 // ── digest seed section (deliverable #4 lives in digest.py; this is the TS twin
@@ -490,7 +556,7 @@ export function buildSeedSection(input: SeedSectionInput): string {
   let cards: string[] = [];
   try {
     cards = existsSync(input.daysDir)
-      ? readdirSync(input.daysDir).filter((f) => /\.md$/.test(f)).sort()
+      ? sortCardFiles(readdirSync(input.daysDir).filter((f) => /\.md$/.test(f)))
       : [];
   } catch {
     cards = [];
@@ -551,36 +617,49 @@ let morningTimer: NodeJS.Timeout | null = null;
 let middayTimer: NodeJS.Timeout | null = null;
 
 async function runMorning(retriesLeft: number): Promise<void> {
-  if (!rolloverEnabled()) return; // honor a flip-to-off since scheduling
-  for (const target of LIVE_TARGETS) {
-    try {
-      const res = await runTalkRollover({ target, trigger: 'morning' });
-      if (!res.ran && res.reason.includes('in flight') && retriesLeft > 0) {
-        setTimeout(() => { void runMorning(retriesLeft - 1); }, MORNING_RETRY_MS).unref?.();
-        return;
+  // Whole body guarded: rolloverEnabled() reads the DB, and this runs via
+  // `void runMorning(...)`, so an uncaught throw would be an unhandled rejection.
+  try {
+    if (!rolloverEnabled()) return; // honor a flip-to-off since scheduling
+    for (const target of LIVE_TARGETS) {
+      try {
+        const res = await runTalkRollover({ target, trigger: 'morning' });
+        if (!res.ran && res.reason.includes('in flight') && retriesLeft > 0) {
+          setTimeout(() => { void runMorning(retriesLeft - 1); }, MORNING_RETRY_MS).unref?.();
+          return;
+        }
+        if (res.ran) console.log(`[talk-rollover] morning: ${res.externalId}: ${res.reason}`);
+      } catch (err) {
+        console.error(`[talk-rollover] morning failed for ${target.externalId}:`, err);
       }
-      if (res.ran) console.log(`[talk-rollover] morning: ${res.externalId}: ${res.reason}`);
-    } catch (err) {
-      console.error(`[talk-rollover] morning failed for ${target.externalId}:`, err);
     }
+  } catch (err) {
+    console.error('[talk-rollover] morning tick failed:', err);
   }
 }
 
 async function runMiddayCheck(): Promise<void> {
-  if (!rolloverEnabled()) return;
-  const cap = middayTokenCap();
-  for (const target of LIVE_TARGETS) {
-    try {
-      const conv = getConversation(target.externalId);
-      if (!conv) continue;
-      if (isConversationActive(conv.id)) continue; // wait for an idle gap
-      const tok = measureSessionTokens(conv.id);
-      if (tok.replayed < cap) continue;
-      const res = await runTalkRollover({ target, trigger: 'midday' });
-      if (res.ran) console.log(`[talk-rollover] midday (session ${tok.replayed} ≥ ${cap}): ${res.reason}`);
-    } catch (err) {
-      console.error(`[talk-rollover] midday check failed for ${target.externalId}:`, err);
+  try {
+    if (!rolloverEnabled()) return;
+    const cap = middayTokenCap();
+    for (const target of LIVE_TARGETS) {
+      try {
+        const conv = getConversation(target.externalId);
+        if (!conv) continue;
+        if (isConversationActive(conv.id)) continue; // wait for an idle gap
+        const tok = measureSessionTokens(conv.id);
+        if (tok.replayed < cap) continue;
+        // runTalkRollover no-ops when there are no new turns since the last roll,
+        // so a just-cleared session whose last (stale) assistant turn still reads
+        // big can't double-roll — it simply reports 'no new turns'.
+        const res = await runTalkRollover({ target, trigger: 'midday' });
+        if (res.ran) console.log(`[talk-rollover] midday (session ${tok.replayed} ≥ ${cap}): ${res.reason}`);
+      } catch (err) {
+        console.error(`[talk-rollover] midday check failed for ${target.externalId}:`, err);
+      }
     }
+  } catch (err) {
+    console.error('[talk-rollover] midday tick failed:', err);
   }
 }
 
@@ -608,8 +687,6 @@ export function startTalkRolloverWorker(): void {
 /** Used by the hermetic check to read a just-written card back off disk. */
 export function listDayCards(daysDir: string): { file: string; mtime: number }[] {
   if (!existsSync(daysDir)) return [];
-  return readdirSync(daysDir)
-    .filter((f) => /\.md$/.test(f))
-    .map((f) => ({ file: f, mtime: statSync(path.join(daysDir, f)).mtimeMs }))
-    .sort((a, b) => a.file.localeCompare(b.file));
+  const files = sortCardFiles(readdirSync(daysDir).filter((f) => /\.md$/.test(f)));
+  return files.map((f) => ({ file: f, mtime: statSync(path.join(daysDir, f)).mtimeMs }));
 }

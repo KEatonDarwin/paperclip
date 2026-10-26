@@ -22,6 +22,7 @@ import {
   pickCardPath,
   cardDateFor,
   rolloverEnabled,
+  sortCardFiles,
   KILL_SWITCH_KEY,
   type RolloverTarget,
 } from '../src/talk-rollover.js';
@@ -194,6 +195,71 @@ async function main() {
     ok('MUT1 first file carries ALPHA-MARK only', b1.includes('ALPHA-MARK') && !b1.includes('BETA-MARK'));
     ok('MUT2 second file carries BETA-MARK only', b2.includes('BETA-MARK') && !b1.includes('BETA-MARK'));
     ok('MUT3 mutation changed the on-disk output', b1 !== b2);
+  }
+
+  // ── N. chronological card sort (codex #3): parts after bare date, 2 < 10 ───
+  {
+    const sorted = sortCardFiles(['2026-10-26-part10.md', '2026-10-26.md', '2026-10-26-part2.md', '2026-10-25.md']);
+    ok('N1 date ascending then part ascending (bare = part 1, 2 before 10)',
+      JSON.stringify(sorted) === JSON.stringify(['2026-10-25.md', '2026-10-26.md', '2026-10-26-part2.md', '2026-10-26-part10.md']),
+      sorted.join(','));
+  }
+
+  // ── O. re-check before clear: turn starts mid-roll → abort, nothing mutated ─
+  {
+    const t = target('cockpit:test-o');
+    const cid = freshConv(t.externalId);
+    setSession(cid, 'sess-O');
+    addUser(cid, 'hi'); addAsst(cid, 'yo', { cacheRead: 10 });
+    let calls = 0;
+    const flipActive = () => { calls += 1; return calls >= 2; }; // idle at entry, busy at the re-check
+    const res = await runTalkRollover({ target: t, now: FIXED_NOW, runOneShot: okOneShot('O'), isActive: flipActive });
+    ok('O1 aborts when a turn starts mid-roll', res.ran === false && /mid-roll/.test(res.reason), res.reason);
+    ok('O2 no card written on mid-roll abort', !existsSync(t.daysDir) || readdirSync(t.daysDir).length === 0);
+    ok('O3 session preserved on mid-roll abort', getConversation(t.externalId)!.claude_session_id === 'sess-O');
+    ok('O4 no bump on mid-roll abort', (sqliteDb.prepare(`SELECT COUNT(*) c FROM turns WHERE conversation_id=? AND role='bump'`).get(cid) as any).c === 0);
+  }
+
+  // ── P. kill switch flipped OFF during the writer → abort, nothing mutated ───
+  {
+    const t = target('cockpit:test-p');
+    const cid = freshConv(t.externalId);
+    setSession(cid, 'sess-P');
+    addUser(cid, 'hi'); addAsst(cid, 'yo', { cacheRead: 10 });
+    const flipOff = async () => { setSetting(KILL_SWITCH_KEY, 'off'); return okOneShot('P')(); };
+    const res = await runTalkRollover({ target: t, now: FIXED_NOW, runOneShot: flipOff, isActive: () => false });
+    ok('P1 aborts when switch flipped off mid-roll', res.ran === false && /flipped off/.test(res.reason), res.reason);
+    ok('P2 session preserved', getConversation(t.externalId)!.claude_session_id === 'sess-P');
+    setSetting(KILL_SWITCH_KEY, 'on'); // restore for later blocks
+  }
+
+  // ── Q. writer output with no ## heading → rejected, fail-closed ─────────────
+  {
+    const t = target('cockpit:test-q');
+    const cid = freshConv(t.externalId);
+    setSession(cid, 'sess-Q');
+    addUser(cid, 'hi'); addAsst(cid, 'yo', { cacheRead: 10 });
+    const res = await runTalkRollover({ target: t, now: FIXED_NOW, runOneShot: async () => 'Error: subscription spent. Please retry.', isActive: () => false });
+    ok('Q1 non-card output rejected', res.ran === false && /not a valid card/.test(res.reason), res.reason);
+    ok('Q2 session preserved on junk output', getConversation(t.externalId)!.claude_session_id === 'sess-Q');
+  }
+
+  // ── R. concurrency lock: two concurrent rolls → one runs, one is refused ────
+  {
+    const t = target('cockpit:test-r');
+    const cid = freshConv(t.externalId);
+    setSession(cid, 'sess-R');
+    addUser(cid, 'hi'); addAsst(cid, 'yo', { cacheRead: 10 });
+    const slow = () => new Promise<string>((r) => setTimeout(() => r('## Done\n- R\n'), 20));
+    const [a, b] = await Promise.all([
+      runTalkRollover({ target: t, now: FIXED_NOW, runOneShot: slow, isActive: () => false }),
+      runTalkRollover({ target: t, now: FIXED_NOW, runOneShot: slow, isActive: () => false }),
+    ]);
+    const ranCount = [a, b].filter((x) => x.ran).length;
+    const lockedCount = [a, b].filter((x) => /already running/.test(x.reason)).length;
+    ok('R1 exactly one concurrent roll ran', ranCount === 1, `ran=${ranCount}`);
+    ok('R2 the other was refused by the lock', lockedCount === 1, `${a.reason} | ${b.reason}`);
+    ok('R3 only one card written', readdirSync(t.daysDir).length === 1);
   }
 
   // ── L. seed section (TS twin): open items + last 3 + older index + cap ─────

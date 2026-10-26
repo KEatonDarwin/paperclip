@@ -93,7 +93,10 @@ const WRITER_MODEL = 'claude-haiku-4-5-20251001';
 const WRITER_TIMEOUT_MS = 90_000;
 /** Cap the day's conversation text handed to the writer. The seat's own turns
  *  are already summaries-of-work, so this is generous. */
-const MAX_PROMPT_CHARS = 60_000;
+const MAX_PROMPT_CHARS = 120_000;
+/** Per-turn cap so one pathologically huge turn can't blow the whole budget (or
+ *  the model's context) on its own. */
+const MAX_TURN_CHARS = 24_000;
 
 // settings keys that track per-seat rollover state (keyed by external_id)
 const lastIdxKey = (ext: string) => `talk_rollover_last_idx:${ext}`;
@@ -126,7 +129,15 @@ export interface SessionTokens {
 }
 
 /** The replayed-context size of the most recent assistant step. Zero when the
- *  conversation has no token-bearing assistant turn yet. */
+ *  conversation has no token-bearing assistant turn yet.
+ *
+ *  This is a HEURISTIC backstop for the mid-day net, not a precise session-token
+ *  accounting: the turns table stores per-turn usage, not per-model-call, and
+ *  doesn't tag which session a turn belonged to. So right after a clear the last
+ *  (stale) assistant turn can still read big — but the marker guard in
+ *  runTalkRollover ("no new turns since last rollover") makes that a harmless
+ *  no-op, never a double-roll. Firing the net a little early or late only shifts
+ *  WHEN a fresh head is cut, which is exactly what the net is for. */
 export function measureSessionTokens(conversationId: number): SessionTokens {
   const r = latestAssistantTokensStmt.get(conversationId);
   if (!r) return { turnIndex: null, input: 0, cacheRead: 0, cacheWrite: 0, replayed: 0 };
@@ -207,7 +218,12 @@ export function buildDayCardPrompt(label: string, turns: DayTurn[]): string {
   for (let i = turns.length - 1; i >= 0; i--) {
     const t = turns[i];
     const who = t.role === 'user' ? 'Kevin' : 'JARVIS';
-    const block = `\n### ${who} (${t.createdAt})\n${t.content}\n`;
+    // Cap a single turn so one giant message can't exhaust the budget / the
+    // model's context by itself.
+    const content = t.content.length > MAX_TURN_CHARS
+      ? t.content.slice(0, MAX_TURN_CHARS) + '\n…(long turn trimmed)…'
+      : t.content;
+    const block = `\n### ${who} (${t.createdAt})\n${content}\n`;
     if (size + block.length > MAX_PROMPT_CHARS && parts.length > 0) { trimmed = true; break; }
     parts.push(block);
     size += block.length;
@@ -457,6 +473,13 @@ export async function runTalkRollover(opts: RolloverOpts): Promise<RolloverResul
     if (isActive(conv.id)) {
       return { ...base, reason: 'a turn started mid-roll — aborted before any change' };
     }
+    // A turn may have started AND FINISHED during the writer (idle again now).
+    // It left content turns the card doesn't cover; clearing the session now
+    // would drop them from the fresh head until the next roll. Abort instead —
+    // the next idle roll summarizes the whole thing.
+    if (gatherTurnsSince(conv.id, windowEndIdx).length > 0) {
+      return { ...base, reason: 'new turns arrived mid-roll — aborted before any change' };
+    }
 
     const { file, part } = pickCardPath(target.daysDir, dateIso);
     const partSuffix = part > 1 ? ` (part ${part})` : '';
@@ -594,8 +617,11 @@ function nowCT(): Date {
   return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' }));
 }
 
-/** ms until the next HH:00 CT (default 04:00). Same offset trick as the 8am
- *  briefing scheduler in index.ts. */
+/** ms until the next HH:00 CT (default 04:00). Same offset trick as the existing
+ *  8am briefing scheduler in index.ts (reused deliberately rather than inventing
+ *  a divergent TZ calc). Known shared limitation: at the two DST transitions a
+ *  year it can be ±1h off — harmless for a "roughly 04:00" housekeeping job, and
+ *  the idle-retry loop absorbs it. */
 export function msUntilNextCT(hour: number, from: Date = new Date()): number {
   const now = from;
   const target = new Date(now.toLocaleString('en-US', { timeZone: 'America/Chicago' }));
@@ -624,7 +650,11 @@ async function runMorning(retriesLeft: number): Promise<void> {
     for (const target of LIVE_TARGETS) {
       try {
         const res = await runTalkRollover({ target, trigger: 'morning' });
-        if (!res.ran && res.reason.includes('in flight') && retriesLeft > 0) {
+        // Retry on any transient "seat was busy / raced" reason, not just the
+        // entry-gate "in flight" — a turn that started during the writer aborts
+        // with a 'mid-roll' reason and must still be retried, or the morning
+        // roll is abandoned until mid-day/next day.
+        if (!res.ran && /in flight|mid-roll|already running/.test(res.reason) && retriesLeft > 0) {
           setTimeout(() => { void runMorning(retriesLeft - 1); }, MORNING_RETRY_MS).unref?.();
           return;
         }

@@ -23,8 +23,10 @@ import {
   cardDateFor,
   rolloverEnabled,
   sortCardFiles,
+  buildDayCardPrompt,
   KILL_SWITCH_KEY,
   type RolloverTarget,
+  type DayTurn,
 } from '../src/talk-rollover.js';
 
 let passed = 0;
@@ -260,6 +262,32 @@ async function main() {
     ok('R1 exactly one concurrent roll ran', ranCount === 1, `ran=${ranCount}`);
     ok('R2 the other was refused by the lock', lockedCount === 1, `${a.reason} | ${b.reason}`);
     ok('R3 only one card written', readdirSync(t.daysDir).length === 1);
+  }
+
+  // ── S. turn finishes DURING the writer (idle again) → abort, don't clear ───
+  {
+    const t = target('cockpit:test-s');
+    const cid = freshConv(t.externalId);
+    setSession(cid, 'sess-S');
+    addUser(cid, 'hi'); addAsst(cid, 'yo', { cacheRead: 10 });
+    // writer "takes a while", during which a new turn lands AND completes (idle)
+    const raceyWriter = async () => { addUser(cid, 'oh one more thing'); addAsst(cid, 'noted', { cacheRead: 10 }); return '## Done\n- S\n'; };
+    const res = await runTalkRollover({ target: t, now: FIXED_NOW, runOneShot: raceyWriter, isActive: () => false });
+    ok('S1 aborts when new turns land mid-roll (start-and-finish race)', res.ran === false && /new turns arrived mid-roll/.test(res.reason), res.reason);
+    ok('S2 no card written', !existsSync(t.daysDir) || readdirSync(t.daysDir).length === 0);
+    ok('S3 session preserved — the new turn is not stranded in a cleared session', getConversation(t.externalId)!.claude_session_id === 'sess-S');
+  }
+
+  // ── T. prompt caps: tail kept when over budget, single huge turn capped ────
+  {
+    const many: DayTurn[] = [];
+    for (let i = 0; i < 400; i++) many.push({ turnIndex: i, role: i % 2 ? 'assistant' : 'user', content: `turn ${i} ` + 'x'.repeat(2000), createdAt: '2026-10-26 09:00:00' });
+    const p = buildDayCardPrompt('Mon, Oct 26', many);
+    ok('T1 over-budget prompt keeps the newest turn (tail)', p.includes('turn 399'));
+    ok('T2 over-budget prompt drops the oldest turn', !p.includes('turn 0 ') && p.includes('earlier turns trimmed'));
+    const huge: DayTurn[] = [{ turnIndex: 0, role: 'user', content: 'y'.repeat(500_000), createdAt: '2026-10-26 09:00:00' }];
+    const ph = buildDayCardPrompt('Mon, Oct 26', huge);
+    ok('T3 a single huge turn is capped, not passed whole', ph.length < 60_000 && ph.includes('long turn trimmed'));
   }
 
   // ── L. seed section (TS twin): open items + last 3 + older index + cap ─────

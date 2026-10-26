@@ -111,3 +111,26 @@ is untouched and still applies.
   the session. A writer failure leaves the session intact (no stranded seat).
 - The divider uses the existing `bump` role, so it shows as a distinct card and is
   never counted as a message or replayed to the fresh head.
+
+## Known limits (reviewed, accepted by design)
+
+A two-pass codex review ran; the real correctness/safety findings are fixed
+(concurrency lock, re-check-before-clear + the start-and-finish race, window-end
+marker, atomic clear+marker, chronological card sort, card-heading validation,
+worker error boundaries, prompt tail-truncation + per-turn cap, morning retry on
+any transient reason, proof DB guard). These were weighed and left as-is:
+
+- **Mid-day token measure is a heuristic**, not precise per-session accounting
+  (the turns table doesn't tag sessions). It only decides WHEN to cut a fresh
+  head; the "no new turns" marker guard means an early/late/stale read is a
+  harmless no-op, never a double-roll. Tunable via `talk_rollover_midday_token_cap`.
+- **04:00 scheduling can be ±1h at the two DST transitions a year** — the same
+  approximation the existing 8am briefing cron uses (reused deliberately). Fine
+  for a "roughly 04:00" housekeeping job; the idle-retry loop absorbs it.
+- **The card is a lossy summary.** On a marathon day whose new conversation text
+  exceeds the prompt budget, the oldest turns are dropped from the card (the full
+  transcript still exists and is reachable via `find_chats`/`read_chat`). The
+  mid-day net keeps days from getting that large in the first place.
+- **Card validation is structural** (must have a `## ` heading) — it catches the
+  realistic failure (a CLI error string authorizing a clear), not a
+  well-formed-but-wrong card, which can't be judged without another model call.

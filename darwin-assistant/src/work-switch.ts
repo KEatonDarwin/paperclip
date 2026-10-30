@@ -63,6 +63,12 @@ export const LANES: LaneDef[] = [
   // recoverable (the next sweep catches up from the file high-water mark).
   { key: 'mike_ingest', label: 'Mike Radar ingest', what: 'the hourly Lovable archive ingest',          kind: 'process' },
   { key: 'mike_report', label: 'Mike Radar reports', what: 'the nightly per-project engineering reports', kind: 'process' },
+  // Tree Steward (tree-646923b4). In-process, NOT a timer: the steward is
+  // event-driven off the finish path — it fires the instant a node finishes
+  // blocked_question, so there is no periodic unit to gate with ExecCondition.
+  // Switching it off leaves every blocked_question sitting for Kevin exactly as
+  // before, which is the whole point of the lane.
+  { key: 'steward',   label: 'Tree Steward',      what: 'auto-answering blocked_question nodes',        kind: 'process' },
 ];
 
 export const LANE_KEYS = LANES.map((l) => l.key);

@@ -12,6 +12,7 @@ import { createHopperItem } from './hopper.js';
 // exact failure this debrief exists to prevent. Module load is DDL only; the
 // dispatch loop starts from startHopperEngine(), which this does not call.
 import './hopper-engine.js';
+import { stewardRollup, renderStewardBlock } from './tree-steward-rollup.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -284,6 +285,8 @@ interface DebriefSignal {
   blockedNodes: string;
   /** Deterministic follow-on guesses — the fallback's section 3. */
   fallbackFollowOns: FollowOn[];
+  /** Pre-rendered Tree Steward rollup block ('' when nothing to report). */
+  stewardBlock: string;
 }
 
 /** Recently-active build threads + their latest summary — the "where we left
@@ -585,6 +588,9 @@ function buildDebriefPrompt(s: DebriefSignal): string {
     '   needs him, say "Nothing waiting on you."',
     "5. *I'd start with:* — the SINGLE highest-leverage next move, and offer to run it. ONE",
     '   thing. Actually choose, like a human collaborator sizing up the day — do not hedge.',
+    s.stewardBlock
+      ? 'After section 5, add ONE final short section: reproduce the TREE STEWARD block below VERBATIM (it is already written in Slack format — do not rephrase, renumber, or re-summarize it). Omit this entirely when that block is absent.'
+      : '',
     '',
     'Voice: warm, direct, broad strokes (no root-cause detail), concise — he reads this on a',
     'phone. Open with a one-line greeting that includes the date. Keep the whole thing tight.',
@@ -605,6 +611,10 @@ function buildDebriefPrompt(s: DebriefSignal): string {
     `=== RECENT COCKPIT THREAD ACTIVITY (context for what he was driving himself) ===\n${s.threads}`,
     '',
     `=== CALENDAR TODAY ===\n${s.calendar}`,
+    '',
+    s.stewardBlock
+      ? `=== TREE STEWARD (last ${OVERNIGHT_HOURS}h — reproduce VERBATIM as the final section) ===\n${s.stewardBlock}`
+      : '',
     '',
     'Output the finished Slack message text first — no preamble, no code fences, no explanation.',
     `Then, on its own line, output exactly ${FOLLOWON_MARKER} followed by a JSON array of the`,
@@ -684,6 +694,9 @@ function fallbackDebrief(s: DebriefSignal): string {
   if (s.blockedNodes !== '(none)') needs.push(s.blockedNodes);
   if (s.kevinTodos !== '(none)') needs.push(s.kevinTodos);
   lines.push(needs.length ? needs.join('\n') : '• Nothing waiting on you.');
+  // Tree Steward rollup — rendered here too so it survives every model timeout
+  // (the whole reason this fallback exists). '' when nothing to report.
+  if (s.stewardBlock) lines.push('', s.stewardBlock);
   lines.push(
     '',
     s.blockedNodes !== '(none)'
@@ -729,6 +742,10 @@ export async function buildMorningBriefing(opts?: { fileCandidates?: boolean }):
     engineEvents: overnightEngineEvents(),
     blockedNodes: blocked.text,
     fallbackFollowOns: deriveFollowOns(overnight.rows, blocked.rows),
+    // Same defensive convention as the other signals: the helper never throws and
+    // returns '' when there's nothing to report. OVERNIGHT_HOURS keeps the window
+    // locked to the rest of the debrief's.
+    stewardBlock: renderStewardBlock(stewardRollup(OVERNIGHT_HOURS)),
   };
 
   // Sunday is a rest day — no work push, and nothing gets filed into his hopper.

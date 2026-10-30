@@ -129,14 +129,18 @@ function composeCue(
       const tag = n.status === 'blocked_question' ? ' [needs Kevin]' : '';
       lines.push(`  #${n.id} ${firstLine(n.title, 120)}${tag}${why ? ` — ${why}` : ''}`);
     }
-    // blocked_question is reserved for a call only Kevin can make (the Smart
-    // Unblocker explicitly never touches them) — the cue must not invite JARVIS
-    // to answer one on his behalf.
+    // blocked_question is the steward's domain: the tree-steward triages these
+    // automatically (see src/tree-steward-trigger.ts) — it adopts the worker's
+    // own recommendation for product/spec calls and parks a Kevin card only for
+    // the escalation-bar, test-or-DB-fence, and no-recommendation cases. So a
+    // [needs Kevin] tag now means "the steward flagged this for Kevin", not
+    // "always Kevin's". The Smart Unblocker still owns plain `blocked` nodes;
+    // the two must never overlap — steward = blocked_question, unblocker = blocked.
     const questionOnly = blockedNodes.every((n) => n.status === 'blocked_question');
     lines.push(
       questionOnly
-        ? "Next: this is a blocked_question — Kevin's call, not yours. Surface it to him and answer the node only once he has decided."
-        : "Next: unstick the blocked node(s) per the Smart Unblocker rule if the subscription juice allows; any node tagged [needs Kevin] is his call — surface it, don't answer it yourself.",
+        ? 'Next: the steward triages these blocked_question(s) (src/tree-steward-trigger.ts). Check whether it already handled them: if it parked a Kevin card, THAT one is his call — surface it and do not answer it; if it auto-adopted the worker recommendation, nothing is needed here beyond noting it.'
+        : "Next: unstick the plain blocked node(s) per the Smart Unblocker rule if the subscription juice allows; any node tagged [needs Kevin] is a blocked_question the steward triages (src/tree-steward-trigger.ts) — if it parked a card, surface it and don't answer it yourself.",
     );
   }
 

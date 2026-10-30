@@ -89,26 +89,79 @@ export async function onBlockedQuestionFinished(ctx: StewardTriggerContext): Pro
 }
 
 /**
- * Act on a steward decision.
+ * Act on a steward decision — the effects stage.
  *
- * ⚠️ INTENTIONALLY INERT IN THIS NODE (#1712). This node wires the exactly-once,
- * event-driven trigger and nothing more. It deliberately does NOT answer any real
- * node, because the guardrails that make auto-answering safe do not exist yet.
+ * This node fills in the real `auto_answer` effect and nothing more. The branches:
  *
- * Node #381 fills in the real effects HERE, and ONLY here:
- *   - on `auto_answer`: re-queue the node via POST /hopper-nodes/:id/answer with
- *     `decision.answer`, record it with log_decision, and post one line to the
- *     origin thread;
- *   - on `park_card` / `noop`: leave the node parked for Kevin (the card the
- *     notification already created) and, where useful, note why.
- * Until that lands, the ONLY effect is a single structured log line, so nothing
- * can answer a real node before the guardrails exist.
+ *   - `auto_answer`: adopt the worker's own recommendation. Requires a non-empty
+ *     `decision.answer` — an auto_answer with no answer text is a classifier bug,
+ *     and answering a real node with an empty string would unstick the tree with
+ *     nothing, so we refuse (log + return) rather than act. Otherwise we hand off
+ *     to `executeAutoAnswer`, which performs, in order, (1) ANSWER the node back to
+ *     pending, (2) write the Decision Ledger row, (3) queue one breadcrumb into the
+ *     origin thread. We log ONLY the effects its return value actually confirms —
+ *     never a flag the result did not set.
+ *   - `park_card`: INERT here by design. We log a single PARK line and do nothing
+ *     else — no notification, no answer, no decision row. ⚠️ The card surface Kevin
+ *     reviews, together with the guardrails that make parking actionable, is NODE
+ *     #382's job and lands THERE, not here.
+ *   - `noop`: return silently (the classifier already found nothing to do).
+ *
+ * The whole body is wrapped so a broken steward can never break a worker's finish.
+ *
+ * WHY THE ACT IMPORT IS DYNAMIC: same reason tree-cue gives for loading agent.js —
+ * `./tree-steward-act.ts` statically imports hopper-engine (for answerHopperNode),
+ * so a static edge from this trigger would help close an import cycle through the
+ * engine's module graph. Loading it with `await import('./tree-steward-act.js')`
+ * keeps hopper-engine's module graph unchanged and keeps the whole path provable
+ * with injected fakes (no DB / model / network).
  */
 export async function applyStewardDecision(
   ctx: StewardTriggerContext,
   decision: StewardDecision,
 ): Promise<void> {
-  console.log(
-    `[tree-steward] node ${ctx.nodeId} tree ${ctx.treeId}: ${decision.action} (${decision.category}) — ${decision.reason}`,
-  );
+  try {
+    if (decision.action === 'noop') return;
+
+    if (decision.action === 'park_card') {
+      console.log(
+        `[tree-steward] node ${ctx.nodeId}: PARK (${decision.category}) — ${decision.reason} — card pending (node #382)`,
+      );
+      return;
+    }
+
+    if (decision.action === 'auto_answer') {
+      // An auto_answer with no answer text is a classifier bug; answering a real
+      // node with '' would unstick the tree with nothing. Refuse, do not act.
+      const answer = (decision.answer ?? '').trim();
+      if (answer === '') {
+        console.error(
+          `[tree-steward] node ${ctx.nodeId}: auto_answer with empty answer — refusing to answer (classifier bug; category ${decision.category})`,
+        );
+        return;
+      }
+
+      // Dynamic import — see the header: keeps hopper-engine's module graph
+      // unchanged and the path provable with fakes.
+      const { executeAutoAnswer } = await import('./tree-steward-act.js');
+      const r = executeAutoAnswer({
+        nodeId: ctx.nodeId,
+        treeId: ctx.treeId,
+        title: ctx.title,
+        question: ctx.question ?? '',
+        answer,
+        category: decision.category,
+        reason: decision.reason,
+      });
+      // Report ONLY the effects the return value confirms — never a flag it did not set.
+      console.log(
+        `[tree-steward] node ${ctx.nodeId} tree ${ctx.treeId}: AUTO-ANSWER (${decision.category}) — ` +
+          `answered=${r.answered} decision=${r.decisionWritten} origin=${r.linePosted}`,
+      );
+      return;
+    }
+  } catch (err) {
+    // A broken steward must never break a worker's finish.
+    console.error(`[tree-steward] applyStewardDecision failed for node ${ctx.nodeId}:`, err);
+  }
 }

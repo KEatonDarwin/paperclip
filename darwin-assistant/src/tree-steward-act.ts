@@ -14,18 +14,21 @@
 // EVERY effect is injectable (see StewardEffects) PRECISELY so this whole path
 // can be proven with fakes — no database connection, no model call, no network.
 // `executeAutoAnswer(..., effects = realStewardEffects)` runs the real writes in
-// production; a test passes spy fakes and asserts order + isolation. That is the
-// entire reason this module exists as a seam.
+// production; a dry-run passes spy fakes and asserts order + isolation. That is
+// the entire reason this module exists as a seam.
 //
-// ⚠️ This module must NEVER be statically imported by hopper-engine.ts. It
-// statically imports hopper-engine (for answerHopperNode); the reverse would be
-// a cycle. The trigger reaches THIS module by dynamic import instead.
-
-import { answerHopperNode } from './hopper-engine.js';
-import { insertJarvisDecision } from './jarvis-decisions.js';
-import { getConversation } from './conversation-db.js';
-import { getHopperTree } from './hopper-engine.js';
-import { cueTargetForTree } from './goals.js';
+// ⚠️ IMPORT HAZARD (node #1718): the real effects live in modules that open the
+// jarvis.db sqlite handle at load time (conversation-db.ts does `new Database()`
+// at module scope, and hopper-engine / jarvis-decisions / goals all pull it in).
+// If those were STATICALLY imported here, merely importing `executeAutoAnswer`
+// (or the StewardEffects type) would open — and with an unset JARVIS_DB_PATH,
+// CREATE — a database, which breaks any fake-only proof and can't run DB-free.
+// So every real implementation is loaded by DYNAMIC import INSIDE
+// realStewardEffects' own methods. The module graph of this file is now empty:
+// importing executeAutoAnswer loads NO db/model/network module. The real writes
+// still happen in production the first time a method runs (the trigger reaches
+// this module by dynamic import already). This also removes the old static
+// hopper-engine import cycle entirely.
 
 /** Max chars of the worker's question we keep on the audit row — enough to read
  *  cold, not a wall. */
@@ -78,7 +81,8 @@ export const realStewardEffects: StewardEffects = {
   // exported function IS that endpoint's own code path — identical write, identical
   // side effects (node → pending + answer, tree re-armed, dispatch tick), with no
   // new write path and no self-HTTP call needing a bearer key.
-  answerNode(nodeId, answer) {
+  async answerNode(nodeId, answer) {
+    const { answerHopperNode } = await import('./hopper-engine.js');
     answerHopperNode(nodeId, answer);
   },
 
@@ -87,7 +91,8 @@ export const realStewardEffects: StewardEffects = {
   // 'jarvis'. We let the insert default its conversation context — a steward
   // auto-answer is fired from the engine, not a tool turn, so there is honestly
   // no conversation to attribute it to.
-  recordDecision(input) {
+  async recordDecision(input) {
+    const { insertJarvisDecision } = await import('./jarvis-decisions.js');
     insertJarvisDecision({
       question: oneLine(input.question, QUESTION_CAP),
       decidedBy: 'jarvis',
@@ -112,8 +117,15 @@ export const realStewardEffects: StewardEffects = {
   // just this import with a scoped ESM loader hook — no real model call / no API
   // key). If there is no conversation for the thread we bail silently rather than
   // create one — same as tree-cue.
-  postOriginLine(treeId, line) {
+  async postOriginLine(treeId, line) {
     if (treeId === null) return;
+    // Dynamic imports (route a): these modules open the DB, so we only load them
+    // when the breadcrumb actually fires — never at import of this file.
+    const [{ getHopperTree }, { cueTargetForTree }, { getConversation }] = await Promise.all([
+      import('./hopper-engine.js'),
+      import('./goals.js'),
+      import('./conversation-db.js'),
+    ]);
     const tree = getHopperTree(treeId);
     const originExt = cueTargetForTree(treeId) ?? tree?.origin_thread_ext ?? null;
     if (!originExt) return; // no planting thread to wake
@@ -121,13 +133,12 @@ export const realStewardEffects: StewardEffects = {
     const conv = getConversation(originExt);
     if (!conv) return; // no conversation → bail silently, never create one
     const convId = conv.id;
-    void import('./thread-message-queue.js')
-      .then((queue) => {
-        queue.enqueueMessage(convId, line);
-      })
-      .catch((err) => {
-        console.error(`[tree-steward] origin-line enqueue failed for ${treeId}:`, err);
-      });
+    try {
+      const queue = await import('./thread-message-queue.js');
+      queue.enqueueMessage(convId, line);
+    } catch (err) {
+      console.error(`[tree-steward] origin-line enqueue failed for ${treeId}:`, err);
+    }
   },
 };
 

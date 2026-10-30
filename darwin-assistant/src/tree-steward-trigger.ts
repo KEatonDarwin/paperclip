@@ -124,8 +124,24 @@ export async function applyStewardDecision(
     if (decision.action === 'noop') return;
 
     if (decision.action === 'park_card') {
+      // Node #382: the classifier already ruled this Kevin's call (escalation bar,
+      // test/DB fence, or a real decision with nothing to adopt). Raise the rich
+      // Kevin card carrying the classifier's own category + reason, and answer
+      // nothing. DYNAMIC import for the same reason the act import is dynamic (see
+      // the header): tree-steward-card.ts statically pulls in conversation-db, which
+      // opens the sqlite handle at module load — a static edge here would open the
+      // DB merely by importing this trigger.
+      const { raiseStewardParkCard } = await import('./tree-steward-card.js');
+      raiseStewardParkCard({
+        nodeId: ctx.nodeId,
+        treeId: ctx.treeId,
+        title: ctx.title,
+        question: ctx.question ?? '',
+        category: decision.category,
+        reason: decision.reason,
+      });
       console.log(
-        `[tree-steward] node ${ctx.nodeId}: PARK (${decision.category}) — ${decision.reason} — card pending (node #382)`,
+        `[tree-steward] node ${ctx.nodeId}: PARK (${decision.category}) — ${decision.reason} — card raised`,
       );
       return;
     }
@@ -137,6 +153,34 @@ export async function applyStewardDecision(
       if (answer === '') {
         console.error(
           `[tree-steward] node ${ctx.nodeId}: auto_answer with empty answer — refusing to answer (classifier bug; category ${decision.category})`,
+        );
+        return;
+      }
+
+      // Node #382 — THE GUARD GATE. Consulted BEFORE any effect runs, so the lane
+      // switch, the per-tree cap, and the never-answer-twice rule get the final say
+      // over the classifier. A check that ran after the node was already unstuck
+      // would not be a guard; this sits ahead of executeAutoAnswer. If the guard
+      // says no, we answer NOTHING and raise the Kevin card instead, carrying the
+      // guard's own code + reason. Both modules load by DYNAMIC import for the same
+      // reason the act import is dynamic (see the header): tree-steward-guard.ts and
+      // tree-steward-card.ts each statically pull in conversation-db, which opens
+      // the sqlite handle at module load — a static edge here would open the DB
+      // merely by importing this trigger.
+      const { stewardAllowed, recordStewardAnswer } = await import('./tree-steward-guard.js');
+      const verdict = stewardAllowed(ctx.treeId, ctx.nodeId);
+      if (!verdict.allowed) {
+        const { raiseStewardParkCard } = await import('./tree-steward-card.js');
+        raiseStewardParkCard({
+          nodeId: ctx.nodeId,
+          treeId: ctx.treeId,
+          title: ctx.title,
+          question: ctx.question ?? '',
+          category: verdict.code,
+          reason: verdict.reason,
+        });
+        console.log(
+          `[tree-steward] node ${ctx.nodeId} tree ${ctx.treeId}: PARK (guard:${verdict.code}) — ${verdict.reason} — card raised`,
         );
         return;
       }
@@ -153,6 +197,10 @@ export async function applyStewardDecision(
         category: decision.category,
         reason: decision.reason,
       });
+      // Record the answer ONLY after a confirmed success (r.answered). A failed
+      // answer must never burn the per-tree cap or poison the never-answer-twice
+      // list — otherwise a single transient failure would lock the node out forever.
+      if (r.answered) recordStewardAnswer(ctx.treeId, ctx.nodeId);
       // Report ONLY the effects the return value confirms — never a flag it did not set.
       console.log(
         `[tree-steward] node ${ctx.nodeId} tree ${ctx.treeId}: AUTO-ANSWER (${decision.category}) — ` +

@@ -1477,6 +1477,14 @@ export function finishHopperNode(
       });
     }
     notifyTreeStatusListeners(node.tree_id, 'blocked');
+    // Tree Steward (tree-0dd74c62): a blocked_question is the exactly-once seam
+    // where a stuck tree asks for a call. Fire-and-forget, guarded exactly like
+    // the notification above (foundry trees run their own loop, never the steward).
+    // The import is dynamic so hopper-engine's module graph is unchanged — the
+    // trigger reaches settings/goals paths, so we load it lazily as tree-cue does.
+    if (latest?.status === 'blocked_question' && !isFoundryTree(tree)) {
+      void import('./tree-steward-trigger.js').then((m) => m.onBlockedQuestionFinished({ nodeId: id, treeId: node.tree_id, title: node.title, question: payload.question ?? null, result: payload.result ?? null })).catch((err) => console.error('[hopper-engine] tree-steward trigger failed:', err));
+    }
   } else {
     setNode(id, { status: 'blocked', result: payload.result ?? null, lease_expires_at: null });
     const latest = getNodeStmt.get(id) ?? null;

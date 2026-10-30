@@ -32,7 +32,6 @@ const SCRATCH_DB = process.env.JARVIS_DB_PATH;
 
 import {
   classifyBlockedQuestion,
-  extractRecommendation,
   type StewardInput,
   type StewardDecision,
 } from '../src/tree-steward.js';
@@ -228,92 +227,6 @@ for (const c of cases) {
   }
   out('');
 }
-
-// ---------------------------------------------------------------------------
-// DIAGNOSTIC — act-seam artifact capture for the auto-answer case.
-//
-// The primary run above shows the LIVE classifier currently PARKS the real
-// auto-answer case: its narrative prose trips Rule 3 (bare "production"),
-// Rule 3 destructive (bare "drop", from "DROP THE RELEASE") and Rule 4's fence
-// (bare "migrat", from "migrations are sound") — all false positives on a
-// description of a bug, none a request to touch prod / drop data / run a
-// migration. So Rule 5 never runs and executeAutoAnswer never fires on the live
-// path.
-//
-// To still deliver the node's goal — "the exact answer, the exact log_decision
-// payload and the exact origin-thread line" for this real case — this section
-// exercises the REAL `extractRecommendation` on the REAL question text (proving
-// the worker genuinely stated a recommendation the steward was built to adopt),
-// rebuilds the exact answer string Rule 5 constructs, and runs the REAL
-// `executeAutoAnswer` with recording fakes. Nothing here edits src, bends the
-// fixture, or rewords the question; it deliberately bypasses only the escalation
-// gate the primary run exposed as a false positive, and is labelled as such.
-out('='.repeat(78));
-out('DIAGNOSTIC: act-seam capture for the auto-answer case (REAL extractRecommendation + REAL executeAutoAnswer).');
-out('  Conditional on resolving the escalation/fence false-positives shown above; see this node\'s finding.');
-out('-'.repeat(78));
-const autoCase = cases.find((c) => c.label === 'auto-answer-case');
-if (!autoCase) {
-  out('  (no auto-answer-case in fixture — skipped)');
-} else {
-  const haystack = `${autoCase.question}\n${autoCase.result ?? ''}`;
-  const rec = extractRecommendation(haystack);
-  out(`  extractRecommendation on the real #${autoCase.sourceNodeId} text -> ${rec ? JSON.stringify({ strong: rec.strong, text: rec.text }) : 'null'}`);
-  if (!rec) {
-    out('  🔴 extractRecommendation returned null — cannot build an auto-answer. (This is exactly what the');
-    out('     mutation step forces, proving this capture genuinely depends on the real extraction.)');
-  } else {
-    // The exact string classifyBlockedQuestion builds at Rule 5 (tree-steward.ts).
-    const answer = `Go with your recommendation: ${rec.text}`;
-    const category = 'has_recommendation';
-    const reason = `Rule 5: the worker stated its own ${rec.strong ? 'explicit' : 'soft'} recommendation and no escalation/fence fired — adopting it rather than offering an opinion of my own.`;
-    const { log, effects } = makeFakes();
-    const r = executeAutoAnswer(
-      {
-        nodeId: autoCase.sourceNodeId,
-        treeId: autoCase.sourceTreeId,
-        title: autoCase.title,
-        question: autoCase.question,
-        answer,
-        category,
-        reason,
-      },
-      effects,
-    );
-    out(`  executeAutoAnswer return = answered=${r.answered} decisionWritten=${r.decisionWritten} linePosted=${r.linePosted}`);
-    out(`  ordered call log = [${log.map((x) => x.effect).join(' -> ')}]`);
-
-    const a = log.find((x) => x.effect === 'answerNode') as Extract<Call, { effect: 'answerNode' }> | undefined;
-    const d = log.find((x) => x.effect === 'recordDecision') as Extract<Call, { effect: 'recordDecision' }> | undefined;
-    const p = log.find((x) => x.effect === 'postOriginLine') as Extract<Call, { effect: 'postOriginLine' }> | undefined;
-
-    out('');
-    out('  ── ARTIFACT (a): THE ANSWER handed to answerNode ──');
-    out(`  nodeId: ${a ? a.nodeId : '(never called)'}`);
-    out(`  answer: ${a ? JSON.stringify(a.answer) : '(never called)'}`);
-
-    out('');
-    out('  ── ARTIFACT (b): THE DECISION PAYLOAD handed to recordDecision (every field) ──');
-    if (d) {
-      out(`  nodeId   : ${d.input.nodeId}`);
-      out(`  treeId   : ${d.input.treeId === null ? 'null' : JSON.stringify(d.input.treeId)}`);
-      out(`  question : ${JSON.stringify(d.input.question.slice(0, 200))}${d.input.question.length > 200 ? ' …[' + d.input.question.length + ' chars total]' : ''}`);
-      out(`  decision : ${JSON.stringify(d.input.decision)}`);
-      out(`  rationale: ${JSON.stringify(d.input.rationale)}`);
-      out(`  category : ${JSON.stringify(d.input.category)}`);
-      out('  (decided_by is hard-set to "jarvis" INSIDE realStewardEffects.recordDecision, not observed by the fake.)');
-    } else {
-      out('  (recordDecision never called)');
-    }
-
-    out('');
-    out('  ── ARTIFACT (c): THE ORIGIN LINE handed to postOriginLine ──');
-    out(`  treeId: ${p ? (p.treeId === null ? 'null' : JSON.stringify(p.treeId)) : '(never called)'}`);
-    out(`  line  : ${p ? JSON.stringify(p.line) : '(never called)'}`);
-    if (p) out(`  single-line (no embedded newline)? ${!p.line.includes('\n')}`);
-  }
-}
-out('');
 
 out('='.repeat(78));
 out(`${cases.length} cases, ${matched} matched, ${mismatched} mismatched`);

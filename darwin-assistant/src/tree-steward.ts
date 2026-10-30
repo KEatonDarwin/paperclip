@@ -83,73 +83,165 @@ export type EscalationCategory =
   | 'escalation_external'
   | 'escalation_money';
 
+// ---------------------------------------------------------------------------
+// Sentence-scoped intent matching (shared by the escalation bar and the fence)
+// ---------------------------------------------------------------------------
+//
+// WHY: a worker question that merely DESCRIBES a bug ("production would store
+// the wrong time", "this code path deletes the draft row", "the email template
+// renders twice", "the invoice shows $1,240") must NOT park — it is narrative,
+// not a request to act. Only an INTENT to act on a sensitive thing is Kevin's
+// call. So we (1) split the text into sentences, and (2) within ONE sentence
+// require BOTH a sensitive OBJECT of a category AND an act-intent: one of that
+// category's action verbs used in ACTION FORM, or a first-person permission
+// frame. Narrative prose in other sentences can no longer trip the bar.
+// Deterministic string work only — no NLP, no clock, no locale surprises.
+
+/** Split into clauses on sentence terminators (. ! ?), newlines, semicolons and
+ *  spaced dashes. A terminator only ends a clause when followed by whitespace or
+ *  end-of-text, so intra-token dots like "jarvis.service", "routes/console.php"
+ *  and "PHP 8.4" are kept whole (splitting them would hide the very objects the
+ *  bar must see); the semicolon/dash splits keep a narrative clause ("… — the
+ *  second UPDATE re-evaluates … the committed row") from being bundled with an
+ *  unrelated object elsewhere in a long sentence. Simple + deterministic. */
+export function splitSentences(text: string): string[] {
+  return (text ?? '')
+    .split(/(?<=[.!?])\s+|\n+|\s*;\s*|\s+[—–]\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/** Words that, immediately before an action verb, mark it as NARRATION rather
+ *  than intent: determiners ("the delete button"), copulas/auxiliaries ("was
+ *  run", "is deleted"), and inability/negation ("cannot run", "not run").
+ *  Deliberately EXCLUDES will/would/should/shall/can/could/may — those read as
+ *  intent, and the permission frames key on should/can/may + I/we. */
+const NARRATION_BEFORE =
+  /\b(?:the|a|an|this|that|these|those|its|their|our|my|your|his|her|no|any|each|every|another|other|two|one|some|was|were|is|are|be|been|being|am|has|have|had|not|never|cannot|can't|couldn't|won't|wouldn't|didn't|doesn't|don't|shouldn't|already)\s*$/i;
+
+/** True when `verb` occurs in `sentence` in ACTION FORM — the match is not
+ *  immediately preceded by a narration marker. The verb regexes below match
+ *  only base/imperative forms (`\bdelete\b`, never "deletes"/"deleted"), so the
+ *  third-person-s and past-tense narration forms already fall out; this guard
+ *  additionally rejects "was run" / "the delete" / "cannot run". */
+function hasActionVerb(sentence: string, verb: RegExp): boolean {
+  const re = new RegExp(verb.source, 'gi');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(sentence)) !== null) {
+    if (!NARRATION_BEFORE.test(sentence.slice(0, m.index))) return true;
+    if (m.index === re.lastIndex) re.lastIndex++; // zero-width safety
+  }
+  return false;
+}
+
+/** A category fires on a sentence when it names a sensitive OBJECT of that
+ *  category AND one of the category's own ACTION VERBS appears in action form in
+ *  the SAME sentence. Both halves must be of the matching category: this is what
+ *  keeps a worker's own permission frame ("should I run the migration to add the
+ *  column") from mis-attributing a sentence to the wrong category on a bare
+ *  object word ("column") — the category verb, not a generic frame, is the
+ *  binding intent signal, and that is also the tighter (safer) guard. A real
+ *  "should I <verb> <object>" escalation always carries the category's verb
+ *  (restart jarvis.service / merge to main / DM Mike on Slack / subscribe …),
+ *  so requiring it loses no genuine park case. */
+function categoryFires(sentence: string, objects: RegExp[], verbs: RegExp[]): boolean {
+  if (!objects.some((re) => re.test(sentence))) return false;
+  return verbs.some((re) => hasActionVerb(sentence, re));
+}
+
+/** INTENTIONAL always-escalate allowlist — the only things that park on their
+ *  MENTION, with no verb required, because naming them at all deserves Kevin:
+ *  the two live production database identifiers and a force-push (there is no
+ *  benign force-push). Everything else must show intent. Keep this list tiny. */
+const ALWAYS_ESCALATE: { re: RegExp; category: EscalationCategory }[] = [
+  { re: /tdhmike_dhub/i, category: 'escalation_production' },
+  { re: /kuojrvfdjjqhqyvkuiam/i, category: 'escalation_production' },
+  { re: /\bforce[-\s]?push\b/i, category: 'escalation_destructive' },
+];
+
 /**
- * Detect, case-insensitively over the combined question+result text, whether
- * the question touches the fixed escalation bar. Returns the specific category
- * that fired, or null. Groups are checked in the spec's order (a→e); the first
- * hit wins so `category` names the most serious matched concern.
+ * Detect, over the combined question+result text, whether the question shows an
+ * INTENT to act that touches the fixed escalation bar. Returns the specific
+ * category, or null. The always-escalate allowlist is checked first; then the
+ * five categories in the spec's priority order (a→e), so `category` names the
+ * most serious matched concern. Intent-matched, sentence-scoped: a bare mention
+ * ("production would store the wrong time") no longer fires — only a request to
+ * act on it ("should I write the production rows") does.
  */
 export function detectEscalation(text: string): EscalationCategory | null {
-  const h = (text ?? '').toLowerCase();
-  if (!h.trim()) return null;
+  const raw = text ?? '';
+  if (!raw.trim()) return null;
 
-  // (a) live production servers, files or databases
-  const production: RegExp[] = [
-    /\bproduction\b/,
-    /\bprod\s+(db|database|server|checkout|hub|data)\b/,
-    /\blive\s+(production|server|checkout|hub|database|db|data|site)\b/,
-    /\bthe\s+live\s+hub\b/,
-    /tdhmike_dhub/,
-    /kuojrvfdjjqhqyvkuiam/,
-    /jarvis\.service/,
-    /\brestart\b[^.\n]{0,24}\b(jarvis|service)\b/,
-    /\bdeploy(ing|ment)?\b/,
-  ];
-  if (production.some((re) => re.test(h))) return 'escalation_production';
-
-  // (b) destructive / irreversible operations
-  const destructive: RegExp[] = [
-    /\bdrop\b/,
-    /\bdelete\b/,
-    /\btruncate\b/,
-    /\bwipe\b/,
-    /\bforce[-\s]?push\b/,
-    /\brevoke\b/,
-    /\bdelete\s+(the\s+|a\s+)?branch\b/,
-  ];
-  if (destructive.some((re) => re.test(h))) return 'escalation_destructive';
-
-  // (c) merging to main/master
-  if (/\bmerg(e|ing)\b[^.\n]{0,40}\b(main|master)\b/.test(h) || /\bmerge\s+to\s+(main|master)\b/.test(h)) {
-    return 'escalation_merge_main';
+  // Always-escalate allowlist: naming these needs no verb (see ALWAYS_ESCALATE).
+  for (const a of ALWAYS_ESCALATE) {
+    if (a.re.test(raw)) return a.category;
   }
 
-  // (d) external-facing action under Kevin's identity
-  const external: RegExp[] = [
-    /\bslack\b/,
-    /\bemail\b/,
-    /\bpublic\s+(pr|pull\s+request|post)\b/,
-    /\bpull\s+request\s+(to|against)\b/,
-    /\b(to|message|notify|ping|dm)\s+mike\b/,
-    /\bmike\s+or\s+anyone\b/,
-    /\bpublish\b/,
-    /\bpost\s+(to|publicly|on)\b/,
-  ];
-  if (external.some((re) => re.test(h))) return 'escalation_external';
+  const sentences = splitSentences(raw);
 
-  // (e) money
-  const money: RegExp[] = [
-    /\bsubscri(be|ption)\b/,
-    /\bcontract\b/,
-    /\bpurchas(e|ing)\b/,
-    /\bspend\b/,
-    /\bbuy\b/,
-    /\bpaid\s+plan\b/,
-    /\bpayment\b/,
-    /\$\s?\d/,
+  // (a) live production servers, files or databases.
+  const prodObjects: RegExp[] = [
+    /\bproduction\b/i,
+    /\bprod\s+(?:db|database|server|checkout|hub|data|site)\b/i,
+    /\blive\s+(?:production|server|checkout|hub|database|db|data|site)\b/i,
+    /\bthe\s+live\s+hub\b/i,
+    /\bjarvis\.service\b/i,
+    /\bthe\s+daemon\b/i,
   ];
-  if (money.some((re) => re.test(h))) return 'escalation_money';
+  const prodVerbs: RegExp[] = [
+    /\brestart\b/, /\breboot\b/, /\breload\b/,
+    /\bdeploy\b/, /\bredeploy\b/, /\bpush\b/,
+  ];
 
+  // (b) destructive / irreversible operations.
+  const destructiveObjects: RegExp[] = [
+    /\bbranch\b/i, /\bdatabase\b/i, /\bdb\b/i, /\btable\b/i, /\bschema\b/i,
+    /\brows?\b/i, /\brecords?\b/i, /\bcolumn\b/i,
+  ];
+  const destructiveVerbs: RegExp[] = [
+    /\bdrop\b/, /\bdelete\b/, /\btruncate\b/, /\bwipe\b/, /\bpurge\b/, /\brevoke\b/,
+  ];
+
+  // (c) merging to main/master.
+  const mergeObjects: RegExp[] = [/\b(?:main|master)\b/i];
+  const mergeVerbs: RegExp[] = [/\bmerge\b/];
+
+  // (d) external-facing action under Kevin's identity.
+  const externalObjects: RegExp[] = [
+    /\bslack\b/i, /\bemail\b/i, /\bmike\b/i,
+    /\bpublic\s+(?:pr|pull\s+request|post)\b/i, /\bpull\s+request\b/i,
+    /\btwitter\b/i, /\blinkedin\b/i,
+  ];
+  const externalVerbs: RegExp[] = [
+    /\bdm\b/, /\bemail\b/, /\bslack\b/, /\bmessage\b/, /\bnotify\b/,
+    /\bping\b/, /\bpost\b/, /\bpublish\b/, /\bsend\b/, /\btweet\b/,
+  ];
+
+  // (e) money.
+  const moneyObjects: RegExp[] = [
+    /\$\s?\d/, /\bsubscription\b/i, /\bpaid\s+plan\b/i, /\bcontract\b/i,
+    /\bpayment\b/i, /\binvoice\b/i, /\bcost\b/i, /\bfee\b/i, /\bprice\b/i,
+    /\b\d+\s?\/\s?(?:month|mo|year|yr)\b/i, /\b\d+\s?(?:usd|dollars?)\b/i,
+  ];
+  const moneyVerbs: RegExp[] = [
+    /\bbuy\b/, /\bpurchase\b/, /\bsubscribe\b/, /\bpay\b/, /\bspend\b/,
+    /\bcharge\b/, /\brenew\b/,
+  ];
+
+  const categories: { name: EscalationCategory; objects: RegExp[]; verbs: RegExp[] }[] = [
+    { name: 'escalation_production', objects: prodObjects, verbs: prodVerbs },
+    { name: 'escalation_destructive', objects: destructiveObjects, verbs: destructiveVerbs },
+    { name: 'escalation_merge_main', objects: mergeObjects, verbs: mergeVerbs },
+    { name: 'escalation_external', objects: externalObjects, verbs: externalVerbs },
+    { name: 'escalation_money', objects: moneyObjects, verbs: moneyVerbs },
+  ];
+
+  // Priority order (a→e): the most serious matched concern names the category.
+  for (const cat of categories) {
+    if (sentences.some((s) => categoryFires(s, cat.objects, cat.verbs))) {
+      return cat.name;
+    }
+  }
   return null;
 }
 
@@ -158,35 +250,45 @@ export function detectEscalation(text: string): EscalationCategory | null {
 // ---------------------------------------------------------------------------
 
 /**
- * True when the question is test- or database-related beyond a pure read:
- * running any test suite, a migration, a seed, a write/update/insert/delete
- * against any database, or granting a privilege. Destructive DB verbs
- * (drop/delete/truncate) are already caught upstream by the escalation bar;
- * this covers the rest of the fence.
+ * True when the question shows an INTENT to do something test- or database-
+ * related beyond a pure read: running a test suite, a migration, a seed, a
+ * write/insert/update against any database, or granting a privilege. Destructive
+ * DB verbs (drop/delete/truncate) are caught upstream by the escalation bar;
+ * this covers the rest of the fence. Intent-matched and sentence-scoped on the
+ * same rule as the escalation bar, so "the migration that added this column"
+ * (narrative) no longer parks while "should I run the migration" still does.
  */
 export function isTestOrDbBeyondRead(text: string): boolean {
-  const h = (text ?? '').toLowerCase();
-  if (!h.trim()) return false;
-  const patterns: RegExp[] = [
-    /\btest\s+suite\b/,
-    /\brun\s+(the\s+)?(unit\s+|integration\s+)?tests?\b/,
-    /\b(npm|yarn|pnpm|bun)\s+(run\s+)?test\b/,
-    /\bcomposer\s+test\b/,
-    /\bphpunit\b/,
-    /\bpest\b/,
-    /\bvitest\b/,
-    /\bjest\b/,
-    /\bmocha\b/,
-    /\bartisan\s+(test|migrate|db:)/,
-    /\bmigrat(e|ion|ions)\b/,
-    /\bdb:(seed|wipe|migrate)\b/,
-    /\bseed(ing|ed)?\s+(the\s+)?(db|database|data)\b/,
-    /\binsert\s+into\b/,
-    /\bupdate\b[^.\n]{0,40}\bset\b/,
-    /\bgrant\b[^.\n]{0,24}\b(privilege|privileges|on|to)\b/,
-    /\bwrit(e|ing)\s+(to\s+)?(the\s+)?(db|database)\b/,
+  const raw = text ?? '';
+  if (!raw.trim()) return false;
+
+  // SQL-shaped / tool-invocation patterns carry object + verb in one token and
+  // are self-evidently an intent to run a test or mutate data; match directly.
+  const standalone: RegExp[] = [
+    /\binsert\s+into\b/i,
+    /\bupdate\b[^.\n]{0,40}\bset\b/i,
+    /\bdelete\s+from\b/i,
+    /\b(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?test\b/i,
+    /\bcomposer\s+test\b/i,
+    /\bartisan\s+(?:test|migrate|db:)/i,
+    /\bphpunit\b/i, /\bvitest\b/i, /\bpest\b/i, /\bjest\b/i, /\bmocha\b/i,
+    /\bdb:(?:seed|wipe|migrate|fresh)\b/i,
   ];
-  return patterns.some((re) => re.test(h));
+  if (standalone.some((re) => re.test(raw))) return true;
+
+  // Otherwise require, within ONE sentence, a fence OBJECT plus act-intent (a
+  // fence verb in action form OR a first-person permission frame).
+  const objects: RegExp[] = [
+    /\btest\s+suite\b/i, /\bsuite\b/i, /\btests?\b/i, /\bunit\s+tests?\b/i,
+    /\bmigration\b/i, /\bseed\b/i,
+    /\bdatabase\b/i, /\bdb\b/i, /\bschema\b/i, /\btable\b/i,
+    /\bprivileges?\b/i,
+  ];
+  const verbs: RegExp[] = [
+    /\brun\b/, /\brerun\b/, /\bwrite\b/, /\binsert\b/, /\bupdate\b/,
+    /\bseed\b/, /\bmigrate\b/, /\bgrant\b/, /\bexecute\b/,
+  ];
+  return splitSentences(raw).some((s) => categoryFires(s, objects, verbs));
 }
 
 // ---------------------------------------------------------------------------

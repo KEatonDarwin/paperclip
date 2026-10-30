@@ -30,6 +30,38 @@ export interface StewardTriggerContext {
 }
 
 // ---------------------------------------------------------------------------
+// STEWARD MODE (node #383) — shadow posture
+// ---------------------------------------------------------------------------
+// The steward's posture. 'card_only' (the DEFAULT) means classify-and-card only:
+// the steward never auto-answers a real node — it raises the Kevin card carrying
+// what it WOULD have answered and stops. 'live' means auto-answering is on.
+export type StewardMode = 'card_only' | 'live';
+
+/**
+ * Resolve the current steward mode from the `steward_mode` setting.
+ *
+ * 🔴 THE DEFAULT IS THE SAFE SIDE — 'card_only'. Shadow-first is the Darwin
+ * posture: a feature that answers real nodes must be turned ON deliberately,
+ * never by accident. So ANY value that is not the exact string 'live' (after a
+ * trim + lower-case) — unset, empty, a misspelling like 'liv'/'LIVE!', 'yes',
+ * 'on' — resolves to 'card_only'. A typo in a settings value must never be the
+ * thing that starts answering real nodes.
+ *
+ * ASYNC + DYNAMIC IMPORT ON PURPOSE: this reads via the SAME dynamically-imported
+ * getSetting the kill switch uses (see onBlockedQuestionFinished below). The
+ * trigger file deliberately keeps conversation-db OUT of its static import graph
+ * (see the file header and the dynamic card/guard/act imports) so that merely
+ * importing this trigger never opens the sqlite handle at module load. A static
+ * `import { getSetting }` would break that invariant, so stewardMode stays async
+ * and loads getSetting the same dynamic way — a pure read, allowed under the fence.
+ */
+export async function stewardMode(): Promise<StewardMode> {
+  const { getSetting } = await import('./conversation-db.js');
+  const raw = (getSetting('steward_mode') ?? '').trim().toLowerCase();
+  return raw === 'live' ? 'live' : 'card_only';
+}
+
+// ---------------------------------------------------------------------------
 // EXACTLY-ONCE GUARD
 // ---------------------------------------------------------------------------
 // A module-level Set of node ids already handled. The steward must act on a
@@ -131,6 +163,14 @@ export async function applyStewardDecision(
       // the header): tree-steward-card.ts statically pulls in conversation-db, which
       // opens the sqlite handle at module load — a static edge here would open the
       // DB merely by importing this trigger.
+      // A park is a park in EITHER mode (this branch is unchanged by mode), but
+      // the card body should say which mode produced it so Kevin can tell a
+      // shadow-period card from a real one at a glance. The card module (locked
+      // this tree) exposes NO dedicated mode field — its rendered free-text fields
+      // are category/reason/question/wouldHaveAnswered — so we fold a compact mode
+      // tag into `reason`, the field it already renders as the "why" line, rather
+      // than inventing a field or editing the card module.
+      const mode = await stewardMode();
       const { raiseStewardParkCard } = await import('./tree-steward-card.js');
       raiseStewardParkCard({
         nodeId: ctx.nodeId,
@@ -138,18 +178,52 @@ export async function applyStewardDecision(
         title: ctx.title,
         question: ctx.question ?? '',
         category: decision.category,
-        reason: decision.reason,
+        reason: `[steward mode: ${mode}] ${decision.reason}`,
       });
       console.log(
-        `[tree-steward] node ${ctx.nodeId}: PARK (${decision.category}) — ${decision.reason} — card raised`,
+        `[tree-steward] node ${ctx.nodeId}: PARK (${decision.category}, mode:${mode}) — ${decision.reason} — card raised`,
       );
       return;
     }
 
     if (decision.action === 'auto_answer') {
+      // The answer the classifier would adopt. Computed up front because it is
+      // used BOTH for the live effect AND, in shadow mode, as the "would have
+      // answered" shown on the card.
+      const answer = (decision.answer ?? '').trim();
+
+      // ── MODE GATE (node #383) — STEP 2 in the fixed order. STEP 1, the
+      //    `tree_steward` kill switch, already ran in onBlockedQuestionFinished
+      //    before any classify. This gate sits BEFORE the empty-answer refusal,
+      //    BEFORE the guard, and BEFORE any effect: a mode checked after a node is
+      //    already answered is not a mode. In card_only (the DEFAULT) the steward
+      //    CLASSIFIES and CARDS but answers NOTHING — raise the park card carrying
+      //    what it WOULD have answered, log one SHADOW line, and RETURN. No answer,
+      //    no Decision Ledger row, no origin-thread breadcrumb, and crucially NO
+      //    recordStewardAnswer: a shadow run must not burn the per-tree cap or the
+      //    never-answer-twice list, so Kevin sees EVERY case during the shadow
+      //    period. Only 'live' falls through to the guard gate and the effects.
+      if ((await stewardMode()) === 'card_only') {
+        const { raiseStewardParkCard } = await import('./tree-steward-card.js');
+        raiseStewardParkCard({
+          nodeId: ctx.nodeId,
+          treeId: ctx.treeId,
+          title: ctx.title,
+          question: ctx.question ?? '',
+          category: decision.category,
+          reason: decision.reason,
+          wouldHaveAnswered: answer,
+        });
+        console.log(
+          `[tree-steward] node ${ctx.nodeId} tree ${ctx.treeId}: SHADOW (card_only) — ` +
+            `would AUTO-ANSWER (${decision.category}); carded with wouldHaveAnswered, no effects, no recordStewardAnswer`,
+        );
+        return;
+      }
+
+      // ── LIVE mode only from here down. ───────────────────────────────────────
       // An auto_answer with no answer text is a classifier bug; answering a real
       // node with '' would unstick the tree with nothing. Refuse, do not act.
-      const answer = (decision.answer ?? '').trim();
       if (answer === '') {
         console.error(
           `[tree-steward] node ${ctx.nodeId}: auto_answer with empty answer — refusing to answer (classifier bug; category ${decision.category})`,

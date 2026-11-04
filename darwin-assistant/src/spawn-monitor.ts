@@ -128,6 +128,8 @@ export interface SpawnMonitorNodeDetail {
   answer: string | null;
   result: string | null;
   result_summary: string | null;
+  /** Non-blocking advisory (Haiku) notes beside a gate node's verdict; never a verdict. */
+  advisory_review: string | null;
   worker_thread_ext: string | null;
   lease_expires_at: string | null;
   adapter: string | null;
@@ -400,6 +402,7 @@ export function buildSpawnMonitorTreeDetail(
     answer: n.answer,
     result: n.result,
     result_summary: n.result_summary,
+    advisory_review: n.advisory_review ?? null,
     worker_thread_ext: n.worker_thread_ext,
     lease_expires_at: n.lease_expires_at,
     adapter: n.adapter,

@@ -80,7 +80,7 @@ interface GitRun {
  * arg-safety violation DOES throw: reaching one is a bug in a caller, not a
  * runtime condition.
  */
-function runGit(cwd: string, args: readonly string[], timeoutMs = GIT_TIMEOUT_MS): GitRun {
+export function runGit(cwd: string, args: readonly string[], timeoutMs = GIT_TIMEOUT_MS): GitRun {
   assertGitArgsSafe(args);
   try {
     const out = execFileSync('git', args as string[], {

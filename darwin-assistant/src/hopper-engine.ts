@@ -17,6 +17,7 @@ import {
 } from './throttle.js';
 import { laneHoldReason } from './work-switch.js';
 import { summarizeNodeResult } from './result-summary.js';
+import { maybeRunAdvisoryReview } from './advisory-reviewer.js';
 
 // Layman layer everywhere (tree-9e15d8a7): notification bodies should never
 // dump a worker's entire raw result — cap at a sentence/word boundary and
@@ -138,6 +139,9 @@ export interface HopperNodeRow {
    *  finish may carry a `plan` that expands onto this same tree. Null on every
    *  other node (the column is nullable, additive, applied at boot). */
   node_kind: string | null;
+  /** Non-binding Haiku "worth a look" notes beside a gate (VERIFY:/ACCEPT:) node's
+   *  verdict (advisory-reviewer.ts). NEVER read by any verdict parser; null = none. */
+  advisory_review: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -319,6 +323,10 @@ for (const col of [
   // Planning-as-a-tree-node: 'planning' = the speed-lane Planning node. Nullable,
   // additive — null on every existing row, so nothing reads differently.
   'node_kind TEXT',
+  // Advisory reviewer (non-blocking Haiku second opinion beside the gate verdict).
+  // Its OWN column on purpose: parseVerdict reads `result`, night-shift/narrator
+  // regex `result_summary` for VERDICT FAIL -- advisory text must reach neither.
+  'advisory_review TEXT',
 ]) {
   try {
     sqliteDb.exec(`ALTER TABLE hopper_nodes ADD COLUMN ${col}`);
@@ -1609,6 +1617,11 @@ async function generateAndStoreResultSummary(id: number, title: string, outcome:
   if (summary) setNode(id, { result_summary: summary });
 }
 
+/** Advisory-reviewer's only write path: its own column, nothing else. */
+export function setHopperNodeAdvisory(id: number, text: string): void {
+  setNode(id, { advisory_review: text });
+}
+
 export function finishHopperNode(
   id: number,
   outcome: 'done' | 'split' | 'blocked_question' | 'blocked',
@@ -1700,6 +1713,14 @@ export function finishHopperNode(
   if (finalNode?.result && finalNode.result.trim()) {
     void generateAndStoreResultSummary(id, finalNode.title, outcome, finalNode.result).catch((err) => {
       console.error(`[hopper-engine] result-summary generation failed for node ${id}:`, err);
+    });
+  }
+  // Advisory reviewer: non-blocking Haiku second opinion on a finished GATE node
+  // (VERIFY:/ACCEPT:). Same contract as the summary above -- must never throw into
+  // the finish path; it also swallows its own errors, the .catch is belt-and-braces.
+  if (outcome === 'done' && finalNode) {
+    void maybeRunAdvisoryReview(finalNode, tree).catch((err) => {
+      console.error(`[hopper-engine] advisory review failed for node ${id}:`, err);
     });
   }
   queueMicrotask(() => void dispatchTick('node_finished'));

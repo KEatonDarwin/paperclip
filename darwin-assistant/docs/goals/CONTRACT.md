@@ -1,0 +1,1015 @@
+# GOALS — CONTRACT (binding data / API / tool contract, v0)
+
+**Status:** BINDING as of 2026-09-19 (tree-2d558f04, node #454). `DESIGN.md` is the concept + visual spec; THIS file is what the backend lane (`hopper/goals`, darwin-assistant) and the UI lane (`hopper/goals-ui`, jarvis-command-center) build against **without talking to each other**. Do not thin it out. Do not invent beyond it. If something is genuinely missing, the builder adds it here in the same commit (additive only) and says so in its finish result.
+
+**Namespace rule (hard):** tables `goal*` · module `src/goals.ts` · routes `/api/v1/goals/*` · tool `goals` · SSE `goal`, `goal_node`, `goal_focus` · threads `cockpit:goal-<id>` · cockpit routes `/goals`, `/goals/$goalId`. Nothing in here imports from, references, or reuses `workbench*`, `smart-todos*`, `workstreams*`, `thread-todos*`, or the idea-tree UI. The ONLY reused assets are (a) the hopper engine (`createHopperTree` + `agreeHopperTree` + `GET /hopper-trees/:id` for the read-only overlay), (b) the existing conversation store + `/threads/:ext/messages` ingest, and (c) `ThreadPane`'s conversation rendering on the cockpit side.
+
+---
+
+## 0. Vocabulary (from DESIGN.md, restated so nothing is ambiguous)
+
+| Term | Meaning |
+|---|---|
+| **Goal** | A root. `goals` row. Owns exactly one thread `cockpit:goal-<id>`. Never a task. |
+| **Node** | Anything under a goal, any depth. `goal_nodes` row. |
+| **Ghost** | A node with `state='ghost'` (JARVIS-proposed, not yet ✓'d) — OR a set node carrying a pending edit/removal. Rendered dashed/dimmed. |
+| **Set** | `state='set'`: real, approved, in the tree for good. |
+| **Leaf kind** | `leaf_kind ∈ {none, machine, human}`. `machine` = JARVIS can build it → Plan → hopper tree. `human` = only Kevin can do it (amber). `none` = not decided / still splits. |
+| **Plan** | JSON on a machine leaf describing what gets built. Ghost until approved. |
+| **Focus** | Server-owned pointer: one goal → at most one node. Clicking = focus. Zero model calls. |
+| **Batch** | A set of ghosts proposed together, sharing `proposal_batch` (uuid). Enables "✓ all / ✕ all". |
+| **actor** | `'kevin' \| 'jarvis' \| 'system'` — who caused a change. |
+
+Authorship: `authored_by ∈ {kevin, jarvis}`. Kevin-authored nodes are born `set`; JARVIS-authored nodes are born `ghost`. This is the ONE rule that decides whether a write is a ghost.
+
+---
+
+## 1. SQLite DDL (jarvis.db, `src/goals.ts`)
+
+Idempotent, declared at module load via `sqliteDb.exec(...)` exactly like `thread-links.ts`. Every table uses `TEXT` ISO timestamps via `datetime('now')`, `INTEGER PRIMARY KEY AUTOINCREMENT`, and `CHECK` constraints on enums. No migrations framework — additive `ALTER TABLE` guarded by a `PRAGMA table_info` check if a later version needs a column.
+
+```sql
+CREATE TABLE IF NOT EXISTS goals (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  title         TEXT    NOT NULL,
+  done_means    TEXT,                                    -- REQUIRED to become 'set'
+  notes         TEXT,
+  status        TEXT    NOT NULL DEFAULT 'ghost'
+                CHECK (status IN ('ghost','set','done','parked')),
+  authored_by   TEXT    NOT NULL DEFAULT 'kevin'
+                CHECK (authored_by IN ('kevin','jarvis')),
+  thread_ext    TEXT    UNIQUE,                          -- 'cockpit:goal-<id>' once the chat exists (NULL until first open)
+  promoted_from_node_id INTEGER REFERENCES goal_nodes(id), -- set when this goal was promoted out of a node
+  sort_order    INTEGER NOT NULL DEFAULT 0,
+  verified_at   TEXT,                                    -- when status flipped to 'done'
+  archived      INTEGER NOT NULL DEFAULT 0,              -- 0/1; archived goals hidden from the forest by default
+  created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS goal_nodes (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  goal_id            INTEGER NOT NULL REFERENCES goals(id),
+  parent_id          INTEGER REFERENCES goal_nodes(id),  -- NULL = direct child of the goal root
+  title              TEXT    NOT NULL,
+  done_means         TEXT,                               -- REQUIRED to become 'set'
+  notes              TEXT,
+  authored_by        TEXT    NOT NULL DEFAULT 'jarvis'
+                     CHECK (authored_by IN ('kevin','jarvis')),
+  state              TEXT    NOT NULL DEFAULT 'ghost'
+                     CHECK (state IN ('ghost','set','planned','working','check','done','parked','discarded')),
+  leaf_kind          TEXT    NOT NULL DEFAULT 'none'
+                     CHECK (leaf_kind IN ('none','machine','human')),
+  plan_state         TEXT    NOT NULL DEFAULT 'none'
+                     CHECK (plan_state IN ('none','proposed','approved')),
+  plan               TEXT,                               -- JSON (see §1.2) or NULL
+  tree_id            TEXT,                               -- hopper_trees.id once dispatched (no FK: hopper engine owns that table)
+  tree_status_cache  TEXT,                               -- last observed hopper tree status: 'active'|'done'|'blocked' (badge only)
+  pending_title      TEXT,                               -- JARVIS-proposed edit awaiting ✓/✕ (set nodes only)
+  pending_done_means TEXT,                               -- same
+  pending_removal    INTEGER NOT NULL DEFAULT 0,         -- 0/1: JARVIS-proposed strike awaiting ✓/✕ (set nodes only)
+  pending_by         TEXT    CHECK (pending_by IN ('jarvis') OR pending_by IS NULL),
+  proposal_batch     TEXT,                               -- uuid shared by ghosts proposed together (NULL once set/discarded)
+  promoted_to_goal_id INTEGER REFERENCES goals(id),      -- set when this node was promoted into its own goal
+  sort_order         INTEGER NOT NULL DEFAULT 0,
+  verified_at        TEXT,                               -- when state flipped to 'done'
+  created_at         TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at         TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_goal_nodes_goal   ON goal_nodes(goal_id, parent_id, sort_order, id);
+CREATE INDEX IF NOT EXISTS idx_goal_nodes_batch  ON goal_nodes(proposal_batch);
+CREATE INDEX IF NOT EXISTS idx_goal_nodes_tree   ON goal_nodes(tree_id);
+
+CREATE TABLE IF NOT EXISTS goal_events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  goal_id     INTEGER NOT NULL REFERENCES goals(id),
+  node_id     INTEGER REFERENCES goal_nodes(id),         -- NULL = goal-level event
+  actor       TEXT    NOT NULL CHECK (actor IN ('kevin','jarvis','system')),
+  kind        TEXT    NOT NULL,                          -- see §1.3
+  text        TEXT,                                      -- human-readable one-liner
+  data        TEXT,                                      -- JSON details (old/new values, tree_id, batch id…) or NULL
+  created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_goal_events_goal ON goal_events(goal_id, id);
+
+CREATE TABLE IF NOT EXISTS goal_focus (
+  goal_id     INTEGER PRIMARY KEY REFERENCES goals(id),  -- one focus row per goal
+  node_id     INTEGER REFERENCES goal_nodes(id),         -- NULL = goal root focused / no node focused
+  set_by      TEXT    NOT NULL DEFAULT 'kevin' CHECK (set_by IN ('kevin','jarvis','system')),
+  updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+### 1.1 Column semantics that the code must enforce (not just the CHECKs)
+
+- `goals.done_means` and `goal_nodes.done_means` MUST be non-empty (trimmed) before `status/state` may become `set`. Server returns `409 done_means_required` otherwise.
+- `goal_nodes.parent_id` MUST reference a node in the same `goal_id` (server-validated; `400 parent_goal_mismatch`).
+- A node may only be created under a parent whose `state ∈ {set, planned, working, check}` — never under a ghost, discarded, parked, or done node (`409 parent_not_set`). Direct children of the root require `goals.status ∈ {set}` (`409 goal_not_set`). **This is how "one layer ahead, never two" is enforced structurally: a ghost cannot have children.**
+- `leaf_kind` may only be `machine`/`human` on a node with NO non-discarded children (`409 node_has_children`). Creating a child under a node with `leaf_kind != 'none'` resets that node's `leaf_kind` to `none` and `plan_state` to `none`, `plan` to NULL — only allowed while `state ∈ {set}` (`409 leaf_already_dispatched` if `planned/working/check/done`).
+- `plan`/`plan_state` are only meaningful when `leaf_kind='machine'`. Setting `leaf_kind` to `human` or `none` clears `plan`, `plan_state='none'`.
+- `pending_*` fields exist only on `state='set'` nodes (and `planned`, for a title/done_means tweak). Resolving them (accept/reject) always clears all four (`pending_title`, `pending_done_means`, `pending_removal`, `pending_by`).
+- `proposal_batch` is set at proposal time for JARVIS-authored ghosts; cleared to NULL when the node becomes `set` or `discarded`.
+- `discarded` nodes are kept (audit) but excluded from every tree read unless `?include_discarded=1`.
+- `sort_order`: siblings ordered by `(sort_order ASC, id ASC)`. New nodes default to `max(sibling sort_order)+1`.
+- `updated_at` bumps on every write. `goals.updated_at` also bumps whenever any of its nodes/focus changes (drives "last activity" on the forest card).
+
+### 1.2 `plan` JSON (machine leaves)
+
+```json
+{
+  "what": "One paragraph: what gets built.",
+  "deliverable": "One line: the artifact (branch/doc/endpoint/…) that proves done_means.",
+  "model": "claude-sonnet-5",
+  "adapter": "claude",
+  "estimate": "~40 min, ~3 worker turns",
+  "nodes": [
+    { "title": "…", "spec": "…", "adapter": "claude", "model": "claude-sonnet-5", "depends_on_indexes": [] },
+    { "title": "…", "spec": "…", "adapter": "claude", "model": "claude-opus-5", "depends_on_indexes": [0] }
+  ],
+  "proposed_at": "2026-09-19T17:10:00Z",
+  "approved_at": null
+}
+```
+- `nodes[]` is EXACTLY the hopper engine's `NewNodeInput[]` shape (title, spec, adapter, model, depends_on_indexes, priority). Flat DAG only (`parent_index` forbidden). 1–12 nodes.
+- `adapter` is always `"claude"` in v0 (standing 🅰️🅱️ directive — the harness picks account A/B). `model` per `skills/jarvis-router/SKILL.md` tiers: Light `claude-haiku-4-5-20251001` · Standard `claude-sonnet-5` (default) · Heavy `claude-opus-5` (review gates/design). Never `claude-fable-5` on a leaf. Server rejects a plan whose `nodes[]` is empty, has a non-claude adapter, or has a fable/frontier model (`400 plan_invalid`).
+- Top-level `model` is the headline shown on the Plan card (the dominant tier); `estimate` is free text.
+
+### 1.3 `goal_events.kind` vocabulary (closed list)
+
+`goal_created` · `goal_set` · `goal_done` · `goal_parked` · `goal_unparked` · `goal_updated` · `thread_opened` ·
+`node_proposed` · `node_created` (kevin-authored, born set) · `node_accepted` · `node_discarded` · `node_updated` ·
+`edit_proposed` · `edit_accepted` · `edit_rejected` · `removal_proposed` · `removal_accepted` · `removal_rejected` ·
+`leaf_kind_set` · `plan_proposed` · `plan_approved` · `plan_rejected` · `tree_planted` · `tree_done` · `tree_blocked` ·
+`node_check` (auto-flip) · `node_verified` · `node_parked` · `node_unparked` · `node_promoted` · `human_done` · `focus_set` · `log` ·
+`ghost_edited_by_kevin` · `kevin_okd_edit` · `node_agreed` · `jarvis_pushed_back` (all four v0.1 §11.2) ·
+`node_moved` · `move_proposed` · `move_accepted` · `move_rejected` · `kevin_restructured` (all five v0.2 §13).
+
+Every state-changing route/tool op in §3/§5 writes exactly one event (listed per route). `focus_set` is written on focus PUT only when the node actually changes (no spam on re-clicks).
+
+---
+
+## 2. State machines (server-enforced; any other transition → `409 invalid_transition` with `{from, to}` in `extra`)
+
+### 2.1 Node `state`
+
+| From | To | Trigger | Preconditions |
+|---|---|---|---|
+| *(new, jarvis)* | `ghost` | propose | parent set (or goal set for root-level) |
+| *(new, kevin)* | `set` | `set_from_kevin` / POST node with `authored_by=kevin` | done_means present; parent set |
+| `ghost` | `set` | accept (one/batch/all) | done_means present |
+| `ghost` | `discarded` | discard | — |
+| `set` | `planned` | approve_plan when tree planting THROWS (plan approved, no tree yet — transient, retry re-plants) | leaf_kind=machine, plan_state=proposed |
+| `set` | `working` | approve_plan (normal path: set→working in one transaction, `planned` skipped) | leaf_kind=machine, plan_state=proposed |
+| `planned` | `working` | retry plant (`POST /nodes/:id/approve_plan` again) | tree_id NULL |
+| `working` | `check` | **system**: linked hopper tree status → `done` | — |
+| `set` (non-leaf) | `check` | **system**: every non-discarded child is `done` (and ≥1 child exists) | — |
+| `set` (human leaf) | `check` | Kevin clicks **Done** (`POST /nodes/:id/human_done`) | leaf_kind=human |
+| `check` | `done` | verify (Kevin ✓ or JARVIS `verify` op) | — |
+| `check` | `set` | verify `passed=false` (reopen). Machine leaf: `plan_state='none'`, prior `plan`/`tree_id` kept for reference; a fresh propose_plan → approve_plan plants a NEW tree | — |
+| `set`,`planned`,`check` | `parked` | park | — |
+| `working` | `parked` | park — allowed; hopper tree is NOT touched (engine keeps running); UI shows parked + working pill | — |
+| `parked` | *(previous state)* | unpark — server restores the state it left from (stored in the `node_parked` event `data.from`) | — |
+| `set` (with `pending_removal=1`) | `discarded` | resolve removal accept | — |
+| `set`,`planned`,`check`,`working` | *(unchanged)* + `promoted_to_goal_id` | promote — node stays in place as a link stub; its subtree MOVES to the new goal (see §3.16) | — |
+
+Rules: `done` and `discarded` are terminal (no transition out). `working` cannot be discarded. A node can be promoted at most once.
+
+### 2.2 Goal `status`
+
+| From | To | Trigger |
+|---|---|---|
+| *(new)* | `ghost` | POST /goals without done_means (the normal `+ New goal` path) |
+| *(new)* | `set` | POST /goals WITH done_means |
+| `ghost` | `set` | PATCH /goals/:id with done_means (any actor) — goals never need a ✓; done_means IS the approval |
+| `set` | `done` | POST /goals/:id/verify (root done_means verified). Precondition: every non-discarded, non-parked node is `done` (`409 children_not_done`) |
+| `set` | `parked` | park |
+| `parked` | `set` | unpark |
+| `done` | *(terminal)* | — |
+
+### 2.3 `plan_state` (machine leaves only)
+
+`none → proposed` (propose_plan; replaces any prior proposed plan) · `proposed → approved` (approve_plan) · `proposed → none` (reject_plan, or leaf_kind change) · `approved` is terminal for that plan; a `check → set` reopen resets to `none`.
+
+### 2.4 System auto-flips (run inside the same write transaction that triggered them)
+
+1. **Child settles → parent check.** After any node write that leaves a node at `done` (or `discarded`), the server re-evaluates the parent: if parent `state='set'`, has ≥1 non-discarded child, and ALL non-discarded, non-parked children are `done` → parent → `check`, event `node_check`, emit `goal_node`. Recurse upward (a parent flipping to `check` does not flip ITS parent — that needs a verify). Root-level: if all root nodes are done, nothing auto-flips on the goal (goal `done` is always an explicit verify).
+2. **Tree done → node check.** `hopper-engine.ts` `maybeFinishTree()` calls `goalsOnTreeStatus(treeId, 'done')` (exported from `goals.ts`, imported lazily to avoid a cycle). Node with `tree_id=treeId` and `state='working'` → `check`, `tree_status_cache='done'`, event `tree_done`.
+3. **Tree blocked → badge only.** When any node of the linked tree lands `blocked` or `blocked_question`, the engine calls `goalsOnTreeStatus(treeId, 'blocked')` → `tree_status_cache='blocked'`, event `tree_blocked` (once per transition; a later unblock → `goalsOnTreeStatus(treeId,'active')` → cache `'active'`). Node `state` stays `working`.
+
+---
+
+## 3. HTTP routes — all under `/api/v1/goals`, bearer `JARVIS_COCKPIT_KEY`, JSON in/out, errors as `{ "error": { "code", "message", ...extra } }` via the existing `sendError`. Mount in `handlers/api-v1.ts` next to the hopper routes.
+
+### 3.0 Shared response shapes
+
+```ts
+type GoalRow = {
+  id: number; title: string; done_means: string | null; notes: string | null;
+  status: 'ghost'|'set'|'done'|'parked'; authored_by: 'kevin'|'jarvis';
+  thread_ext: string | null; promoted_from_node_id: number | null;
+  sort_order: number; verified_at: string | null; archived: 0|1;
+  created_at: string; updated_at: string;
+};
+type GoalCounts = {
+  total: number; done: number; working: number; check: number;
+  need_you: number;        // = ghosts + human_open + check + nodes with plan_state='proposed'
+  ghosts: number;          // state='ghost' OR any pending_* set
+  human_open: number;      // leaf_kind='human' AND state='set'
+  awaiting_jarvis: number; // v0.1 §11.1 — ghosts with review_state='awaiting_jarvis' (Kevin OK'd, waiting on JARVIS); need_you unchanged
+  node_chats: number;      // v0.3 §14.1 — non-discarded nodes with a node chat (thread_ext set)
+  progress: number;        // 0..100 = round(100 * done / max(1, total_non_discarded_non_parked))
+};
+type GoalSummary = GoalRow & { counts: GoalCounts; focus_node_id: number | null; last_event_at: string | null };
+
+type GoalNodeRow = {
+  id: number; goal_id: number; parent_id: number | null;
+  title: string; done_means: string | null; notes: string | null;
+  authored_by: 'kevin'|'jarvis';
+  state: 'ghost'|'set'|'planned'|'working'|'check'|'done'|'parked'|'discarded';
+  leaf_kind: 'none'|'machine'|'human';
+  plan_state: 'none'|'proposed'|'approved'; plan: PlanJson | null;
+  tree_id: string | null; tree_status_cache: 'active'|'done'|'blocked'|null;
+  pending_title: string | null; pending_done_means: string | null; pending_removal: 0|1; pending_by: 'jarvis'|null;
+  proposal_batch: string | null; promoted_to_goal_id: number | null;
+  // v0.1 §11.1 — Kevin-edit tracking + JARVIS weigh-in gate:
+  last_edited_by: 'kevin'|'jarvis'|null;      // who last edited this ghost's title/done_means/notes; NULL once it leaves ghost
+  kevin_edit_original: string | null;         // JSON {title,done_means,notes} snapshot of the JARVIS wording at Kevin's FIRST edit
+  review_state: 'none'|'awaiting_jarvis'|'pushed_back';
+  review_note: string | null;                 // JARVIS's push-back note
+  // v0.2 §13.1 — Kevin structure changes + JARVIS pending move:
+  kevin_moved_at: string | null; kevin_move_from: number | null;   // Kevin's last move of this node (from parent id, -1 = root); NULL once the round closes
+  pending_parent_id: number | null;           // JARVIS-proposed re-parent awaiting ✓/✕ (-1 = to root); resolved by route 19
+  thread_ext: string | null;                  // v0.3 §14.1 — the node's own chat `cockpit:goal-<g>-node-<n>`, NULL until Kevin opens one
+  sort_order: number; verified_at: string | null; created_at: string; updated_at: string;
+  // derived, always present on reads:
+  depth: number;             // 0 = direct child of root
+  child_count: number;       // non-discarded children
+  path: string[];            // titles root→this, e.g. ["Goal title","Parent","This"]
+};
+type GoalTree = { goal: GoalSummary; nodes: GoalNodeRow[]; focus: FocusRow };  // nodes = flat pre-order (parent before children), siblings by sort_order
+type FocusRow = { goal_id: number; node_id: number | null; set_by: 'kevin'|'jarvis'|'system'; updated_at: string; path: string[] };
+type GoalEventRow = { id: number; goal_id: number; node_id: number | null; actor: 'kevin'|'jarvis'|'system'; kind: string; text: string | null; data: unknown | null; created_at: string };
+```
+
+`actor` on write requests: optional body field `actor` ∈ `kevin|jarvis|system`; default `kevin` for HTTP (the cockpit is Kevin's hand), `jarvis` when called via the tool (§5). Every write response returns the full affected row(s) AND the server emits the matching SSE event (§4) — clients may patch from the response or refetch on SSE; both are correct.
+
+### 3.1 Goals
+
+| # | Route | Body | 2xx response | Event |
+|---|---|---|---|---|
+| 1 | `GET /goals?include_done=0&include_archived=0` | — | `{ goals: GoalSummary[] }` ordered `sort_order, id` | — |
+| 2 | `POST /goals` | `{ title, done_means?, notes?, authored_by? ('kevin' default), actor? }` | `201 { goal: GoalSummary, thread: { external_id, created: true, seed_text } }` — creates the thread row immediately (`getOrCreateConversation('cockpit:goal-<id>')`, renamed `🎯 <title>`), stores `thread_ext`, returns seed_text so the client can post it (§8). status = `set` if done_means non-empty else `ghost`. | `goal_created` (+`thread_opened`) |
+| 3 | `GET /goals/:id?include_discarded=0` | — | `GoalTree` | — |
+| 4 | `PATCH /goals/:id` | `{ title?, done_means?, notes?, sort_order?, archived?, actor? }` | `{ goal: GoalSummary }`. Setting a non-empty done_means on a `ghost` goal flips it to `set`. | `goal_updated` / `goal_set` |
+| 5 | `POST /goals/:id/verify` | `{ passed: true, note?, actor? }` | `{ goal }` → `done`, `verified_at`. `passed:false` → no-op 200 with `{ goal, verified:false }`. `409 children_not_done`. | `goal_done` |
+| 6 | `POST /goals/:id/park` / `POST /goals/:id/unpark` | `{ actor? }` | `{ goal }` | `goal_parked` / `goal_unparked` |
+| 7 | `GET /goals/:id/events?after=<id>&limit=100` | — | `{ events: GoalEventRow[] }` ascending by id | — |
+| 8 | `GET /goals/:id/thread` | — | `{ external_id: 'cockpit:goal-<id>', created: boolean, seed_text: string \| null }` — find-or-create, 2-step (§8): server creates/links the conversation; **client** POSTs `seed_text` to `POST /threads/:ext/messages` when `created=true`. Also called `POST` (same behavior) for symmetry with `/workstreams/:id/discuss`. | `thread_opened` (first time only) |
+
+### 3.2 Nodes — `/goals/:id/nodes…` (goal id in path; node ids must belong to that goal → `404 node_not_found`)
+
+| # | Route | Body | Response | Event |
+|---|---|---|---|---|
+| 9 | `POST /goals/:id/nodes` | `{ title, done_means?, notes?, parent_id? (null=root-level), authored_by? , leaf_kind?, sort_order?, actor? }` | `201 { node: GoalNodeRow }`. **`authored_by='kevin'` (default over HTTP) → born `set`** (done_means REQUIRED → `409 done_means_required`). **`authored_by='jarvis'` → born `ghost`** with a fresh `proposal_batch`. Parent preconditions §1.1. | `node_created` / `node_proposed` |
+| 10 | `POST /goals/:id/nodes/propose` | `{ parent_id (null=root-level), items: [{ title, done_means, notes?, leaf_kind? }], actor:'jarvis' }` | `201 { batch_id, nodes: GoalNodeRow[] }` — all `ghost`, `authored_by='jarvis'`, same `proposal_batch`. **items must NOT nest** (`400 no_nesting` — one layer ahead). 1–12 items. | `node_proposed` ×N (data.batch_id) |
+| 11 | `POST /goals/:id/nodes/:nodeId/accept` | `{ actor? }` | `{ node }` ghost→set; clears `proposal_batch`. `409 done_means_required` if empty. | `node_accepted` |
+| 12 | `POST /goals/:id/batches/:batchId/accept` | `{ ids?: number[], actor? }` | `{ nodes: GoalNodeRow[] }` — all ghosts in batch (or the subset in `ids`) → set. Any missing done_means → whole call `409 done_means_required` with `extra.node_ids`. | `node_accepted` ×N |
+| 13 | `POST /goals/:id/accept_all` | `{ parent_id?: number\|null, actor? }` | `{ nodes }` — every ghost in the goal (or only ghosts under `parent_id` when provided; `null` = root-level ghosts) → set. Also accepts ALL pending edits/removals in scope? **No.** accept_all is ghosts only; pending diffs are resolved individually (§3.4). | `node_accepted` ×N |
+| 14 | `POST /goals/:id/nodes/:nodeId/discard` | `{ reason?, actor? }` | `{ node }` ghost→discarded | `node_discarded` |
+| 15 | `POST /goals/:id/batches/:batchId/discard` | `{ ids?, actor? }` | `{ nodes }` | `node_discarded` ×N |
+| 16 | `PATCH /goals/:id/nodes/:nodeId` | `{ title?, done_means?, notes?, sort_order?, actor? }` | `{ node }` — **direct edit**. Allowed for `actor='kevin'` on any non-terminal node. For `actor='jarvis'` allowed ONLY on `ghost` nodes (its own proposals morphing during conversation); on a set node JARVIS must use propose_edit (`403 jarvis_must_propose`). | `node_updated` (data.old/new) |
+
+### 3.3 Pending edits / removals (JARVIS → set node)
+
+| # | Route | Body | Response | Event |
+|---|---|---|---|---|
+| 17 | `POST /goals/:id/nodes/:nodeId/propose_edit` | `{ title?, done_means?, actor:'jarvis' }` (≥1 field) | `{ node }` with `pending_title`/`pending_done_means` set, `pending_by='jarvis'`. Only on `state ∈ {set, planned}`. Replaces any earlier pending edit. | `edit_proposed` |
+| 18 | `POST /goals/:id/nodes/:nodeId/propose_removal` | `{ reason?, actor:'jarvis' }` | `{ node }` with `pending_removal=1`. Only on `state ∈ {set}` with **no non-discarded children** (`409 node_has_children`) and not `working` (`409 leaf_already_dispatched`). | `removal_proposed` |
+| 19 | `POST /goals/:id/nodes/:nodeId/resolve_pending` | `{ accept: boolean, actor? }` | `{ node }`. accept+edit → title/done_means overwritten. accept+removal → `discarded`. reject → pending_* cleared, node untouched. `409 nothing_pending`. | `edit_accepted`/`edit_rejected`/`removal_accepted`/`removal_rejected` |
+
+### 3.4 Leaf kind, plan, dispatch, verify
+
+| # | Route | Body | Response | Event |
+|---|---|---|---|---|
+| 20 | `POST /goals/:id/nodes/:nodeId/leaf_kind` | `{ leaf_kind: 'none'\|'machine'\|'human', actor? }` | `{ node }`. Preconditions §1.1. Setting `human`/`none` clears plan. **Note:** JARVIS setting leaf_kind on a SET node is NOT a ghost operation — leaf kind is a classification, not content; it applies immediately (DESIGN: "decide leaf kind when a node can't split"). Kevin can flip it back any time. | `leaf_kind_set` |
+| 21 | `POST /goals/:id/nodes/:nodeId/propose_plan` | `{ plan: PlanJson, actor:'jarvis' }` | `{ node }` `plan_state='proposed'`, plan stored with `proposed_at`. Requires `leaf_kind='machine'`, `state='set'` (`409 plan_requires_machine_leaf`). Validation §1.2 → `400 plan_invalid` with `extra.reason`. | `plan_proposed` |
+| 22 | `POST /goals/:id/nodes/:nodeId/reject_plan` | `{ reason?, actor? }` | `{ node }` `plan_state='none'`, `plan=null` | `plan_rejected` |
+| 23 | `POST /goals/:id/nodes/:nodeId/approve_plan` | `{ actor? }` | `{ node, tree: { id, topic }, hopper_nodes: HopperNodeRow[] }`. **Server does, in order:** (a) `plan_state='approved'`, `plan.approved_at`; (b) `createHopperTree(topic, 'cockpit:goal-<id>', plan.nodes)` where `topic = "<goal title> › <node path…> — <node title>"` (≤300 chars); (c) `agreeHopperTree(tree.id)`; (d) node `tree_id=tree.id`, `tree_status_cache='active'`, `state='working'`. If (b)/(c) throws: node left at `planned` (plan approved, no tree) and `502 tree_plant_failed`; a retry of the same route from `planned` re-runs (b)–(d). Precondition `plan_state='proposed'` (`409 plan_not_proposed`). | `plan_approved` + `tree_planted` (data.tree_id) |
+| 24 | `POST /goals/:id/nodes/:nodeId/human_done` | `{ note?, actor? }` | `{ node }` human leaf `set → check` (Kevin says he did it; still verified against done_means like everything else — one click `Done`, one click `Verified ✓`; JARVIS's `verify` op may do the second). | `human_done` |
+| 25 | `POST /goals/:id/nodes/:nodeId/verify` | `{ passed: boolean, note?, actor? }` | `{ node }`. `passed:true`: `check → done`, `verified_at`; then run §2.4(1) for the parent. `passed:false`: `check → set`; if machine leaf: `plan_state='none'` (plan kept in `plan` for reference, `tree_id` kept), `tree_status_cache=null`. `409 invalid_transition` unless `state='check'`. | `node_verified` (data.passed, note) |
+| 26 | `POST /goals/:id/nodes/:nodeId/park` / `…/unpark` | `{ actor? }` | `{ node }` | `node_parked` (data.from) / `node_unparked` |
+| 27 | `POST /goals/:id/nodes/:nodeId/promote` | `{ actor? }` | `201 { goal: GoalSummary, node: GoalNodeRow, thread: { external_id, created:true, seed_text } }` — see §3.16 | `node_promoted` + on new goal `goal_created`, `thread_opened` |
+| 28 | `GET /goals/:id/nodes/:nodeId/tree` | — | proxy of `GET /hopper-trees/:treeId` → `{ tree, nodes }` for the overlay; `404 no_tree` when `tree_id` NULL. (Read-only; the overlay never edits.) | — |
+
+### 3.5 Focus
+
+| # | Route | Body | Response | Event |
+|---|---|---|---|---|
+| 29 | `GET /goals/:id/focus` | — | `{ focus: FocusRow }` (row auto-created with `node_id=null` if absent) | — |
+| 30 | `PUT /goals/:id/focus` | `{ node_id: number \| null, set_by? ('kevin' default) }` | `{ focus: FocusRow }`. **ZERO model calls, ZERO thread creation.** `404 node_not_found` if node not in goal; discarded nodes cannot be focused (`409 node_discarded`). | `focus_set` only if node_id changed |
+
+### 3.6 Promotion semantics (route 27, "the only escape hatch")
+
+1. Create a new goal: `title` = node title, `done_means` = node done_means, `notes` = node notes, `authored_by` = node authored_by, `status='set'` (done_means already present, guaranteed by the node being set), `promoted_from_node_id = node.id`.
+2. Create + link its thread (`cockpit:goal-<newId>`), same as POST /goals.
+3. **Move the subtree:** every descendant of the node gets `goal_id=newId`; the node's direct children get `parent_id=NULL` (they become root-level in the new goal). States/plans/tree_ids carry over untouched. `goal_focus` for the old goal: if it pointed into the moved subtree, reset to `node_id=null`.
+4. The original node stays in the old goal as a **link stub**: `promoted_to_goal_id=newId`, state unchanged, `leaf_kind='none'`, `child_count=0` after the move. UI renders it with a "→ goal" chip; clicking navigates to `/goals/<newId>`. When the new goal reaches `done`, the server flips the stub node `→ check` (event `node_check`, data.reason='promoted_goal_done'), so the parent goal still verifies it.
+5. Preconditions: `state ∈ {set, planned, check, working}`, not already promoted (`409 already_promoted`).
+
+---
+
+## 4. SSE (via the existing `/events` stream; add `'goal','goal_node','goal_focus'` to the `FORWARD` set in `api-v1.ts` and the union in `sse-bus.ts`; add the same three to the cockpit `sse-worker.ts` `EVENT_TYPES`). All three are **global** (no `conversationId` — same treatment as `hopper_node`/`workstream`), so admin-scope clients receive them all; the cockpit filters by `goal_id` client-side.
+
+```ts
+export interface GoalEvent {            // 'goal'
+  type: 'goal';
+  action: 'created' | 'updated' | 'deleted';   // 'deleted' reserved (v0 never hard-deletes; archived → 'updated')
+  goal: GoalSummary;
+}
+export interface GoalNodeEvent {        // 'goal_node'
+  type: 'goal_node';
+  action: 'created' | 'updated' | 'deleted';   // 'deleted' reserved; discard → 'updated' with state='discarded'
+  goal_id: number;
+  node: GoalNodeRow;                            // includes derived depth/child_count/path
+  batch_id?: string;                            // present on propose/batch accept/discard so the UI can animate the bracket
+}
+export interface GoalFocusEvent {       // 'goal_focus'
+  type: 'goal_focus';
+  goal_id: number;
+  focus: FocusRow;
+}
+```
+Emission rules: one `goal_node` per affected node row (a batch of 6 ghosts = 6 events sharing `batch_id`); one `goal` event after any change that alters `GoalCounts`/`status`/`updated_at` (i.e. after every node write too — the forest card must stay live); `goal_focus` on PUT focus when changed and on promote-reset. Wire format is the existing one: `event: goal_node\ndata: {...,"external_id":undefined}`.
+
+---
+
+## 5. The `goals` JARVIS tool (`src/tools/goals-tool.ts`, registered in `tools/index.ts`)
+
+**Scope resolution:** the tool reads `context.externalId`. If it matches `^cockpit:goal-(\d+)$`, `goal_id` is implied and **args.goal_id is ignored**; outside a goal thread, `goal_id` is required on every op except `list`. Writes from the tool are always `actor='jarvis'` (the tool cannot impersonate Kevin — except `set_from_kevin`, which records `authored_by='kevin'` because Kevin dictated it verbatim).
+
+**THE RULE (in the tool description, verbatim):** *"Propose for anything not dictated verbatim by Kevin. `set_from_kevin` is ONLY for a node Kevin literally spelled out (title + what done means) in this conversation; everything you think of, infer, reword, split, or remove goes through propose / propose_edit / propose_remove and renders as a ghost until he ✓s it. Never create grandchildren: propose children only under the focused node or a node he named, one layer at a time. Every proposed node MUST carry a one-line done_means."*
+
+| op | args | does (route) | returns |
+|---|---|---|---|
+| `list` | `goal_id?` — without it: the forest; with it: the full tree | GET /goals or GET /goals/:id | `{ goals }` or `GoalTree` (nodes trimmed to `id,parent_id,title,done_means,state,leaf_kind,plan_state,tree_id,tree_status_cache,pending_*,proposal_batch,depth,child_count,authored_by`) |
+| `set_goal_done_means` | `done_means` | PATCH /goals/:id `{ done_means, actor:'jarvis' }` — ONLY after Kevin confirmed the sentence in this conversation; flips a ghost goal to set | `{ goal }` |
+| `propose` | `parent_id` (number \| null = root-level; **defaults to the current focus node** when omitted inside a goal thread), `items: [{title, done_means, notes?, leaf_kind?}]` (1–12, NO nesting) | POST …/nodes/propose | `{ batch_id, nodes }` |
+| `set_from_kevin` | `parent_id` (same default), `title`, `done_means`, `notes?`, `leaf_kind?` | POST …/nodes with `authored_by='kevin'` | `{ node }` (born set) |
+| `accept` | `node_id?` \| `batch_id?` \| `all:true` (+ `parent_id?` for all) — exactly one | routes 11/12/13 — **use ONLY when Kevin said yes in this conversation** ("yep", "go", "✓ all"); never accept your own proposal unprompted | `{ nodes }` |
+| `discard` | `node_id?` \| `batch_id?` — exactly one | routes 14/15 | `{ nodes }` |
+| `edit_ghost` | `node_id`, `title?`, `done_means?`, `notes?` | route 16 PATCH with `actor='jarvis'` — reword YOUR OWN still-ghost proposal in place while Kevin talks it through (DESIGN: "we'd talk about it a little bit more and watch it change"). The server 403s `jarvis_must_propose` on anything already set, so this cannot write real content. Do NOT discard + re-propose to reword — that loses the row and its batch bracket. | `{ node }` |
+| `propose_edit` | `node_id`, `title?`, `done_means?` | route 17 | `{ node }` |
+| `propose_remove` | `node_id`, `reason?` | route 18 | `{ node }` |
+| `move` | `node_id`, `parent_id` (number \| null) | v0.2 §13.6 — ghost → route 31 direct (actor jarvis); non-ghost → route 32 `propose_move` (pending move Kevin ✓s via route 19) | `{ node, moved:true }` / `{ node, proposed:true }` |
+| `set_leaf_kind` | `node_id`, `leaf_kind` | route 20 | `{ node }` |
+| `propose_plan` | `node_id`, `plan: PlanJson` (§1.2; the tool fills `adapter:'claude'` on every node if omitted and rejects fable/non-claude before hitting the server) | route 21 | `{ node }` |
+| `dispatch` | `node_id` | route 23 approve_plan — **only when Kevin approved the plan in conversation** (the normal path is his click on the Plan card; this exists so "yeah go build it" typed in chat works) | `{ node, tree }` |
+| `verify` | `node_id`, `passed: boolean`, `note?` | route 25 (or route 5 when `node_id` is omitted and `goal:true` → verify the goal root) | `{ node }` / `{ goal }` |
+| `human_done` | `node_id`, `note?` | route 24 — only when Kevin said he did it | `{ node }` |
+| `park` / `unpark` | `node_id?` (omit → the goal) | routes 26 / 6 | `{ node }` / `{ goal }` |
+| `log` | `node_id?`, `text` | inserts `goal_events` kind=`log`, actor=jarvis; emits `goal` | `{ event }` |
+| `promote` | `node_id` | route 27 | `{ goal, node, thread }` — the tool ALSO posts `seed_text` to the new thread via the internal ingest so the promoted goal's chat boots (tool-side only; HTTP callers do the 2-step) |
+| `focus` | `node_id: number \| null` | PUT focus with `set_by='jarvis'` — use sparingly (e.g. right after Kevin accepts a batch, focus the first child so the next layer proposal lands there) | `{ focus }` |
+
+Arg schema (JSON-schema, for the tool `parameters`): `operation` enum of the ops above incl. `set_goal_done_means` (required); `goal_id`, `node_id`, `parent_id` (number \| null), `batch_id` (string), `all` (boolean), `items` (array of objects `{title, done_means, notes?, leaf_kind?}`), `title`, `done_means`, `notes`, `leaf_kind` (enum), `plan` (object), `passed` (boolean), `note`, `reason`, `text`, `goal` (boolean).
+
+> **Added by the review node (#460), additive per this file's preamble:** the `edit_ghost` op above. §3.2 route 16 always allowed `actor='jarvis'` to PATCH a ghost, but §5's op table had no way to reach it, so the only way for JARVIS to reword a proposal mid-conversation was discard + re-propose — which destroys the ghost row and its batch bracket under Kevin's cursor. The op is a thin wrapper over the existing route; the ghost-only guard is unchanged and still server-side. Every op returns `{ error: string }` (not a throw) on precondition failure, echoing the server's `error.code` + message so JARVIS can explain it to Kevin.
+
+---
+
+## 6. Per-turn focus injection (`agent.ts`, `cockpit:goal-*` threads only)
+
+Add `goalContextBlock = buildGoalThreadContext(conv.external_id)` (exported from `goals.ts`) to `perTurnContextPrefix` right after `workbenchContextBlock`. Returns `''` for any thread whose external_id doesn't match `^cockpit:goal-(\d+)$` or whose goal no longer exists. Injected **once per turn, server-side, never into the transcript / stored turn content** (same treatment as `threadContextLine`). Format, exactly:
+
+```
+<goal_focus goal_id="12" node_id="87" path="Ship Perclickity v2 › Media-buy stats › Create monitoring" state="set" leaf_kind="none" pending="none"/>
+<goal_tree goal_id="12" status="set" progress="38" working="1" need_you="3">
+# Ship Perclickity v2 — done: Kevin can see media-buy revenue per link in the dashboard, reconciled to QB
+- [set] #41 Media-buy stats — done: /stats page shows revenue per linkId for any date range
+  - [done ✓] #55 external_id=linkId mapping — done: every click row carries linkId
+  - [set ▶] #87 Create monitoring — done: an Overwatch query rule fails when daily revenue < 7-day avg -5%
+    - [ghost b:3f9c] #101 Capture the SQL from smarty-pants — done: rule body = the proven query
+    - [ghost b:3f9c] #102 Register the rule via lanes-tool — done: rule id returned, status query
+  - [working 🌳 tree-9a1b2c3d] #56 Stats dashboard branch — done: perclickity/media-buy-stats reviewed
+  - [human] #60 Kevin places the index.php redirect — done: redirect live on prod
+- [check] #42 QB reconciliation — done: monthly totals match QB within $1
+- [set ✎pending] #43 Docs — done: outbox/perclickity-v2.md reviewed
+</goal_tree>
+```
+Rules for the snapshot:
+- Root line: `# <goal title> — done: <done_means>`; nodes as `- [<state marker>] #<id> <title> — done: <done_means>`, indented two spaces per depth. Markers: `ghost b:<batch4>` · `set` · `set ✎pending` (pending edit) · `set ✂pending` (pending removal) · `planned` · `working 🌳 <tree_id>` (+ ` ⚠blocked` when `tree_status_cache='blocked'`) · `check` · `done ✓` · `parked` · `human` prefix replaces `set` when `leaf_kind='human'` (`human`, `human check`…) · `machine` likewise when `leaf_kind='machine'` and `plan_state='none'`; `machine plan?` when `plan_state='proposed'`. `▶` after the marker on the focused node. Promoted stubs: `→ goal #<id>`.
+- **Collapse rule (mirrors the UI):** always include the root, every ancestor of the focused node, the focused node's siblings (title only, no children), and the focused node's children. Everything else collapses to `- [<state>] #<id> <title> (+N)` where N = hidden descendant count. If nothing is focused, show root-level nodes + their direct children only. Hard cap 60 lines; beyond that, drop the deepest collapsed lines first and append `… (+M more)`.
+- `discarded` nodes never appear. `parked` appear collapsed.
+- The block is generated from the DB every turn (no caching), cost ~≤1.5k tokens by the cap.
+- **No transcript is ever injected** — the goal chat's memory IS this snapshot + the normal session resume. The `SKILL.md` (written by the docs node) tells JARVIS how to read it; the contract only fixes the format.
+
+---
+
+## 7. Hopper integration mapping
+
+| Goals side | Hopper side |
+|---|---|
+| `plan.nodes[]` | `createHopperTree(topic, 'cockpit:goal-<id>', nodes)` — flat DAG, `parent_index` never set, ordering only via `depends_on_indexes`. `adapter='claude'` on every node; `model` per §1.2 (Standard sonnet default, Heavy opus for a review node, Light haiku for mechanical). A plan with ≥3 nodes SHOULD end with an adversarial-review node on `claude-opus-5` depending on the build nodes (rubric convention; the server does not enforce it, the tool's plan-building guidance does). |
+| approve_plan | `agreeHopperTree(tree.id)` immediately (Kevin's ✓ on the Plan card IS the "agree"; no second confirm loop). |
+| `tree_id` | `hopper_trees.id`; overlay reads `GET /goals/:id/nodes/:nodeId/tree` (= `GET /hopper-trees/:treeId`) and live-updates from the existing `hopper_node` SSE filtered by `tree_id`. |
+| node `working` | tree `active` |
+| node `check` | tree `done` (engine → `goalsOnTreeStatus(treeId,'done')` from `maybeFinishTree`) |
+| node stays `working` + `tree_status_cache='blocked'` | any tree node `blocked`/`blocked_question` (engine → `goalsOnTreeStatus(treeId,'blocked')` from `finishHopperNode`/lease-recovery; back to `'active'` when the blocked node is answered/retried and no blocked nodes remain). The UI shows a red `blocked` badge on the working pill; Kevin answers inside the overlay's existing answer box (the overlay is read-only for structure, but the `blocked_question` answer box is allowed because it's the existing spawn-tree surface). |
+| tree `archived` while node `working` | treat as `'blocked'` for the badge (event `tree_blocked`, data.reason='archived'). |
+| Engine hook wiring | `hopper-engine.ts` calls `goalsOnTreeStatus` through a lazy `import('./goals.js')` (or a registered callback `registerTreeStatusListener(fn)` exported from hopper-engine and called at goals.ts load) — builder picks; the callback form is preferred to avoid an import cycle. Must be a no-op when no goal node references the tree. |
+| Worker prompt | unchanged — workers don't know about goals. The tree `topic` carries the goal path so cockpit sidebar/tree listings read naturally. |
+
+---
+
+## 8. Thread naming + seed text
+
+- **Name:** `cockpit:goal-<goal.id>` (numeric id, never the title). Conversation label: `🎯 <goal title>` (≤120 chars), re-applied on goal rename (PATCH title → `renameConversation`).
+- **2-step open (identical to `/workstreams/:id/discuss` + hopper promote):** `GET|POST /goals/:id/thread` returns `{ external_id, created, seed_text }`. When `created=true`, the **client** POSTs `{ text: seed_text }` to `POST /api/v1/threads/<external_id>/messages` — that runs a full JARVIS turn on the battle-tested ingest path. When `created=false`, `seed_text` is `null` and nothing is posted. The `goals` tool's `promote` op is the one exception (tool posts the seed itself, §5).
+- **Goal `done_means` authorship:** set by Kevin (PATCH from the UI header card) OR by JARVIS via the tool op `set_goal_done_means` once Kevin has confirmed the sentence in chat (goals have no ghost mechanism; done_means IS the approval).
+- **Seed text (`composeGoalSeed(goal)`), exactly this shape:**
+
+```
+🎯 GOAL CHAT — this thread belongs to goal #<id> "<title>" and nothing else. Read skills/goals/SKILL.md before your first reply (it is the operating contract for goal chats); the `goals` tool is how you touch the tree. Every turn of this thread is prefixed with a <goal_focus/> line + a <goal_tree> snapshot — that snapshot is your memory of this goal; never ask Kevin to restate it.
+
+Goal: <title>
+Done means: <done_means | "(not set yet)">
+Notes: <notes | "(none)">
+Status: <status> · nodes: <total> (<done> done · <working> working · <need_you> need you)
+Focus: <path | "(none — the goal itself)">
+
+Rules for this chat (short form; SKILL.md has the long form):
+1. No done_means yet → clarify in ≤5 questions, propose one sentence, and when Kevin confirms it call `goals` op `set_goal_done_means`.
+2. Everything you add/reword/remove is a ghost until Kevin ✓s: use `propose` / `propose_edit` / `propose_remove`. `set_from_kevin` only for nodes he dictated verbatim.
+3. One layer ahead, never two: propose children only under the focused node (or the goal root when nothing is focused).
+4. A node that can't split is a leaf: `set_leaf_kind` machine (you can spec it) or human (only Kevin can do it). Machine leaves get a `propose_plan`; Kevin approves on the card (or says go → `dispatch`).
+5. Push back when a branch doesn't serve the goal. Verify against done_means before anything becomes done (`verify`).
+6. Kevin never has to say which node he means — the focus line tells you. If he clearly means a different node, say which one you're taking it as.
+
+Open with: if done_means is empty, your clarify questions; otherwise a two-line read of where this goal stands and what you'd propose next under the current focus.
+```
+
+(Substitute the `<…>` placeholders server-side; keep the `Rules` block verbatim so both lanes and the SKILL.md agree on the same numbered rules.)
+
+---
+
+## 9. Cockpit surface (what the UI lane builds against; the backend lane ignores this section)
+
+- Routes: `/goals` (forest) and `/goals/$goalId` (split view) in `src/routes/`, own shell (`GoalsShell`), NOT wrapped in the cockpit's thread-sidebar layout. Top bar: `◀ Cockpit` → `/`.
+- Client fns in `cockpit-api.ts` (additive): `listGoals`, `createGoal`, `getGoal`, `patchGoal`, `verifyGoal`, `parkGoal/unparkGoal`, `listGoalEvents`, `openGoalThread`, `createGoalNode`, `proposeGoalNodes`, `acceptGoalNode`, `acceptGoalBatch`, `acceptAllGoalNodes`, `discardGoalNode`, `discardGoalBatch`, `patchGoalNode`, `resolveGoalPending`, `setGoalLeafKind`, `rejectGoalPlan`, `approveGoalPlan`, `humanDoneGoalNode`, `verifyGoalNode`, `parkGoalNode/unparkGoalNode`, `promoteGoalNode`, `getGoalNodeTree`, `getGoalFocus`, `setGoalFocus` — one per route in §3, same names as the route verbs. Types `GoalRow/GoalSummary/GoalNodeRow/GoalTree/FocusRow/GoalEventRow/PlanJson` copied from §3.0 verbatim.
+- SSE: `onGoal`, `onGoalNode`, `onGoalFocus` handlers; `goal`,`goal_node`,`goal_focus` added to `sse-worker.ts` `EVENT_TYPES`. On any event for the open goal: patch the row in place from the payload (no refetch needed; refetch is allowed as a fallback).
+- Left pane = `ThreadPane`'s conversation rendering for `cockpit:goal-<id>` (open via `openGoalThread`; on `created=true` POST seed via the existing `sendThreadMessage`). Composer shows the `Talking about: <path> ✕` chip from the `goal_focus` state.
+- Every click on a node row → `setGoalFocus(goalId, nodeId)` (debounced 150ms, optimistic). Esc → `setGoalFocus(goalId, null)`.
+- Approve/✓/✕/Done/Verified/Plan-approve are single-click row affordances calling the routes above with default `actor='kevin'`. No modals in the main loop. `⋯` menu = park/unpark, promote, edit (inline), discard (ghost only).
+- Working pill click → overlay rendering `getGoalNodeTree` + live `hopper_node` events; includes the existing blocked_question answer box behavior (POST `/hopper-nodes/:id/answer`, already exists) and nothing else editable.
+- Divider position persisted in `localStorage` key `goals.split.<goalId>`.
+
+---
+
+## 10. Acceptance (both lanes; the sim node runs these against a scratch DB, the review node checks them)
+
+1. `POST /goals {title}` → ghost goal + thread row + seed; `PATCH done_means` → set. `POST /goals {title, done_means}` → set directly.
+2. `POST /nodes` with `authored_by=kevin` → `set`; without done_means → `409 done_means_required`. With `authored_by=jarvis` → `ghost` + batch.
+3. `propose` with nested `items[].children` → `400 no_nesting`. Propose under a ghost parent → `409 parent_not_set`.
+4. Batch of 3 ghosts: `accept` one → set (batch cleared on that row); `batches/:id/accept` → remaining two set; `accept_all` with no ghosts → `{ nodes: [] }` 200.
+5. `propose_edit` on a set node → pending fields; `resolve_pending {accept:true}` → applied + cleared; `{accept:false}` → cleared, untouched. `propose_edit` on a ghost → `409 invalid_transition` (JARVIS edits its own ghosts via PATCH instead).
+6. `propose_removal` on a node with children → `409 node_has_children`.
+7. `leaf_kind machine` + `propose_plan` (2 nodes, sonnet + opus review) + `approve_plan` → hopper tree exists with status `active`, 2 pending nodes, node `working`, `tree_id` set. Simulated `finishHopperNode(done)` on both → tree `done` → node `check` (via `goalsOnTreeStatus`). `verify {passed:true}` → `done`; parent with all children done → `check` automatically.
+8. `approve_plan` with a `claude-fable-5` node in the plan → `400 plan_invalid` at propose time already.
+9. `PUT focus` → `goal_focus` SSE fired; repeat same node → no event, no `focus_set` row. Focus a discarded node → `409`.
+10. `buildGoalThreadContext('cockpit:goal-<id>')` renders the §6 block, respects the collapse rule and the 60-line cap; returns `''` for a non-goal thread.
+11. `promote` → new goal with the subtree moved (children re-rooted), stub node keeps state + `promoted_to_goal_id`; old goal's focus reset if it was inside the subtree; new goal `done` → stub → `check`.
+12. `human_done` → `check`; `verify` → `done`. `park` on working → parked with tree untouched; `unpark` restores `working`.
+13. The three SSE types appear in `/events` for an admin key; a non-admin key still receives them (global events are not thread-scoped).
+14. `tsc` clean in darwin-assistant; cockpit `bun run build` (NOT the deploy script) clean.
+
+---
+
+## 11. v0.1 — Kevin edits a ghost → JARVIS weighs in → both agree → it solidifies (added 2026-09-19, additive)
+
+**Why (Kevin, verbatim, 2026-09-19):** *"I should be able to click any of them, see the synopsis/details, and I should be able to just erase/edit what's there. And it should 'save' the change and understand that I made the change. That way when it's not my turn — when I OK it or whatever — it would see that I made a change and would 'think about' the change, acknowledge I made it, and give me its thought on it. If it agrees, then we're good and it solidifies. But if you push back on it and don't think it should confirm yet, then we talk that one out until we're both good."*
+
+**The one rule this section adds:** a ghost solidifies (`ghost → set`) only when **the party who did NOT make the last edit** approves it.
+- JARVIS proposed / last reworded it + Kevin ✓ → `set` (v0 behaviour, unchanged).
+- Kevin last edited it + Kevin ✓ → **not set yet**: the node enters `review_state='awaiting_jarvis'`, a cue is posted into the goal chat, and JARVIS must either `accept` (agree → `set`) or `push_back` (stays ghost, note shown; they talk it out). JARVIS rewording it with `edit_ghost` hands the last word back to JARVIS, so Kevin's next ✓ sets it.
+- Kevin-AUTHORED nodes (`set_from_kevin` / POST node authored_by=kevin) are still born `set` — the pinned weigh-in on authored nodes is NOT part of v0.1 (only edits to JARVIS proposals). The mechanism below is what v1.1 would reuse.
+
+### 11.1 DDL (additive `ALTER TABLE goal_nodes ADD COLUMN …`, idempotent, guarded by PRAGMA table_info)
+
+```
+last_edited_by       TEXT CHECK (last_edited_by IN ('kevin','jarvis') OR last_edited_by IS NULL)  -- who last changed title/done_means/notes while ghost; NULL = untouched since proposal
+kevin_edit_original  TEXT   -- JSON {title, done_means, notes} = the JARVIS wording at the moment of Kevin's FIRST edit of this ghost; never overwritten by later Kevin edits; cleared (NULL) when the node leaves ghost
+review_state         TEXT NOT NULL DEFAULT 'none' CHECK (review_state IN ('none','awaiting_jarvis','pushed_back'))
+review_note          TEXT   -- JARVIS's push-back note (one or two sentences); cleared when review_state returns to 'none'
+```
+All four are returned on every `GoalNodeRow` read (add to §3.0 type). `GoalCounts` gains `awaiting_jarvis: number` (ghosts with `review_state='awaiting_jarvis'`); `need_you` is unchanged.
+
+### 11.2 Semantics (server-enforced in `goals.ts`)
+
+| Action | actor | Precondition | Effect | event kind |
+|---|---|---|---|---|
+| PATCH node (route 16) title/done_means/notes | kevin | state=ghost | `last_edited_by='kevin'`; if `kevin_edit_original IS NULL` snapshot the pre-edit `{title,done_means,notes}` into it; `review_state='none'`, `review_note=NULL` (a fresh edit re-opens the round) | `ghost_edited_by_kevin` (data: `{old,new}`) |
+| PATCH node / `edit_ghost` | jarvis | state=ghost | `last_edited_by='jarvis'`; `review_state='none'`, `review_note=NULL` (JARVIS took the last word; Kevin's next ✓ sets it). `kevin_edit_original` is kept for the audit trail | `node_updated` (unchanged kind) |
+| accept (one / batch / all) | kevin | state=ghost, `last_edited_by='kevin'` | **does NOT set.** `review_state='awaiting_jarvis'`, `proposal_batch` kept. Then fire ONE cue per HTTP request (§11.3) listing every node that just went awaiting. Nodes in the same request whose `last_edited_by != 'kevin'` set normally | `kevin_okd_edit` |
+| accept | kevin | state=ghost, `review_state='awaiting_jarvis'` (re-click) | `409 awaiting_jarvis` — message: "JARVIS is weighing in on your edit — see the chat" | — |
+| accept | kevin | state=ghost, `review_state='pushed_back'`, `last_edited_by='kevin'` | re-asks: `review_state='awaiting_jarvis'`, `review_note` kept, cue fires again with the note quoted ("Kevin re-OK'd without changes after your push-back") | `kevin_okd_edit` |
+| accept | jarvis | state=ghost, `review_state ∈ {awaiting_jarvis, pushed_back}` | `state='set'`, `review_state='none'`, `review_note=NULL`, `kevin_edit_original=NULL`, `last_edited_by=NULL`, `proposal_batch=NULL` | `node_agreed` (text: "JARVIS agreed with Kevin's edit: <title>") |
+| accept | jarvis | state=ghost, `review_state='none'` | unchanged v0 rule (only when Kevin said yes in chat) | `node_accepted` |
+| `push_back` (NEW tool op + route `POST /goals/:id/nodes/:nodeId/push_back {note}`) | jarvis | state=ghost, `review_state='awaiting_jarvis'` (also allowed from `none` when `last_edited_by='kevin'`) | `review_state='pushed_back'`, `review_note=note` (required, non-empty) | `jarvis_pushed_back` (text = note) |
+| discard | either | state=ghost | unchanged; clears review fields | `node_discarded` |
+| ghost → set by any path | — | — | clears `review_state/review_note/kevin_edit_original/last_edited_by` | — |
+
+`goal_events.kind` closed list gains: `ghost_edited_by_kevin` · `kevin_okd_edit` · `node_agreed` · `jarvis_pushed_back`.
+
+### 11.3 The cue (backend → goal chat)
+
+Same seam as `dispatch-gate.ts fireCue`: `processMessage(text, 'cockpit:goal-<id>', 'goal-cue:<goalId>:<eventId>')`; if the conversation is in flight (`getInFlightMessageId`) or throws `ConversationBusyError` → `enqueueMessage`. Fired once per accept request, after the write transaction commits. Text, exactly this shape (one block per node):
+
+```
+[goal #1 — Kevin edited 2 of your proposals and OK'd them. Weigh in.]
+#12 now: "New title" — done: "new done_means"
+    was (yours): "Old title" — done: "old done_means"
+#14 now: … / was (yours): …
+For each node: acknowledge the change in a sentence, then either agree → `goals` op `accept` {node_id} (it solidifies), or `push_back` {node_id, note} with your reason in one or two sentences and talk it out. Don't restate the rest of the tree.
+```
+When it is a re-ask after push-back, add a line `you pushed back with: "<review_note>"` under that node.
+
+### 11.4 Focus injection additions (§6)
+
+- Node marker gains `✎K` when `last_edited_by='kevin'` (ghost only). Line suffix: ` — AWAITING YOUR TAKE (was: "<original title>")` for `awaiting_jarvis`; ` — you pushed back: "<review_note>"` for `pushed_back`.
+- `<goal_tree …>` gains attribute `awaiting_you="N"`.
+
+### 11.5 Cockpit (§9 additions — `GoalTreePanel.tsx`, `cockpit-api.ts`)
+
+- **Click any row → focus AND expand it in place** (one expanded row at a time; a second click on the same row collapses it; expansion survives refetch/SSE). The expanded block sits directly under the row, inside the tree — no modal, no page change — and shows the FULL title, full done_means, notes, and a meta line (`proposed by JARVIS · edited by you 2m ago` / `authored by you`), plus `was: "<kevin_edit_original.title>" — done: "…"` when present.
+- **Inline edit:** title / done_means / notes are auto-sized textareas when `state ∈ {ghost, set, planned}` and `pending_removal=0`. Save on blur or ⌘/Ctrl+Enter; Esc reverts. PATCH route 16 (actor defaults to kevin). Toast on error, optimistic update.
+- **Row chips:** `✎ you` (small, amber) on a Kevin-edited ghost; `JARVIS weighing in…` (pulsing) when `awaiting_jarvis` — the row's ✓ is disabled with tooltip "JARVIS is weighing in — see the chat"; `JARVIS pushed back` (destructive tint) when `pushed_back` — the note is shown in the expanded block, ✓ re-enabled (re-ask).
+- **Batch bar `✓ all`:** result toast splits the outcome: "3 set · 2 sent to JARVIS to weigh in".
+- **Header card:** the goal's title/done_means no longer truncate silently — click expands + edits (PATCH /goals/:id), same textarea behaviour.
+- Collapsed rows keep single-line truncation but always carry the full text in `title=` tooltips.
+
+---
+
+## 12. Guards (v0.2) — every `done_means` can become a monitored Overwatch rule (added 2026-09-19, additive)
+
+**Why (Kevin, verbatim, 2026-09-19):** *"All of the leaves/branches in the goal system have a 'done' reasoning. Basically it's win condition. That is absolutely positively primed for reliable automation into a coded overwatch rule. Something that is checked with overwatch to make sure that it's still working (in the case that it makes sense that is)… I think that's one hell of a thing if it works like I hope it will."*
+
+Concept + loop = `docs/goals/GUARDS.md`. Overwatch API, read from source = `docs/goals/GUARDS-RECON.md` (**read it — it corrects two things GUARDS.md got wrong**). Optional push channel = `docs/goals/GUARDS-OVERWATCH-WEBHOOK.md`. This section is the binding contract; it is purely additive on Goals v0/v0.1 shapes.
+
+**Two recon facts that drive everything here (do not re-litigate — cited in GUARDS-RECON):**
+1. **The Overwatch rule key is server-generated** (`prompt.<slug>-<rand4>`); a client cannot choose it. → We put the goal/node identity in the rule **`name`**, and **store the returned `key`** in `goal_guards.overwatch_key`. `overwatch_rule_id` stays NULL (the API has no numeric id).
+2. **`GET /rules/{key}` already returns `last_result {status,value,summary,at}`.** → A **poller** is the health source; the webhook (§12.8) is OPTIONAL and off the critical path.
+
+**Namespace additions (hard):** table `goal_guards` · routes `/api/v1/goals/:id/guards*` + `/api/v1/goals/guards/webhook` · tool ops `propose_guard`/`discard_guard`/`list_guards` (on the existing `goals` tool) · SSE `goal_guard` · events `guard_*`. All Overwatch traffic goes through one module-internal client `src/goals-overwatch.ts` (create/get/patch/delete) so the key/auth/degrade logic lives in exactly one place.
+
+### 12.1 SQLite DDL (jarvis.db, in `src/goals.ts` — new table, idempotent `CREATE TABLE IF NOT EXISTS`)
+
+```sql
+CREATE TABLE IF NOT EXISTS goal_guards (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  goal_id           INTEGER NOT NULL REFERENCES goals(id),
+  node_id           INTEGER REFERENCES goal_nodes(id),        -- NULL = guard on the goal root
+  state             TEXT    NOT NULL DEFAULT 'ghost'
+                    CHECK (state IN ('ghost','set','discarded')),
+  mode              TEXT    NOT NULL DEFAULT 'query'
+                    CHECK (mode IN ('query','agent')),
+  title             TEXT    NOT NULL,                          -- plain-words label ("first paid-lead send inside 4h")
+  -- query mode:
+  sql               TEXT,
+  comparator        TEXT    CHECK (comparator IN ('gte','lte','gt','lt','eq') OR comparator IS NULL),
+  threshold         REAL,
+  value_column      TEXT,
+  sample_columns    TEXT,                                     -- JSON array of column names or NULL
+  -- agent mode:
+  check_prompt      TEXT,
+  failure_prompt    TEXT,
+  -- overwatch rule knobs:
+  cadence           INTEGER NOT NULL DEFAULT 60,              -- cadence_minutes we ask Overwatch to run at
+  severity          TEXT    NOT NULL DEFAULT 'medium'
+                    CHECK (severity IN ('critical','high','medium','low')),
+  ow_group          TEXT    NOT NULL DEFAULT 'custom',        -- must be a whitelisted Overwatch group (recon §2)
+  window_minutes    INTEGER NOT NULL DEFAULT 60,
+  -- linkage to the live rule (filled on accept):
+  overwatch_key     TEXT,                                     -- the server-generated key; NULL while ghost / unwritten
+  overwatch_rule_id TEXT,                                     -- reserved; stays NULL (API keys by string)
+  -- health (from the poller / webhook):
+  health            TEXT    NOT NULL DEFAULT 'unknown'
+                    CHECK (health IN ('unknown','passing','failing','error')),
+  last_checked_at   TEXT,
+  last_value        REAL,
+  last_summary      TEXT,
+  authored_by       TEXT    NOT NULL DEFAULT 'jarvis'
+                    CHECK (authored_by IN ('kevin','jarvis')),
+  created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at        TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_goal_guards_goal ON goal_guards(goal_id, node_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_guards_owkey ON goal_guards(overwatch_key) WHERE overwatch_key IS NOT NULL;
+-- one ACTIVE guard per node (v0): enforce in code, not by index, because discarded rows must be allowed to pile up.
+```
+
+Column rules the code enforces:
+- **One non-discarded guard per node** (v0). A `propose_guard` on a node that already has a `ghost`/`set` guard → `409 guard_exists`.
+- A guard may be proposed only on a node whose `state ∈ {check, done}` (`409 node_not_verifiable`), or on the goal root when `goal.status='done'` (all nodes done). The win condition must be real before we monitor it (GUARDS.md).
+- `mode='query'` requires `sql`, `comparator`, `threshold` non-null before `accept` (`409 guard_incomplete`, `extra.missing`). `mode='agent'` requires `check_prompt`.
+- `ow_group` must be one of the whitelisted Overwatch groups (recon §2: `leads,email,queue,billing,revenue,system,custom,general`); default `custom`. Not validated by us at write time (Overwatch 422s a bad group on accept); the tool guidance defaults it to `custom`.
+- `updated_at` bumps on every write; the parent `goals.updated_at` bumps too (guards affect the forest card's `guards_failing`).
+
+### 12.2 State machine (server-enforced; other transitions → `409 invalid_transition {from,to}`)
+
+**Lifecycle `state`:** `ghost` (proposed, not written to Overwatch) → `set` (Kevin ✓, rule written, `overwatch_key` stored) → `discarded` (removed; if it was `set`, the Overwatch rule is DELETEd first). `discarded` is terminal. Kevin may edit a ghost's sql/threshold/etc inline before ✓ (route 33 PATCH, actor kevin) exactly like a ghost node; a set guard's knobs may still be PATCHed (route 33) → the change is pushed to Overwatch via `PATCH /rules/{key}` in the same transaction.
+
+**Health (independent axis, only meaningful when `state='set'`):** `unknown` (created, Overwatch hasn't run it yet, or Overwatch unreachable) → `passing` / `failing` / `error`, driven by the poller/webhook per the recon §5 mapping:
+
+| Overwatch `last_result` | `goal_guards.health` |
+|---|---|
+| `null` (never run) / API unreachable / no key | `unknown` |
+| `status='ok'` | `passing` |
+| `status='fail'` or `status='warn'` | `failing` |
+| `status='error'`, or `at` older than `max(3×cadence, 60m)` | `error` |
+
+Ghost/discarded guards are always reported `health='unknown'` regardless.
+
+### 12.3 The loop (verify → propose → accept → watch → cue)
+
+1. **Verify → propose.** When a node reaches `done` (via §3 route 25 verify, or a human leaf's `human_done`+verify) AND the `done_means` is a measurable condition over Hub data worth checking on a cadence (JARVIS's judgment — GUARDS.md "guardable"), the goal chat calls `goals` op `propose_guard`. Not every done node gets one; one-offs and agreements don't.
+2. **Kevin ✓ (Shape).** `POST /goals/:id/guards/:gid/accept` → server writes the rule to Overwatch via `src/goals-overwatch.ts` create, stores `overwatch_key`, `state='set'`, `health='unknown'`, event `guard_set`. ✕ = `discard`.
+3. **Watch.** The poller (§12.7) reads each `set` guard's `GET /rules/{key}` every `goal_guard_poll_min`, maps `last_result.status` (§12.2), stores `last_value/last_summary/last_checked_at`, flips `health` **only on change**, emits `goal_guard` + the matching `guard_*` event.
+4. **Fail → cue.** On `passing → failing` (state CHANGE only): event `guard_failed`, cue into the goal chat (§12.6), UI shows the node's red shield + the goal card's failing count. JARVIS then proposes the fix under that node (a child or a Plan) — the tree grows where it broke. `failing → passing` → `guard_recovered` + a one-line cue. `* → error` → `guard_error` + cue (distinct wording: the check itself broke, not necessarily the goal).
+
+### 12.4 HTTP routes — under `/api/v1/goals`, bearer `JARVIS_COCKPIT_KEY` (the webhook, route 35, is the ONE exception — its own secret)
+
+| # | Route | Body | 2xx response | Event |
+|---|---|---|---|---|
+| 31 | `GET /goals/:id/guards` | — | `{ guards: GoalGuardRow[], overwatch_connected: boolean }` (all non-discarded for the goal; `?include_discarded=1` to include; `overwatch_connected` = both env vars present, so the UI can show "Overwatch not connected" on load — review #479) | — |
+| 32 | `POST /goals/:id/guards/propose` | `{ node_id (null=root), mode ('query'\|'agent'), title, sql?, comparator?, threshold?, value_column?, sample_columns?, check_prompt?, failure_prompt?, cadence?, severity?, ow_group?, window_minutes?, actor:'jarvis' }` | `201 { guard: GoalGuardRow }` — `state='ghost'`, nothing written to Overwatch yet. Preconditions §12.1 (`409 node_not_verifiable`/`guard_exists`). | `guard_proposed` |
+| 33 | `PATCH /goals/:id/guards/:gid` | any of the query/agent/knob fields + `title`, `actor?` | `{ guard }` — direct edit. `actor='kevin'` on ghost OR set. `actor='jarvis'` only on ghost (its own proposal morphing; on a set guard → `403 jarvis_must_propose` — v0 has no guard propose_edit, JARVIS discards+re-proposes or asks Kevin to edit). **If the guard is `set`, the change is pushed to Overwatch (`PATCH /rules/{overwatch_key}`) inside the same write; a `422` from Overwatch → `422 overwatch_rejected {extra.reason}` and the local row is NOT changed.** | `guard_updated` |
+| 34 | `POST /goals/:id/guards/:gid/accept` | `{ actor? }` | `{ guard }` — ghost→set. Server calls Overwatch create (recon §2), stores `overwatch_key`, `health='unknown'`. `409 guard_incomplete {extra.missing}` if required mode fields absent. **If Overwatch is not configured (`503`/no key) → `503 overwatch_not_connected`, guard stays ghost** (nothing lost; re-accept when the key lands). Overwatch `422` → `422 overwatch_rejected {extra.reason}`. | `guard_set` |
+| — | `POST /goals/:id/guards/:gid/discard` | `{ reason?, actor? }` | `{ guard }` — →discarded. If it was `set`, DELETE the Overwatch rule first (`DELETE /rules/{key}`); a `404` from Overwatch (already gone) is tolerated; any other Overwatch error still discards locally but sets `last_summary='overwatch delete failed: …'` (don't strand the UI). | `guard_discarded` |
+| — | `GET /goals/:id/guards/:gid` | — | `{ guard: GoalGuardRow }`; `404 guard_not_found` if not in this goal. | — |
+| 35 | `POST /goals/guards/webhook` (GLOBAL, not under `:id`) | `{ key, status, value?, summary?, ran_at? }` | `{ ok: true }` — OPTIONAL push path (§12.8). **NOT bearer-authed:** header `X-Goals-Guard-Secret` compared constant-time to `GOALS_GUARD_WEBHOOK_SECRET`; unset → `503`, wrong → `401`. Looks up guard by `overwatch_key`; unknown key → `404 no_guard_for_key` (ignored, not alarmed). Applies the SAME `applyGuardHealth()` as the poller. | `guard_failed`/`guard_recovered`/`guard_error` on change only |
+
+`GoalGuardRow` (returned on every guard read; add to §3.0 types):
+```ts
+type GoalGuardRow = {
+  id: number; goal_id: number; node_id: number | null;
+  state: 'ghost'|'set'|'discarded';
+  mode: 'query'|'agent'; title: string;
+  sql: string | null; comparator: 'gte'|'lte'|'gt'|'lt'|'eq'|null; threshold: number | null;
+  value_column: string | null; sample_columns: string[] | null;
+  check_prompt: string | null; failure_prompt: string | null;
+  cadence: number; severity: 'critical'|'high'|'medium'|'low'; ow_group: string; window_minutes: number;
+  overwatch_key: string | null; overwatch_rule_id: string | null;
+  health: 'unknown'|'passing'|'failing'|'error';
+  last_checked_at: string | null; last_value: number | null; last_summary: string | null;
+  authored_by: 'kevin'|'jarvis'; created_at: string; updated_at: string;
+  // derived on reads:
+  node_title: string | null;     // for cue/UI labels; null when guard is on the goal root
+  dashboard_url: string | null;  // Overwatch dashboard link once set
+};
+```
+
+### 12.5 `goals` tool ops (added to §5's op table; scope-resolution + actor rules identical to §5)
+
+| op | args | does (route) | returns |
+|---|---|---|---|
+| `list_guards` | `goal_id?` (implied in a goal thread) | GET /goals/:id/guards | `{ guards }` |
+| `propose_guard` | `node_id?` (omitted = the current focus inside a goal thread, like `propose`'s `parent_id`; explicit `null` = root), `mode` (`'query'` default), `title`, `sql?`,`comparator?`,`threshold?`,`value_column?`,`sample_columns?`, `check_prompt?`,`failure_prompt?`, `cadence?`,`severity?`,`ow_group?` — the tool fills `ow_group:'custom'` when omitted, and prefers `mode='query'` (captured proven SQL) over `agent` | route 32 | `{ guard }` (ghost) |
+| `discard_guard` | `guard_id` | route …/discard | `{ guard }` |
+
+Guidance in the tool description (verbatim intent): *"When a node verifies done and its done_means is a measurable condition over Hub data worth watching (a rate, a count, a reconciliation — NOT a one-off deliverable or an agreement), propose a Guard: capture the SQL that PROVED the done_means during verify (don't re-derive it — recon §0.1), pick the comparator so `value COMPARATOR threshold` = the win condition holding, and write a plain-words `title`. Kevin ✓s it on the card; only then is it written to Overwatch. Never accept your own guard proposal. If Overwatch isn't connected, the proposal still stands as a ghost and writes the moment Kevin's key lands."*
+
+(There is no guard `accept`/`verify` tool op — accept is Kevin's click, route 34; a guard is not a node in the node state machine.)
+
+### 12.6 The cue (backend → goal chat) — same seam as §11.3 (`processMessage` / `enqueueMessage`, id `goal-guard:<goalId>:<guardId>:<eventId>`)
+
+Fired once per `health` transition (never per poll). Exact shapes:
+
+```
+[goal #12 — guard on #87 "Create monitoring" is FAILING: revenue -7.4% vs 7-day avg]
+Propose the fix under that node (a child or a Plan) — the win condition it protects has broken. Don't restate the rest of the tree.
+```
+```
+[goal #12 — guard on #87 "Create monitoring" RECOVERED: revenue +1.2% vs 7-day avg]
+```
+```
+[goal #12 — guard on #87 "Create monitoring" ERRORED: the check itself failed (bad SQL or Hub unreachable) — <summary>. This is the guard, not necessarily the goal; fix the rule or tell me to discard it.]
+```
+Root-goal guards read `guard on this goal "<goal title>"` instead of `on #<node> "<title>"`.
+
+### 12.7 The poller (`src/goals.ts` interval, started at module load like the watchdog cadence)
+
+- Interval = settings-KV **`goal_guard_poll_min`** (default **10**, floored at 1). Read via the uncached `getSetting` so a live change takes effect next tick.
+- Each tick: for every `state='set'` guard with a non-null `overwatch_key`, `GET /rules/{key}` via `src/goals-overwatch.ts`. Map `last_result` → health (§12.2). Store `last_value/last_summary/last_checked_at` always; flip `health` and emit `goal_guard` + `guard_*` + cue **only on change** (compare to the row's current `health`). One in-flight guard per tick is fine; batch sequentially, don't hammer.
+- **Degrade:** if Overwatch is unconfigured (no `OVERWATCH_API_URL`/`OVERWATCH_API_KEY`) the poller is a no-op (guards sit `unknown`). If a single `GET` throws/times out, that guard → `health` unchanged this tick (transient), but if `last_checked_at` goes older than `max(3×cadence,60m)` it flips to `error` with `last_summary='guard stale — Overwatch not reporting'`.
+- **One code path** `applyGuardHealth(guardId, {status,value,summary,at})` is shared by the poller and the webhook (route 35) so push and poll can never diverge; it is idempotent (unchanged health = no event, no cue).
+
+### 12.8 Optional webhook (push) — see `docs/goals/GUARDS-OVERWATCH-WEBHOOK.md`
+Route 35 above is the Goals-side receiver (safe to build now, dormant until `GOALS_GUARD_WEBHOOK_SECRET` is set and Kevin adds the `webhook` notify channel on the darwin-dashboard box). The poller stays on as the safety net even when the webhook is live. Not required for v0.2 correctness.
+
+### 12.9 SSE (add `'goal_guard'` to the `FORWARD` set in `api-v1.ts`, the union in `sse-bus.ts`, and `sse-worker.ts` `EVENT_TYPES`; global, like `goal`/`goal_node`)
+
+```ts
+export interface GoalGuardEvent {          // 'goal_guard'
+  type: 'goal_guard';
+  action: 'proposed' | 'set' | 'updated' | 'discarded' | 'health';  // 'health' = passing/failing/error change
+  goal_id: number;
+  guard: GoalGuardRow;                      // includes derived node_title/dashboard_url + current health
+}
+```
+A `goal` event is ALSO emitted after any guard write that changes `GoalCounts` (i.e. when `guards`/`guards_failing` move — §12.11), so the forest card stays live.
+
+### 12.10 `goal_events.kind` additions (closed list §1.3 gains):
+`guard_proposed` · `guard_set` · `guard_discarded` · `guard_updated` · `guard_failed` · `guard_recovered` · `guard_error`.
+Each guard write/health-change writes exactly one such event (actor: `jarvis` for propose/discard via tool, `kevin` for accept/HTTP edits, `system` for poller/webhook health flips).
+
+### 12.11 Focus injection (§6 additions) + counts (§3.0 additions)
+
+- **`GoalCounts` gains:** `guards: number` (count of `state='set'` guards in the goal) and `guards_failing: number` (`state='set'` AND `health IN ('failing','error')`). `need_you` is UNCHANGED (a failing guard cues the chat; it is not a fresh approval the way a ghost/plan is — the fix it prompts becomes a new ghost, which already counts).
+- **`<goal_tree …>` attribute:** add `guards_failing="N"` when > 0 (omit when 0).
+- **Node line suffix** in the §6 snapshot, for a node carrying a `set` guard: ` 🛡` (passing/unknown) or ` 🛡✗ "<last_summary>"` (failing/error). Placed after any existing markers, before the focus `▶`. Root guard: append ` 🛡✗ "<summary>"` to the `#` root line.
+- **Seed text (§8):** no change required; SKILL.md (docs node) teaches JARVIS the guard loop and when a done node is "guardable".
+
+### 12.12 Env contract (darwin-assistant `.env`; all optional — Guards degrade cleanly without them)
+
+| var | meaning | absent behavior |
+|---|---|---|
+| `OVERWATCH_API_URL` | e.g. `https://health.thedarwinhub.com` (the `src/goals-overwatch.ts` client prefixes `/api/v1/overwatch/rules`) | Guards UI shows "Overwatch not connected"; `accept` → `503 overwatch_not_connected` (proposal stays ghost); poller no-op |
+| `OVERWATCH_API_KEY` | bearer for the Overwatch rule API (recon §1) | same as above |
+| `GOALS_GUARD_WEBHOOK_SECRET` | shared secret for route 35 (OPTIONAL push) | route 35 → `503`; polling still covers health fully |
+
+Kevin supplies `OVERWATCH_API_URL` + `OVERWATCH_API_KEY` once (GUARDS.md "what Kevin has to supply"). Until then everything works except the actual write/read to Overwatch — proposals accumulate as ghosts and are written the moment the key lands. **No API key is ever used for a model call** (this is a monitoring API key, the allowed read/write-a-rule exception — it never authenticates a model).
+
+### 12.13 Acceptance (guards; sim node runs these against a scratch DB with a stubbed Overwatch client)
+
+1. `propose_guard` on a `done` node (query mode, sql+comparator+threshold) → `ghost`; on a `set` (unverified) node → `409 node_not_verifiable`; a second propose on a node that already has a guard → `409 guard_exists`.
+2. `accept` with Overwatch stub returning a key → `state='set'`, `overwatch_key` stored, `health='unknown'`, event `guard_set`. Accept with the stub unconfigured → `503 overwatch_not_connected`, guard stays ghost.
+3. Poller tick with stub `last_result.status='ok'` → `health='passing'` (event on the flip from unknown); flip stub to `'fail'` → `health='failing'`, `guard_failed` event + cue fired once; a second identical tick → NO event, NO cue. `'fail'→'ok'` → `guard_recovered`. `status='error'` → `guard_error`.
+4. `PATCH` a set guard's threshold → Overwatch stub `PATCH /rules/{key}` called; stub `422` → `422 overwatch_rejected`, local row unchanged.
+5. `discard` a set guard → Overwatch stub `DELETE /rules/{key}` called, `state='discarded'`; stub `404` tolerated.
+6. Route 35 webhook with a valid secret + known key → same `applyGuardHealth` path as the poller (health flips, cue fires once); wrong secret → `401`; unset secret → `503`; unknown key → `404 no_guard_for_key`.
+7. `GoalCounts.guards`/`guards_failing` reflect set/failing guards; `<goal_tree>` shows `guards_failing="N"` and the node ` 🛡✗ "…"` suffix; `need_you` unchanged by guard state.
+8. `goal_guard` SSE reaches an admin key; `tsc` clean.
+
+## 13. v0.2 — Kevin restructures the tree himself (add row / move / indent) → JARVIS weighs in on his next turn (added 2026-09-19, additive)
+
+**Why (Kevin, verbatim, 2026-09-19, thread cockpit:fff28b3e-…):** *"I just had Jarvis clear out the 5 items it wrote in response to my initial request and create a new layer of top levels (like MBI, BI, etc) so that way we can keep the todo items grouped together as we go forward. Technically, if I had a way to add a row and indent things into that row, I wouldn't need to say anything to jarvis and waste a turn. I could just move them around and then you would check me after i do it during one of your replies, letting me know if you agree or not, etc."*
+
+**THE PIN this builds (DESIGN.md):** Kevin's own nodes are born SET, but JARVIS gets to weigh in afterwards — *"maybe we both agree and it locks in."* v0.1 (§11) built that loop for **text edits to JARVIS ghosts**. This section builds it for **structure**: Kevin adds a row, edits a set row, or drags a row under a new parent — the tree changes **immediately** (no ghost, no turn), the node is flagged `awaiting_jarvis`, and ONE debounced cue lands in the goal chat so JARVIS reviews the whole burst on its next turn and either agrees (flag clears) or pushes back (flag becomes a conversation marker; the node is NEVER un-set).
+
+**Two rules this section adds:**
+1. **A Kevin structure change is real the moment he makes it.** Kevin-actor `POST /nodes` (route 9), `PATCH /nodes/:id` on a set node (route 16, text changed), and the new `move` route (31) write the tree directly AND mark the node `review_state='awaiting_jarvis'`, `last_edited_by='kevin'`. Pushing back on a set node never changes its state — `pushed_back` on a non-ghost is a flag for the conversation, nothing more.
+2. **JARVIS still proposes structure.** JARVIS may `move` only its own ghosts directly. Moving a set node goes through a pending move (`pending_parent_id`) that Kevin ✓s via route 19 — exactly the `propose_edit` shape.
+
+### 13.1 DDL (additive `ALTER TABLE goal_nodes ADD COLUMN …`, idempotent, guarded by PRAGMA table_info — same `ensureGoalNodeColumn` helper as §11.1)
+
+```
+kevin_moved_at     TEXT      -- ISO datetime of Kevin's most recent move of this node; NULL when the move round closed (accept) or never moved
+kevin_move_from    INTEGER   -- parent id the node was moved FROM in that move; -1 = it was root-level; NULL with kevin_moved_at
+pending_parent_id  INTEGER   -- JARVIS-proposed re-parent awaiting ✓/✕ (non-ghost nodes only); -1 = propose moving to root-level; NULL = no pending move
+```
+All three are returned on every `GoalNodeRow` read (add to §3.0 type). `kevin_edit_original` (§11.1) is REUSED for set nodes: on Kevin's first text edit of a **set** node in an open round it snapshots the pre-edit `{title, done_means, notes}` (so the cue can show was/now); it is cleared when the round closes (JARVIS `accept`). `GoalCounts.awaiting_jarvis` now counts **any** node with `review_state='awaiting_jarvis'` (ghost or not); `need_you` unchanged.
+
+`goal_events.kind` closed list gains: `node_moved` · `move_proposed` · `move_accepted` · `move_rejected` · `kevin_restructured` (the digest cue was posted; data = the burst).
+
+### 13.2 Route 31 — `POST /goals/:id/nodes/:nodeId/move`
+
+| Body | Response | Event |
+|---|---|---|
+| `{ parent_id: number \| null, sort_order?: number, actor? ('kevin' default) }` | `{ node: GoalNodeRow }` | `node_moved` (data `{old_parent_id, new_parent_id, old_sort_order, new_sort_order, actor}`; `null` = root) |
+
+Semantics (server-enforced in `goals.ts` `moveGoalNode`):
+- Re-parents **within the same goal**. `parent_id` must be a node of this goal (`400 parent_goal_mismatch`) with `state ∈ {set, planned, working, check}` (`409 parent_not_set`), or `null` for root-level (requires `goals.status='set'`, `409 goal_not_set` — same check as route 9).
+- The node must be non-terminal: `state ∉ {done, discarded}` (`409 invalid_transition`). A `working` leaf MAY move — its `tree_id`/plan ride along untouched. `ghost`/`parked`/`check`/`planned` may move.
+- **No cycles:** `parent_id` must not be the node itself or any descendant of it (`409 move_cycle`).
+- Moving a node with children moves the **whole subtree** (children keep `parent_id` → the node; only their derived `path`/`depth` change).
+- `sort_order`: must be a **finite** number (NaN/Infinity are ignored as if omitted — review fix node #483). When omitted and the parent changes → `max(sibling sort_order)+1` under the new parent; when omitted and the parent is unchanged → kept. A call that changes neither parent nor sort_order is a **no-op** (200, node returned, no event, no review flag).
+- **A same-parent REORDER is not a restructure (review fix, node #483).** When `parent_id` is unchanged and only `sort_order` moves (the cockpit's drag-before/after within one parent), the write happens and `node_moved` is logged, but **no review flag is set and no cue is scheduled** — §13.4 row 3 applies only when the parent actually changes. This matches §13.8, which deliberately routes `Alt+↑/↓` sibling reorders through route 16 as un-flagged. Ordering a list is not something JARVIS weighs in on; re-grouping it is.
+- New parent leaf reset: same as route 9 — moving anything under a parent with `leaf_kind != 'none'` resets that parent's `leaf_kind/plan_state/plan`. **`409 leaf_already_dispatched` if that parent is `planned/working/check/done` — and (review fix, node #483) this is a PRECONDITION checked inside `validateMoveTarget`, not an apply-time surprise**, so `propose_move` (route 32) refuses an impossible move up front and route 19's pre-validation catches it before any write. (Before the fix, ✓-ing a combined edit+move proposal onto a dispatched leaf wrote the text edit, cleared every `pending_*`, and *then* threw — the edit half-applied and the move silently lost.)
+- Old parent: after the move, §2.4(1) runs for the **old** parent (if its remaining non-parked children are all `done`, it flips `→ check`, event `node_check`). A parent left with zero children never vacuously completes. The NEW parent is never un-checked (consistent with route 9, which also allows a child under a `check` parent).
+- `actor='jarvis'` on a **non-ghost** node → `403 jarvis_must_propose` (use route 32). `actor='jarvis'` on its own ghost → direct move, no review flag.
+- **`actor='kevin'` (default) → the review flag** (§13.4): `review_state='awaiting_jarvis'`, `last_edited_by='kevin'`, `kevin_moved_at=now`, `kevin_move_from=<old parent id | -1>`, `review_note=NULL`; the digest cue is scheduled (§13.5). Any state — a ghost Kevin drags is also flagged (Kevin placing a JARVIS ghost is an implicit OK of its placement; JARVIS `accept` then sets it via the §11.2 `node_agreed` path).
+- SSE: `goal_node` `updated` for the node **and every descendant** (their derived `path`/`depth` changed — same treatment as promote), then `goal` (counts). If the focus points at the node or a descendant, a `goal_focus` event is emitted with the refreshed `path` — the focus row itself is untouched (no `focus_set` event).
+
+### 13.3 Route 32 — `POST /goals/:id/nodes/:nodeId/propose_move` (JARVIS → set node) + route 19 extension
+
+| Body | Response | Event |
+|---|---|---|
+| `{ parent_id: number \| null, actor:'jarvis' }` | `{ node }` with `pending_parent_id` set (`-1` when `parent_id` is null), `pending_by='jarvis'` | `move_proposed` (data `{parent_id}`) |
+
+- Only on `state ∈ {set, planned, check, parked}` (`409 invalid_transition`); never on `working` (`409 leaf_already_dispatched`). Preconditions of §13.2 (parent state, same goal, no cycle) are checked at proposal time AND again at resolve.
+- A pending move **coexists** with a pending text edit (both are diffs Kevin ✓s together); a pending **removal** supersedes both (`propose_removal` clears `pending_parent_id`; `propose_move`/`propose_edit` clear `pending_removal`). Proposing a move to the node's current parent is a `409 nothing_to_move`.
+- **Route 19 `resolve_pending`:** `hasPending` now also includes `pending_parent_id IS NOT NULL`. `accept:true` applies the text edit (if any) AND performs the move (same code path as route 31 with `actor='kevin'` but **without** the review flag — JARVIS proposed it, Kevin agreed, so the round is closed: the node's `review_state/review_note/last_edited_by/kevin_moved_at/kevin_move_from/kevin_edit_original` are cleared). Events: `edit_accepted` and/or `move_accepted` (+ `node_moved`, actor kevin). `accept:false` clears every pending_* incl. `pending_parent_id` (`edit_rejected`/`move_rejected`) and leaves review fields alone. Resolve re-validates the move; if it no longer applies (parent discarded, cycle) → `409` with the move's code and the pending fields are left for JARVIS to re-propose.
+
+### 13.4 The review flag on non-ghost nodes (extends §11.2)
+
+| Action | actor | Precondition | Effect | event kind |
+|---|---|---|---|---|
+| route 9 create (`authored_by='kevin'`, born set) | kevin | — | `review_state='awaiting_jarvis'`, `last_edited_by='kevin'`; digest scheduled (kind `added`) | `node_created` (unchanged) |
+| route 16 PATCH title/done_means/notes | kevin | `state='set'`, text actually changed (a bare re-save or a `sort_order`-only reorder is NOT an edit — §11.2 rule, unchanged) | `review_state='awaiting_jarvis'`, `last_edited_by='kevin'`, `review_note=NULL`; `kevin_edit_original` snapshots the pre-edit text if NULL; digest scheduled (kind `edited`) | `node_updated` (unchanged) |
+| route 31 move | kevin | §13.2 | as §13.2; digest scheduled (kind `moved`) | `node_moved` |
+| `accept` {node_id} (route 11 / tool op) | jarvis | `state != 'ghost'`, `review_state ∈ {awaiting_jarvis, pushed_back}` | **state unchanged**; `review_state='none'`, `review_note=NULL`, `last_edited_by=NULL`, `kevin_edit_original=NULL`, `kevin_moved_at=NULL`, `kevin_move_from=NULL` | `node_agreed` (text: "JARVIS agreed with Kevin's change: <title>") |
+| `accept` | jarvis | `state != 'ghost'`, `review_state='none'` | unchanged v0: `409 invalid_transition` (nothing to agree with) | — |
+| `accept` | kevin | `state != 'ghost'` | unchanged v0: `409 invalid_transition` (Kevin has no ✓ on a set row) | — |
+| `push_back` {note} | jarvis | `state != 'ghost'`, `review_state='awaiting_jarvis'` (or `'none'` with `last_edited_by='kevin'`) | `review_state='pushed_back'`, `review_note=note`. **The node stays set/planned/working/… — never un-set.** They talk it out; the round closes by JARVIS `accept`, by Kevin ✓-ing a JARVIS counter-proposal (route 19 accept), or by Kevin changing it again (a fresh edit/move re-opens `awaiting_jarvis`, note cleared) | `jarvis_pushed_back` |
+| node → `done` (route 25 passed) / `discarded` (route 14 / 19 removal) | — | — | review fields + `kevin_moved_at/kevin_move_from` cleared (terminal). A promoted subtree keeps its flags — they travel to the new goal, whose chat weighs in | (existing kinds) |
+
+Everything §11.2 says about **ghosts** is unchanged. Only ONE round is open per node at a time: a second Kevin change while `awaiting_jarvis` just refreshes the round (and the digest lists the node once, with its latest change).
+
+### 13.5 The structure digest cue (extends §11.3)
+
+Kevin drags several rows in a burst, so the cue is **debounced 20 s per goal** (env `GOALS_STRUCTURE_DEBOUNCE_MS`, default `20000`; the sim sets it low). Each Kevin structure change (§13.4 rows 1–3) adds `{node_id, kind: added|moved|edited, from, to}` to the goal's in-memory burst and (re)starts the timer. When it fires, the server re-reads every burst node, drops any that no longer awaits JARVIS (already agreed / discarded), writes ONE `kevin_restructured` event (data = the burst) and posts ONE cue through the §11.3 seam (`processMessage(text, 'cockpit:goal-<id>', 'goal-structure:<goalId>:<lastEventId>')`, `enqueueMessage` when busy). Text, exactly this shape:
+
+```
+[goal #7 — Kevin restructured the tree: moved "Docs" under "BI"; added "BI" under root; edited "MBI". Weigh in.]
+#12 moved: "Docs" — from: Goal › MBI → now: Goal › BI
+#15 added: "BI" under Goal (root) — done: "every BI module has a dashboard"
+#9 edited: "MBI" now: "MBI (media-buy intake)" — done: "…"
+    was: "MBI" — done: "…"
+For each node: acknowledge the change in a sentence, then either agree → `goals` op `accept` {node_id} (the flag clears; it stays set), or `push_back` {node_id, note} with your reason in one or two sentences and talk it out. Don't restate the rest of the tree.
+```
+- A node that was `pushed_back` and then changed again by Kevin is listed like any other change; the fresh change already cleared `review_note` (§13.4), so no "you pushed back with" line is added — JARVIS's earlier note is in the chat history.
+- The burst is process memory: if the service restarts inside the 20 s window no cue posts, but the nodes are still `awaiting_jarvis` and the §6 snapshot flags them (`↕K`/`✎K` + `AWAITING YOUR TAKE`), so JARVIS still weighs in on its next turn. Kevin-actor `move` of a ghost is included in the burst; JARVIS-actor changes never are. A goal with no conversation yet logs and skips (same as §11.3).
+
+### 13.6 Tool (§5 additions)
+
+| op | args | does | returns |
+|---|---|---|---|
+| `move` | `node_id`, `parent_id` (number \| null) | **ghost** node → route 31 with `actor='jarvis'` (direct, no flag). **Non-ghost** node → route 32 `propose_move` (a pending move Kevin ✓s; the tool never moves a set node directly) | `{ node, moved:true }` or `{ node, proposed:true }` |
+
+The op table's `accept` row now also closes a set-node round (§13.4). `push_back` works on non-ghost nodes (§13.4). `list` trims now include `kevin_moved_at`, `kevin_move_from`, `pending_parent_id`. Tool description gains one sentence: *"When Kevin restructures the tree himself (adds a row, edits a set row, drags a row under a new parent) the change is already real and flagged awaiting you: on your next turn `accept` {node_id} to agree or `push_back` {node_id, note} — never try to undo it; to move a set node yourself use `move` (it becomes a pending move he ✓s), your own ghosts move directly."*
+
+### 13.7 Focus injection (§6 additions)
+
+- Node marker gains ` ↕K` when `kevin_moved_at IS NOT NULL AND review_state='awaiting_jarvis'`, and ` ✎K` on a **non-ghost** node when `last_edited_by='kevin' AND review_state='awaiting_jarvis'` and it was not moved (added / text-edited). A pending JARVIS move renders `set ↕pending` (alongside `✎pending`/`✂pending`; `pending` attr on `<goal_focus>` gains the value `move`; when both an edit and a move are pending the label is `edit+move`).
+- Line suffix for `awaiting_jarvis`: ` — AWAITING YOUR TAKE (was: "<original title>")` when `kevin_edit_original` is present (unchanged), else ` — AWAITING YOUR TAKE (moved from: "<old parent title | root>")` when `kevin_moved_at` is set, else ` — AWAITING YOUR TAKE (Kevin added this)`.
+- `<goal_tree awaiting_you="N">` already counts these (shared `review_state`).
+
+### 13.8 Cockpit (§9 additions — what the UI lane builds against)
+
+- **Add row:** a `+` affordance on the root and on every set-ish row (`set/planned/working/check`) opens an inline row (title + done_means) → route 9 with `authored_by='kevin'` (born set, flagged). Enter saves, Esc cancels.
+- **Indent / outdent:** `Tab` = move under the previous sibling; `Shift+Tab` = move under the grandparent, after the current parent. Both = route 31 with the computed `parent_id` (+ `sort_order`). `Alt+↑/↓` = reorder among siblings (route 16 `sort_order` only — not flagged).
+- **Drag re-parent:** drag a row onto another row (drop = child, appended) or between rows (drop = sibling at that position) → route 31. Disallowed targets (ghost/done/discarded/parked parents, own subtree) render no drop zone. The subtree moves with the row.
+- **Chips:** the existing amber `JARVIS weighing in…` chip renders on set rows too (`review_state='awaiting_jarvis'`), with `↕` when `kevin_moved_at` is set; `JARVIS pushed back` (destructive tint) on set rows shows the note in the expanded block. A JARVIS pending move renders the row with a dashed `→ under "<parent title>"` diff line + the same ✓/✕ as a pending edit (route 19).
+- **SSE:** on `goal_node` for a moved node, patch it AND its descendants from the events (the server emits every one); re-sort children by `(sort_order, id)`.
+
+### 13.9 Acceptance (sim checks `V02-1…`, run by `npm run goals:sim`)
+
+1. Kevin move re-parents a set node under another set node → 200, `parent_id` updated, `node_moved` event, `review_state='awaiting_jarvis'`, `last_edited_by='kevin'`, `kevin_moved_at` set, `kevin_move_from` = old parent (`-1` for root).
+2. Moving a subtree carries the children (their `path` / `depth` change; `goal_node` SSE emitted for the node and each descendant).
+3. Cycle (`parent_id` = own descendant) → `409 move_cycle`; done/discarded node → `409 invalid_transition`; ghost parent → `409 parent_not_set`; other goal's node → `400 parent_goal_mismatch`.
+4. Debounced digest: three Kevin changes (move + add + set-node edit) inside the window → exactly ONE cue, correlation `goal-structure:<goalId>:<eventId>`, listing all three; a change JARVIS already agreed to before the timer fires is not listed.
+5. JARVIS `accept` on a set node awaiting → state still `set`, review fields + `kevin_moved_*` cleared, `node_agreed`; JARVIS `push_back` on a set node → `review_state='pushed_back'`, still `set`.
+6. JARVIS `move` on a set node (tool / route 31 actor jarvis) → `403 jarvis_must_propose`; route 32 sets `pending_parent_id`; route 19 accept performs the move (node ends under the proposed parent, no review flag, `move_accepted` + `node_moved`); route 19 reject clears `pending_parent_id`.
+7. Sort-order-only PATCH on a set node and a no-op move → no review flag, no cue.
+8. Old parent left with only `done` children after a move → `check` (§2.4(1)); old parent left empty → unchanged.
+9. All 80 v0/v0.1 checks still pass.
+10. (review fix) A same-parent reorder writes `sort_order` + logs `node_moved`, but leaves `review_state='none'` / `kevin_moved_at=NULL` and fires no cue; a genuine re-parent of the same node still does both.
+11. (review fix) `propose_move` onto a `planned`/`working` leaf → `409 leaf_already_dispatched` at proposal time; a pending text edit on that node is untouched and still resolves cleanly on its own.
+12. (review fix) A non-finite `sort_order` is ignored rather than clobbering the row to 0.
+
+---
+
+## 14. v0.3 — Node chats: a linked, pinned-focus chat for ONE node, on Kevin's say-so (added 2026-09-20, additive)
+
+**Why (Kevin, verbatim, 2026-09-20, thread cockpit:fff28b3e-…):** *"if we have one chat going for this goal, which is what I wanted to begin with, but I wanted to talk directly about #7 there, which could end up being one heck of a long chat, I'm thinking it would make sense to spawn another chat, 'link' them together, and allow me to talk to it to straighten some of the things out that need to be straightened out. I would want that to be my decision, I don't wanna spawn a chat for everything when I click on it. But I want to be able to click on something and be like 'this deserves a new chat' and make it easy to 'switch' to that chat when I want to keep working on it. Or even open that extra chat in a new window and work on it at the same time."*
+
+**What a node chat IS:** the same goal machinery with the FOCUS PINNED to one node. It is **NOT a promotion** (§3.6 re-roots a subtree into a new goal; a node chat stays inside the same goal and the same server-owned tree, so nothing can diverge). Both chats read the same `goal_nodes` rows; the node chat just cannot see or touch anything above its node.
+
+**Four rules this section adds:**
+1. **Explicit Kevin action only.** A node chat exists only after Kevin opened it (a row/drawer action, the `⧉`/💬 affordance, or telling JARVIS in words). Clicking a row still only sets focus (§3.5 — zero model calls, zero thread creation). One chat per node, find-or-create, forever.
+2. **Pinned scope.** Inside `cockpit:goal-<g>-node-<n>` the `goals` tool's implicit goal is `g`, its implicit parent is `n`, and every op that names a node/parent/batch/guard outside `n`'s subtree is refused with `outside_pinned_scope` — a plain message telling JARVIS to say so, because it happens in the goal chat. `focus` is clamped to the subtree.
+3. **One snapshot, two windows.** Both chats are injected from the same DB every turn (§6). The goal chat marks a node with 💬 when it has a chat and carries one line per node chat ("#7 chat, last: …"); the node chat carries the goal root + the path above the node + the node's own subtree only.
+4. **Cues route to the nearest chat.** Weigh-in (§11.3), structure (§13.5), guard (§12.6) and tree-done/blocked cues for a node — or anything in its subtree — go to the node's chat if it exists, else to the goal chat. **Never both.** `cueTargetForNode` is the single resolver.
+
+### 14.1 DDL (additive `ALTER TABLE goal_nodes ADD COLUMN …`, idempotent, guarded by PRAGMA table_info — same `ensureGoalNodeColumn` helper as §11.1)
+
+```
+thread_ext   TEXT   -- the node's own conversation external_id, `cockpit:goal-<g>-node-<n>`; NULL until Kevin opens one; never cleared (the thread is a record)
+```
+plus `CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_nodes_thread_ext ON goal_nodes(thread_ext) WHERE thread_ext IS NOT NULL`.
+
+`GoalNodeRow` (§3.0) gains `thread_ext: string | null`. `GoalCounts` gains `node_chats: number` (non-discarded nodes with a non-null `thread_ext`). `need_you` is unchanged. `goal_events.kind` closed list gains `node_thread_opened` (first open only; data `{ external_id }`).
+
+**Thread naming:** `cockpit:goal-<goal.id>-node-<node.id>` (numeric ids, never titles). Conversation label: `💬 #<n> <node title> · 🎯 <goal title>` (≤120 chars), re-applied when the node's title changes (route 16) and when the goal is renamed (route 4). **The node id is authoritative for scope; `<g>` is a hint** — if the node was later promoted into another goal (§3.6) the thread follows the node (`goal_id` is read off the row), and a node chat whose pinned node has itself become a promoted stub renders a one-line snapshot pointing at the new goal's chat instead of a tree.
+
+### 14.2 Route 36 — `GET|POST /goals/:id/nodes/:nodeId/thread` (find-or-create, same 2-step shape as route 8)
+
+| Body | Response | Event |
+|---|---|---|
+| `{ actor? ('kevin' default) }` (GET: none) | `200 { external_id: 'cockpit:goal-<g>-node-<n>', created: boolean, seed_text: string \| null, node: GoalNodeRow }` — **the caller posts `seed_text` to `POST /threads/:ext/messages` when `created=true`** (§8 2-step; `seed_text` is `null` when `created=false` and nothing is posted). Sets `goal_nodes.thread_ext`, renames the conversation, emits `goal_node` `updated` + `goal` (counts). Preconditions: node in goal (`404 node_not_found`), `state != 'discarded'` (`409 node_discarded`), not a promoted stub (`409 already_promoted` — "talk to goal #<new> instead"). GET and POST behave identically. | `node_thread_opened` (first time only) + `thread_opened`-style `goal_node` SSE |
+
+**Seed text (`composeNodeChatSeed(goal, node)`), exactly this shape** (the `Rules` block mirrors §8 so SKILL.md has one numbered list to teach; rules 1 and 7 are the node-chat-specific ones):
+
+```
+💬 NODE CHAT — this thread belongs to node #<n> "<node title>" of goal #<g> "<goal title>" and nothing else. Read skills/goals/SKILL.md before your first reply (it is the operating contract for goal chats; the "Node chats" section applies here); the `goals` tool is how you touch the tree. Every turn of this thread is prefixed with a <goal_focus pinned="<n>"/> line + a <goal_tree> snapshot of THIS BRANCH ONLY — that snapshot is your memory of it; never ask Kevin to restate it.
+
+Goal: <goal title> — done means: <goal done_means | "(not set yet)">
+Path: <Goal title › … › parent title | "(root-level node)">
+Node: #<n> <node title>
+Done means: <node done_means | "(not set yet)">
+Notes: <notes | "(none)">
+State: <state> · leaf: <leaf_kind> · subtree: <N> node(s) (<done> done · <working> working · <ghosts> ghost)
+
+Rules for this chat (short form; SKILL.md has the long form):
+1. You can only shape INSIDE this branch: propose / propose_edit / propose_remove / move / plans / verify on #<n> and its descendants. Anything above it — or a sibling of it — is out of scope: say so in one line and it happens in the goal chat (the ↑ back to goal chat link in the header).
+2. Everything you add/reword/remove is a ghost until Kevin ✓s: use `propose` / `propose_edit` / `propose_remove`. `set_from_kevin` only for nodes he dictated verbatim.
+3. One layer ahead, never two: propose children only under the focused node (default: #<n> itself).
+4. A node that can't split is a leaf: `set_leaf_kind` machine (you can spec it) or human (only Kevin can do it). Machine leaves get a `propose_plan`; Kevin approves on the card (or says go → `dispatch`).
+5. Push back when a branch doesn't serve #<n>'s done_means. Verify against done_means before anything becomes done (`verify`).
+6. Kevin never has to say which node he means — the focus line tells you. If he clearly means a different node, say which one you're taking it as.
+7. Cues for this branch (Kevin's edits + restructures, guard failures, finished trees) land HERE, not in the goal chat. A `[goal #<g> — …]` message is one of those; handle it the same way SKILL.md says.
+
+Open with: a two-line read of where #<n> stands against its done_means and what you'd propose next under it.
+```
+
+### 14.3 Pinned scope (server-side in `src/goals.ts` `resolveGoalScope`, enforced by `src/tools/goals-tool.ts`)
+
+`resolveGoalScope(externalId)` → `{ goal_id, pinned_node_id: number | null } | null`:
+- `^cockpit:goal-(\d+)$` → `{ goal_id: g, pinned_node_id: null }` (unchanged §5 behaviour).
+- `^cockpit:goal-(\d+)-node-(\d+)$` → node `n` is loaded; `{ goal_id: node.goal_id, pinned_node_id: n }`. A missing/discarded node → `null` (the tool answers `pinned_node_gone`; the injection is `''`).
+
+Inside a node chat the tool applies, before any route:
+- **Implicit parent** (`propose`, `set_from_kevin`, `propose_guard` when omitted): the goal focus **if it is inside the subtree** (walked up to the nearest set-ish ancestor, never above `n`), else `n` itself. `parent_id: null` (root-level) → `outside_pinned_scope`.
+- **Named ids:** `node_id` / `parent_id` / the ids behind `batch_id` / a guard's `node_id` must be `n` or a descendant of `n` → otherwise `403 outside_pinned_scope` with message *"#<x> '<title>' is outside this chat's branch (#<n> '<title>'). Say so in one line — that change happens in the goal chat."* A `batch_id` is in scope only if **every** ghost in the batch is (a batch never spans a pinned boundary in practice; if it does, name the nodes).
+- **`accept all:true`** → every ghost in the subtree (`parent_id` optional, must be in scope). One review cue for the whole request (§11.2), routed per §14.6.
+- **Goal-level ops** — `set_goal_done_means`, `verify {goal:true}`, `park`/`unpark` with no `node_id`, `promote` of `n` itself, `move` of `n` itself (its parent is above the boundary) → `outside_pinned_scope`. `promote`/`move` of a **descendant** are allowed (a promoted descendant leaves the subtree; its own chat, if any, follows it — §14.1).
+- **`focus`** → `node_id` must be in scope; `null` is clamped to `n` (the node chat's "nothing focused" IS the pinned node). Set with `set_by='jarvis'` on the goal's single focus row — **there is only one focus pointer per goal**; the tree pane (either window) shows it.
+- **`log`** without `node_id` logs on `n`; with one, in scope only.
+- **`list`**, **`list_guards`** are read-only and unrestricted (the whole goal, so JARVIS can explain what is above it).
+- **`open_node_chat`** (§14.7) inside a node chat → `outside_pinned_scope` unless the target is a descendant (opening a chat for a grandchild from a node chat is allowed; it nests).
+
+HTTP routes are **not** scoped — the cockpit is Kevin's hand and a node-chat window's tree pane still shows the whole goal. Scope is a JARVIS discipline, enforced in the tool layer where JARVIS lives.
+
+### 14.4 Focus injection (§6 additions) — two shapes
+
+**Goal chat (`cockpit:goal-<g>`):**
+- Node line suffix ` 💬` for a node with `thread_ext` (after the guard suffix, before `(+N)`/the review suffix).
+- After `</goal_tree>`, when the goal has ≥1 node chat, ONE block:
+```
+<node_chats goal_id="12" count="2">
+#7 chat, last: "Proposed 3 children under #7; waiting on Kevin's ✓" (14m ago)
+#41 chat, last: (no replies yet)
+</node_chats>
+```
+`last` = the first non-empty line of that thread's latest assistant turn (`turns.role='assistant'`, `tool_name IS NULL`, non-empty `content`), ≤160 chars with `…`; age from `created_at` (`<1m` / `Nm` / `Nh` / `Nd` ago). Discarded nodes never appear.
+
+**Node chat (`cockpit:goal-<g>-node-<n>`):**
+```
+<goal_focus goal_id="12" node_id="102" pinned="87" path="Media-buy stats › Create monitoring › Register the rule" state="ghost" leaf_kind="none" pending="none"/>
+<goal_tree goal_id="12" pinned="87" status="set" progress="38" working="1" need_you="3" awaiting_you="0">
+# Ship Perclickity v2 — done: Kevin can see media-buy revenue per link in the dashboard, reconciled to QB
+↑ Media-buy stats   (above this chat — changes there happen in the goal chat)
+- [set ▶] #87 Create monitoring — done: an Overwatch query rule fails when daily revenue < 7-day avg -5%
+  - [ghost b:3f9c] #101 Capture the SQL from smarty-pants — done: rule body = the proven query
+  - [ghost b:3f9c ▶] #102 Register the rule via lanes-tool — done: rule id returned, status query
+</goal_tree>
+```
+- `node_id` on `<goal_focus>` = the **effective** focus: the goal's focus row when it points inside the subtree, else `n`. `pinned="n"` is always present. `path` is the full path (goal title omitted, as today).
+- Root line as today; then ONE `↑ <ancestor titles joined by " › ">   (above this chat — changes there happen in the goal chat)` line when the node is not root-level; then the pinned node at depth 0 and its subtree beneath. Collapse rule (§6) applies relative to the effective focus **with the pinned node always expanded one layer**. Same 60-line cap. Counts on `<goal_tree>` are the whole goal's (so JARVIS knows the goal's temperature), `guards_failing` as §12.11.
+- A pinned node that is a promoted stub renders only: `# <goal> — …` + `- [<marker>] #n <title> → goal #<new> — this branch now lives in cockpit:goal-<new>; talk there.`
+
+### 14.5 Route 36's SSE + counts
+
+`goal_node` `updated` for the node (its `thread_ext` is now set) then `goal` (counts.`node_chats`). The goal card shows `💬 N` when `node_chats > 0` (§14.8).
+
+### 14.6 Cue routing — `cueTargetForNode(goalId, nodeId | null)` (exported from `src/goals.ts`)
+
+Walks `nodeId` → parent → … and returns the first `thread_ext` whose conversation exists; `null` node (goal-level) or no hit → `cockpit:goal-<g>`. Every cue firer uses it:
+- §11.3 `fireGoalReviewCue` and §13.5 `fireGoalStructureCue`: nodes in one request/burst are **grouped by target** and ONE cue per target is posted (text + correlation key unchanged, `externalId` = the target; the header still says `[goal #g — …]`). A node chat receives only its own branch's lines.
+- §12.6 `fireGuardCue`: target = `cueTargetForNode(goal_id, guard.node_id)` (root guards → goal chat).
+- Tree done/blocked (`src/tree-cue.ts`): when a goal node references the finished tree (`goal_nodes.tree_id`), the cue posts to `cueTargetForNode(goal_id, node_id)` instead of `hopper_trees.origin_thread_ext` (exported helper `cueTargetForTree(treeId)` → ext or `null` when no goal node owns the tree; dedupe/kill-switch/foundry rules unchanged). `goalsOnTreeStatus` (the state flip) is untouched.
+- Never both: a node chat existing means the goal chat does **not** get that node's cue. The goal chat's `<node_chats>` block is how the goal chat stays aware.
+
+### 14.7 Tool (§5 additions)
+
+| op | args | does | returns |
+|---|---|---|---|
+| `open_node_chat` | `node_id` | route 36 with `actor='jarvis'`, then the tool posts `seed_text` itself via the internal ingest when `created=true` (same tool-side exception as `promote`). **Only when Kevin asked for it in words** ("give #7 its own chat", "open a chat for this") — never on your own initiative. | `{ external_id, created, node }` |
+
+`list` trims gain `thread_ext`. Tool description gains: *"Kevin can give one node its own chat (💬, `cockpit:goal-<g>-node-<n>`): inside it you are PINNED to that node — shape only inside its branch; anything above it → say so, it happens in the goal chat. Call `open_node_chat` {node_id} only when Kevin asked for it in words."* Every scope refusal returns `{ error, code:'outside_pinned_scope' }` (not a throw), like every other precondition failure.
+
+### 14.8 Cockpit (§9 additions — what the UI lane builds against)
+
+- **Row action** `💬 Open a chat for this` in the `⋯` menu / expanded block on `ghost`, `set`, `planned`, `working` (and `check`) rows → route 36 (`POST`), then `sendThreadMessage(seed_text)` when `created=true`, then switch the LEFT pane to that thread (the tree stays).
+- **Chip** `💬` on any row with `thread_ext`: click = switch the left pane to that thread; `⧉` beside it = `window.open('/thread/<ext>')`. The left pane header in a node chat shows `↑ back to goal chat` (switches back to `cockpit:goal-<g>`), and the composer's focus chip reads `Pinned: #<n> <title>` plus the normal `Talking about:` chip when the goal focus is inside the branch.
+- **Goal card** (forest) shows `💬 N` from `counts.node_chats`.
+- Client fns (additive): `openGoalNodeThread(goalId, nodeId)`. SSE: `goal_node` `updated` carries `thread_ext`; patch in place. `GoalNodeRow.thread_ext` + `GoalCounts.node_chats` copied from §14.1.
+- Focus stays ONE pointer per goal (§3.5): clicking a row in either window sets the same focus; the node chat's injection clamps it (§14.4).
+
+### 14.9 Acceptance (sim checks `V03-1…`, run by `npm run goals:sim`)
+
+1. Route 36 on a set node → `200 created:true`, `external_id = cockpit:goal-<g>-node-<n>`, non-null `seed_text` in the §14.2 shape, `node.thread_ext` set, `node_thread_opened` event, conversation exists + labelled; the second call (GET or POST) → `created:false`, `seed_text:null`, same `external_id`; `counts.node_chats` = 1.
+2. Route 36 preconditions: discarded → `409 node_discarded`; promoted stub → `409 already_promoted`; other goal → `404 node_not_found`.
+3. Tool scope inside the node chat: `propose` with no `parent_id` lands under `n`; `propose`/`accept`/`propose_edit`/`move`/`focus`/`propose_guard` naming a node outside the subtree → `code:'outside_pinned_scope'`; `parent_id:null` → the same; `set_goal_done_means` / `verify {goal:true}` / `promote` of `n` → the same; a descendant is allowed.
+4. `focus {node_id:null}` inside the node chat → the goal focus row = `n` (`set_by='jarvis'`); `focus` on a descendant works; the goal chat's `list` shows the same focus (one pointer).
+5. Injection, node chat: `<goal_focus pinned="n">`, the `↑` line, the pinned node at depth 0, descendants beneath, NO sibling/ancestor node lines; injection, goal chat: ` 💬` on the node line + a `<node_chats count="…">` block with one line per node chat (`(no replies yet)` before any assistant turn; the latest assistant line ≤160 chars once one exists).
+6. Cue routing: Kevin edits + ✓s a ghost under `n` → the review cue's `externalId` = the node chat; the same on a node OUTSIDE the subtree → the goal chat; a structure burst spanning both → two cues, one per target, each listing only its own nodes; a guard health flip on a node under `n` → node chat; a root guard → goal chat; a finished hopper tree planted from a node under `n` → tree cue posts to the node chat, not `origin_thread_ext`.
+7. A goal with node chats on two different nodes → `counts.node_chats = 2`; discarding a node with a chat does not count it.
+8. All 121 v0/v0.1/v0.2/guards checks still pass.
+9. (review, node #491) `V03-9`: a `discard`/`accept {batch_id}` whose batch lives outside the branch → `outside_pinned_scope` (the outside ghosts are untouched); an in-branch batch discards; `log` with no `node_id` lands on the pinned node; `open_node_chat` on the pin itself → refused; every remaining write op (`push_back`, `edit_ghost`, `propose_remove`, `set_leaf_kind`, `dispatch`, `verify`, `human_done`, `park`/`unpark` with or without a node, `set_from_kevin` with an outside/null parent, `accept all` with an outside/null parent) → `outside_pinned_scope`.
+
+### 14.10 Review fixes (node #491, 2026-09-20) — cockpit only; backend passed as built
+
+1. `writeChatParam` preserved the router's `history.state` (it was `replaceState(null, …)`, which wiped TanStack's `__TSR_index` and could break back/forward after a chat switch).
+2. The composer chip's relative path under the pin is sliced by position (`path.slice(depth + 2)`), not by `indexOf(title)` — two nodes may share a title.
+3. If the pinned node is discarded/deleted from the other window (its `goal_node` SSE drops it from the page's node list), the left pane bounces back to the goal chat with a toast instead of sitting on a dead thread (the tool would only answer `pinned_node_gone`).

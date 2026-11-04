@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""steer-hook — PostToolUse hook that hands a running chat new information.
+
+Installed per spawn by agent.ts via `claude --settings <tmp.json>` (never in a
+live CLAUDE_CONFIG_DIR). argv[1] = this conversation's steer spool dir.
+
+Claims every `<id>.pending.json` by atomic rename (-> `.claimed.json`; if the
+rename fails another hook already took it) and prints one `additionalContext`
+block so the model sees it before its next step.
+
+FAILS OPEN: any problem prints nothing and exits 0, leaving the item pending —
+the server hands it back to the queue at turn end, so nothing is ever lost.
+Sub-agent hook calls are skipped so a steer lands in the MAIN turn's context.
+"""
+import json, os, sys, glob
+
+try:
+    spool = sys.argv[1]
+    try:
+        ev = json.load(sys.stdin)
+    except Exception:
+        ev = {}
+    if not isinstance(ev, dict):
+        ev = {}
+    if ev.get("agent_id") or ev.get("subagent_id") or ev.get("parent_tool_use_id"):
+        sys.exit(0)
+    items = []
+    for p in sorted(glob.glob(os.path.join(spool, "*.pending.json"))):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                item = json.load(f)
+            claimed = p[: -len(".pending.json")] + ".claimed.json"
+            os.rename(p, claimed)  # atomic claim; ENOENT = someone else won
+        except Exception:
+            continue
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            items.append(item)
+    if not items:
+        sys.exit(0)
+    blocks = []
+    for it in items:
+        when = str(it.get("sent_at", ""))[11:19]
+        blocks.append("[New message from %s, sent %sZ, while you were working]\n%s"
+                      % (it.get("from", "Kevin"), when, it["text"]))
+    text = ("\n\n".join(blocks) +
+            "\n\nFinish the step you are on, then adapt. Treat this as if it had been typed into the "
+            "chat just now; where it conflicts with earlier instructions it is newer.")
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": ev.get("hook_event_name", "PostToolUse"),
+        "additionalContext": text}}))
+except SystemExit:
+    raise
+except Exception:
+    sys.exit(0)

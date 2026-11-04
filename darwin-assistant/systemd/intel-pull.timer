@@ -1,0 +1,13 @@
+# INTEL DESK — fires intel-pull.service every morning. Committed here for
+# JARVIS to install at deploy time. Not installed by this build.
+
+[Unit]
+Description=Run JARVIS Intel Desk every morning
+
+[Timer]
+OnCalendar=*-*-* 06:30:00
+Persistent=true
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target

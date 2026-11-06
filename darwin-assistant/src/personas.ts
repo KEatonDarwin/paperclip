@@ -11,7 +11,7 @@
 // before this file existed. A missing/corrupt registry = no personas (fail to the old path).
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 
 export interface PersonaDef {
   key: string;
@@ -114,17 +114,27 @@ export function renderPlaybook(p: PersonaDef): string {
 }
 
 /**
- * The memory block for a persona seat. Replaces (worker) or wraps (inherit) the shared
- * block. `sharedBlock` is what loadMemoryBlock(maxChars,'full') returned, passed in so this
- * module never imports prompt.ts (prompt.ts imports us).
+ * The separately-injected pieces of a seat's memory block, exactly as rendered into it
+ * (questions already tail-trimmed). Used by buildPersonaMemoryBlock and by the baggage
+ * meter (src/baggage-meter.ts) so both always measure the same text.
  */
-export function buildPersonaMemoryBlock(p: PersonaDef, sharedBlock: () => string): string {
+export function personaMemoryParts(p: PersonaDef): { identityPath: string; memoryPath: string; identity: string; memory: string; playbook: string; questions: string } {
   const identityPath = join(p.dir, p.identity || 'identity.md');
   const memoryPath = join(p.dir, p.memory || 'memory.md');
   const identity = readOr(identityPath, `_(identity file missing: ${identityPath})_`);
   const memory = readOr(memoryPath, '_(no own memory yet)_');
   const playbook = renderPlaybook(p);
-  const questions = readOr(join(p.dir, 'questions.md'), '');
+  const questionsRaw = readOr(join(p.dir, 'questions.md'), '');
+  return { identityPath, memoryPath, identity, memory, playbook, questions: questionsRaw ? tail(questionsRaw, 60) : '' };
+}
+
+/**
+ * The memory block for a persona seat. Replaces (worker) or wraps (inherit) the shared
+ * block. `sharedBlock` is what loadMemoryBlock(maxChars,'full') returned, passed in so this
+ * module never imports prompt.ts (prompt.ts imports us).
+ */
+export function buildPersonaMemoryBlock(p: PersonaDef, sharedBlock: () => string): string {
+  const { identityPath, memoryPath, identity, memory, playbook, questions } = personaMemoryParts(p);
   const parts: string[] = [
     `## Who you are in this seat — ${p.label || p.key} (persona level "${p.key}")`,
     `_Source: ${identityPath}. Injected fresh every turn. This seat has its OWN memory file (${memoryPath}); \`read_memory\`/\`write_memory\` here read and write THAT file, not the shared JARVIS memory. Same diet rules: supersede in place, keep it lean._`,
@@ -140,7 +150,7 @@ export function buildPersonaMemoryBlock(p: PersonaDef, sharedBlock: () => string
     '---',
   ];
   if (playbook) parts.push('', `## Your playbook (${join(p.dir, p.playbook || 'playbook')})`, '', playbook, '', '---');
-  if (questions) parts.push('', '## Your questions log (questions.md, newest tail)', '', tail(questions, 60), '', '---');
+  if (questions) parts.push('', '## Your questions log (questions.md, newest tail)', '', questions, '', '---');
   if (p.inherit_shared_memory !== false) {
     parts.push('', '## The shared JARVIS memory (inherited — everything JARVIS knows; your own memory above wins on how YOU work, the non-negotiables win over both)', '', sharedBlock());
   }
@@ -167,6 +177,34 @@ export function buildPersonaDigestBlock(externalId: string | null | undefined): 
     } catch (err) {
       text = `_(digest unavailable: ${err instanceof Error ? err.message.split('\n')[0] : String(err)})_`;
     }
+    if (text.length > max) text = `${text.slice(0, max)}\n_(digest truncated to ${max} chars)_`;
+    digestCache.set(p.key, { at: now, text });
+  }
+  return `<persona_digest persona="${p.key}" generated="${new Date().toISOString()}">\n${text}\n</persona_digest>\n\n`;
+}
+
+/**
+ * Same block as buildPersonaDigestBlock, but the digest command runs OFF the event loop
+ * (execFile, not execFileSync) and shares the same cache. For the baggage meter's daily
+ * snapshot, which must never stall the server the way a cold sync digest could (<=20s).
+ */
+export async function buildPersonaDigestBlockAsync(externalId: string | null | undefined): Promise<string> {
+  const p = resolvePersonaForThread(externalId);
+  if (!p || !p.live_digest_cmd || !p.live_digest_cmd.length) return '';
+  const ttl = Math.max(5, p.live_digest_ttl_seconds ?? 90) * 1000;
+  const max = Math.max(1000, p.live_digest_max_chars ?? 30000);
+  const hit = digestCache.get(p.key);
+  const now = Date.now();
+  let text: string;
+  if (hit && now - hit.at < ttl) {
+    text = hit.text;
+  } else {
+    const [cmd, ...args] = p.live_digest_cmd;
+    text = await new Promise<string>((resolve) => {
+      execFile(cmd, args, { encoding: 'utf-8', timeout: 20_000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+        resolve(err ? `_(digest unavailable: ${err.message.split('\n')[0]})_` : String(stdout).trim());
+      });
+    });
     if (text.length > max) text = `${text.slice(0, max)}\n_(digest truncated to ${max} chars)_`;
     digestCache.set(p.key, { at: now, text });
   }

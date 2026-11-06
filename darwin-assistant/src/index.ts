@@ -21,6 +21,7 @@ import { startFoundry } from './foundry.js';
 import { startNotepadDriver } from './notepad-driver.js';
 import { startMonitorScheduler } from './monitors.js';
 import { startHealthMonitor } from './health-monitor.js';
+import { startBaggageMeter } from './baggage-meter.js';
 import { startMikeRadarDriver } from './mike-radar-driver.js';
 import { seedPageRegistry } from './page-companion.js';
 import { ALL_TOOLS } from './tools/index.js';
@@ -173,6 +174,7 @@ async function main() {
   // plus the spike → suggestion loop. Plain code, zero model calls except one
   // rate-limited cue per spike. HEALTH_MONITOR=0 disables.
   if (process.env.HEALTH_MONITOR !== '0') startHealthMonitor();
+  startBaggageMeter();
 
   // Cockpit Monitors — cheap scheduled prompt-check agents. Runs through the
   // same processMessage/local-CLI adapter seam as normal cockpit threads.

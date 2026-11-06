@@ -587,6 +587,7 @@ import {
 } from '../conversation-db.js';
 import { query } from '../db.js';
 import { memoryMeter } from '../memory-meter.js';
+import { baggageReport } from '../baggage-meter.js';
 import { listVaultTree, readVaultFile, searchVault, resolveVaultRawFile } from '../vault-page.js';
 import { normalizeLinkTarget, resolveVaultPath, resolveVaultPaths } from '../vault-resolve.js';
 import {
@@ -5110,6 +5111,15 @@ export function createApiV1Router(): Router {
       res.json({ ok: true, ...memoryMeter() });
     } catch (err) {
       sendError(res, 500, 'memory_meter_failed', (err as Error).message);
+    }
+  });
+
+  // Baggage meter (diet/baggage-meter): per-seat fixed injection by block + 7-day trend. Read-only.
+  router.get('/baggage-meter', async (_req: AuthedRequest, res) => {
+    try {
+      res.json(await baggageReport());
+    } catch (err) {
+      sendError(res, 500, 'baggage_meter_failed', (err as Error).message);
     }
   });
 

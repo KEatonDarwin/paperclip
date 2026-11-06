@@ -4,7 +4,6 @@ import { createSlackApp, sendDailyBriefing } from './handlers/slack.js';
 import { createWebhookRouter } from './handlers/webhook.js';
 import { startCheckinWorker } from './checkin-worker.js';
 import { startThreadReminderWorker } from './thread-reminders.js';
-import { startTalkRolloverWorker } from './talk-rollover.js';
 import { enqueueCalendarCheckins } from './briefing.js';
 import { startUiServer } from './ui-server.js';
 import { catchUp as ftsCatchUp } from './thread-fts.js';
@@ -22,7 +21,9 @@ import { startFoundry } from './foundry.js';
 import { startNotepadDriver } from './notepad-driver.js';
 import { startMonitorScheduler } from './monitors.js';
 import { startHealthMonitor } from './health-monitor.js';
+import { startBaggageMeter } from './baggage-meter.js';
 import { startMikeRadarDriver } from './mike-radar-driver.js';
+import { startTalkRolloverWorker } from './talk-rollover.js';
 import { seedPageRegistry } from './page-companion.js';
 import { ALL_TOOLS } from './tools/index.js';
 import { writeToolManifest } from './mcp/tool-manifest.js';
@@ -160,12 +161,6 @@ async function main() {
   // Slack creds the way the Postgres-backed check-in worker does.
   startThreadReminderWorker();
 
-  // Talk-seat daily rollover (goal #19). Gives the front-seat chat a fresh head
-  // each morning (04:00 CT) + a ~400k mid-day safety net, so it stops replaying
-  // a million+ cached tokens per step. Entirely gated by settings-KV
-  // `talk_daily_rollover` (default OFF) — holds timers, does no work, until flipped.
-  startTalkRolloverWorker();
-
   // Hopper Engine — the autonomous work-tree dispatcher. Event-driven (ticks
   // fire on node state writes); the 60s interval inside is only the safety net.
   startHopperEngine(processMessage);
@@ -180,6 +175,7 @@ async function main() {
   // plus the spike → suggestion loop. Plain code, zero model calls except one
   // rate-limited cue per spike. HEALTH_MONITOR=0 disables.
   if (process.env.HEALTH_MONITOR !== '0') startHealthMonitor();
+  startBaggageMeter();
 
   // Cockpit Monitors — cheap scheduled prompt-check agents. Runs through the
   // same processMessage/local-CLI adapter seam as normal cockpit threads.
@@ -189,6 +185,12 @@ async function main() {
   // file->SQLite) plus the 23:40 CT per-project report pass. In-process on
   // purpose: no new systemd units. MIKE_RADAR_DRIVER=0 disables.
   startMikeRadarDriver();
+
+  // Talk-seat rollover (goal #19). Gives cockpit:alpha-talk a fresh CLI head at
+  // ~04:00 CT and whenever its per-step context crosses talk_rollover_size_tokens,
+  // distilling the day into a board-augmented card first. Entirely gated by the
+  // settings-KV kill switch `talk_daily_rollover` (ships OFF — holds timers only).
+  startTalkRolloverWorker();
 
   if (slackApp) {
     await slackApp.start();

@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
+import Database, { type Database as BetterSqlite3Database } from 'better-sqlite3';
 import {
   sqliteDb,
   getConversation,
@@ -11,17 +12,21 @@ import {
 import { isConversationActive } from './agent.js';
 import { findClaudeAccount } from './claude-accounts.js';
 import { isScratchEnv } from './sim-guard.js';
+import { listQueuedMessages } from './thread-message-queue.js';
+import { isExpired } from './queue-merge.js';
+import { steerDir } from './steer-inbox.js';
 
-// ── Talk-seat daily rollover (goal #19, PLAN outbox/talk-daily-rollover) ──────
+// ── Talk-seat rollover: daily + size trigger (goal #19) ───────────────────────
 //
 // The Talk seat (cockpit:alpha-talk) runs on a native --resume CLI session, so
 // every step re-reads the whole session. With claude_autocompact_tokens=0 that
-// session grows toward the full window — recent steps were replaying 1.3M–2.3M
-// cached tokens EACH. The fix keeps it ONE chat but gives it a fresh head every
-// morning: at ~04:00 CT (or mid-day if the session passes ~400k before then) a
-// B-account one-shot distils the day's turns into a day card, posts a visible
-// divider, and clears the session pointer so the next message starts fresh — and
-// the persona digest seeds the fresh head with the recent cards.
+// session grows toward the full window — recent steps were replaying 1M–4.7M
+// cached tokens EACH (measured 2026-11-06). The fix keeps it ONE chat but gives
+// it a fresh head: at ~04:00 CT, AND whenever the live session's per-step context
+// crosses a measured size threshold, a B-account one-shot distils the day's turns
+// into a day card (augmented with board-sourced truth), posts a visible divider,
+// and clears the session pointer so the next message starts fresh — the persona
+// digest seeds the fresh head with the recent card(s).
 //
 // Everything here is plain SQLite + one model one-shot. The session pointer is
 // only ever CLEARED, never a transcript row deleted (PLAN rule). The whole thing
@@ -30,7 +35,7 @@ import { isScratchEnv } from './sim-guard.js';
 // ── config ───────────────────────────────────────────────────────────────────
 
 /** A seat the rollover manages. The live one is alpha-talk; tests add their own
- *  isolated target so the proof never touches the real seat's days folder. */
+ *  isolated target so a forced run never touches the real seat's days folder. */
 export interface RolloverTarget {
   externalId: string;
   /** Absolute dir the day cards are written into (one .md per rollover). */
@@ -51,19 +56,42 @@ export const LIVE_TARGETS: RolloverTarget[] = [
 
 /** Kill switch — settings-KV `talk_daily_rollover`. Anything other than the
  *  literal string 'on' (including absent) means OFF. Default OFF until Kevin
- *  flips it after the proof. */
+ *  flips it after the live check. */
 export const KILL_SWITCH_KEY = 'talk_daily_rollover';
 export function rolloverEnabled(): boolean {
   return (getSetting(KILL_SWITCH_KEY) ?? 'off').trim().toLowerCase() === 'on';
 }
 
-/** Mid-day safety net: roll when the live session's replayed context passes this
- *  many tokens. Overridable via settings-KV for tuning without a redeploy. */
-const DEFAULT_MIDDAY_TOKEN_CAP = 400_000;
-export function middayTokenCap(): number {
-  const raw = getSetting('talk_rollover_midday_token_cap');
-  const n = raw != null && raw.trim() !== '' ? parseInt(raw, 10) : NaN;
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MIDDAY_TOKEN_CAP;
+/** SIZE TRIGGER (settings-KV `talk_rollover_size_tokens`).
+ *
+ *  Roll a fresh head when the seat's per-step replayed context crosses this many
+ *  tokens, IN ADDITION to the 04:00 CT daily roll. Measured default 180,000.
+ *
+ *  WHY 180,000 (measured on conv 4316 / cockpit:alpha-talk, 2026-11-06, last 9d):
+ *  the per-turn token columns are SUMS across a turn's tool sub-calls, so
+ *  input+cache_read+cache_write is an UPPER BOUND on single-call window size, not
+ *  a literal window. On this (pre-rollover, never-reset) session the signal sits
+ *  ~1.0M–3.4M per turn and has hit 19M — exactly the unbounded growth this trigger
+ *  exists to kill. A fresh head's floor is ~42K (system prompt + digest). Kevin's
+ *  alpha-talk also hits an early-summarize pathology around ~250K tokens (a
+ *  SEPARATE bug another lane owns — not touched here), so the threshold must sit
+ *  safely BELOW 250K: 180K leaves margin while still giving a fresh head real room
+ *  to grow (~4x the floor) before a same-day cut. Erring slightly EARLY is safe —
+ *  the "no new turns since last roll" marker makes an over-eager check a no-op,
+ *  never a double-roll. Tune after a week of post-deploy numbers (the session will
+ *  run far smaller once the daily roll is actually resetting it). */
+export const SIZE_TRIGGER_KEY = 'talk_rollover_size_tokens';
+const DEFAULT_SIZE_TRIGGER_TOKENS = 180_000;
+/** Legacy key the branch shipped (never set in live). Read as a fallback so a
+ *  value set under the old name is still honoured; the new key wins. */
+const LEGACY_SIZE_KEY = 'talk_rollover_midday_token_cap';
+export function sizeTriggerTokens(): number {
+  for (const key of [SIZE_TRIGGER_KEY, LEGACY_SIZE_KEY]) {
+    const raw = getSetting(key);
+    const n = raw != null && raw.trim() !== '' ? parseInt(raw, 10) : NaN;
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return DEFAULT_SIZE_TRIGGER_TOKENS;
 }
 
 /** Chronological sort key for a card filename. `YYYY-MM-DD.md` is part 1 of its
@@ -83,7 +111,7 @@ export function sortCardFiles(files: string[]): string[] {
   });
 }
 
-/** In-process lock so the 04:00 run, its idle retries, the mid-day tick, and a
+/** In-process lock so the 04:00 run, its idle retries, the size tick, and a
  *  manual call can never summarize the same seat concurrently (they share one
  *  event loop; the writer is awaited, so two entrants could both pass the
  *  marker check before either advances it). */
@@ -123,21 +151,23 @@ export interface SessionTokens {
   input: number;
   cacheRead: number;
   cacheWrite: number;
-  /** The number that matters for "how big is this session per step" — what the
-   *  native --resume replays each turn. */
+  /** The size signal: the input-side tokens of the most recent assistant step
+   *  (input + cache_read + cache_write). This is what the SIZE trigger compares
+   *  to `talk_rollover_size_tokens`. */
   replayed: number;
 }
 
 /** The replayed-context size of the most recent assistant step. Zero when the
  *  conversation has no token-bearing assistant turn yet.
  *
- *  This is a HEURISTIC backstop for the mid-day net, not a precise session-token
- *  accounting: the turns table stores per-turn usage, not per-model-call, and
- *  doesn't tag which session a turn belonged to. So right after a clear the last
- *  (stale) assistant turn can still read big — but the marker guard in
+ *  HEURISTIC, not precise per-session accounting: the turns table stores per-turn
+ *  usage SUMMED across the turn's sub-calls (a tool-heavy turn re-reads the cached
+ *  prefix on every sub-call), and doesn't tag which session a turn belonged to. So
+ *  `replayed` is an UPPER BOUND on the single-call window, and right after a clear
+ *  the last (stale) assistant turn can still read big — but the marker guard in
  *  runTalkRollover ("no new turns since last rollover") makes that a harmless
- *  no-op, never a double-roll. Firing the net a little early or late only shifts
- *  WHEN a fresh head is cut, which is exactly what the net is for. */
+ *  no-op, never a double-roll. Firing the trigger a little early or late only
+ *  shifts WHEN a fresh head is cut, which is exactly what the trigger is for. */
 export function measureSessionTokens(conversationId: number): SessionTokens {
   const r = latestAssistantTokensStmt.get(conversationId);
   if (!r) return { turnIndex: null, input: 0, cacheRead: 0, cacheWrite: 0, replayed: 0 };
@@ -145,6 +175,41 @@ export function measureSessionTokens(conversationId: number): SessionTokens {
   const cacheRead = r.cache_read_tokens ?? 0;
   const cacheWrite = r.cache_write_tokens ?? 0;
   return { turnIndex: r.turn_index, input, cacheRead, cacheWrite, replayed: input + cacheRead + cacheWrite };
+}
+
+// ── pending-work guard (no turn running AND nothing queued/steered) ─────────────
+
+/** A seat is "busy" for rollover purposes if a turn is in flight OR a message is
+ *  waiting to be delivered to it — a queued message (sent while a turn ran, not
+ *  yet drained and not expired) or a pending/claimed steer file. Rolling while a
+ *  message is pending would clear the session out from under a message the fresh
+ *  head would then answer with no context, so the roll must wait for a clean gap.
+ *  Fail-CLOSED: any read error counts as "pending" (block the roll), never as
+ *  "clear". */
+export function seatHasPendingMessage(conversationId: number, now: Date = new Date()): boolean {
+  // 1) queued messages (thread_message_queue). A row that is past its expires_at
+  //    is dropped at the next drain, so it does not block.
+  try {
+    const nowMs = now.getTime();
+    const queued = listQueuedMessages(conversationId);
+    if (queued.some((m) => !isExpired(m, nowMs))) return true;
+  } catch {
+    return true; // can't tell → fail closed
+  }
+  // 2) steer files on disk (steer-inbox). These are only written DURING a running
+  //    turn (which isConversationActive already blocks) and are settled at turn
+  //    end — leftovers that return to the queue are caught above — but a crash can
+  //    strand a pending/claimed file, so check directly and fail closed.
+  try {
+    const dir = steerDir(conversationId);
+    if (existsSync(dir)) {
+      const files = readdirSync(dir);
+      if (files.some((f) => f.endsWith('.pending.json') || f.endsWith('.claimed.json'))) return true;
+    }
+  } catch {
+    return true; // can't tell → fail closed
+  }
+  return false;
 }
 
 // ── the day's turns ────────────────────────────────────────────────────────────
@@ -181,6 +246,117 @@ export function gatherTurnsSince(conversationId: number, sinceIdx: number): DayT
     content: r.content ?? '',
     createdAt: r.created_at,
   }));
+}
+
+// ── board-sourced carry-over block (deliverable #4) ─────────────────────────────
+
+const BOARD_DB = '/home/kevin/alpha-board/board.db';
+const CARRY_MAX_LANES = 40;
+const CARRY_STATUS_CHARS = 110;
+const CARRY_MAX_DECISION_CHARS = 1500; // runaway guard only; decisions kept verbatim
+
+function oneLine(s: string | null | undefined, n: number): string {
+  if (!s) return '';
+  const flat = s.replace(/\s+/g, ' ').trim();
+  return flat.length > n ? flat.slice(0, n) + '…' : flat;
+}
+function laneLabel(lane: string): string {
+  return lane.replace(/^cockpit:/, '').replace(/^alpha-lane-/, '');
+}
+
+/** The deterministic truth the card MUST carry, pulled straight from the alpha
+ *  board (NOT trusted to the model): TODAY's verbatim Kevin decisions, the open
+ *  asks, and which lane owns what (active lanes + one-line status). Read-only.
+ *  Fail-OPEN: a board hiccup returns '' — this AUGMENTS the model card, it is
+ *  never a gate on the roll. */
+export function buildCarryOverBlock(now: Date = new Date(), boardDbPath: string = BOARD_DB): string {
+  if (!existsSync(boardDbPath)) return '';
+  let bdb: BetterSqlite3Database | null = null;
+  try {
+    bdb = new Database(boardDbPath, { readonly: true, fileMustExist: true });
+    bdb.pragma('busy_timeout = 2000');
+    const nowIso = now.toISOString();
+    const out: string[] = ['## Carry-over (from the alpha board)', ''];
+
+    // (a) TODAY's verbatim Kevin decisions — kept whole (verbatim), as block quotes.
+    out.push("### Kevin's decisions today (verbatim)");
+    try {
+      const decisions = bdb.prepare(
+        `SELECT body FROM entries
+         WHERE kind='decision' AND active=1 AND body IS NOT NULL AND trim(body) <> ''
+           AND date(ts,'-6 hours') = date(?, '-6 hours')
+         ORDER BY ts ASC`,
+      ).all(nowIso) as { body: string }[];
+      if (decisions.length) {
+        for (const d of decisions) {
+          const body = d.body.length > CARRY_MAX_DECISION_CHARS
+            ? d.body.slice(0, CARRY_MAX_DECISION_CHARS) + ' …(trimmed)'
+            : d.body;
+          out.push(...body.split(/\r?\n/).map((l) => `> ${l}`), '');
+        }
+      } else {
+        out.push('- _(none recorded on the board today)_', '');
+      }
+    } catch {
+      out.push('- _(decisions unreadable)_', '');
+    }
+
+    // (b) open asks from Kevin — active board questions.
+    out.push('### Open asks from Kevin');
+    try {
+      const asks = bdb.prepare(
+        `SELECT lane, body FROM entries
+         WHERE kind='question' AND active=1 AND body IS NOT NULL AND trim(body) <> ''
+           AND NOT EXISTS (SELECT 1 FROM entries s
+                           WHERE s.supersedes_id = entries.id)
+         ORDER BY ts DESC LIMIT 20`,
+      ).all() as { lane: string; body: string }[];
+      if (asks.length) {
+        for (const a of asks) out.push(`- (${laneLabel(a.lane)}) ${oneLine(a.body, 160)}`);
+      } else {
+        out.push("- _(none open on the board — see the model card's \"Still open\" above)_");
+      }
+      out.push('');
+    } catch {
+      out.push('- _(asks unreadable)_', '');
+    }
+
+    // (c) which lane owns what — active lanes (latest status/claim, not released,
+    //     touched in the last 3 days), one line each.
+    out.push('### Lanes in flight (who owns what)');
+    try {
+      const lanes = bdb.prepare(
+        `SELECT e.lane AS lane, e.body AS body, e.ts AS ts
+         FROM entries e
+         WHERE e.id IN (
+           SELECT MAX(id) FROM entries
+           WHERE active=1 AND kind IN ('status','claim')
+             AND body IS NOT NULL AND trim(body) <> ''
+             AND (lane LIKE 'cockpit:alpha-lane-%' OR lane LIKE 'alpha-lane-%')
+           GROUP BY lane
+         )
+         AND NOT EXISTS (SELECT 1 FROM entries r
+                         WHERE r.lane = e.lane AND r.kind='release' AND r.id > e.id)
+         AND e.ts >= datetime(?, '-3 days')
+         ORDER BY e.ts DESC
+         LIMIT ${CARRY_MAX_LANES}`,
+      ).all(nowIso) as { lane: string; body: string; ts: string }[];
+      if (lanes.length) {
+        for (const l of lanes) out.push(`- **${laneLabel(l.lane)}** — ${oneLine(l.body, CARRY_STATUS_CHARS)}`);
+      } else {
+        out.push('- _(no active lanes on the board in the last 3 days)_');
+      }
+      out.push('');
+    } catch {
+      out.push('- _(lanes unreadable)_', '');
+    }
+
+    return out.join('\n').trimEnd() + '\n';
+  } catch {
+    return ''; // board unavailable — augmentation only, never block the card
+  } finally {
+    try { bdb?.close(); } catch { /* ignore */ }
+  }
 }
 
 // ── day-card prompt + one-shot ──────────────────────────────────────────────────
@@ -332,7 +508,7 @@ export function runDayCardOneShot(prompt: string, model = WRITER_MODEL, timeoutM
 // ── writing the card, divider, and session clear ───────────────────────────────
 
 /** Pick the card filename. The first roll for a date is `YYYY-MM-DD.md`; a later
- *  roll the same date (the mid-day safety net) becomes `YYYY-MM-DD-part2.md`,
+ *  roll the same date (the size trigger firing again) becomes `YYYY-MM-DD-part2.md`,
  *  `-part3`, … so no card is ever overwritten. Returns the absolute path and the
  *  1-based part number. */
 export function pickCardPath(daysDir: string, dateIso: string): { file: string; part: number } {
@@ -347,8 +523,8 @@ export function pickCardPath(daysDir: string, dateIso: string): { file: string; 
 }
 
 const clearSessionStmt = sqliteDb.prepare<[number]>(
-  // Same effect as setThreadMcpConnectors (conversation-db.ts:348): drop the
-  // native --resume pointer so the next message starts a fresh CLI session.
+  // Same effect as setThreadMcpConnectors (conversation-db.ts): drop the native
+  // --resume pointer so the next message starts a fresh CLI session.
   // NEVER touches the turns table.
   `UPDATE conversations
    SET claude_session_id = NULL, session_adapter = NULL, session_account = NULL,
@@ -385,19 +561,24 @@ export interface RolloverOpts {
   runOneShot?: (prompt: string) => Promise<string>;
   /** test seam — override the in-flight check. Defaults to isConversationActive. */
   isActive?: (conversationId: number) => boolean;
-  /** 'morning' (04:00) or 'midday' (safety net). Affects the reason string only. */
-  trigger?: 'morning' | 'midday' | 'manual';
+  /** test seam — override the queued/steered check. Defaults to seatHasPendingMessage. */
+  hasPending?: (conversationId: number) => boolean;
+  /** test seam — inject a fake board block. Defaults to the real board read. */
+  carryOver?: (now: Date) => string;
+  /** 'morning' (04:00), 'size' (size trigger), or 'manual'. Reason string only. */
+  trigger?: 'morning' | 'size' | 'manual';
   /** skip the kill-switch gate (proof-run only — the default honors it). */
   bypassKillSwitch?: boolean;
 }
 
 /**
  * Run ONE rollover cycle for one seat. Order is fail-closed on purpose:
- *   1. gather the day's turns   (nothing new → skip, leave session alone)
- *   2. write the day card FILE
- *   3. post the visible divider (bump role — not a user turn, never wakes the seat)
- *   4. ONLY THEN clear the session pointer + advance the marker
- * If 2 or 3 throw, 4 never runs, so we never lose the thread with no card to show
+ *   1. gate: enabled + not in flight + nothing queued/steered
+ *   2. gather the day's turns   (nothing new → skip, leave session alone)
+ *   3. write the day card FILE  (model card + deterministic board carry-over)
+ *   4. post the visible divider (bump role — not a user turn, never wakes the seat)
+ *   5. ONLY THEN clear the session pointer + advance the marker
+ * If 3 or 4 throw, 5 never runs, so we never lose the thread with no card to show
  * for it. Returns a structured result; never throws for a skip.
  */
 export async function runTalkRollover(opts: RolloverOpts): Promise<RolloverResult> {
@@ -414,11 +595,13 @@ export async function runTalkRollover(opts: RolloverOpts): Promise<RolloverResul
   if (!conv) return { ...base, reason: 'conversation not found' };
 
   const isActive = opts.isActive ?? isConversationActive;
+  const hasPending = opts.hasPending ?? ((id: number) => seatHasPendingMessage(id, now));
   if (isActive(conv.id)) return { ...base, reason: 'a turn is in flight — retry later' };
+  if (hasPending(conv.id)) return { ...base, reason: 'a message is queued/steered for this seat — retry later' };
 
-  // Concurrency lock: the morning run, its retries, the mid-day tick, and a
-  // manual call share one event loop and all await the writer, so without this
-  // two of them could both pass the marker check and double-roll.
+  // Concurrency lock: the morning run, its retries, the size tick, and a manual
+  // call share one event loop and all await the writer, so without this two of
+  // them could both pass the marker check and double-roll.
   if (rolling.has(ext)) return { ...base, reason: 'a rollover is already running for this seat' };
   rolling.add(ext);
   try {
@@ -464,14 +647,17 @@ export async function runTalkRollover(opts: RolloverOpts): Promise<RolloverResul
     }
 
     // RE-CHECK right before mutating state: a turn may have started during the
-    // writer run, or Kevin may have flipped the switch off. Either way, abort
-    // WITHOUT writing the card or clearing the session — the next idle rollover
-    // picks the window up cleanly.
+    // writer run, a message may have been queued/steered, or Kevin may have
+    // flipped the switch off. Either way, abort WITHOUT writing the card or
+    // clearing the session — the next idle rollover picks the window up cleanly.
     if (!opts.bypassKillSwitch && !rolloverEnabled()) {
       return { ...base, reason: 'kill switch flipped off mid-roll — aborted before any change' };
     }
     if (isActive(conv.id)) {
       return { ...base, reason: 'a turn started mid-roll — aborted before any change' };
+    }
+    if (hasPending(conv.id)) {
+      return { ...base, reason: 'a message was queued/steered mid-roll — aborted before any change' };
     }
     // A turn may have started AND FINISHED during the writer (idle again now).
     // It left content turns the card doesn't cover; clearing the session now
@@ -480,6 +666,18 @@ export async function runTalkRollover(opts: RolloverOpts): Promise<RolloverResul
     if (gatherTurnsSince(conv.id, windowEndIdx).length > 0) {
       return { ...base, reason: 'new turns arrived mid-roll — aborted before any change' };
     }
+
+    // Deterministic board carry-over the card MUST carry (verbatim decisions,
+    // open asks, lane ownership). Appended to the model card; fail-open ('').
+    let carryOver = '';
+    try {
+      carryOver = (opts.carryOver ?? buildCarryOverBlock)(now);
+    } catch {
+      carryOver = '';
+    }
+    const cardWithCarry = carryOver.trim()
+      ? `${cardBody}\n\n${carryOver.trim()}\n`
+      : `${cardBody}\n`;
 
     const { file, part } = pickCardPath(target.daysDir, dateIso);
     const partSuffix = part > 1 ? ` (part ${part})` : '';
@@ -490,7 +688,7 @@ export async function runTalkRollover(opts: RolloverOpts): Promise<RolloverResul
     const header = `# 📅 ${label}${partSuffix}\n\n`;
     try {
       mkdirSync(target.daysDir, { recursive: true });
-      writeFileSync(file, frontMatter + header + cardBody + '\n', 'utf8');
+      writeFileSync(file, frontMatter + header + cardWithCarry, 'utf8');
     } catch (err) {
       return { ...base, reason: `card write failed: ${err instanceof Error ? err.message : String(err)}` };
     }
@@ -548,30 +746,25 @@ export async function runTalkRollover(opts: RolloverOpts): Promise<RolloverResul
   }
 }
 
-// ── digest seed section (deliverable #4 lives in digest.py; this is the TS twin
-//    used only to prove the seed content in the hermetic check) ────────────────
+// ── digest seed section (deliverable #5 lives in scripts/talk-rollover/digest.py;
+//    this is the TS twin used only to document the seed content) ────────────────
 
 export interface SeedSectionInput {
   daysDir: string;
   /** open items — one line each (the fresh head's to-do carryover). */
   openItems: string[];
-  recentCount?: number; // default 3
-  maxChars?: number;    // default 20000
-  now?: Date;
+  maxChars?: number; // default 3000 (small seed)
 }
 
-/** Build the digest seed section the fresh head sees: today's open items + the
- *  last N day cards in full + a one-line index of older cards. Bounded so the
- *  whole digest stays under the persona's 30k cap. This is the reference the
- *  Python digest.py mirrors; the hermetic check asserts they agree in shape. */
+/** Build the SMALL digest seed the fresh head sees: the last card's open items +
+ *  a one-line index of older cards + a pointer to the days folder. Bounded to
+ *  3,000 bytes — NOT the full card bodies. This is the reference the Python
+ *  digest.py mirrors. */
 export function buildSeedSection(input: SeedSectionInput): string {
-  const recentCount = input.recentCount ?? 3;
-  const maxChars = input.maxChars ?? 20_000;
-  const lines: string[] = [];
-  lines.push('## Talk seat — carried forward');
-  lines.push('');
+  const maxChars = input.maxChars ?? 3_000;
+  const lines: string[] = ['## Talk seat — carried forward', ''];
   if (input.openItems.length) {
-    lines.push('### Open items');
+    lines.push('### Open items (from the last card)');
     for (const it of input.openItems) lines.push(`- ${it}`);
     lines.push('');
   }
@@ -584,26 +777,11 @@ export function buildSeedSection(input: SeedSectionInput): string {
   } catch {
     cards = [];
   }
-  const recent = cards.slice(-recentCount);
-  const older = cards.slice(0, Math.max(0, cards.length - recentCount));
-
-  lines.push(`### Recent day cards (last ${recent.length})`);
-  for (const f of recent) {
-    let body = '';
-    try {
-      body = readFileSync(path.join(input.daysDir, f), 'utf8');
-    } catch {
-      body = '_(unreadable)_';
-    }
-    lines.push(`<day-card file="${f}">`);
-    lines.push(body.trim());
-    lines.push('</day-card>');
+  if (cards.length) {
+    lines.push(`### Day-card index (${cards.length}, newest last)`);
+    lines.push(cards.map((f) => f.replace(/\.md$/, '')).join(', '));
     lines.push('');
-  }
-  if (older.length) {
-    lines.push(`### Older cards (${older.length}, read on demand)`);
-    lines.push(older.map((f) => f.replace(/\.md$/, '')).join(', '));
-    lines.push('');
+    lines.push(`_Read any card in full: ${input.daysDir}/<date>.md (also via find_chats / read_chat)._`);
   }
 
   let out = lines.join('\n');
@@ -612,10 +790,6 @@ export function buildSeedSection(input: SeedSectionInput): string {
 }
 
 // ── the worker ──────────────────────────────────────────────────────────────────
-
-function nowCT(): Date {
-  return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' }));
-}
 
 /** ms until the next HH:00 CT (default 04:00). Same offset trick as the existing
  *  8am briefing scheduler in index.ts (reused deliberately rather than inventing
@@ -637,10 +811,10 @@ export function msUntilNextCT(hour: number, from: Date = new Date()): number {
 const MORNING_HOUR = 4;
 const MORNING_RETRY_MS = 10 * 60 * 1000; // retry every 10 min while a turn runs
 const MORNING_MAX_RETRIES = 8;           // ~80 min of retries, then give up for today
-const MIDDAY_TICK_MS = 15 * 60 * 1000;   // how often the safety net checks
+const SIZE_TICK_MS = 15 * 60 * 1000;     // how often the size trigger checks
 
 let morningTimer: NodeJS.Timeout | null = null;
-let middayTimer: NodeJS.Timeout | null = null;
+let sizeTimer: NodeJS.Timeout | null = null;
 
 async function runMorning(retriesLeft: number): Promise<void> {
   // Whole body guarded: rolloverEnabled() reads the DB, and this runs via
@@ -653,8 +827,8 @@ async function runMorning(retriesLeft: number): Promise<void> {
         // Retry on any transient "seat was busy / raced" reason, not just the
         // entry-gate "in flight" — a turn that started during the writer aborts
         // with a 'mid-roll' reason and must still be retried, or the morning
-        // roll is abandoned until mid-day/next day.
-        if (!res.ran && /in flight|mid-roll|already running/.test(res.reason) && retriesLeft > 0) {
+        // roll is abandoned until the size trigger / next day.
+        if (!res.ran && /in flight|queued\/steered|mid-roll|already running/.test(res.reason) && retriesLeft > 0) {
           setTimeout(() => { void runMorning(retriesLeft - 1); }, MORNING_RETRY_MS).unref?.();
           return;
         }
@@ -668,28 +842,29 @@ async function runMorning(retriesLeft: number): Promise<void> {
   }
 }
 
-async function runMiddayCheck(): Promise<void> {
+async function runSizeCheck(): Promise<void> {
   try {
     if (!rolloverEnabled()) return;
-    const cap = middayTokenCap();
+    const cap = sizeTriggerTokens();
     for (const target of LIVE_TARGETS) {
       try {
         const conv = getConversation(target.externalId);
         if (!conv) continue;
-        if (isConversationActive(conv.id)) continue; // wait for an idle gap
+        if (isConversationActive(conv.id)) continue;          // wait for an idle gap
+        if (seatHasPendingMessage(conv.id)) continue;         // nothing queued/steered
         const tok = measureSessionTokens(conv.id);
         if (tok.replayed < cap) continue;
         // runTalkRollover no-ops when there are no new turns since the last roll,
         // so a just-cleared session whose last (stale) assistant turn still reads
         // big can't double-roll — it simply reports 'no new turns'.
-        const res = await runTalkRollover({ target, trigger: 'midday' });
-        if (res.ran) console.log(`[talk-rollover] midday (session ${tok.replayed} ≥ ${cap}): ${res.reason}`);
+        const res = await runTalkRollover({ target, trigger: 'size' });
+        if (res.ran) console.log(`[talk-rollover] size (session ${tok.replayed} ≥ ${cap}): ${res.reason}`);
       } catch (err) {
-        console.error(`[talk-rollover] midday check failed for ${target.externalId}:`, err);
+        console.error(`[talk-rollover] size check failed for ${target.externalId}:`, err);
       }
     }
   } catch (err) {
-    console.error('[talk-rollover] midday tick failed:', err);
+    console.error('[talk-rollover] size tick failed:', err);
   }
 }
 
@@ -703,18 +878,18 @@ function scheduleMorning(): void {
   console.log(`[talk-rollover] next morning rollover in ${(ms / 3_600_000).toFixed(1)}h`);
 }
 
-/** Start the rollover worker: the 04:00 CT morning roll + the ~400k mid-day
- *  safety net. Cheap at rest (one SELECT per 15-min tick when enabled). Entirely
- *  gated by the kill switch, so with it OFF this does nothing but hold timers. */
+/** Start the rollover worker: the 04:00 CT morning roll + the size trigger.
+ *  Cheap at rest (one SELECT per 15-min tick when enabled). Entirely gated by the
+ *  kill switch, so with it OFF this does nothing but hold timers. */
 export function startTalkRolloverWorker(): void {
-  if (morningTimer || middayTimer) return;
+  if (morningTimer || sizeTimer) return;
   scheduleMorning();
-  middayTimer = setInterval(() => { void runMiddayCheck(); }, MIDDAY_TICK_MS);
-  middayTimer.unref?.();
+  sizeTimer = setInterval(() => { void runSizeCheck(); }, SIZE_TICK_MS);
+  sizeTimer.unref?.();
   console.log('[talk-rollover] worker started (kill switch gates all work)');
 }
 
-/** Used by the hermetic check to read a just-written card back off disk. */
+/** Used by a read-only inspector to read a just-written card back off disk. */
 export function listDayCards(daysDir: string): { file: string; mtime: number }[] {
   if (!existsSync(daysDir)) return [];
   const files = sortCardFiles(readdirSync(daysDir).filter((f) => /\.md$/.test(f)));

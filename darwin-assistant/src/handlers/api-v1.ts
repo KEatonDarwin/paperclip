@@ -1660,6 +1660,35 @@ function serializeTurn(turn: TurnRow, convSource?: string, externalId?: string):
   };
 }
 
+// STEER-BY-DEFAULT (2026-11-06): texts that exist to START their own turn (cues,
+// reports, watchdog/curator/autopilot wakes) keep the queue even from a non-UI
+// caller. Superset of the old alpha-lane exclusion list.
+const CUE_TEXT_RE = /^\s*(\[(report:|silence ping|morning cue|cue|recue|debrief|tree |night-shift|watchdog|curator)|\u{1F319} AUTOPILOT CUE)/iu;
+
+/**
+ * Who a mid-turn message is "from", as the model will read it ("New message from
+ * <name>"). Kevin's own composer (the cockpit proxy stamps x-jarvis-client:
+ * cockpit-ui) is 'Kevin'; every other caller is another JARVIS instance or script
+ * and is named by, in order: the x-jarvis-from header (a chat's external id →
+ * its title, or a plain name), the text's own tag, the old Alpha rules, else a
+ * generic automated label. Never 'Kevin' for a non-UI caller.
+ */
+function resolveChatSender(req: AuthedRequest, text: string, fromCockpitUi: boolean, alphaLaneDefault: boolean): string {
+  if (/^\s*\[via alpha/i.test(text) || alphaLaneDefault) return 'Alpha';
+  if (fromCockpitUi) return 'Kevin';
+  const hdr = (req.get('x-jarvis-from') ?? '').trim().slice(0, 200);
+  if (hdr) {
+    const c = hdr.includes(':') ? getConversation(hdr) : undefined;
+    const name = (c?.title ?? hdr).replace(/\s+/g, ' ').slice(0, 60);
+    if (name) return name;
+  }
+  const tag = /^\s*\[(jarvis-job|watchdog|curator|tree |night-shift)/i.exec(text);
+  if (tag) return tag[1].trim();
+  const rep = /^\s*\[report:([^\]\s]+)\]/i.exec(text);
+  if (rep) return getConversation(rep[1])?.title?.slice(0, 60) ?? 'a spawned chat';
+  return 'another JARVIS chat';
+}
+
 function findConversationForCaller(caller: ApiKeyRow, externalId: string): ConversationRow | { error: { status: number; code: string; message: string } } {
   if (!callerOwnsExternalId(caller.id, externalId)) {
     return { error: { status: 403, code: 'thread_not_owned_by_caller', message: 'This thread is not owned by the authenticated caller' } };
@@ -7229,13 +7258,18 @@ export function createApiV1Router(): Router {
     if (pending) {
       // STEER INBOX: while a turn runs, `mode` picks how this message lands —
       // 'steer' (delivered at the next step, no stop), 'interrupt' (stop now, this
-      // goes next) or 'after' (the queue). Absent = 'after', except Alpha's own
-      // drops into a lane, which steer. Anything that cannot be steered falls back
-      // to the queue and says why (steer_fallback).
-      const isAlphaLane = externalId.startsWith('cockpit:alpha-lane-') && !/^\s*\[(report:|silence ping|morning cue|cue)/i.test(text);
+      // goes next) or 'after' (the queue). Absent = 'steer' for anything that is NOT
+      // Kevin's own composer (STEER-BY-DEFAULT, 2026-11-06: a JARVIS instance talking
+      // to another chat should never make it wait), 'after' for Kevin's composer
+      // (it picks a mode itself while a turn runs), and 'after' for cue/report texts
+      // that exist to start their own turn. Anything that cannot be steered falls
+      // back to the queue and says why (steer_fallback).
+      const isAlphaLane = externalId.startsWith('cockpit:alpha-lane-') && !CUE_TEXT_RE.test(text);
+      const fromCockpitUi = req.get('x-jarvis-client') === 'cockpit-ui';
+      const isAutomatedPost = !fromCockpitUi && !CUE_TEXT_RE.test(text);
       const modeRaw = typeof body.mode === 'string' ? body.mode.toLowerCase() : null;
-      const mode = modeRaw === 'steer' || modeRaw === 'interrupt' || modeRaw === 'after' ? modeRaw : isAlphaLane ? 'steer' : 'after';
-      const from = /^\s*\[via alpha/i.test(text) || (modeRaw === null && isAlphaLane) ? 'Alpha' : 'Kevin';
+      const mode = modeRaw === 'steer' || modeRaw === 'interrupt' || modeRaw === 'after' ? modeRaw : isAlphaLane || isAutomatedPost ? 'steer' : 'after';
+      const from = resolveChatSender(req, text, fromCockpitUi, modeRaw === null && isAlphaLane);
       let steerFallback: string | undefined;
       if (mode !== 'after') {
         if (savedImages.length || savedFiles.length) {
